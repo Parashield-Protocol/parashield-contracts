@@ -1,4 +1,4 @@
-//! Parashield Governance DAO — v2 (not yet implemented)
+//! Parashield Governance DAO
 //!
 //! Token-weighted governance over protocol parameters:
 //!   - Add/remove insurance products
@@ -9,52 +9,264 @@
 //!
 //! Governance token: SHIELD (Stellar asset, tradeable on built-in DEX)
 //! Proposal lifecycle: Draft → Active → Passed/Rejected → Executed
-//! Quorum: 10% of circulating SHIELD; simple majority to pass
+//! Quorum: configurable % of total supply; configurable majority to pass
 //!
-//! Full design: see ARCHITECTURE.md § Governance DAO
+//! v2 — full implementation; DAO is now deployable and testable.
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, Address, Bytes, Env, Symbol};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, contracterror, panic_with_error,
+    token, Address, Bytes, Env, Symbol,
+};
+
+pub mod types;
+pub use types::*;
+
+#[contracttype]
+enum StorageKey {
+    Initialized,
+    Admin,
+    Config,
+    NextProposalId,
+    Proposal(u64),
+    VoteRecord(u64, Address),
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    AlreadyInitialized   = 1,
+    NotInitialized       = 2,
+    Unauthorized         = 3,
+    InsufficientWeight   = 4,
+    ProposalNotFound     = 5,
+    ProposalNotActive    = 6,
+    AlreadyVoted         = 7,
+    VotingClosed         = 8,
+    VotingStillOpen      = 9,
+    ProposalNotPassed    = 10,
+    AlreadyExecuted      = 11,
+    AlreadyCancelled     = 12,
+}
 
 #[contract]
 pub struct GovernanceDao;
 
 #[contractimpl]
 impl GovernanceDao {
-    pub fn initialize(_env: Env, _admin: Address, _governance_token: Address) {
-        unimplemented!("GovernanceDao is scheduled for v2. See ARCHITECTURE.md for design.")
-    }
 
-    /// Create a governance proposal.
-    pub fn create_proposal(
-        _env: Env,
-        _proposer: Address,
-        _title: Symbol,
-        _description: Symbol,
-        _proposal_type: Symbol,
-        _execution_data: Option<Bytes>,
-    ) -> u128 {
-        unimplemented!()
-    }
-
-    /// Cast a vote on an active proposal.
-    pub fn vote(
-        _env: Env,
-        _voter: Address,
-        _proposal_id: u128,
-        _support: bool,
-        _weight: i128,
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        config: DaoConfig,
     ) {
-        unimplemented!()
+        if env.storage().instance().has(&StorageKey::Initialized) {
+            panic_with_error!(&env, Error::AlreadyInitialized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&StorageKey::Initialized,    &true);
+        env.storage().instance().set(&StorageKey::Admin,          &admin);
+        env.storage().instance().set(&StorageKey::Config,         &config);
+        env.storage().instance().set(&StorageKey::NextProposalId, &0u64);
     }
 
-    /// Execute a passed proposal after the timelock.
-    pub fn execute(_env: Env, _proposal_id: u128) {
-        unimplemented!()
+    // ── Proposals ─────────────────────────────────────────────────────────────
+
+    pub fn create_proposal(
+        env: Env,
+        proposer: Address,
+        title: Bytes,
+        target: Address,
+        function: Symbol,
+    ) -> u64 {
+        proposer.require_auth();
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+
+        let gov_token = token::Client::new(&env, &config.gov_token);
+        let weight = gov_token.balance(&proposer);
+        if weight < config.proposal_threshold {
+            panic_with_error!(&env, Error::InsufficientWeight);
+        }
+
+        let proposal_id: u64 = env.storage().instance()
+            .get(&StorageKey::NextProposalId).unwrap_or(0);
+        let now = env.ledger().timestamp();
+
+        let proposal = Proposal {
+            id:            proposal_id,
+            proposer:      proposer.clone(),
+            title,
+            target,
+            function,
+            status:        ProposalStatus::Active,
+            votes_for:     0,
+            votes_against: 0,
+            votes_abstain: 0,
+            created_at:    now,
+            vote_end:      now + config.voting_period,
+        };
+
+        env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
+        env.storage().instance().set(&StorageKey::NextProposalId, &(proposal_id + 1));
+
+        proposal_id
     }
 
-    /// Cancel a proposal (admin emergency only).
-    pub fn cancel(_env: Env, _admin: Address, _proposal_id: u128) {
-        unimplemented!()
+    pub fn vote(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+        choice: VoteChoice,
+    ) {
+        voter.require_auth();
+
+        let mut proposal: Proposal = env.storage().persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        if proposal.status != ProposalStatus::Active {
+            panic_with_error!(&env, Error::ProposalNotActive);
+        }
+        if env.ledger().timestamp() > proposal.vote_end {
+            panic_with_error!(&env, Error::VotingClosed);
+        }
+        let vote_key = StorageKey::VoteRecord(proposal_id, voter.clone());
+        if env.storage().persistent().has(&vote_key) {
+            panic_with_error!(&env, Error::AlreadyVoted);
+        }
+
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let weight = token::Client::new(&env, &config.gov_token).balance(&voter);
+        if weight <= 0 { panic_with_error!(&env, Error::InsufficientWeight); }
+
+        match choice {
+            VoteChoice::For     => proposal.votes_for     += weight,
+            VoteChoice::Against => proposal.votes_against += weight,
+            VoteChoice::Abstain => proposal.votes_abstain += weight,
+        }
+
+        env.storage().persistent().set(&vote_key, &VoteRecord {
+            voter,
+            choice,
+            weight,
+        });
+        env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
+    }
+
+    pub fn finalize(env: Env, proposal_id: u64) {
+        let mut proposal: Proposal = env.storage().persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        if proposal.status != ProposalStatus::Active {
+            panic_with_error!(&env, Error::ProposalNotActive);
+        }
+        if env.ledger().timestamp() <= proposal.vote_end {
+            panic_with_error!(&env, Error::VotingStillOpen);
+        }
+
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let total_supply = token::Client::new(&env, &config.gov_token).total_supply();
+        let total_votes  = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
+        let quorum_needed = total_supply * config.quorum_bps as i128 / 10_000;
+
+        if total_votes < quorum_needed {
+            proposal.status = ProposalStatus::Failed;
+        } else {
+            let for_bps = if total_votes > 0 {
+                proposal.votes_for * 10_000 / total_votes
+            } else {
+                0
+            };
+            proposal.status = if for_bps as u32 >= config.majority_bps {
+                ProposalStatus::Passed
+            } else {
+                ProposalStatus::Failed
+            };
+        }
+
+        env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
+    }
+
+    pub fn execute(env: Env, proposal_id: u64) {
+        let mut proposal: Proposal = env.storage().persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        if proposal.status == ProposalStatus::Executed {
+            panic_with_error!(&env, Error::AlreadyExecuted);
+        }
+        if proposal.status == ProposalStatus::Cancelled {
+            panic_with_error!(&env, Error::AlreadyCancelled);
+        }
+        if proposal.status != ProposalStatus::Passed {
+            panic_with_error!(&env, Error::ProposalNotPassed);
+        }
+
+        // Signal execution — actual cross-contract call is the caller's responsibility
+        // (they build the Auth tree) to avoid this contract needing admin on targets.
+        proposal.status = ProposalStatus::Executed;
+        env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
+    }
+
+    pub fn cancel(env: Env, admin: Address, proposal_id: u64) {
+        Self::require_admin(&env, &admin);
+
+        let mut proposal: Proposal = env.storage().persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        if proposal.status != ProposalStatus::Active {
+            panic_with_error!(&env, Error::ProposalNotActive);
+        }
+
+        proposal.status = ProposalStatus::Cancelled;
+        env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
+    }
+
+    // ── Queries ───────────────────────────────────────────────────────────────
+
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
+        env.storage().persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound))
+    }
+
+    pub fn get_vote(env: Env, proposal_id: u64, voter: Address) -> Option<VoteRecord> {
+        env.storage().persistent()
+            .get(&StorageKey::VoteRecord(proposal_id, voter))
+    }
+
+    pub fn get_config(env: Env) -> DaoConfig {
+        env.storage().instance().get(&StorageKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
+    }
+
+    pub fn get_admin(env: Env) -> Address {
+        env.storage().instance().get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
+    }
+
+    pub fn proposal_count(env: Env) -> u64 {
+        env.storage().instance().get(&StorageKey::NextProposalId).unwrap_or(0)
+    }
+
+    // ── Admin ─────────────────────────────────────────────────────────────────
+
+    pub fn update_config(env: Env, admin: Address, config: DaoConfig) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&StorageKey::Config, &config);
+    }
+
+    fn require_admin(env: &Env, caller: &Address) {
+        let admin: Address = env.storage().instance().get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        if *caller != admin { panic_with_error!(env, Error::Unauthorized); }
+        caller.require_auth();
     }
 }
+
+#[cfg(test)]
+mod test;
