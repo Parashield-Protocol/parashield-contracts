@@ -50,6 +50,7 @@ pub enum Error {
     NoDataAvailable     = 6,
     InvalidConfidence   = 7,
     InvalidWeight       = 8,
+    StaleData           = 9,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -236,6 +237,76 @@ impl OracleVerifier {
             if p.timestamp > last_updated { last_updated = p.timestamp; }
         }
         AggregatedData { median_value, oracle_count, min_confidence, last_updated }
+    }
+
+    /// Like `verify_trigger` but panics with `StaleData` if the newest submission
+    /// is older than `max_age_seconds`. Use this in parametric claim paths that
+    /// require fresh oracle data.
+    pub fn verify_trigger_fresh(
+        env: Env,
+        data_type: Symbol,
+        key: Symbol,
+        condition: TriggerCondition,
+        max_age_seconds: u64,
+    ) -> bool {
+        let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
+        let points: Vec<OracleDataPoint> = env.storage().persistent()
+            .get(&dp_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoDataAvailable));
+        if points.is_empty() { panic_with_error!(&env, Error::NoDataAvailable); }
+
+        let now = env.ledger().timestamp();
+        let mut latest_ts = 0u64;
+        for i in 0..points.len() {
+            let ts = points.get_unchecked(i).timestamp;
+            if ts > latest_ts { latest_ts = ts; }
+        }
+        if now.saturating_sub(latest_ts) > max_age_seconds {
+            panic_with_error!(&env, Error::StaleData);
+        }
+
+        let median = Self::get_median_value(&env, &data_type, &key);
+        match condition.comparison {
+            TriggerComparison::LessThan    => median < condition.threshold,
+            TriggerComparison::GreaterThan => median > condition.threshold,
+            TriggerComparison::Equal       => median == condition.threshold,
+        }
+    }
+
+    /// Submit data for multiple keys in one call.
+    /// Each tuple: (key, value, confidence, timestamp).
+    pub fn batch_submit_data(
+        env: Env,
+        oracle: Address,
+        data_type: Symbol,
+        submissions: Vec<(Symbol, i128, u32, u64)>,
+    ) {
+        oracle.require_auth();
+        let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
+        let entry: OracleEntry = env.storage().persistent()
+            .get(&oracle_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
+        if !entry.active { panic_with_error!(&env, Error::Unauthorized); }
+
+        for i in 0..submissions.len() {
+            let (key, value, confidence, timestamp) = submissions.get_unchecked(i);
+            if confidence > 100 { panic_with_error!(&env, Error::InvalidConfidence); }
+            let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
+            let mut points: Vec<OracleDataPoint> = env.storage().persistent()
+                .get(&dp_key)
+                .unwrap_or_else(|| Vec::new(&env));
+            let new_point = OracleDataPoint { oracle: oracle.clone(), value, confidence, timestamp };
+            let mut found = false;
+            for j in 0..points.len() {
+                if points.get_unchecked(j).oracle == oracle {
+                    points.set(j, new_point.clone());
+                    found = true;
+                    break;
+                }
+            }
+            if !found { points.push_back(new_point); }
+            env.storage().persistent().set(&dp_key, &points);
+        }
     }
 
     /// List all registered oracle addresses.
