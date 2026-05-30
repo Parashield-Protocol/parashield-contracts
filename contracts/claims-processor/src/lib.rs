@@ -220,6 +220,34 @@ impl ClaimsProcessor {
         Self::evaluate_and_settle(&env, &mut claim)
     }
 
+    /// Process up to `limit` pending claims parametrically in one call.
+    /// Returns a Vec of (claim_id, result) pairs for the processed claims.
+    /// Skips any claim that is not in Pending status (idempotent).
+    pub fn batch_auto_process(env: Env, caller: Address, limit: u32) -> Vec<(u128, ClaimResult)> {
+        caller.require_auth();
+        let pending: Vec<u128> = env.storage().instance()
+            .get(&StorageKey::PendingClaims)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut results: Vec<(u128, ClaimResult)> = Vec::new(&env);
+        let process_count = if pending.len() < limit { pending.len() } else { limit };
+
+        for i in 0..process_count {
+            let claim_id = pending.get_unchecked(i);
+            let mut claim: Claim = match env.storage().persistent()
+                .get(&StorageKey::Claim(claim_id)) {
+                Some(c) => c,
+                None    => continue,
+            };
+            if claim.status != ClaimStatus::Pending { continue; }
+            if claim.processed_at.is_some() { continue; }
+
+            let result = Self::evaluate_and_settle(&env, &mut claim);
+            results.push_back((claim_id, result));
+        }
+        results
+    }
+
     // ── Dispute ───────────────────────────────────────────────────────────────
 
     pub fn dispute_claim(env: Env, claimant: Address, claim_id: u128, reason: soroban_sdk::Symbol) {
