@@ -1,0 +1,21 @@
+[package]
+name = "parashield-claims-processor"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+testutils = ["soroban-sdk/testutils"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+parashield-policy-engine  = { path = "../policy-engine" }
+parashield-oracle-verifier = { path = "../oracle-verifier" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+parashield-policy-engine  = { path = "../policy-engine",   features = ["testutils"] }
+parashield-oracle-verifier = { path = "../oracle-verifier", features = ["testutils"] }

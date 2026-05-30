@@ -1,0 +1,302 @@
+//! Parashield Oracle Verifier
+//!
+//! Authorized oracle addresses submit real-world data (rainfall, flight status,
+//! on-chain metrics). The contract stores submissions and exposes a
+//! `verify_trigger` function used by the Claims Processor to determine whether
+//! a policy's payout condition has been met.
+//!
+//! Design notes
+//! ─────────────
+//! - Multiple oracles can submit the same key; the contract computes a
+//!   confidence-weighted median for aggregation.
+//! - Only the admin can register/remove oracle addresses.
+//! - Any oracle already registered for a (data_type) may submit data.
+//! - Duplicate submissions from the same oracle overwrite the previous value.
+#![no_std]
+
+use soroban_sdk::{
+    contract, contractimpl, contracttype, contracterror, panic_with_error,
+    Address, Env, Symbol, Vec,
+};
+
+pub mod types;
+pub use types::*;
+
+// ─── Storage keys ─────────────────────────────────────────────────────────────
+
+#[contracttype]
+enum StorageKey {
+    Initialized,
+    Admin,
+    /// OracleEntry for (data_type, oracle_address)
+    Oracle(Symbol, Address),
+    /// Vec<OracleDataPoint> — all submissions for (data_type, key)
+    DataPoints(Symbol, Symbol),
+    /// Vec<Address> — every registered oracle address
+    OracleList,
+}
+
+// ─── Errors ───────────────────────────────────────────────────────────────────
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    AlreadyInitialized  = 1,
+    NotInitialized      = 2,
+    Unauthorized        = 3,
+    OracleNotRegistered = 4,
+    OracleAlreadyExists = 5,
+    NoDataAvailable     = 6,
+    InvalidConfidence   = 7,
+    InvalidWeight       = 8,
+}
+
+// ─── Contract ─────────────────────────────────────────────────────────────────
+
+#[contract]
+pub struct OracleVerifier;
+
+#[contractimpl]
+impl OracleVerifier {
+
+    // ── Lifecycle ────────────────────────────────────────────────────────────
+
+    /// One-time initialisation. Caller becomes admin.
+    pub fn initialize(env: Env, admin: Address) {
+        if env.storage().instance().has(&StorageKey::Initialized) {
+            panic_with_error!(&env, Error::AlreadyInitialized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&StorageKey::Initialized, &true);
+        env.storage().instance().set(&StorageKey::Admin, &admin);
+        env.storage().instance().set(&StorageKey::OracleList, &Vec::<Address>::new(&env));
+    }
+
+    // ── Oracle Management (admin only) ───────────────────────────────────────
+
+    /// Register an oracle address for a given data type with a relative weight.
+    /// `weight` is 1-100; higher-weight oracles contribute more to the median.
+    pub fn add_oracle(
+        env: Env,
+        admin: Address,
+        oracle: Address,
+        data_type: Symbol,
+        weight: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+        if weight == 0 || weight > 100 {
+            panic_with_error!(&env, Error::InvalidWeight);
+        }
+        let key = StorageKey::Oracle(data_type.clone(), oracle.clone());
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(&env, Error::OracleAlreadyExists);
+        }
+        let entry = OracleEntry { oracle: oracle.clone(), data_type, weight, active: true };
+        env.storage().persistent().set(&key, &entry);
+
+        let mut list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::OracleList)
+            .unwrap_or_else(|| Vec::new(&env));
+        list.push_back(oracle);
+        env.storage().instance().set(&StorageKey::OracleList, &list);
+    }
+
+    /// Deactivate an oracle (soft delete — historical data is retained).
+    pub fn remove_oracle(env: Env, admin: Address, oracle: Address, data_type: Symbol) {
+        Self::require_admin(&env, &admin);
+        let key = StorageKey::Oracle(data_type.clone(), oracle.clone());
+        let mut entry: OracleEntry = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
+        entry.active = false;
+        env.storage().persistent().set(&key, &entry);
+    }
+
+    // ── Data Submission ───────────────────────────────────────────────────────
+
+    /// Submit a data point for a (data_type, key) pair.
+    ///
+    /// - `data_type`: category — "weather", "flight", "onchain", "disaster"
+    /// - `key`: specific measurement — "rainfall:kisumu:2026-06", "flight:KQ100:2026-06-15"
+    /// - `value`: 7-decimal fixed point (same precision as Stellar assets)
+    /// - `confidence`: 0-100 reliability score
+    /// - `timestamp`: Unix timestamp of the real-world observation
+    pub fn submit_data(
+        env: Env,
+        oracle: Address,
+        data_type: Symbol,
+        key: Symbol,
+        value: i128,
+        confidence: u32,
+        timestamp: u64,
+    ) {
+        oracle.require_auth();
+        if confidence > 100 {
+            panic_with_error!(&env, Error::InvalidConfidence);
+        }
+
+        // Verify oracle is registered and active for this data_type
+        let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
+        let entry: OracleEntry = env
+            .storage()
+            .persistent()
+            .get(&oracle_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
+        if !entry.active {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        // Load existing submissions for this (data_type, key)
+        let dp_key = StorageKey::DataPoints(data_type, key);
+        let mut points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&dp_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Overwrite existing submission from this oracle; append if new
+        let new_point = OracleDataPoint { oracle: oracle.clone(), value, confidence, timestamp };
+        let mut found = false;
+        for i in 0..points.len() {
+            if points.get_unchecked(i).oracle == oracle {
+                points.set(i, new_point.clone());
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            points.push_back(new_point);
+        }
+
+        env.storage().persistent().set(&dp_key, &points);
+    }
+
+    // ── Verification ─────────────────────────────────────────────────────────
+
+    /// Returns true if the aggregated oracle value satisfies `condition`.
+    /// This is the single function the Claims Processor calls to decide payout.
+    pub fn verify_trigger(
+        env: Env,
+        data_type: Symbol,
+        key: Symbol,
+        condition: TriggerCondition,
+    ) -> bool {
+        let median = Self::get_median_value(&env, &data_type, &key);
+        match condition.comparison {
+            TriggerComparison::LessThan    => median < condition.threshold,
+            TriggerComparison::GreaterThan => median > condition.threshold,
+            TriggerComparison::Equal       => median == condition.threshold,
+        }
+    }
+
+    /// Return the most recent submission from any oracle for (data_type, key).
+    /// Panics with NoDataAvailable if no submissions exist.
+    pub fn get_data(env: Env, data_type: Symbol, key: Symbol) -> OracleDataPoint {
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type, key))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoDataAvailable));
+        if points.is_empty() {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+        // Return the most recently timestamped submission
+        let mut latest = points.get_unchecked(0);
+        for i in 1..points.len() {
+            let p = points.get_unchecked(i);
+            if p.timestamp > latest.timestamp {
+                latest = p;
+            }
+        }
+        latest
+    }
+
+    /// Return aggregated statistics across all oracle submissions for (data_type, key).
+    pub fn get_aggregated(env: Env, data_type: Symbol, key: Symbol) -> AggregatedData {
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoDataAvailable));
+        if points.is_empty() {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+        let median_value = Self::get_median_value(&env, &data_type, &key);
+        let oracle_count = points.len();
+        let mut min_confidence = 100u32;
+        let mut last_updated = 0u64;
+        for i in 0..oracle_count {
+            let p = points.get_unchecked(i);
+            if p.confidence < min_confidence { min_confidence = p.confidence; }
+            if p.timestamp > last_updated { last_updated = p.timestamp; }
+        }
+        AggregatedData { median_value, oracle_count, min_confidence, last_updated }
+    }
+
+    /// List all registered oracle addresses.
+    pub fn get_oracles(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::OracleList)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    pub fn get_admin(env: Env) -> Address {
+        env.storage().instance().get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
+    }
+
+    // ── Internal helpers ─────────────────────────────────────────────────────
+
+    fn require_admin(env: &Env, caller: &Address) {
+        let admin: Address = env.storage().instance().get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        if *caller != admin {
+            panic_with_error!(env, Error::Unauthorized);
+        }
+        caller.require_auth();
+    }
+
+    /// Compute the simple median of all submitted values for (data_type, key).
+    fn get_median_value(env: &Env, data_type: &Symbol, key: &Symbol) -> i128 {
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
+            .unwrap_or_else(|| panic_with_error!(env, Error::NoDataAvailable));
+        let n = points.len();
+        if n == 0 { panic_with_error!(env, Error::NoDataAvailable); }
+        // Collect and sort values
+        let mut values: soroban_sdk::Vec<i128> = soroban_sdk::Vec::new(env);
+        for i in 0..n {
+            values.push_back(points.get_unchecked(i).value);
+        }
+        // Insertion sort (small n — no std available)
+        for i in 1..values.len() {
+            let mut j = i;
+            while j > 0 && values.get_unchecked(j - 1) > values.get_unchecked(j) {
+                let a = values.get_unchecked(j - 1);
+                let b = values.get_unchecked(j);
+                values.set(j - 1, b);
+                values.set(j, a);
+                j -= 1;
+            }
+        }
+        let mid = n / 2;
+        if n % 2 == 1 {
+            values.get_unchecked(mid)
+        } else {
+            (values.get_unchecked(mid - 1) + values.get_unchecked(mid)) / 2
+        }
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod test;
