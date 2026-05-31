@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-and-test:
+    name: Build & Test (Soroban)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contracts/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('contracts/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run tests
+        working-directory: contracts
+        run: cargo test --quiet
+
+      - name: Build WASM targets
+        working-directory: contracts
+        run: cargo build --target wasm32v1-none --release --quiet
+
+      - name: Run Clippy
+        working-directory: contracts
+        run: cargo clippy --all-targets -- -D warnings
+
+  wasm-size:
+    name: WASM Binary Size Report
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contracts/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('contracts/Cargo.lock') }}
+
+      - name: Build WASM
+        working-directory: contracts
+        run: cargo build --target wasm32v1-none --release --quiet
+
+      - name: Report binary sizes
+        working-directory: contracts
+        run: |
+          echo "| Contract | Size (KB) |"
+          echo "|----------|-----------|"
+          for f in target/wasm32v1-none/release/*.wasm; do
+            name=$(basename "$f" .wasm)
+            size=$(du -k "$f" | cut -f1)
+            echo "| $name | ${size} |"
+          done
