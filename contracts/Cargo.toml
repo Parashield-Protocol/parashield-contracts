@@ -24,3 +24,9 @@ lto = true
 [profile.release-with-logs]
 inherits = "release"
 debug-assertions = true
+
+# dev-optimized: faster build for local iteration
+[profile.dev]
+opt-level = 0
+debug = true
+overflow-checks = true
