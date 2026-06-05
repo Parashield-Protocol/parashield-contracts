@@ -344,3 +344,5 @@ fn map_comparison(
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_integration;
