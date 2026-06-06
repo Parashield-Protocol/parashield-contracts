@@ -277,6 +277,20 @@ impl RiskPool {
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
     }
 
+    pub fn get_lp_count(env: Env) -> u32 {
+        let list: Vec<Address> = env.storage().instance()
+            .get(&StorageKey::LpList)
+            .unwrap_or_else(|| Vec::new(&env));
+        list.len()
+    }
+
+    /// Available (unlocked) liquidity in USDC stroops.
+    pub fn get_available_liquidity(env: Env) -> i128 {
+        let deposited: i128 = env.storage().instance().get(&StorageKey::TotalDeposited).unwrap_or(0);
+        let locked: i128    = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
+        deposited.saturating_sub(locked)
+    }
+
     // ── Admin ─────────────────────────────────────────────────────────────────
 
     pub fn pause(env: Env, admin: Address) {
