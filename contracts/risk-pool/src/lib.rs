@@ -321,3 +321,5 @@ impl RiskPool {
 mod test;
 #[cfg(test)]
 mod test_advanced;
+#[cfg(test)]
+mod test_edge;
