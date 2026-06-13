@@ -65,6 +65,22 @@ check-tools:
 	@rustup target list --installed | grep -q wasm32v1-none || (echo "Adding wasm32v1-none target..." && rustup target add wasm32v1-none)
 	@echo "All required tools found."
 
+## Run full pre-release check: tests + lint + wasm-sizes
+pre-release: test lint wasm-sizes
+	@echo "==> Pre-release checks passed. Ready to tag."
+
+## Deploy to Mainnet — requires DEPLOYER_SECRET env var
+deploy-mainnet:
+	./scripts/deploy_mainnet.sh
+
+## Submit oracle data (see scripts/submit_oracle_data.sh for env vars)
+submit-oracle:
+	./scripts/submit_oracle_data.sh
+
+## Check deployed contract balances
+check-balances:
+	./scripts/check_balances.sh
+
 ## Print sizes of compiled WASMs
 wasm-sizes: build
 	@echo "Contract WASM sizes:"
