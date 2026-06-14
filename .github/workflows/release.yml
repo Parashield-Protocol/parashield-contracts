@@ -1,0 +1,63 @@
+name: Release WASM Artifacts
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Release WASM
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contracts/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('contracts/Cargo.lock') }}
+
+      - name: Run tests
+        working-directory: contracts
+        run: cargo test --quiet
+
+      - name: Build optimized WASM
+        working-directory: contracts
+        run: cargo build --target wasm32v1-none --release --quiet
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          cp contracts/target/wasm32v1-none/release/*.wasm dist/
+          ls -lh dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.wasm
+          generate_release_notes: true
+          body: |
+            ## Parashield Protocol ${{ github.ref_name }}
+
+            ### Contracts
+            - `parashield_oracle_verifier.wasm` — Oracle data aggregation
+            - `parashield_policy_engine.wasm` — Insurance product and policy management
+            - `parashield_claims_processor.wasm` — Automated claim evaluation
+            - `parashield_risk_pool.wasm` — LP liquidity pools with yield distribution
+            - `parashield_governance_dao.wasm` — Token-weighted protocol governance
+
+            ### Verification
+            Verify WASM hash against the published checksum before deploying.

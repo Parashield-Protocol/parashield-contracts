@@ -96,3 +96,14 @@ pub struct Policy {
     pub status: PolicyStatus,
     pub created_at: u64,
 }
+
+/// Summary stats for a product — returned by get_product_stats.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductStats {
+    pub product_id: u128,
+    pub total_policies: u32,
+    pub active_policies: u32,
+    pub total_coverage: i128,
+    pub total_premium_collected: i128,
+}

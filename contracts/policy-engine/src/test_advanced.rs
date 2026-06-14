@@ -1,0 +1,130 @@
+//! Advanced policy-engine tests: emergency pause, product deprecation, cancel.
+#![cfg(test)]
+
+extern crate std;
+
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    token, Address, Env,
+};
+
+use crate::{
+    CreateProductParams, PolicyEngine, PolicyEngineClient,
+    ProductStatus, TriggerComparison, TriggerType,
+};
+use soroban_sdk::symbol_short;
+
+fn basic_params() -> CreateProductParams {
+    CreateProductParams {
+        name:               symbol_short!("crop"),
+        category:           symbol_short!("crop"),
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  500_000_000i128,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       100_0000000i128,
+        coverage_max:       100_000_0000000i128,
+        premium_rate_bps:   300u32,
+        max_duration_days:  90u32,
+    }
+}
+
+fn setup() -> (Env, PolicyEngineClient<'static>, Address, Address, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin  = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let user   = Address::generate(&env);
+
+    let usdc = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    token::StellarAssetClient::new(&env, &usdc).mint(&user, &10_000_0000000i128);
+    token::StellarAssetClient::new(&env, &usdc).mint(&admin, &1_000_000_0000000i128);
+
+    let pe_id = env.register(PolicyEngine, ());
+    let pe    = PolicyEngineClient::new(&env, &pe_id);
+    pe.initialize(&admin, &usdc, &oracle);
+
+    // fund the contract for coverage payouts
+    token::StellarAssetClient::new(&env, &usdc).mint(&pe_id, &1_000_000_0000000i128);
+
+    (env, pe, admin, oracle, user)
+}
+
+// ── emergency pause ────────────────────────────────────────────────────────────
+
+#[test]
+fn is_paused_defaults_to_false() {
+    let (_, pe, _, _, _) = setup();
+    assert!(!pe.is_paused());
+}
+
+#[test]
+fn emergency_pause_sets_paused_flag() {
+    let (_, pe, admin, _, _) = setup();
+    pe.emergency_pause(&admin);
+    assert!(pe.is_paused());
+}
+
+#[test]
+fn emergency_resume_clears_paused_flag() {
+    let (_, pe, admin, _, _) = setup();
+    pe.emergency_pause(&admin);
+    pe.emergency_resume(&admin);
+    assert!(!pe.is_paused());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn non_admin_cannot_pause() {
+    let (env, pe, _, _, user) = setup();
+    pe.emergency_pause(&user);
+}
+
+// ── product lifecycle ──────────────────────────────────────────────────────────
+
+#[test]
+fn deprecate_product_removes_from_active_list() {
+    let (_, pe, admin, _, _) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params());
+    assert_eq!(pe.get_active_products().len(), 1);
+    pe.deprecate_product(&admin, &prod_id);
+    assert_eq!(pe.get_active_products().len(), 0);
+    let prod = pe.get_product(&prod_id);
+    assert_eq!(prod.status, ProductStatus::Deprecated);
+}
+
+#[test]
+fn pause_product_changes_status_but_stays_in_active_list() {
+    let (_, pe, admin, _, _) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params());
+    pe.pause_product(&admin, &prod_id);
+    let prod = pe.get_product(&prod_id);
+    assert_eq!(prod.status, ProductStatus::Paused);
+}
+
+// ── policy cancellation ────────────────────────────────────────────────────────
+
+#[test]
+fn cancel_policy_returns_premium_to_holder() {
+    let (env, pe, admin, _, user) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params());
+    let policy_id = pe.buy_policy(
+        &user, &prod_id, &1_000_0000000i128, &symbol_short!("kis2606"), &30u32,
+    );
+    pe.cancel_policy(&user, &policy_id);
+    let policy = pe.get_policy(&policy_id);
+    assert_eq!(policy.status, crate::PolicyStatus::Cancelled);
+}
+
+// ── user policy query ─────────────────────────────────────────────────────────
+
+#[test]
+fn get_user_policies_tracks_multiple_policies() {
+    let (_, pe, admin, _, user) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params());
+    pe.buy_policy(&user, &prod_id, &200_0000000i128, &symbol_short!("kis2606"), &30u32);
+    pe.buy_policy(&user, &prod_id, &300_0000000i128, &symbol_short!("kis2606"), &30u32);
+    let policies = pe.get_user_policies(&user);
+    assert_eq!(policies.len(), 2);
+}

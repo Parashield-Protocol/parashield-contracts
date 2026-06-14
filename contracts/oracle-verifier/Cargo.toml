@@ -1,8 +1,13 @@
 [package]
-name = "parashield-oracle-verifier"
-version = "0.1.0"
-edition = "2021"
-publish = false
+name        = "parashield-oracle-verifier"
+version     = "0.2.0"
+edition     = "2021"
+description = "Multi-oracle data aggregation and trigger verification for Parashield Protocol"
+authors     = ["Parashield Protocol <contracts@parashield.xyz>"]
+keywords    = ["soroban", "stellar", "oracle", "insurance", "defi"]
+categories  = ["cryptography::cryptocurrencies"]
+license     = "MIT"
+publish     = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]

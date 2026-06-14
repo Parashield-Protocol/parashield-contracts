@@ -1,8 +1,13 @@
 [package]
-name = "parashield-governance-dao"
-version = "0.1.0"
-edition = "2021"
-publish = false
+name        = "parashield-governance-dao"
+version     = "0.2.0"
+edition     = "2021"
+description = "Token-weighted governance DAO for Parashield Protocol parameter management"
+authors     = ["Parashield Protocol <contracts@parashield.xyz>"]
+keywords    = ["soroban", "stellar", "governance", "dao", "defi"]
+categories  = ["cryptography::cryptocurrencies"]
+license     = "MIT"
+publish     = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]

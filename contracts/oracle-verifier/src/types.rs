@@ -58,3 +58,15 @@ pub struct OracleEntry {
     pub weight: u32,
     pub active: bool,
 }
+
+/// Summary returned by get_oracle_health for a specific oracle.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleHealth {
+    pub oracle: Address,
+    pub data_type: Symbol,
+    pub weight: u32,
+    pub active: bool,
+    /// Timestamp of their most recent submission, or 0 if never.
+    pub last_submitted: u64,
+}

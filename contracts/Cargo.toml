@@ -11,6 +11,11 @@ resolver = "2"
 [workspace.dependencies]
 soroban-sdk = { version = "22", features = ["testutils"] }
 
+[workspace.metadata.parashield]
+protocol-version = "2"
+audit-status     = "pending"
+target-network   = "stellar-mainnet"
+
 [profile.release]
 opt-level = "z"
 overflow-checks = true
@@ -24,3 +29,9 @@ lto = true
 [profile.release-with-logs]
 inherits = "release"
 debug-assertions = true
+
+# dev-optimized: faster build for local iteration
+[profile.dev]
+opt-level = 0
+debug = true
+overflow-checks = true

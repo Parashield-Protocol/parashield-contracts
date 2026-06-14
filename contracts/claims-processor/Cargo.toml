@@ -1,8 +1,13 @@
 [package]
-name = "parashield-claims-processor"
-version = "0.1.0"
-edition = "2021"
-publish = false
+name        = "parashield-claims-processor"
+version     = "0.2.0"
+edition     = "2021"
+description = "Automatic claim evaluation and settlement engine for Parashield Protocol"
+authors     = ["Parashield Protocol <contracts@parashield.xyz>"]
+keywords    = ["soroban", "stellar", "claims", "insurance", "defi"]
+categories  = ["cryptography::cryptocurrencies"]
+license     = "MIT"
+publish     = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -11,11 +16,11 @@ crate-type = ["cdylib", "rlib"]
 testutils = ["soroban-sdk/testutils"]
 
 [dependencies]
-soroban-sdk = { workspace = true }
-parashield-policy-engine  = { path = "../policy-engine" }
+soroban-sdk               = { workspace = true }
+parashield-policy-engine   = { path = "../policy-engine" }
 parashield-oracle-verifier = { path = "../oracle-verifier" }
 
 [dev-dependencies]
-soroban-sdk = { workspace = true, features = ["testutils"] }
-parashield-policy-engine  = { path = "../policy-engine",   features = ["testutils"] }
+soroban-sdk               = { workspace = true, features = ["testutils"] }
+parashield-policy-engine   = { path = "../policy-engine",   features = ["testutils"] }
 parashield-oracle-verifier = { path = "../oracle-verifier", features = ["testutils"] }

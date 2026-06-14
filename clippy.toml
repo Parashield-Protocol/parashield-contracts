@@ -1,0 +1,8 @@
+# Clippy configuration for Parashield smart contracts.
+# Applied by: cargo clippy --all-targets -- -D warnings
+
+# Allow unwrap() in test code — panics are acceptable in test contexts.
+allow-unwrap-in-tests = true
+
+# Cognitive complexity threshold — Soroban contracts have complex state machines.
+cognitive-complexity-threshold = 30

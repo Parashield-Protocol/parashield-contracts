@@ -1,5 +1,5 @@
 use super::*;
-use soroban_sdk::{symbol_short, testutils::Address as _, Env};
+use soroban_sdk::{symbol_short, testutils::{Address as _, Ledger}, Env, Symbol};
 
 fn setup() -> (Env, Address, Address) {
     let env = Env::default();
@@ -203,4 +203,67 @@ fn test_median_even_count() {
     client.submit_data(&oracle2, &weather(), &kisumu_key(), &40_000_000i128, &90u32, &1748736000u64);
     let agg = client.get_aggregated(&weather(), &kisumu_key());
     assert_eq!(agg.median_value, 35_000_000);
+}
+
+// ── Staleness and batch tests ─────────────────────────────────────────────────
+
+#[test]
+fn verify_trigger_fresh_passes_with_current_data() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+    let now: u64 = 1_748_736_000;
+    env.ledger().with_mut(|l| l.timestamp = now);
+    client.submit_data(&oracle, &weather(), &kisumu_key(), &30_000_000i128, &95u32, &now);
+    let condition = TriggerCondition {
+        data_type:  weather(),
+        key:        kisumu_key(),
+        threshold:  50_000_000i128,
+        comparison: TriggerComparison::LessThan,
+    };
+    // data is fresh (age = 0s), max_age = 3600s
+    let result = client.verify_trigger_fresh(&weather(), &kisumu_key(), &condition, &3600u64);
+    assert!(result);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn verify_trigger_fresh_rejects_stale_data() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+    // Submit at t=100, ledger timestamp at t=100+86401 (>24h later)
+    client.submit_data(&oracle, &weather(), &kisumu_key(), &30_000_000i128, &95u32, &100u64);
+    env.ledger().with_mut(|l| l.timestamp = 100 + 86_401);
+    let condition = TriggerCondition {
+        data_type:  weather(),
+        key:        kisumu_key(),
+        threshold:  50_000_000i128,
+        comparison: TriggerComparison::LessThan,
+    };
+    client.verify_trigger_fresh(&weather(), &kisumu_key(), &condition, &86_400u64);
+}
+
+#[test]
+fn batch_submit_data_stores_all_keys() {
+    use soroban_sdk::Vec;
+
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+
+    let flight_key = symbol_short!("flightKQ");
+    let mut subs: Vec<(Symbol, i128, u32, u64)> = Vec::new(&env);
+    subs.push_back((kisumu_key(), 30_000_000i128, 90u32, 1_748_736_000u64));
+    subs.push_back((flight_key.clone(), 120_000_000i128, 85u32, 1_748_736_000u64));
+
+    client.batch_submit_data(&oracle, &weather(), &subs);
+
+    let dp1 = client.get_data(&weather(), &kisumu_key());
+    let dp2 = client.get_data(&weather(), &flight_key);
+    assert_eq!(dp1.value, 30_000_000i128);
+    assert_eq!(dp2.value, 120_000_000i128);
 }

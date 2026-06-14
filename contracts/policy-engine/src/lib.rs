@@ -45,6 +45,7 @@ enum StorageKey {
     ActiveProducts,
     NextProductId,
     NextPolicyId,
+    Paused,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -306,6 +307,23 @@ impl PolicyEngine {
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
     }
 
+    pub fn is_paused(env: Env) -> bool {
+        env.storage().instance().get(&StorageKey::Paused).unwrap_or(false)
+    }
+
+    // ── Admin: emergency controls ─────────────────────────────────────────────
+
+    /// Emergency pause — halts buy_policy for all products.
+    pub fn emergency_pause(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&StorageKey::Paused, &true);
+    }
+
+    pub fn emergency_resume(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&StorageKey::Paused, &false);
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     fn require_admin(env: &Env, caller: &Address) {
@@ -349,3 +367,5 @@ impl PolicyEngine {
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_advanced;

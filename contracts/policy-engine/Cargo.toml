@@ -1,8 +1,13 @@
 [package]
-name = "parashield-policy-engine"
-version = "0.1.0"
-edition = "2021"
-publish = false
+name        = "parashield-policy-engine"
+version     = "0.2.0"
+edition     = "2021"
+description = "Insurance product catalogue and policy lifecycle management for Parashield Protocol"
+authors     = ["Parashield Protocol <contracts@parashield.xyz>"]
+keywords    = ["soroban", "stellar", "insurance", "policy", "defi"]
+categories  = ["cryptography::cryptocurrencies"]
+license     = "MIT"
+publish     = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
