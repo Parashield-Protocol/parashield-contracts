@@ -149,6 +149,20 @@ impl PolicyEngine {
         let mut product: InsuranceProduct = Self::load_product(&env, product_id);
         product.status = ProductStatus::Deprecated;
         env.storage().persistent().set(&StorageKey::Product(product_id), &product);
+
+        let mut active_products: Vec<u128> = env.storage().instance()
+            .get(&StorageKey::ActiveProducts).unwrap_or_else(|| Vec::new(&env));
+        let mut idx = None;
+        for i in 0..active_products.len() {
+            if active_products.get_unchecked(i) == product_id {
+                idx = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = idx {
+            active_products.remove(i);
+            env.storage().instance().set(&StorageKey::ActiveProducts, &active_products);
+        }
     }
 
     // ── Policy Lifecycle ──────────────────────────────────────────────────────

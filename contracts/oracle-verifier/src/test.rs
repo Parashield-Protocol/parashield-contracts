@@ -1,3 +1,5 @@
+#![allow(clippy::inconsistent_digit_grouping)]
+#![allow(unused_variables)]
 use super::*;
 use soroban_sdk::{symbol_short, testutils::{Address as _, Ledger}, Env, Symbol};
 
@@ -5,7 +7,7 @@ fn setup() -> (Env, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
     let admin  = Address::generate(&env);
-    let oracle = Address::generate(&env);
+    let _oracle = Address::generate(&env);
     let contract_id = env.register(OracleVerifier, ());
     OracleVerifierClient::new(&env, &contract_id).initialize(&admin);
     (env, admin, contract_id)
@@ -76,6 +78,31 @@ fn test_remove_oracle_deactivates() {
     // After removal, submit_data should panic (unauthorized)
 }
 
+#[test]
+fn test_set_min_confidence() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    client.set_min_confidence(&admin, &50u32);
+    // Should be able to set it. We'll verify its effect in another test.
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_set_min_confidence_invalid() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    client.set_min_confidence(&admin, &101u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_set_min_confidence_unauthorized() {
+    let (env, _admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let impostor = Address::generate(&env);
+    client.set_min_confidence(&impostor, &50u32);
+}
+
 // ── Data submission ───────────────────────────────────────────────────────────
 
 #[test]
@@ -98,6 +125,26 @@ fn test_unregistered_oracle_cannot_submit() {
     let client  = OracleVerifierClient::new(&env, &contract_id);
     let stranger = Address::generate(&env);
     client.submit_data(&stranger, &weather(), &kisumu_key(), &32_000_000i128, &95u32, &1748736000u64);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_submit_data_zero_confidence() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+    client.submit_data(&oracle, &weather(), &kisumu_key(), &32_000_000i128, &0u32, &1748736000u64);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_submit_data_over_100_confidence() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+    client.submit_data(&oracle, &weather(), &kisumu_key(), &32_000_000i128, &101u32, &1748736000u64);
 }
 
 #[test]
@@ -167,6 +214,48 @@ fn test_verify_trigger_greater_than() {
         comparison: TriggerComparison::GreaterThan,
     };
     assert!(client.verify_trigger(&wind, &key, &condition));
+}
+
+#[test]
+fn test_verify_trigger_skips_low_confidence() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle1 = Address::generate(&env);
+    let oracle2 = Address::generate(&env);
+    let oracle3 = Address::generate(&env);
+    
+    client.add_oracle(&admin, &oracle1, &weather(), &100u32);
+    client.add_oracle(&admin, &oracle2, &weather(), &100u32);
+    client.add_oracle(&admin, &oracle3, &weather(), &100u32);
+    
+    client.set_min_confidence(&admin, &80u32);
+    
+    // oracle1: high confidence (90), low value (10mm)
+    client.submit_data(&oracle1, &weather(), &kisumu_key(), &10_000_000i128, &90u32, &1748736000u64);
+    // oracle2: low confidence (60), high value (90mm)
+    client.submit_data(&oracle2, &weather(), &kisumu_key(), &90_000_000i128, &60u32, &1748736000u64);
+    // oracle3: high confidence (85), low value (15mm)
+    client.submit_data(&oracle3, &weather(), &kisumu_key(), &15_000_000i128, &85u32, &1748736000u64);
+
+    let agg = client.get_aggregated(&weather(), &kisumu_key());
+    // Only two valid points left (10mm, 15mm) -> median = (10+15)/2 = 12.5mm
+    assert_eq!(agg.median_value, 12_500_000i128);
+
+    let condition = TriggerCondition {
+        data_type: weather(),
+        key: kisumu_key(),
+        threshold: 50_000_000,
+        comparison: TriggerComparison::LessThan,
+    };
+    // If it included oracle2 (90mm), median would be 15mm. Both are < 50mm, so still true.
+    // Let's test GreaterThan with threshold 40mm. Median is 12.5 (without oracle2) so false.
+    let condition2 = TriggerCondition {
+        data_type: weather(),
+        key: kisumu_key(),
+        threshold: 40_000_000,
+        comparison: TriggerComparison::GreaterThan,
+    };
+    assert!(!client.verify_trigger(&weather(), &kisumu_key(), &condition2));
 }
 
 // ── Multi-oracle median ───────────────────────────────────────────────────────

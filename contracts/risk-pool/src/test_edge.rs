@@ -1,3 +1,4 @@
+#![allow(clippy::inconsistent_digit_grouping)]
 //! Edge case tests for the risk pool — zero shares, full withdrawal, stress.
 #![cfg(test)]
 

@@ -168,7 +168,7 @@ impl GovernanceDao {
         }
 
         let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
-        let total_supply = token::Client::new(&env, &config.gov_token).total_supply();
+        let total_supply = config.total_supply;
         let total_votes  = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
         let quorum_needed = total_supply * config.quorum_bps as i128 / 10_000;
 

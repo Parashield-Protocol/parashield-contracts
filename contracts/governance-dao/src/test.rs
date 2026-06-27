@@ -1,3 +1,5 @@
+#![allow(clippy::inconsistent_digit_grouping)]
+#![allow(unused_variables)]
 #![cfg(test)]
 
 extern crate std;
@@ -7,7 +9,7 @@ use soroban_sdk::{
     token, Address, Bytes, Env, Symbol,
 };
 
-use crate::{DaoConfig, Error, GovernanceDao, GovernanceDaoClient, VoteChoice};
+use crate::{DaoConfig, GovernanceDao, GovernanceDaoClient, VoteChoice};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -37,6 +39,7 @@ fn setup() -> (Env, GovernanceDaoClient<'static>, Address, Address, Address, Add
         &admin,
         &DaoConfig {
             gov_token:           gov_token_id,
+            total_supply:        1_600_000_0000000i128,
             proposal_threshold:  10_000_0000000i128,  // 10k SHIELD
             quorum_bps:          1_000u32,             // 10%
             majority_bps:        5_100u32,             // 51%
@@ -51,7 +54,7 @@ fn setup() -> (Env, GovernanceDaoClient<'static>, Address, Address, Address, Add
 
 #[test]
 fn initialize_stores_config() {
-    let (env, dao, admin, _, _, target) = setup();
+    let (_env, dao, admin, _, _, _target) = setup();
     let cfg = dao.get_config();
     assert_eq!(cfg.quorum_bps,    1_000);
     assert_eq!(cfg.majority_bps,  5_100);
@@ -64,11 +67,12 @@ fn initialize_stores_config() {
 fn cannot_initialize_twice() {
     let (env, dao, admin, _, _, _) = setup();
     let gov_token = dao.get_config().gov_token;
-    let target    = Address::generate(&env);
+    let _target    = Address::generate(&env);
     dao.initialize(
         &admin,
         &DaoConfig {
             gov_token,
+            total_supply:       0,
             proposal_threshold: 0,
             quorum_bps:         0,
             majority_bps:       0,

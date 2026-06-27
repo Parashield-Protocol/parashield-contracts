@@ -27,7 +27,7 @@ struct World {
 fn deploy() -> World {
     let env = Env::default();
     env.mock_all_auths();
-    env.budget().reset_unlimited();
+    env.cost_estimate().budget().reset_unlimited();
 
     let admin  = Address::generate(&env);
     let keeper = Address::generate(&env);
