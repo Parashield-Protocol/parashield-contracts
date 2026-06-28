@@ -264,3 +264,25 @@ fn test_deposit_precision_loss_prevented() {
     assert_eq!(shares, 1_000_000_000i128);
     assert!(shares > 0);
 }
+
+// ── pool size cap (Issue #40) ───────────────────────────────────────────────────
+
+/// A deposit that pushes total_deposited past MAX_TOTAL_DEPOSITED (10^15) must
+/// be rejected with PoolCapExceeded (#12).
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn deposit_exceeding_pool_cap_panics() {
+    let (env, pool, usdc, _admin, _treasury, lp1) = setup();
+    // Fund lp1 well above the cap so the failure is the cap, not balance.
+    token::StellarAssetClient::new(&env, &usdc).mint(&lp1, &1_000_000_000_0000000i128);
+    pool.deposit(&lp1, &(1_000_000_000_000_000i128 + 1));
+}
+
+/// A deposit of exactly MAX_TOTAL_DEPOSITED is accepted; the next stroop is not.
+#[test]
+fn deposit_at_pool_cap_succeeds() {
+    let (env, pool, usdc, _admin, _treasury, lp1) = setup();
+    token::StellarAssetClient::new(&env, &usdc).mint(&lp1, &1_000_000_000_0000000i128);
+    pool.deposit(&lp1, &1_000_000_000_000_000i128);
+    assert_eq!(pool.get_stats().total_deposited, 1_000_000_000_000_000i128);
+}
