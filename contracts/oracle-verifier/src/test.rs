@@ -356,3 +356,43 @@ fn batch_submit_data_stores_all_keys() {
     assert_eq!(dp1.value, 30_000_000i128);
     assert_eq!(dp2.value, 120_000_000i128);
 }
+
+// ── Oracle count cap and aggregation overflow safety (Issue #38) ──────────────
+
+/// Registering MAX_ORACLES (100) oracles, all at max weight, and submitting the
+/// max fixed-point value must aggregate without overflowing i128.
+#[test]
+fn test_max_oracles_no_overflow() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+
+    // 7-decimal fixed-point near the protocol's upper bound (~10^15).
+    let big_value: i128 = 1_000_000_000_000_000i128;
+
+    for _ in 0..MAX_ORACLES {
+        let oracle = Address::generate(&env);
+        client.add_oracle(&admin, &oracle, &weather(), &100u32);
+        client.submit_data(&oracle, &weather(), &kisumu_key(), &big_value, &100u32, &1_748_736_000u64);
+    }
+
+    assert_eq!(client.get_oracles().len(), MAX_ORACLES);
+
+    // Aggregation must not overflow; median of identical values is that value.
+    let agg = client.get_aggregated(&weather(), &kisumu_key());
+    assert_eq!(agg.oracle_count, MAX_ORACLES);
+    assert_eq!(agg.median_value, big_value);
+}
+
+/// The 101st oracle must be rejected with TooManyOracles (#10).
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_oracle_cap_rejects_extra() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    for _ in 0..MAX_ORACLES {
+        let oracle = Address::generate(&env);
+        client.add_oracle(&admin, &oracle, &weather(), &100u32);
+    }
+    let extra = Address::generate(&env);
+    client.add_oracle(&admin, &extra, &weather(), &100u32);
+}
