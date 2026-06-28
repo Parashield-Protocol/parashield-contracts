@@ -42,3 +42,41 @@ pub struct Claim {
     pub processed_at: Option<u64>,
     pub dispute_reason: Option<Symbol>,
 }
+
+// ─── Events ──────────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Initialized {
+    pub admin: Address,
+    pub policy_engine: Address,
+    pub oracle_verifier: Address,
+    pub staleness_threshold: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimSubmitted {
+    pub claim_id: u128,
+    pub policy_id: u128,
+    pub claimant: Address,
+    pub coverage_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimProcessed {
+    pub claim_id: u128,
+    pub policy_id: u128,
+    pub trigger_met: bool,
+    pub status: ClaimStatus,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimDisputed {
+    pub claim_id: u128,
+    pub claimant: Address,
+    pub reason: Symbol,
+}
+

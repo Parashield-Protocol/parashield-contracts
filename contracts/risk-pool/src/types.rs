@@ -47,3 +47,73 @@ pub struct PoolStats {
     pub accumulated_premium: i128,
     pub status:          PoolStatus,
 }
+
+// ─── Events ──────────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Initialized {
+    pub admin: Address,
+    pub usdc_token: Address,
+    pub treasury: Address,
+    pub category: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidityDeposited {
+    pub provider: Address,
+    pub amount: i128,
+    pub shares_minted: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidityWithdrawn {
+    pub provider: Address,
+    pub shares_burned: i128,
+    pub amount_returned: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PremiumDistributed {
+    pub amount: i128,
+    pub lp_share: i128,
+    pub treasury_share: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YieldClaimed {
+    pub provider: Address,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapitalLocked {
+    pub policy_id: u128,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapitalReleased {
+    pub policy_id: u128,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolPaused {
+    pub admin: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolResumed {
+    pub admin: Address,
+}
+
+

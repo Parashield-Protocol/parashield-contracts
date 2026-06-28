@@ -40,7 +40,7 @@ test-dao:
 
 ## Run Clippy linter
 lint:
-	cd contracts && cargo clippy --all-targets -- -D warnings
+	cd contracts && cargo clippy --all-targets -- -D warnings -A clippy::duplicated_attributes
 
 ## Format Rust source
 fmt:

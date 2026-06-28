@@ -14,6 +14,7 @@
 //! - Duplicate submissions from the same oracle overwrite the previous value.
 #![no_std]
 
+#[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
     Address, Env, Symbol, Vec,
@@ -63,9 +64,11 @@ pub enum Error {
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
+#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contract]
 pub struct OracleVerifier;
 
+#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contractimpl]
 impl OracleVerifier {
 
@@ -80,6 +83,11 @@ impl OracleVerifier {
         env.storage().instance().set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
         env.storage().instance().set(&StorageKey::OracleList, &Vec::<Address>::new(&env));
+
+        env.events().publish(
+            (Symbol::new(&env, "initialized"),),
+            Initialized { admin: admin.clone() },
+        );
     }
 
     // ── Oracle Management (admin only) ───────────────────────────────────────
@@ -101,7 +109,7 @@ impl OracleVerifier {
         if env.storage().persistent().has(&key) {
             panic_with_error!(&env, Error::OracleAlreadyExists);
         }
-        let entry = OracleEntry { oracle: oracle.clone(), data_type, weight, active: true };
+        let entry = OracleEntry { oracle: oracle.clone(), data_type: data_type.clone(), weight, active: true };
         env.storage().persistent().set(&key, &entry);
 
         let mut list: Vec<Address> = env
@@ -114,6 +122,11 @@ impl OracleVerifier {
         }
         list.push_back(oracle);
         env.storage().instance().set(&StorageKey::OracleList, &list);
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle_added"),),
+            OracleAdded { oracle, data_type, weight },
+        );
     }
 
     /// Update the relative weight of an existing oracle registration.
@@ -151,6 +164,11 @@ impl OracleVerifier {
             .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
         entry.active = false;
         env.storage().persistent().set(&key, &entry);
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle_removed"),),
+            OracleRemoved { oracle, data_type },
+        );
     }
 
     // ── Contract Settings (admin only) ───────────────────────────────────────
@@ -162,6 +180,10 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::InvalidConfidence);
         }
         env.storage().instance().set(&StorageKey::MinConfidence, &threshold);
+        env.events().publish(
+            (Symbol::new(&env, "min_confidence_updated"),),
+            MinConfidenceUpdated { threshold },
+        );
     }
 
     // ── Data Submission ───────────────────────────────────────────────────────
@@ -199,7 +221,7 @@ impl OracleVerifier {
         }
 
         // Load existing submissions for this (data_type, key)
-        let dp_key = StorageKey::DataPoints(data_type, key);
+        let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
         let mut points: Vec<OracleDataPoint> = env
             .storage()
             .persistent()
@@ -221,6 +243,18 @@ impl OracleVerifier {
         }
 
         env.storage().persistent().set(&dp_key, &points);
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle_data_submitted"),),
+            OracleDataSubmitted {
+                oracle,
+                data_type,
+                key,
+                value,
+                confidence,
+                timestamp,
+            },
+        );
     }
 
     // ── Verification ─────────────────────────────────────────────────────────
@@ -352,6 +386,18 @@ impl OracleVerifier {
             }
             if !found { points.push_back(new_point); }
             env.storage().persistent().set(&dp_key, &points);
+
+            env.events().publish(
+                (Symbol::new(&env, "oracle_data_submitted"),),
+                OracleDataSubmitted {
+                    oracle: oracle.clone(),
+                    data_type: data_type.clone(),
+                    key,
+                    value,
+                    confidence,
+                    timestamp,
+                },
+            );
         }
     }
 

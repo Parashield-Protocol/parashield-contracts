@@ -18,6 +18,7 @@
 //! to pay the policyholder when the oracle confirms a trigger.
 #![no_std]
 
+#[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
     token, Address, Env, Symbol, Vec,
@@ -75,9 +76,11 @@ pub enum Error {
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
+#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contract]
 pub struct PolicyEngine;
 
+#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contractimpl]
 impl PolicyEngine {
 
@@ -100,12 +103,27 @@ impl PolicyEngine {
         env.storage().instance().set(&StorageKey::NextProductId, &1u128);
         env.storage().instance().set(&StorageKey::NextPolicyId,  &1u128);
         env.storage().instance().set(&StorageKey::ActiveProducts, &Vec::<u128>::new(&env));
+
+        env.events().publish(
+            (Symbol::new(&env, "initialized"),),
+            Initialized {
+                admin: admin.clone(),
+                usdc_token: usdc_token.clone(),
+                oracle_address: oracle_address.clone(),
+            },
+        );
     }
 
     /// Set the Claims Processor address. Called once after deploying claims contract.
     pub fn set_claims_processor(env: Env, admin: Address, claims_processor: Address) {
         Self::require_admin(&env, &admin);
         env.storage().instance().set(&StorageKey::ClaimsProcessor, &claims_processor);
+        env.events().publish(
+            (Symbol::new(&env, "claims_processor_updated"),),
+            ClaimsProcessorUpdated {
+                claims_processor: claims_processor.clone(),
+            },
+        );
     }
 
     // ── Product Management (admin only) ──────────────────────────────────────
@@ -160,6 +178,16 @@ impl PolicyEngine {
             .get(&StorageKey::ActiveProducts).unwrap_or_else(|| Vec::new(&env));
         products.push_back(id);
         env.storage().instance().set(&StorageKey::ActiveProducts, &products);
+
+        env.events().publish(
+            (Symbol::new(&env, "product_created"),),
+            ProductCreated {
+                product_id: id,
+                name: product.name.clone(),
+                category: product.category.clone(),
+                premium_rate_bps: product.premium_rate_bps,
+            },
+        );
         id
     }
 
@@ -168,6 +196,10 @@ impl PolicyEngine {
         let mut product: InsuranceProduct = Self::load_product(&env, product_id);
         product.status = ProductStatus::Paused;
         env.storage().persistent().set(&StorageKey::Product(product_id), &product);
+        env.events().publish(
+            (Symbol::new(&env, "product_paused"),),
+            ProductPaused { product_id },
+        );
     }
 
     pub fn deprecate_product(env: Env, admin: Address, product_id: u128) {
@@ -255,11 +287,22 @@ impl PolicyEngine {
         env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
 
         // Append to user's policy list
-        let user_key = StorageKey::UserPolicies(buyer);
+        let user_key = StorageKey::UserPolicies(buyer.clone());
         let mut user_policies: Vec<u128> = env.storage().persistent()
             .get(&user_key).unwrap_or_else(|| Vec::new(&env));
         user_policies.push_back(policy_id);
         env.storage().persistent().set(&user_key, &user_policies);
+
+        env.events().publish(
+            (Symbol::new(&env, "policy_created"),),
+            PolicyCreated {
+                policy_id,
+                product_id,
+                policyholder: buyer,
+                coverage_amount,
+                premium_paid: premium,
+            },
+        );
 
         policy_id
     }
@@ -282,6 +325,15 @@ impl PolicyEngine {
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
         token::Client::new(&env, &usdc)
             .transfer(&env.current_contract_address(), &policyholder, &policy.premium_paid);
+
+        env.events().publish(
+            (Symbol::new(&env, "policy_cancelled"),),
+            PolicyCancelled {
+                policy_id,
+                policyholder: policyholder.clone(),
+                refund_amount: policy.premium_paid,
+            },
+        );
         policy.premium_paid
     }
 
@@ -304,6 +356,15 @@ impl PolicyEngine {
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
         token::Client::new(&env, &usdc)
             .transfer(&env.current_contract_address(), &policy.policyholder, &policy.coverage_amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "policy_claimed"),),
+            PolicyClaimed {
+                policy_id,
+                policyholder: policy.policyholder.clone(),
+                coverage_amount: policy.coverage_amount,
+            },
+        );
     }
 
     /// Mark a policy as Expired (trigger not met before end_time).
@@ -319,6 +380,10 @@ impl PolicyEngine {
         }
         policy.status = PolicyStatus::Expired;
         env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
+        env.events().publish(
+            (Symbol::new(&env, "policy_expired"),),
+            PolicyExpired { policy_id },
+        );
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
