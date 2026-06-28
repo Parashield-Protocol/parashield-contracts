@@ -332,3 +332,61 @@ fn test_create_product_overflow_threshold_panics() {
         max_duration_days:  365,
     });
 }
+
+// ── coverage_min / coverage_max bounds checking (Issue #37) ───────────────────
+
+/// coverage_min greater than coverage_max must be rejected with InvalidCoverageRange (#15).
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_create_product_inverted_coverage_range_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.create_product(&admin, &CreateProductParams {
+        name:               symbol_short!("bad"),
+        category:           symbol_short!("crop"),
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       1_000,  // ← invalid: min > max
+        coverage_max:       500,
+        premium_rate_bps:   500,
+        max_duration_days:  365,
+    });
+}
+
+/// coverage_min of zero (free coverage) must be rejected with InvalidCoverageRange (#15).
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_create_product_zero_coverage_min_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.create_product(&admin, &CreateProductParams {
+        name:               symbol_short!("bad"),
+        category:           symbol_short!("crop"),
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       0,  // ← invalid: free coverage
+        coverage_max:       500,
+        premium_rate_bps:   500,
+        max_duration_days:  365,
+    });
+}
+
+// ── Deprecated product cannot be purchased (Issue #39) ────────────────────────
+
+/// buy_policy on a deprecated product must panic with ProductNotActive (#5).
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_deprecated_product_blocks_purchase() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    client.deprecate_product(&admin, &pid);
+
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+    client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+}

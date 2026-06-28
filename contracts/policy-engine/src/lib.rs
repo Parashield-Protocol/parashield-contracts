@@ -68,6 +68,7 @@ pub enum Error {
     AlreadyExpired          = 12,
     InvalidPremiumRate      = 13,
     InvalidTriggerThreshold = 14,
+    InvalidCoverageRange    = 15,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -118,6 +119,11 @@ impl PolicyEngine {
             || params.trigger_threshold > 1_000_000_000_000_000_000_000i128
         {
             panic_with_error!(&env, Error::InvalidTriggerThreshold);
+        }
+        // Coverage bounds must form a valid, positive range: 0 < min < max.
+        // Rejects free coverage (min == 0) and inverted ranges (min >= max).
+        if params.coverage_min <= 0 || params.coverage_min >= params.coverage_max {
+            panic_with_error!(&env, Error::InvalidCoverageRange);
         }
 
         let id = Self::next_product_id(&env);
