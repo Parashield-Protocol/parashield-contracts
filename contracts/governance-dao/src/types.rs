@@ -73,3 +73,59 @@ pub struct DaoConfig {
     /// Voting period in seconds.
     pub voting_period:    u64,
 }
+
+// ─── Events ──────────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Initialized {
+    pub admin: Address,
+    pub gov_token: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalCreated {
+    pub proposal_id: u64,
+    pub proposer: Address,
+    pub target: Address,
+    pub function: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoteCast {
+    pub proposal_id: u64,
+    pub voter: Address,
+    pub choice: VoteChoice,
+    pub weight: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalFinalized {
+    pub proposal_id: u64,
+    pub status: ProposalStatus,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalExecuted {
+    pub proposal_id: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalCancelled {
+    pub proposal_id: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DaoConfigUpdated {
+    pub gov_token: Address,
+    pub proposal_threshold: i128,
+    pub total_supply: i128,
+    pub voting_period: u64,
+}
+

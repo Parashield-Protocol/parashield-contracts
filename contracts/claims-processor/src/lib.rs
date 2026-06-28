@@ -110,6 +110,16 @@ impl ClaimsProcessor {
         env.storage().instance().set(&StorageKey::StalenessThreshold, &staleness_threshold);
         env.storage().instance().set(&StorageKey::NextClaimId, &1u128);
         env.storage().instance().set(&StorageKey::PendingClaims, &Vec::<u128>::new(&env));
+
+        env.events().publish(
+            (Symbol::new(&env, "initialized"),),
+            Initialized {
+                admin: admin.clone(),
+                policy_engine: policy_engine.clone(),
+                oracle_verifier: oracle_verifier.clone(),
+                staleness_threshold,
+            },
+        );
     }
 
     // ── Claim Submission ─────────────────────────────────────────────────────
@@ -142,7 +152,7 @@ impl ClaimsProcessor {
         let claim = Claim {
             id: claim_id,
             policy_id,
-            claimant,
+            claimant: claimant.clone(),
             coverage_amount: policy.coverage_amount,
             observed_value: None,
             trigger_met: false,
@@ -158,6 +168,16 @@ impl ClaimsProcessor {
             .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(&env));
         pending.push_back(claim_id);
         env.storage().instance().set(&StorageKey::PendingClaims, &pending);
+
+        env.events().publish(
+            (Symbol::new(&env, "claim_submitted"),),
+            ClaimSubmitted {
+                claim_id,
+                policy_id,
+                claimant,
+                coverage_amount: policy.coverage_amount,
+            },
+        );
 
         claim_id
     }
@@ -283,8 +303,17 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
         if claim.claimant != claimant { panic_with_error!(&env, Error::Unauthorized); }
         claim.status = ClaimStatus::Disputed;
-        claim.dispute_reason = Some(reason);
+        claim.dispute_reason = Some(reason.clone());
         env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
+
+        env.events().publish(
+            (Symbol::new(&env, "claim_disputed"),),
+            ClaimDisputed {
+                claim_id,
+                claimant,
+                reason,
+            },
+        );
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
@@ -354,6 +383,17 @@ impl ClaimsProcessor {
         };
 
         env.storage().persistent().set(&StorageKey::Claim(claim.id), claim);
+
+        env.events().publish(
+            (Symbol::new(env, "claim_processed"),),
+            ClaimProcessed {
+                claim_id: claim.id,
+                policy_id: claim.policy_id,
+                trigger_met: claim.trigger_met,
+                status: claim.status.clone(),
+            },
+        );
+
         result
     }
 
@@ -367,7 +407,7 @@ impl ClaimsProcessor {
     fn validate_stellar_address(env: &Env, address: &Address) {
         let addr_str = address.to_string();
         
-        // Check length: Stellar addresses are exactly 56 characters
+        // Check length: Stellar public keys are exactly 56 characters
         if addr_str.len() != 56 {
             panic_with_error!(env, Error::InvalidAddress);
         }

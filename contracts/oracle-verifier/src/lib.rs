@@ -26,6 +26,7 @@ pub use types::*;
 /// Maximum number of registered oracles. Bounds the median aggregation loop and
 /// the worst-case weighted sum (MAX_ORACLES * max_weight * max_value) so it
 /// cannot overflow i128.
+#[allow(dead_code)]
 const MAX_ORACLES: u32 = 100;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
@@ -42,6 +43,7 @@ enum StorageKey {
     OracleList,
     /// Global minimum confidence threshold (u32)
     MinConfidence,
+    MaxDataAge,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -83,6 +85,11 @@ impl OracleVerifier {
         env.storage().instance().set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
         env.storage().instance().set(&StorageKey::OracleList, &Vec::<Address>::new(&env));
+
+        env.events().publish(
+            (Symbol::new(&env, "initialized"),),
+            Initialized { admin: admin.clone() },
+        );
     }
 
     // ── Oracle Management (admin only) ───────────────────────────────────────
@@ -104,7 +111,7 @@ impl OracleVerifier {
         if env.storage().persistent().has(&key) {
             panic_with_error!(&env, Error::OracleAlreadyExists);
         }
-        let entry = OracleEntry { oracle: oracle.clone(), data_type, weight, active: true };
+        let entry = OracleEntry { oracle: oracle.clone(), data_type: data_type.clone(), weight, active: true };
         env.storage().persistent().set(&key, &entry);
 
         let mut list: Vec<Address> = env
@@ -117,6 +124,11 @@ impl OracleVerifier {
         }
         list.push_back(oracle);
         env.storage().instance().set(&StorageKey::OracleList, &list);
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle_added"),),
+            OracleAdded { oracle, data_type, weight },
+        );
     }
 
     /// Update the relative weight of an existing oracle registration.
@@ -154,6 +166,11 @@ impl OracleVerifier {
             .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
         entry.active = false;
         env.storage().persistent().set(&key, &entry);
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle_removed"),),
+            OracleRemoved { oracle, data_type },
+        );
     }
 
     // ── Contract Settings (admin only) ───────────────────────────────────────
@@ -165,6 +182,25 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::InvalidConfidence);
         }
         env.storage().instance().set(&StorageKey::MinConfidence, &threshold);
+        env.events().publish(
+            (Symbol::new(&env, "min_confidence_updated"),),
+            MinConfidenceUpdated { threshold },
+        );
+    }
+
+    /// Set the maximum data age in seconds.
+    pub fn set_max_data_age(env: Env, admin: Address, max_age: u64) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&StorageKey::MaxDataAge, &max_age);
+        env.events().publish(
+            (Symbol::new(&env, "max_data_age_updated"),),
+            MaxDataAgeUpdated { max_age },
+        );
+    }
+
+    /// Get the maximum data age in seconds (defaults to 7 days = 604,800 seconds).
+    pub fn get_max_data_age(env: Env) -> u64 {
+        env.storage().instance().get(&StorageKey::MaxDataAge).unwrap_or(604_800)
     }
 
     // ── Data Submission ───────────────────────────────────────────────────────
@@ -202,7 +238,7 @@ impl OracleVerifier {
         }
 
         // Load existing submissions for this (data_type, key)
-        let dp_key = StorageKey::DataPoints(data_type, key);
+        let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
         let mut points: Vec<OracleDataPoint> = env
             .storage()
             .persistent()
@@ -224,6 +260,18 @@ impl OracleVerifier {
         }
 
         env.storage().persistent().set(&dp_key, &points);
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle_data_submitted"),),
+            OracleDataSubmitted {
+                oracle,
+                data_type,
+                key,
+                value,
+                confidence,
+                timestamp,
+            },
+        );
     }
 
     // ── Verification ─────────────────────────────────────────────────────────
@@ -262,6 +310,11 @@ impl OracleVerifier {
             if p.timestamp > latest.timestamp {
                 latest = p;
             }
+        }
+        let max_data_age: u64 = env.storage().instance().get(&StorageKey::MaxDataAge).unwrap_or(604_800);
+        let now = env.ledger().timestamp();
+        if now.saturating_sub(latest.timestamp) > max_data_age {
+            panic_with_error!(&env, Error::NoDataAvailable);
         }
         latest
     }
@@ -355,6 +408,18 @@ impl OracleVerifier {
             }
             if !found { points.push_back(new_point); }
             env.storage().persistent().set(&dp_key, &points);
+
+            env.events().publish(
+                (Symbol::new(&env, "oracle_data_submitted"),),
+                OracleDataSubmitted {
+                    oracle: oracle.clone(),
+                    data_type: data_type.clone(),
+                    key,
+                    value,
+                    confidence,
+                    timestamp,
+                },
+            );
         }
     }
 
@@ -391,6 +456,8 @@ impl OracleVerifier {
             .unwrap_or_else(|| panic_with_error!(env, Error::NoDataAvailable));
         if points.is_empty() { panic_with_error!(env, Error::NoDataAvailable); }
         
+        let max_data_age: u64 = env.storage().instance().get(&StorageKey::MaxDataAge).unwrap_or(604_800);
+        let now = env.ledger().timestamp();
         let min_confidence: u32 = env.storage().instance().get(&StorageKey::MinConfidence).unwrap_or(0);
 
         // Collect values and weights on the stack
@@ -400,7 +467,7 @@ impl OracleVerifier {
         
         for i in 0..points.len() {
             let p = points.get_unchecked(i);
-            if p.confidence >= min_confidence {
+            if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence {
                 let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
                 if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
                     if n < 100 {

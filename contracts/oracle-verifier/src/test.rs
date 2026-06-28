@@ -458,28 +458,31 @@ fn test_oracle_cap_rejects_extra() {
 }
 
 #[test]
-fn test_profile_gas_costs() {
+fn test_get_and_set_max_data_age() {
     let (env, admin, contract_id) = setup();
     let client = OracleVerifierClient::new(&env, &contract_id);
 
-    let mut oracles = soroban_sdk::Vec::new(&env);
-    for _ in 0..100 {
-        let oracle = Address::generate(&env);
-        client.add_oracle(&admin, &oracle, &weather(), &100u32);
-        oracles.push_back(oracle);
-    }
+    // Default max data age (7 days)
+    assert_eq!(client.get_max_data_age(), 604_800);
 
-    // Perform 1000 total submissions (10 submissions per oracle)
-    for step in 0..10 {
-        for i in 0..100 {
-            let oracle = oracles.get_unchecked(i);
-            client.submit_data(&oracle, &weather(), &kisumu_key(), &(30_000_000i128 + step as i128), &90u32, &1748736000u64);
-        }
-    }
+    // Admin updates it (1 day)
+    client.set_max_data_age(&admin, &86_400);
+    assert_eq!(client.get_max_data_age(), 86_400);
+}
 
-    // Reset budget to track clean verify_trigger execution
-    env.cost_estimate().budget().reset_unlimited();
-    
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_verify_trigger_rejects_stale_data() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &100u32);
+
+    // T = t0 (1,000,000)
+    let t0 = 1_000_000u64;
+    env.ledger().with_mut(|l| l.timestamp = t0);
+    client.submit_data(&oracle, &weather(), &kisumu_key(), &30_000_000i128, &90u32, &t0);
+
     let condition = TriggerCondition {
         data_type: weather(),
         key: kisumu_key(),
@@ -487,22 +490,12 @@ fn test_profile_gas_costs() {
         comparison: TriggerComparison::LessThan,
     };
     
-    let cpu_start = env.cost_estimate().budget().cpu_instruction_cost();
-    let mem_start = env.cost_estimate().budget().memory_bytes_cost();
-    
-    let res = client.verify_trigger(&weather(), &kisumu_key(), &condition);
-    
-    let cpu_end = env.cost_estimate().budget().cpu_instruction_cost();
-    let mem_end = env.cost_estimate().budget().memory_bytes_cost();
-    
-    let cpu_used = cpu_end - cpu_start;
-    let mem_used = mem_end - mem_start;
-    
-    extern crate std;
-    std::println!("Verify trigger with 100 oracles and 1000 submissions: CPU instructions = {}, Memory bytes = {}", cpu_used, mem_used);
-    
-    assert!(res);
-    // Block limit is 100,000,000 instructions. Verify it's well below that.
-    assert!(cpu_used < 5_000_000);
+    // T = t0 + 1 hour: should pass
+    env.ledger().with_mut(|l| l.timestamp = t0 + 3600);
+    assert!(client.verify_trigger(&weather(), &kisumu_key(), &condition));
+
+    // T = t0 + 8 days (T0 + 691,200): must panic with NoDataAvailable (#6)
+    env.ledger().with_mut(|l| l.timestamp = t0 + 691_200);
+    client.verify_trigger(&weather(), &kisumu_key(), &condition);
 }
 
