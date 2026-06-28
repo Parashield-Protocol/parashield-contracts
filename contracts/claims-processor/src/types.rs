@@ -23,6 +23,7 @@ pub enum ClaimResult {
     AlreadyClaimed,
     /// Policy is not in Active state (cancelled etc.).
     PolicyNotActive,
+    AlreadyProcessed,
 }
 
 /// A claim record stored on-chain.
