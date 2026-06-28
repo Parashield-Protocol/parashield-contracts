@@ -49,7 +49,7 @@ fn full_setup() -> TestEnv {
     PolicyEngineClient::new(&env, &policy_id)
         .initialize(&admin, &usdc_id, &oracle_id);
     ClaimsProcessorClient::new(&env, &claims_id)
-        .initialize(&admin, &policy_id, &oracle_id);
+        .initialize(&admin, &policy_id, &oracle_id, &604_800u64);
     PolicyEngineClient::new(&env, &policy_id)
         .set_claims_processor(&admin, &claims_id);
 
@@ -100,10 +100,10 @@ fn batch_processes_multiple_pending_claims() {
     );
 
     let p1 = policy_client.buy_policy(
-        &farmer1, &prod_id, &1_000_0000000i128, &symbol_short!("kis2606"), &30u32,
+        &farmer1, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
     );
     let p2 = policy_client.buy_policy(
-        &farmer2, &prod_id, &2_000_0000000i128, &symbol_short!("kis2606"), &30u32,
+        &farmer2, &prod_id, &2_000_0000000i128, &30u32, &symbol_short!("kis2606"),
     );
 
     claims_client.submit_claim(&farmer1, &p1);
@@ -138,7 +138,7 @@ fn batch_skips_non_pending_claims() {
     token::StellarAssetClient::new(&te.env, &te.usdc).mint(&te.policy, &1_000_000_0000000i128);
 
     let p1 = policy_client.buy_policy(
-        &farmer, &prod_id, &1_000_0000000i128, &symbol_short!("kis2606"), &30u32,
+        &farmer, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
     );
     let claim_id = claims_client.submit_claim(&farmer, &p1);
     // Process it once
@@ -146,4 +146,79 @@ fn batch_skips_non_pending_claims() {
     // Batch with limit=10 should return 0 results (already processed)
     let results = claims_client.batch_auto_process(&te.admin, &10u32);
     assert_eq!(results.len(), 0);
+}
+
+// ── Oracle staleness rejection (Issue #3) ─────────────────────────────────────
+
+/// auto_process must panic when oracle data is older than the staleness threshold.
+/// Verifies that verify_trigger_fresh rejects stale data before any state write.
+#[test]
+#[should_panic]
+fn test_stale_oracle_data_rejected() {
+    let te = full_setup();
+    let claims_client = ClaimsProcessorClient::new(&te.env, &te.claims);
+    let policy_client = PolicyEngineClient::new(&te.env, &te.policy);
+    let oracle_client = OracleVerifierClient::new(&te.env, &te.oracle);
+
+    let prod_id = create_drought_product(&te);
+
+    oracle_client.add_oracle(&te.admin, &te.oracle_node, &weather(), &90u32);
+
+    // Submit oracle data with an old timestamp (well within a recognisable epoch)
+    let data_ts: u64 = 1_000_000;
+    oracle_client.submit_data(
+        &te.oracle_node, &weather(), &symbol_short!("kis2606"),
+        &30_000_000i128, &95u32, &data_ts,
+    );
+
+    let farmer = Address::generate(&te.env);
+    token::StellarAssetClient::new(&te.env, &te.usdc).mint(&farmer, &10_000_0000000i128);
+    token::StellarAssetClient::new(&te.env, &te.usdc).mint(&te.policy, &1_000_000_0000000i128);
+
+    let pol_id = policy_client.buy_policy(
+        &farmer, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+    );
+
+    // Advance ledger to more than staleness_threshold (604_800 s) past the data timestamp
+    let stale_now = data_ts + 604_800 + 1;
+    te.env.ledger().with_mut(|l| l.timestamp = stale_now);
+
+    // auto_process must panic — StaleData error from oracle-verifier
+    claims_client.auto_process(&te.admin, &pol_id);
+}
+
+/// auto_process succeeds when oracle data is within the staleness threshold.
+#[test]
+fn test_fresh_oracle_data_accepted() {
+    let te = full_setup();
+    let claims_client = ClaimsProcessorClient::new(&te.env, &te.claims);
+    let policy_client = PolicyEngineClient::new(&te.env, &te.policy);
+    let oracle_client = OracleVerifierClient::new(&te.env, &te.oracle);
+
+    let prod_id = create_drought_product(&te);
+
+    oracle_client.add_oracle(&te.admin, &te.oracle_node, &weather(), &90u32);
+
+    // Submit oracle data at timestamp 1_000_000
+    let data_ts: u64 = 1_000_000;
+    oracle_client.submit_data(
+        &te.oracle_node, &weather(), &symbol_short!("kis2606"),
+        &30_000_000i128, &95u32, &data_ts,
+    );
+
+    let farmer = Address::generate(&te.env);
+    token::StellarAssetClient::new(&te.env, &te.usdc).mint(&farmer, &10_000_0000000i128);
+    token::StellarAssetClient::new(&te.env, &te.usdc).mint(&te.policy, &1_000_000_0000000i128);
+
+    let pol_id = policy_client.buy_policy(
+        &farmer, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+    );
+
+    // Set ledger to within the staleness threshold (data is fresh)
+    let fresh_now = data_ts + 3_600; // 1 hour after data timestamp
+    te.env.ledger().with_mut(|l| l.timestamp = fresh_now);
+
+    // Should succeed and pay out (30mm < 500mm threshold triggers drought product)
+    let result = claims_client.auto_process(&te.admin, &pol_id);
+    assert_eq!(result, ClaimResult::Paid);
 }

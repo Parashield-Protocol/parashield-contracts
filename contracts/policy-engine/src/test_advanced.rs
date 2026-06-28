@@ -110,7 +110,7 @@ fn cancel_policy_returns_premium_to_holder() {
     let (env, pe, admin, _, user) = setup();
     let prod_id = pe.create_product(&admin, &basic_params());
     let policy_id = pe.buy_policy(
-        &user, &prod_id, &1_000_0000000i128, &symbol_short!("kis2606"), &30u32,
+        &user, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
     );
     pe.cancel_policy(&user, &policy_id);
     let policy = pe.get_policy(&policy_id);
@@ -123,8 +123,8 @@ fn cancel_policy_returns_premium_to_holder() {
 fn get_user_policies_tracks_multiple_policies() {
     let (_, pe, admin, _, user) = setup();
     let prod_id = pe.create_product(&admin, &basic_params());
-    pe.buy_policy(&user, &prod_id, &200_0000000i128, &symbol_short!("kis2606"), &30u32);
-    pe.buy_policy(&user, &prod_id, &300_0000000i128, &symbol_short!("kis2606"), &30u32);
+    pe.buy_policy(&user, &prod_id, &200_0000000i128, &30u32, &symbol_short!("kis2606"));
+    pe.buy_policy(&user, &prod_id, &300_0000000i128, &30u32, &symbol_short!("kis2606"));
     let policies = pe.get_user_policies(&user);
     assert_eq!(policies.len(), 2);
 }

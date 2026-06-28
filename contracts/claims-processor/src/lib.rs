@@ -34,11 +34,12 @@ trait IPolicyEngine {
 
 #[soroban_sdk::contractclient(name = "OracleVerifierClient")]
 trait IOracleVerifier {
-    fn verify_trigger(
+    fn verify_trigger_fresh(
         env: Env,
         data_type: soroban_sdk::Symbol,
         key: soroban_sdk::Symbol,
         condition: parashield_oracle_verifier::TriggerCondition,
+        max_age_seconds: u64,
     ) -> bool;
 }
 
@@ -50,6 +51,7 @@ enum StorageKey {
     Admin,
     PolicyEngine,
     OracleVerifier,
+    StalenessThreshold,  // u64 — max acceptable oracle data age in seconds
     Claim(u128),
     PolicyClaim(u128),   // policy_id → claim_id (one claim per policy)
     NextClaimId,
@@ -86,6 +88,7 @@ impl ClaimsProcessor {
         admin: Address,
         policy_engine: Address,
         oracle_verifier: Address,
+        staleness_threshold: u64,
     ) {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
@@ -95,6 +98,7 @@ impl ClaimsProcessor {
         env.storage().instance().set(&StorageKey::Admin, &admin);
         env.storage().instance().set(&StorageKey::PolicyEngine, &policy_engine);
         env.storage().instance().set(&StorageKey::OracleVerifier, &oracle_verifier);
+        env.storage().instance().set(&StorageKey::StalenessThreshold, &staleness_threshold);
         env.storage().instance().set(&StorageKey::NextClaimId, &1u128);
         env.storage().instance().set(&StorageKey::PendingClaims, &Vec::<u128>::new(&env));
     }
@@ -288,6 +292,10 @@ impl ClaimsProcessor {
             .get(&StorageKey::OracleVerifier).unwrap();
         let policy_engine: Address = env.storage().instance()
             .get(&StorageKey::PolicyEngine).unwrap();
+        // Configurable staleness threshold (default 7 days = 604_800 s if not set)
+        let staleness_threshold: u64 = env.storage().instance()
+            .get(&StorageKey::StalenessThreshold)
+            .unwrap_or(604_800u64);
 
         // Reload policy to get trigger params
         let policy = PolicyEngineClient::new(env, &policy_engine)
@@ -300,8 +308,15 @@ impl ClaimsProcessor {
             comparison:  map_comparison(&policy.trigger_comparison),
         };
 
+        // verify_trigger_fresh re-queries the oracle and rejects stale data
+        // in the same atomic call, preventing stale-data and TOCTOU issues.
         let trigger_met = OracleVerifierClient::new(env, &oracle_verifier)
-            .verify_trigger(&policy.oracle_data_type, &policy.oracle_key, &condition);
+            .verify_trigger_fresh(
+                &policy.oracle_data_type,
+                &policy.oracle_key,
+                &condition,
+                &staleness_threshold,
+            );
 
         claim.trigger_met  = trigger_met;
         claim.processed_at = Some(env.ledger().timestamp());

@@ -208,3 +208,127 @@ fn test_non_policyholder_cannot_cancel() {
     let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
     client.cancel_policy(&impostor, &policy_id);
 }
+
+// ── Re-entrancy / double-processing guard (Issue #1) ─────────────────────────
+
+/// pay_claim on an already-claimed policy must return AlreadyClaimed error,
+/// preventing double-payout (re-entrancy guard via state transition check).
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn test_double_pay_claim_panics_with_already_claimed() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client   = PolicyEngineClient::new(&env, &contract_id);
+    let pid      = create_crop_product(&env, &client, &admin);
+    let buyer    = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &10_000_000_000i128);
+    // Pre-fund the contract with coverage capital
+    StellarAssetClient::new(&env, &usdc).mint(&contract_id, &10_000_000_000i128);
+
+    let claims_processor = Address::generate(&env);
+    client.set_claims_processor(&admin, &claims_processor);
+
+    let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+
+    // First call: succeeds (Active → Claimed)
+    client.pay_claim(&claims_processor, &policy_id);
+    // Second call: must panic with AlreadyClaimed (#11)
+    client.pay_claim(&claims_processor, &policy_id);
+}
+
+/// expire_policy on an already-expired policy must return AlreadyExpired error.
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_double_expire_policy_panics_with_already_expired() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client   = PolicyEngineClient::new(&env, &contract_id);
+    let pid      = create_crop_product(&env, &client, &admin);
+    let buyer    = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &10_000_000_000i128);
+
+    let claims_processor = Address::generate(&env);
+    client.set_claims_processor(&admin, &claims_processor);
+
+    let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+
+    // First call: succeeds (Active → Expired)
+    client.expire_policy(&claims_processor, &policy_id);
+    // Second call: must panic with AlreadyExpired (#12)
+    client.expire_policy(&claims_processor, &policy_id);
+}
+
+// ── Premium transfer verification (Issue #2) ─────────────────────────────────
+
+/// buy_policy without sufficient USDC balance must revert — free policies impossible.
+#[test]
+#[should_panic]
+fn test_buy_policy_without_funds_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid    = create_crop_product(&env, &client, &admin);
+
+    // Buyer has zero USDC — no mint, no approval
+    let broke_buyer = Address::generate(&env);
+    client.buy_policy(&broke_buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+}
+
+// ── trigger_threshold bounds checking (Issue #4) ──────────────────────────────
+
+/// trigger_threshold of zero must be rejected with InvalidTriggerThreshold (#14).
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_create_product_zero_threshold_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.create_product(&admin, &CreateProductParams {
+        name:               symbol_short!("bad"),
+        category:           symbol_short!("crop"),
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  0i128,  // ← invalid: zero
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       100_000_000,
+        coverage_max:       10_000_000_000,
+        premium_rate_bps:   500,
+        max_duration_days:  365,
+    });
+}
+
+/// Negative trigger_threshold must be rejected with InvalidTriggerThreshold (#14).
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_create_product_negative_threshold_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.create_product(&admin, &CreateProductParams {
+        name:               symbol_short!("bad"),
+        category:           symbol_short!("crop"),
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  -1i128,  // ← invalid: negative
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       100_000_000,
+        coverage_max:       10_000_000_000,
+        premium_rate_bps:   500,
+        max_duration_days:  365,
+    });
+}
+
+/// Absurdly large trigger_threshold must be rejected with InvalidTriggerThreshold (#14).
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_create_product_overflow_threshold_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.create_product(&admin, &CreateProductParams {
+        name:               symbol_short!("bad"),
+        category:           symbol_short!("crop"),
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  i128::MAX,  // ← invalid: overflows protocol range
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       100_000_000,
+        coverage_max:       10_000_000_000,
+        premium_rate_bps:   500,
+        max_duration_days:  365,
+    });
+}
