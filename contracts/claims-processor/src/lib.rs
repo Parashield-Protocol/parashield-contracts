@@ -95,6 +95,21 @@ impl ClaimsProcessor {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
+        let admin_str = admin.to_string();
+        let admin_prefix = admin_str.to_string();
+        if !admin_prefix.starts_with('G') {
+            panic!("invalid address: admin must be an account address");
+        }
+        let policy_engine_str = policy_engine.to_string();
+        let oracle_verifier_str = oracle_verifier.to_string();
+        let policy_engine_prefix = policy_engine_str.to_string();
+        let oracle_verifier_prefix = oracle_verifier_str.to_string();
+        if !policy_engine_prefix.starts_with('C') {
+            panic!("invalid address: policy_engine must be a contract address");
+        }
+        if !oracle_verifier_prefix.starts_with('C') {
+            panic!("invalid address: oracle_verifier must be a contract address");
+        }
         admin.require_auth();
         env.storage().instance().set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
@@ -163,7 +178,7 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
 
         if claim.status != ClaimStatus::Pending {
-            panic_with_error!(&env, Error::AlreadyProcessed);
+            return ClaimResult::AlreadyProcessed;
         }
         Self::evaluate_and_settle(&env, &mut claim)
     }

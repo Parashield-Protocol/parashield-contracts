@@ -173,11 +173,28 @@ fn test_double_process_idempotent() {
     let second = cp.auto_process(&w.keeper, &pol_id);
 
     assert_eq!(first,  ClaimResult::Paid);
-    assert_eq!(second, ClaimResult::AlreadyProcessed); // <-- Changed from AlreadyClaimed to AlreadyProcessed
-    
+    assert_eq!(second, ClaimResult::AlreadyProcessed);
+
     // Buyer should NOT receive double coverage — exactly one payout
     let balance = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
     assert_eq!(balance, 5_000_000_000 - 50_000_000 + 1_000_000_000);
+}
+
+#[test]
+fn test_process_claim_is_idempotent_after_first_settlement() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    let first = cp.process_claim(&w.keeper, &claim_id);
+    let second = cp.process_claim(&w.keeper, &claim_id);
+
+    assert_eq!(first, ClaimResult::Paid);
+    assert_eq!(second, ClaimResult::AlreadyProcessed);
 }
 
 /// submit_claim on already-claimed policy panics.
