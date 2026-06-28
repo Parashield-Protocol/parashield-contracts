@@ -1,3 +1,4 @@
+#![allow(clippy::inconsistent_digit_grouping)]
 //! Extended integration tests for the Claims Processor.
 //! Covers batch processing, edge cases, and cross-contract error propagation.
 #![cfg(test)]
@@ -5,7 +6,7 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::Address as _,
     token, Address, Env,
 };
 
@@ -21,7 +22,6 @@ use crate::{ClaimsProcessor, ClaimsProcessorClient, ClaimResult};
 use soroban_sdk::{symbol_short, Symbol};
 
 fn weather() -> Symbol { symbol_short!("weather") }
-fn flight()  -> Symbol { symbol_short!("flight")  }
 
 struct TestEnv {
     env:      Env,

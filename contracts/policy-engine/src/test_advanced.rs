@@ -1,10 +1,11 @@
+#![allow(clippy::inconsistent_digit_grouping)]
 //! Advanced policy-engine tests: emergency pause, product deprecation, cancel.
 #![cfg(test)]
 
 extern crate std;
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::Address as _,
     token, Address, Env,
 };
 
@@ -77,7 +78,7 @@ fn emergency_resume_clears_paused_flag() {
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn non_admin_cannot_pause() {
-    let (env, pe, _, _, user) = setup();
+    let (_env, pe, _, _, user) = setup();
     pe.emergency_pause(&user);
 }
 
@@ -107,7 +108,7 @@ fn pause_product_changes_status_but_stays_in_active_list() {
 
 #[test]
 fn cancel_policy_returns_premium_to_holder() {
-    let (env, pe, admin, _, user) = setup();
+    let (_env, pe, admin, _, user) = setup();
     let prod_id = pe.create_product(&admin, &basic_params());
     let policy_id = pe.buy_policy(
         &user, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),

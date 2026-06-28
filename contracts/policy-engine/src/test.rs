@@ -26,7 +26,7 @@ fn setup() -> (Env, Address, Address, Address, Address) {
     (env, admin, oracle, usdc, contract_id)
 }
 
-fn create_crop_product(env: &Env, client: &PolicyEngineClient, admin: &Address) -> u128 {
+fn create_crop_product(_env: &Env, client: &PolicyEngineClient, admin: &Address) -> u128 {
     client.create_product(admin, &CreateProductParams {
         name:               symbol_short!("crop_kism"),
         category:           symbol_short!("crop"),

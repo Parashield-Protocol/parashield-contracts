@@ -34,6 +34,8 @@ enum StorageKey {
     DataPoints(Symbol, Symbol),
     /// Vec<Address> — every registered oracle address
     OracleList,
+    /// Global minimum confidence threshold (u32)
+    MinConfidence,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -118,6 +120,17 @@ impl OracleVerifier {
         env.storage().persistent().set(&key, &entry);
     }
 
+    // ── Contract Settings (admin only) ───────────────────────────────────────
+
+    /// Set the global minimum confidence threshold for oracle data.
+    pub fn set_min_confidence(env: Env, admin: Address, threshold: u32) {
+        Self::require_admin(&env, &admin);
+        if threshold > 100 {
+            panic_with_error!(&env, Error::InvalidConfidence);
+        }
+        env.storage().instance().set(&StorageKey::MinConfidence, &threshold);
+    }
+
     // ── Data Submission ───────────────────────────────────────────────────────
 
     /// Submit a data point for a (data_type, key) pair.
@@ -137,7 +150,7 @@ impl OracleVerifier {
         timestamp: u64,
     ) {
         oracle.require_auth();
-        if confidence > 100 {
+        if confidence == 0 || confidence > 100 {
             panic_with_error!(&env, Error::InvalidConfidence);
         }
 
@@ -290,7 +303,7 @@ impl OracleVerifier {
 
         for i in 0..submissions.len() {
             let (key, value, confidence, timestamp) = submissions.get_unchecked(i);
-            if confidence > 100 { panic_with_error!(&env, Error::InvalidConfidence); }
+            if confidence == 0 || confidence > 100 { panic_with_error!(&env, Error::InvalidConfidence); }
             let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
             let mut points: Vec<OracleDataPoint> = env.storage().persistent()
                 .get(&dp_key)
@@ -340,17 +353,32 @@ impl OracleVerifier {
             .persistent()
             .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
             .unwrap_or_else(|| panic_with_error!(env, Error::NoDataAvailable));
-        let n = points.len();
-        if n == 0 { panic_with_error!(env, Error::NoDataAvailable); }
-        // Collect and sort values
-        let mut values: soroban_sdk::Vec<i128> = soroban_sdk::Vec::new(env);
-        for i in 0..n {
-            values.push_back(points.get_unchecked(i).value);
+        if points.is_empty() { panic_with_error!(env, Error::NoDataAvailable); }
+        
+        let min_confidence: u32 = env.storage().instance().get(&StorageKey::MinConfidence).unwrap_or(0);
+
+        // Collect values and weights
+        let mut values: soroban_sdk::Vec<(i128, u32)> = soroban_sdk::Vec::new(env);
+        let mut total_weight: u32 = 0;
+        
+        for i in 0..points.len() {
+            let p = points.get_unchecked(i);
+            if p.confidence >= min_confidence {
+                let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+                if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+                    values.push_back((p.value, entry.weight));
+                    total_weight += entry.weight;
+                }
+            }
         }
-        // Insertion sort (small n — no std available)
+        
+        let n = values.len();
+        if n == 0 || total_weight == 0 { panic_with_error!(env, Error::NoDataAvailable); }
+        
+        // Insertion sort by value (small n — no std available)
         for i in 1..values.len() {
             let mut j = i;
-            while j > 0 && values.get_unchecked(j - 1) > values.get_unchecked(j) {
+            while j > 0 && values.get_unchecked(j - 1).0 > values.get_unchecked(j).0 {
                 let a = values.get_unchecked(j - 1);
                 let b = values.get_unchecked(j);
                 values.set(j - 1, b);
@@ -358,12 +386,24 @@ impl OracleVerifier {
                 j -= 1;
             }
         }
-        let mid = n / 2;
-        if n % 2 == 1 {
-            values.get_unchecked(mid)
-        } else {
-            (values.get_unchecked(mid - 1) + values.get_unchecked(mid)) / 2
+        
+        let half = total_weight / 2;
+        let mut cumulative = 0;
+        for i in 0..n {
+            let (val, wt) = values.get_unchecked(i);
+            cumulative += wt;
+            if cumulative > half {
+                return val;
+            } else if cumulative == half && total_weight.is_multiple_of(2) {
+                if i + 1 < n {
+                    return (val + values.get_unchecked(i + 1).0) / 2;
+                } else {
+                    return val;
+                }
+            }
         }
+        
+        values.get_unchecked(n - 1).0
     }
 }
 
