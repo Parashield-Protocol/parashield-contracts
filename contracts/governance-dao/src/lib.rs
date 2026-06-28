@@ -69,6 +69,14 @@ impl GovernanceDao {
         env.storage().instance().set(&StorageKey::Admin,          &admin);
         env.storage().instance().set(&StorageKey::Config,         &config);
         env.storage().instance().set(&StorageKey::NextProposalId, &0u64);
+
+        env.events().publish(
+            (Symbol::new(&env, "initialized"),),
+            Initialized {
+                admin: admin.clone(),
+                gov_token: config.gov_token.clone(),
+            },
+        );
     }
 
     // ── Proposals ─────────────────────────────────────────────────────────────
@@ -98,8 +106,8 @@ impl GovernanceDao {
             id:            proposal_id,
             proposer:      proposer.clone(),
             title,
-            target,
-            function,
+            target:        target.clone(),
+            function:      function.clone(),
             status:        ProposalStatus::Active,
             votes_for:     0,
             votes_against: 0,
@@ -110,6 +118,16 @@ impl GovernanceDao {
 
         env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
         env.storage().instance().set(&StorageKey::NextProposalId, &(proposal_id + 1));
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_created"),),
+            ProposalCreated {
+                proposal_id,
+                proposer,
+                target,
+                function,
+            },
+        );
 
         proposal_id
     }
@@ -148,11 +166,21 @@ impl GovernanceDao {
         }
 
         env.storage().persistent().set(&vote_key, &VoteRecord {
-            voter,
-            choice,
+            voter: voter.clone(),
+            choice: choice.clone(),
             weight,
         });
         env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "vote_cast"),),
+            VoteCast {
+                proposal_id,
+                voter,
+                choice,
+                weight,
+            },
+        );
     }
 
     pub fn finalize(env: Env, proposal_id: u64) {
@@ -188,6 +216,14 @@ impl GovernanceDao {
         }
 
         env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_finalized"),),
+            ProposalFinalized {
+                proposal_id,
+                status: proposal.status.clone(),
+            },
+        );
     }
 
     pub fn execute(env: Env, proposal_id: u64) {
@@ -209,6 +245,11 @@ impl GovernanceDao {
         // (they build the Auth tree) to avoid this contract needing admin on targets.
         proposal.status = ProposalStatus::Executed;
         env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_executed"),),
+            ProposalExecuted { proposal_id },
+        );
     }
 
     pub fn cancel(env: Env, admin: Address, proposal_id: u64) {
@@ -224,6 +265,11 @@ impl GovernanceDao {
 
         proposal.status = ProposalStatus::Cancelled;
         env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_cancelled"),),
+            ProposalCancelled { proposal_id },
+        );
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
@@ -258,6 +304,16 @@ impl GovernanceDao {
     pub fn update_config(env: Env, admin: Address, config: DaoConfig) {
         Self::require_admin(&env, &admin);
         env.storage().instance().set(&StorageKey::Config, &config);
+
+        env.events().publish(
+            (Symbol::new(&env, "dao_config_updated"),),
+            DaoConfigUpdated {
+                gov_token: config.gov_token.clone(),
+                proposal_threshold: config.proposal_threshold,
+                total_supply: config.total_supply,
+                voting_period: config.voting_period,
+            },
+        );
     }
 
     fn require_admin(env: &Env, caller: &Address) {

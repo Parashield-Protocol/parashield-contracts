@@ -332,3 +332,40 @@ fn test_create_product_overflow_threshold_panics() {
         max_duration_days:  365,
     });
 }
+
+#[test]
+fn test_buy_policy_emits_event() {
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::{Symbol, TryIntoVal};
+
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid    = create_crop_product(&env, &client, &admin);
+
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+
+    let events = env.events().all();
+    let mut found_policy_created = false;
+    for event in events {
+        let (event_contract, topics, data) = event;
+        if event_contract == contract_id && !topics.is_empty() {
+            let topic_val = topics.get(0).unwrap();
+            let topic: Symbol = topic_val.try_into_val(&env).unwrap();
+            if topic == Symbol::new(&env, "policy_created") {
+                let policy_created_event: PolicyCreated = data.try_into_val(&env).unwrap();
+                assert_eq!(policy_created_event.policy_id, policy_id);
+                assert_eq!(policy_created_event.product_id, pid);
+                assert_eq!(policy_created_event.policyholder, buyer);
+                assert_eq!(policy_created_event.coverage_amount, COVERAGE);
+                assert_eq!(policy_created_event.premium_paid, PREMIUM);
+                found_policy_created = true;
+                break;
+            }
+        }
+    }
+    assert!(found_policy_created, "policy_created event not found or has incorrect data");
+}
+

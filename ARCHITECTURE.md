@@ -125,3 +125,77 @@ SHIELD token holders govern protocol parameters:
 - Policy Engine holds USDC in escrow: no admin withdrawal function
 - Claims Processor is the only address authorized to call `pay_claim` / `expire_policy`
 - All monetary arithmetic uses checked arithmetic (Soroban default with overflow-checks = true)
+
+## Event Schema
+
+All state changes publish events using `env.events().publish(topics, data)` to facilitate off-chain indexing and audit trails.
+
+### 1. Policy Engine Events
+
+Topics format: `("policy_created",)`, `("policy_claimed",)`, etc.
+
+| Topic | Event Data Struct | Description |
+|---|---|---|
+| `initialized` | `Initialized { admin: Address, usdc_token: Address, oracle_address: Address }` | Fired when contract is initialized. |
+| `claims_processor_updated` | `ClaimsProcessorUpdated { claims_processor: Address }` | Fired when Claims Processor is registered. |
+| `product_created` | `ProductCreated { product_id: u128, name: Symbol, category: Symbol, premium_rate_bps: u32 }` | Fired when a new insurance product is defined. |
+| `product_paused` | `ProductPaused { product_id: u128 }` | Fired when a product is paused. |
+| `product_deprecated` | `ProductDeprecated { product_id: u128 }` | Fired when a product is deprecated. |
+| `policy_created` | `PolicyCreated { policy_id: u128, product_id: u128, policyholder: Address, coverage_amount: i128, premium_paid: i128 }` | Fired when a policy is purchased. |
+| `policy_cancelled` | `PolicyCancelled { policy_id: u128, policyholder: Address, refund_amount: i128 }` | Fired when a policy is cancelled and premium refunded. |
+| `policy_claimed` | `PolicyClaimed { policy_id: u128, policyholder: Address, coverage_amount: i128 }` | Fired when a claim is paid out to a policyholder. |
+| `policy_expired` | `PolicyExpired { policy_id: u128 }` | Fired when a policy expires without trigger payout. |
+
+### 2. Claims Processor Events
+
+Topics format: `("claim_submitted",)`, `("claim_processed",)`, etc.
+
+| Topic | Event Data Struct | Description |
+|---|---|---|
+| `initialized` | `Initialized { admin: Address, policy_engine: Address, oracle_verifier: Address, staleness_threshold: u64 }` | Fired when Claims Processor is initialized. |
+| `claim_submitted` | `ClaimSubmitted { claim_id: u128, policy_id: u128, claimant: Address, coverage_amount: i128 }` | Fired when a claim is manually submitted. |
+| `claim_processed` | `ClaimProcessed { claim_id: u128, policy_id: u128, trigger_met: bool, status: ClaimStatus }` | Fired when a claim is settled (Paid or Rejected). |
+| `claim_disputed` | `ClaimDisputed { claim_id: u128, claimant: Address, reason: Symbol }` | Fired when a processed claim is disputed. |
+
+### 3. Oracle Verifier Events
+
+Topics format: `("oracle_added",)`, `("oracle_data_submitted",)`, etc.
+
+| Topic | Event Data Struct | Description |
+|---|---|---|
+| `initialized` | `Initialized { admin: Address }` | Fired when Oracle Verifier is initialized. |
+| `oracle_added` | `OracleAdded { oracle: Address, data_type: Symbol, weight: u32 }` | Fired when a new oracle node is registered. |
+| `oracle_removed` | `OracleRemoved { oracle: Address, data_type: Symbol }` | Fired when an oracle node is deactivated. |
+| `min_confidence_updated` | `MinConfidenceUpdated { threshold: u32 }` | Fired when global minimum confidence changes. |
+| `oracle_data_submitted` | `OracleDataSubmitted { oracle: Address, data_type: Symbol, key: Symbol, value: i128, confidence: u32, timestamp: u64 }` | Fired when an oracle submits observation data. |
+
+### 4. Risk Pool Events
+
+Topics format: `("liquidity_deposited",)`, `("premium_distributed",)`, etc.
+
+| Topic | Event Data Struct | Description |
+|---|---|---|
+| `initialized` | `Initialized { admin: Address, usdc_token: Address, treasury: Address, category: Symbol }` | Fired when Risk Pool is initialized. |
+| `liquidity_deposited` | `LiquidityDeposited { provider: Address, amount: i128, shares_minted: i128 }` | Fired when an LP deposits USDC. |
+| `liquidity_withdrawn` | `LiquidityWithdrawn { provider: Address, shares_burned: i128, amount_returned: i128 }` | Fired when an LP withdraws USDC. |
+| `premium_distributed` | `PremiumDistributed { amount: i128, lp_share: i128, treasury_share: i128 }` | Fired when premium is received and split. |
+| `yield_claimed` | `YieldClaimed { provider: Address, amount: i128 }` | Fired when an LP claims yield. |
+| `capital_locked` | `CapitalLocked { policy_id: u128, amount: i128 }` | Fired when capital is locked for an active policy. |
+| `capital_released` | `CapitalReleased { policy_id: u128, amount: i128 }` | Fired when capital is released back to the pool. |
+| `pool_paused` | `PoolPaused { admin: Address }` | Fired when the pool is paused. |
+| `pool_resumed` | `PoolResumed { admin: Address }` | Fired when the pool is resumed. |
+
+### 5. Governance DAO Events
+
+Topics format: `("proposal_created",)`, `("vote_cast",)`, etc.
+
+| Topic | Event Data Struct | Description |
+|---|---|---|
+| `initialized` | `Initialized { admin: Address, gov_token: Address }` | Fired when Governance DAO is initialized. |
+| `proposal_created` | `ProposalCreated { proposal_id: u64, proposer: Address, target: Address, function: Symbol }` | Fired when a proposal is proposed. |
+| `vote_cast` | `VoteCast { proposal_id: u64, voter: Address, choice: VoteChoice, weight: i128 }` | Fired when a vote is cast. |
+| `proposal_finalized` | `ProposalFinalized { proposal_id: u64, status: ProposalStatus }` | Fired when a voting period closes and proposal status changes. |
+| `proposal_executed` | `ProposalExecuted { proposal_id: u64 }` | Fired when a proposal is executed. |
+| `proposal_cancelled` | `ProposalCancelled { proposal_id: u64 }` | Fired when admin cancels an active proposal. |
+| `dao_config_updated` | `DaoConfigUpdated { gov_token: Address, proposal_threshold: i128, total_supply: i128, voting_period: u64 }` | Fired when DAO parameters change. |
+

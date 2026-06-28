@@ -107,3 +107,73 @@ pub struct ProductStats {
     pub total_coverage: i128,
     pub total_premium_collected: i128,
 }
+
+// ─── Events ──────────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Initialized {
+    pub admin: Address,
+    pub usdc_token: Address,
+    pub oracle_address: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimsProcessorUpdated {
+    pub claims_processor: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductCreated {
+    pub product_id: u128,
+    pub name: Symbol,
+    pub category: Symbol,
+    pub premium_rate_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductPaused {
+    pub product_id: u128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductDeprecated {
+    pub product_id: u128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyCreated {
+    pub policy_id: u128,
+    pub product_id: u128,
+    pub policyholder: Address,
+    pub coverage_amount: i128,
+    pub premium_paid: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyCancelled {
+    pub policy_id: u128,
+    pub policyholder: Address,
+    pub refund_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyClaimed {
+    pub policy_id: u128,
+    pub policyholder: Address,
+    pub coverage_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyExpired {
+    pub policy_id: u128,
+}
+

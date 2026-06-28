@@ -70,3 +70,44 @@ pub struct OracleHealth {
     /// Timestamp of their most recent submission, or 0 if never.
     pub last_submitted: u64,
 }
+
+// ─── Events ──────────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Initialized {
+    pub admin: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleAdded {
+    pub oracle: Address,
+    pub data_type: Symbol,
+    pub weight: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleRemoved {
+    pub oracle: Address,
+    pub data_type: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MinConfidenceUpdated {
+    pub threshold: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleDataSubmitted {
+    pub oracle: Address,
+    pub data_type: Symbol,
+    pub key: Symbol,
+    pub value: i128,
+    pub confidence: u32,
+    pub timestamp: u64,
+}
+

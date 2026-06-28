@@ -86,6 +86,16 @@ impl RiskPool {
         env.storage().instance().set(&StorageKey::AccumulatedPremium, &0i128);
         env.storage().instance().set(&StorageKey::Status,             &PoolStatus::Active);
         env.storage().instance().set(&StorageKey::LpList,             &Vec::<Address>::new(&env));
+
+        env.events().publish(
+            (Symbol::new(&env, "initialized"),),
+            Initialized {
+                admin: admin.clone(),
+                usdc_token: usdc_token.clone(),
+                treasury: treasury.clone(),
+                category: category.clone(),
+            },
+        );
     }
 
     // ── Deposits ──────────────────────────────────────────────────────────────
@@ -137,6 +147,15 @@ impl RiskPool {
         env.storage().instance().set(&StorageKey::TotalDeposited, &(total_deposited + amount));
         env.storage().instance().set(&StorageKey::TotalShares,    &(total_shares + new_shares));
 
+        env.events().publish(
+            (Symbol::new(&env, "liquidity_deposited"),),
+            LiquidityDeposited {
+                provider: provider.clone(),
+                amount,
+                shares_minted: new_shares,
+            },
+        );
+
         new_shares
     }
 
@@ -168,6 +187,15 @@ impl RiskPool {
         env.storage().instance().set(&StorageKey::TotalDeposited, &(total_deposited - amount));
         env.storage().instance().set(&StorageKey::TotalShares,    &(total_shares - shares));
 
+        env.events().publish(
+            (Symbol::new(&env, "liquidity_withdrawn"),),
+            LiquidityWithdrawn {
+                provider: provider.clone(),
+                shares_burned: shares,
+                amount_returned: amount,
+            },
+        );
+
         amount
     }
 
@@ -190,6 +218,15 @@ impl RiskPool {
         let acc: i128 = env.storage().instance()
             .get(&StorageKey::AccumulatedPremium).unwrap_or(0);
         env.storage().instance().set(&StorageKey::AccumulatedPremium, &(acc + lp_share));
+
+        env.events().publish(
+            (Symbol::new(&env, "premium_distributed"),),
+            PremiumDistributed {
+                amount,
+                lp_share,
+                treasury_share: treas_share,
+            },
+        );
     }
 
     pub fn claim_yield(env: Env, provider: Address) -> i128 {
@@ -215,6 +252,14 @@ impl RiskPool {
         position.last_yield_claim = env.ledger().timestamp();
         env.storage().persistent().set(&lp_key, &position);
 
+        env.events().publish(
+            (Symbol::new(&env, "yield_claimed"),),
+            YieldClaimed {
+                provider: provider.clone(),
+                amount: claimable,
+            },
+        );
+
         claimable
     }
 
@@ -234,6 +279,14 @@ impl RiskPool {
             released:  false,
         });
         env.storage().instance().set(&StorageKey::TotalLocked, &(total_locked + amount));
+
+        env.events().publish(
+            (Symbol::new(&env, "capital_locked"),),
+            CapitalLocked {
+                policy_id,
+                amount,
+            },
+        );
     }
 
     pub fn release_for_claim(env: Env, caller: Address, policy_id: u128) {
@@ -246,6 +299,14 @@ impl RiskPool {
         env.storage().persistent().set(&StorageKey::Lock(policy_id), &lock);
         let total_locked: i128 = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
         env.storage().instance().set(&StorageKey::TotalLocked, &(total_locked.saturating_sub(lock.amount)));
+
+        env.events().publish(
+            (Symbol::new(&env, "capital_released"),),
+            CapitalReleased {
+                policy_id,
+                amount: lock.amount,
+            },
+        );
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
@@ -296,11 +357,19 @@ impl RiskPool {
     pub fn pause(env: Env, admin: Address) {
         Self::require_admin(&env, &admin);
         env.storage().instance().set(&StorageKey::Status, &PoolStatus::Paused);
+        env.events().publish(
+            (Symbol::new(&env, "pool_paused"),),
+            PoolPaused { admin: admin.clone() },
+        );
     }
 
     pub fn resume(env: Env, admin: Address) {
         Self::require_admin(&env, &admin);
         env.storage().instance().set(&StorageKey::Status, &PoolStatus::Active);
+        env.events().publish(
+            (Symbol::new(&env, "pool_resumed"),),
+            PoolResumed { admin: admin.clone() },
+        );
     }
 
     fn require_admin(env: &Env, caller: &Address) {

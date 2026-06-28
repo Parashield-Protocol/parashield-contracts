@@ -6,7 +6,7 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::Address as _,
+    testutils::{Address as _, Ledger},
     token, Address, Env,
 };
 

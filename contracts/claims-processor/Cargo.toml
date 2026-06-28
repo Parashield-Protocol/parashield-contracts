@@ -17,8 +17,8 @@ testutils = ["soroban-sdk/testutils"]
 
 [dependencies]
 soroban-sdk               = { workspace = true }
-parashield-policy-engine   = { path = "../policy-engine" }
-parashield-oracle-verifier = { path = "../oracle-verifier" }
+parashield-policy-engine   = { path = "../policy-engine", default-features = false, features = ["library"] }
+parashield-oracle-verifier = { path = "../oracle-verifier", default-features = false, features = ["library"] }
 
 [dev-dependencies]
 soroban-sdk               = { workspace = true, features = ["testutils"] }
