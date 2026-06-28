@@ -120,6 +120,30 @@ impl OracleVerifier {
         );
     }
 
+    /// Update the relative weight of an existing oracle registration.
+    /// `weight` is 1-100; use `add_oracle` only for new registrations.
+    pub fn update_oracle_weight(
+        env: Env,
+        admin: Address,
+        oracle: Address,
+        data_type: Symbol,
+        weight: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+        if weight == 0 || weight > 100 {
+            panic_with_error!(&env, Error::InvalidWeight);
+        }
+
+        let key = StorageKey::Oracle(data_type, oracle);
+        let mut entry: OracleEntry = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
+        entry.weight = weight;
+        env.storage().persistent().set(&key, &entry);
+    }
+
     /// Deactivate an oracle (soft delete — historical data is retained).
     pub fn remove_oracle(env: Env, admin: Address, oracle: Address, data_type: Symbol) {
         Self::require_admin(&env, &admin);

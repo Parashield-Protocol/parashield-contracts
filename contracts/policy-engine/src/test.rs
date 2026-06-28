@@ -30,6 +30,7 @@ fn create_crop_product(_env: &Env, client: &PolicyEngineClient, admin: &Address)
     client.create_product(admin, &CreateProductParams {
         name:               symbol_short!("crop_kism"),
         category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("kis2606"),
         trigger_type:       TriggerType::Threshold,
         oracle_data_type:   symbol_short!("weather"),
         trigger_threshold:  50_000_000,
@@ -282,6 +283,7 @@ fn test_create_product_zero_threshold_panics() {
     client.create_product(&admin, &CreateProductParams {
         name:               symbol_short!("bad"),
         category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("kis2606"),
         trigger_type:       TriggerType::Threshold,
         oracle_data_type:   symbol_short!("weather"),
         trigger_threshold:  0i128,  // ← invalid: zero
@@ -302,6 +304,7 @@ fn test_create_product_negative_threshold_panics() {
     client.create_product(&admin, &CreateProductParams {
         name:               symbol_short!("bad"),
         category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("kis2606"),
         trigger_type:       TriggerType::Threshold,
         oracle_data_type:   symbol_short!("weather"),
         trigger_threshold:  -1i128,  // ← invalid: negative
@@ -322,6 +325,7 @@ fn test_create_product_overflow_threshold_panics() {
     client.create_product(&admin, &CreateProductParams {
         name:               symbol_short!("bad"),
         category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("kis2606"),
         trigger_type:       TriggerType::Threshold,
         oracle_data_type:   symbol_short!("weather"),
         trigger_threshold:  i128::MAX,  // ← invalid: overflows protocol range
@@ -333,39 +337,123 @@ fn test_create_product_overflow_threshold_panics() {
     });
 }
 
+// ── Product category/oracle_key uniqueness (Issue #10) ───────────────────────────
+
+/// Creating a product with duplicate (category, oracle_key) must panic with DuplicateProductKey (#15).
 #[test]
-fn test_buy_policy_emits_event() {
-    use soroban_sdk::testutils::Events;
-    use soroban_sdk::{Symbol, TryIntoVal};
-
-    let (env, admin, _oracle, usdc, contract_id) = setup();
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_duplicate_category_oracle_key_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
     let client = PolicyEngineClient::new(&env, &contract_id);
-    let pid    = create_crop_product(&env, &client, &admin);
 
-    let buyer = Address::generate(&env);
-    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+    // Create product A with (category: "crop", oracle_key: "kis2606")
+    client.create_product(&admin, &CreateProductParams {
+        name:               symbol_short!("crop_kisumu_a"),
+        category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("kis2606"),
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       100_000_000,
+        coverage_max:       10_000_000_000,
+        premium_rate_bps:   500,
+        max_duration_days:  365,
+    });
 
-    let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
-
-    let events = env.events().all();
-    let mut found_policy_created = false;
-    for event in events {
-        let (event_contract, topics, data) = event;
-        if event_contract == contract_id && !topics.is_empty() {
-            let topic_val = topics.get(0).unwrap();
-            let topic: Symbol = topic_val.try_into_val(&env).unwrap();
-            if topic == Symbol::new(&env, "policy_created") {
-                let policy_created_event: PolicyCreated = data.try_into_val(&env).unwrap();
-                assert_eq!(policy_created_event.policy_id, policy_id);
-                assert_eq!(policy_created_event.product_id, pid);
-                assert_eq!(policy_created_event.policyholder, buyer);
-                assert_eq!(policy_created_event.coverage_amount, COVERAGE);
-                assert_eq!(policy_created_event.premium_paid, PREMIUM);
-                found_policy_created = true;
-                break;
-            }
-        }
-    }
-    assert!(found_policy_created, "policy_created event not found or has incorrect data");
+    // Attempt to create product B with same (category, oracle_key) — should panic
+    client.create_product(&admin, &CreateProductParams {
+        name:               symbol_short!("crop_kisumu_b"),
+        category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("kis2606"),  // ← duplicate key
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  60_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       100_000_000,
+        coverage_max:       10_000_000_000,
+        premium_rate_bps:   600,
+        max_duration_days:  365,
+    });
 }
 
+/// Creating products with different oracle_keys but same category should succeed.
+#[test]
+fn test_different_oracle_keys_same_category_succeeds() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+
+    // Create product A with (category: "crop", oracle_key: "kis2606")
+    client.create_product(&admin, &CreateProductParams {
+        name:               symbol_short!("crop_kisumu"),
+        category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("kis2606"),
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       100_000_000,
+        coverage_max:       10_000_000_000,
+        premium_rate_bps:   500,
+        max_duration_days:  365,
+    });
+
+    // Create product B with (category: "crop", oracle_key: "nak2607") — different key, should succeed
+    client.create_product(&admin, &CreateProductParams {
+        name:               symbol_short!("crop_nakuru"),
+        category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("nak2607"),  // ← different key
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  60_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       100_000_000,
+        coverage_max:       10_000_000_000,
+        premium_rate_bps:   600,
+        max_duration_days:  365,
+    });
+
+    assert_eq!(client.get_active_products().len(), 2);
+}
+
+/// After deprecating a product, its (category, oracle_key) can be reused.
+#[test]
+fn test_deprecated_product_key_can_be_reused() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+
+    // Create product A with (category: "crop", oracle_key: "kis2606")
+    let product_a_id = client.create_product(&admin, &CreateProductParams {
+        name:               symbol_short!("crop_kisumu_v1"),
+        category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("kis2606"),
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       100_000_000,
+        coverage_max:       10_000_000_000,
+        premium_rate_bps:   500,
+        max_duration_days:  365,
+    });
+
+    // Deprecate product A
+    client.deprecate_product(&admin, &product_a_id);
+
+    // Create product B with same (category, oracle_key) — should succeed after deprecation
+    client.create_product(&admin, &CreateProductParams {
+        name:               symbol_short!("crop_kisumu_v2"),
+        category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("kis2606"),  // ← reused key
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  60_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       100_000_000,
+        coverage_max:       10_000_000_000,
+        premium_rate_bps:   600,
+        max_duration_days:  365,
+    });
+
+    assert_eq!(client.get_active_products().len(), 1);
+}

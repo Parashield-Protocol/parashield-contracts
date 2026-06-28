@@ -194,12 +194,25 @@ impl ClaimsProcessor {
     pub fn auto_process(env: Env, keeper: Address, policy_id: u128) -> ClaimResult {
         keeper.require_auth();
 
+        // ─── IDEMPOTENCY GUARD ───
+        // Check if an evaluation record already exists for this policy in our storage
+        if env.storage().persistent().has(&StorageKey::PolicyClaim(policy_id)) {
+            let existing_claim_id: u128 = env.storage().persistent()
+                .get(&StorageKey::PolicyClaim(policy_id)).unwrap();
+            
+            if let Some(existing_claim) = env.storage().persistent().get::<StorageKey, Claim>(&StorageKey::Claim(existing_claim_id)) {
+                if existing_claim.status != ClaimStatus::Pending {
+                    return ClaimResult::AlreadyProcessed;
+                }
+            }
+        }
+
         let policy_engine: Address = env.storage().instance()
             .get(&StorageKey::PolicyEngine).unwrap();
         let policy = PolicyEngineClient::new(&env, &policy_engine)
             .get_policy(&policy_id);
 
-        // Idempotency: check current policy status
+        // Idempotency: check current policy status from down-stream contract
         match policy.status {
             parashield_policy_engine::PolicyStatus::Claimed    => return ClaimResult::AlreadyClaimed,
             parashield_policy_engine::PolicyStatus::Expired    => return ClaimResult::Expired,
@@ -215,7 +228,7 @@ impl ClaimsProcessor {
             return ClaimResult::Expired;
         }
 
-        // Create an internal claim record for this auto-processing
+        // Create or get the internal claim record
         let claim_id = if env.storage().persistent().has(&StorageKey::PolicyClaim(policy_id)) {
             env.storage().persistent()
                 .get(&StorageKey::PolicyClaim(policy_id)).unwrap()
@@ -241,7 +254,7 @@ impl ClaimsProcessor {
         let mut claim: Claim = env.storage().persistent()
             .get(&StorageKey::Claim(claim_id)).unwrap();
         if claim.status != ClaimStatus::Pending {
-            return ClaimResult::AlreadyClaimed;
+            return ClaimResult::AlreadyProcessed;
         }
         Self::evaluate_and_settle(&env, &mut claim)
     }

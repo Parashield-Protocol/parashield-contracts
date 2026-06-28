@@ -161,6 +161,7 @@ impl RiskPool {
 
     pub fn withdraw(env: Env, provider: Address, shares: i128) -> i128 {
         provider.require_auth();
+        // Guard: check for zero or negative shares input
         if shares <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
 
         let lp_key = StorageKey::LpPosition(provider.clone());
@@ -267,6 +268,9 @@ impl RiskPool {
 
     pub fn lock_for_policy(env: Env, caller: Address, policy_id: u128, amount: i128) {
         caller.require_auth();
+        // Guard: check for zero or negative lock amount input
+        if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
+
         let total_deposited: i128 = env.storage().instance().get(&StorageKey::TotalDeposited).unwrap_or(0);
         let total_locked: i128    = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
         if total_deposited - total_locked < amount { panic_with_error!(&env, Error::Undercollateralized); }
@@ -294,7 +298,11 @@ impl RiskPool {
         let mut lock: CapitalLock = env.storage().persistent()
             .get(&StorageKey::Lock(policy_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::LockNotFound));
+        
+        // Guard: check for zero or negative amount before processing release metrics
+        if lock.amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if lock.released { panic_with_error!(&env, Error::AlreadyReleased); }
+        
         lock.released = true;
         env.storage().persistent().set(&StorageKey::Lock(policy_id), &lock);
         let total_locked: i128 = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
@@ -335,7 +343,7 @@ impl RiskPool {
 
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&StorageKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized))
     }
 
     pub fn get_lp_count(env: Env) -> u32 {

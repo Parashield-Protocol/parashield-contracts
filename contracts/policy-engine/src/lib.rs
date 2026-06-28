@@ -47,6 +47,8 @@ enum StorageKey {
     NextProductId,
     NextPolicyId,
     Paused,
+    /// Maps (category, oracle_key) -> product_id for uniqueness constraint
+    ProductKey((Symbol, Symbol)),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -69,6 +71,7 @@ pub enum Error {
     AlreadyExpired          = 12,
     InvalidPremiumRate      = 13,
     InvalidTriggerThreshold = 14,
+    DuplicateProductKey    = 15,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -138,11 +141,18 @@ impl PolicyEngine {
             panic_with_error!(&env, Error::InvalidTriggerThreshold);
         }
 
+        // Check for duplicate (category, oracle_key) pair
+        let key = (params.category, params.oracle_key);
+        if env.storage().persistent().has(&StorageKey::ProductKey(key)) {
+            panic_with_error!(&env, Error::DuplicateProductKey);
+        }
+
         let id = Self::next_product_id(&env);
         let product = InsuranceProduct {
             id,
             name:               params.name,
             category:           params.category,
+            oracle_key:         params.oracle_key,
             trigger_type:       params.trigger_type,
             oracle_data_type:   params.oracle_data_type,
             trigger_threshold:  params.trigger_threshold,
@@ -155,6 +165,9 @@ impl PolicyEngine {
             created_at:         env.ledger().timestamp(),
         };
         env.storage().persistent().set(&StorageKey::Product(id), &product);
+
+        // Store the (category, oracle_key) -> product_id mapping for uniqueness
+        env.storage().persistent().set(&StorageKey::ProductKey(key), &id);
 
         let mut products: Vec<u128> = env.storage().instance()
             .get(&StorageKey::ActiveProducts).unwrap_or_else(|| Vec::new(&env));
@@ -204,10 +217,10 @@ impl PolicyEngine {
             products.remove(i);
             env.storage().instance().set(&StorageKey::ActiveProducts, &products);
         }
-        env.events().publish(
-            (Symbol::new(&env, "product_deprecated"),),
-            ProductDeprecated { product_id },
-        );
+
+        // Remove the (category, oracle_key) mapping to allow reuse of the key
+        let key = (product.category, product.oracle_key);
+        env.storage().persistent().remove(&StorageKey::ProductKey(key));
     }
 
     // ── Policy Lifecycle ──────────────────────────────────────────────────────

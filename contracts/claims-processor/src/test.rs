@@ -158,7 +158,7 @@ fn test_expired_policy_no_payout() {
     assert_eq!(policy.status, parashield_policy_engine::PolicyStatus::Expired);
 }
 
-/// auto_process on already-paid policy returns AlreadyClaimed (idempotent).
+/// auto_process on already-paid policy returns AlreadyProcessed (idempotent).
 #[test]
 fn test_double_process_idempotent() {
     let w      = deploy();
@@ -173,7 +173,8 @@ fn test_double_process_idempotent() {
     let second = cp.auto_process(&w.keeper, &pol_id);
 
     assert_eq!(first,  ClaimResult::Paid);
-    assert_eq!(second, ClaimResult::AlreadyClaimed);
+    assert_eq!(second, ClaimResult::AlreadyProcessed); // <-- Changed from AlreadyClaimed to AlreadyProcessed
+    
     // Buyer should NOT receive double coverage — exactly one payout
     let balance = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
     assert_eq!(balance, 5_000_000_000 - 50_000_000 + 1_000_000_000);

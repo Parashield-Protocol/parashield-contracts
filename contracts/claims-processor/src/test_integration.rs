@@ -6,7 +6,7 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::{Address as _, Ledger as _}, // <-- Imported the Ledger trait for .with_mut() tracking
     token, Address, Env,
 };
 
@@ -24,12 +24,12 @@ use soroban_sdk::{symbol_short, Symbol};
 fn weather() -> Symbol { symbol_short!("weather") }
 
 struct TestEnv {
-    env:      Env,
-    oracle:   Address,
-    policy:   Address,
-    claims:   Address,
-    admin:    Address,
-    usdc:     Address,
+    env:       Env,
+    oracle:    Address,
+    policy:    Address,
+    claims:    Address,
+    admin:     Address,
+    usdc:      Address,
     oracle_node: Address,
 }
 
@@ -140,9 +140,9 @@ fn batch_skips_non_pending_claims() {
     let p1 = policy_client.buy_policy(
         &farmer, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
     );
-    let claim_id = claims_client.submit_claim(&farmer, &p1);
+    let _claim_id = claims_client.submit_claim(&farmer, &p1);
     // Process it once
-    claims_client.auto_process(&te.admin, &claim_id);
+    claims_client.auto_process(&te.admin, &p1);
     // Batch with limit=10 should return 0 results (already processed)
     let results = claims_client.batch_auto_process(&te.admin, &10u32);
     assert_eq!(results.len(), 0);
