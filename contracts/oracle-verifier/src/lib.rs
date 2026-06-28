@@ -26,6 +26,7 @@ pub use types::*;
 /// Maximum number of registered oracles. Bounds the median aggregation loop and
 /// the worst-case weighted sum (MAX_ORACLES * max_weight * max_value) so it
 /// cannot overflow i128.
+#[allow(dead_code)]
 const MAX_ORACLES: u32 = 100;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
@@ -42,6 +43,7 @@ enum StorageKey {
     OracleList,
     /// Global minimum confidence threshold (u32)
     MinConfidence,
+    MaxDataAge,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -186,6 +188,21 @@ impl OracleVerifier {
         );
     }
 
+    /// Set the maximum data age in seconds.
+    pub fn set_max_data_age(env: Env, admin: Address, max_age: u64) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&StorageKey::MaxDataAge, &max_age);
+        env.events().publish(
+            (Symbol::new(&env, "max_data_age_updated"),),
+            MaxDataAgeUpdated { max_age },
+        );
+    }
+
+    /// Get the maximum data age in seconds (defaults to 7 days = 604,800 seconds).
+    pub fn get_max_data_age(env: Env) -> u64 {
+        env.storage().instance().get(&StorageKey::MaxDataAge).unwrap_or(604_800)
+    }
+
     // ── Data Submission ───────────────────────────────────────────────────────
 
     /// Submit a data point for a (data_type, key) pair.
@@ -293,6 +310,11 @@ impl OracleVerifier {
             if p.timestamp > latest.timestamp {
                 latest = p;
             }
+        }
+        let max_data_age: u64 = env.storage().instance().get(&StorageKey::MaxDataAge).unwrap_or(604_800);
+        let now = env.ledger().timestamp();
+        if now.saturating_sub(latest.timestamp) > max_data_age {
+            panic_with_error!(&env, Error::NoDataAvailable);
         }
         latest
     }
@@ -434,6 +456,8 @@ impl OracleVerifier {
             .unwrap_or_else(|| panic_with_error!(env, Error::NoDataAvailable));
         if points.is_empty() { panic_with_error!(env, Error::NoDataAvailable); }
         
+        let max_data_age: u64 = env.storage().instance().get(&StorageKey::MaxDataAge).unwrap_or(604_800);
+        let now = env.ledger().timestamp();
         let min_confidence: u32 = env.storage().instance().get(&StorageKey::MinConfidence).unwrap_or(0);
 
         // Collect values and weights
@@ -442,7 +466,7 @@ impl OracleVerifier {
         
         for i in 0..points.len() {
             let p = points.get_unchecked(i);
-            if p.confidence >= min_confidence {
+            if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence {
                 let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
                 if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
                     values.push_back((p.value, entry.weight));

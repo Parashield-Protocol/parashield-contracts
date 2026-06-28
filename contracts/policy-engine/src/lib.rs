@@ -72,6 +72,7 @@ pub enum Error {
     InvalidPremiumRate      = 13,
     InvalidTriggerThreshold = 14,
     DuplicateProductKey    = 15,
+    InvalidCoverageRange    = 16,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -147,8 +148,8 @@ impl PolicyEngine {
         }
 
         // Check for duplicate (category, oracle_key) pair
-        let key = (params.category, params.oracle_key);
-        if env.storage().persistent().has(&StorageKey::ProductKey(key)) {
+        let key = (params.category.clone(), params.oracle_key.clone());
+        if env.storage().persistent().has(&StorageKey::ProductKey(key.clone())) {
             panic_with_error!(&env, Error::DuplicateProductKey);
         }
 
