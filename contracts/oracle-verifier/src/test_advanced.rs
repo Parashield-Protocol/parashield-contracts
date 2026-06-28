@@ -2,6 +2,8 @@
 //! oracle deactivation, and odd/even count median edge cases.
 #![cfg(test)]
 
+extern crate std;
+
 use super::*;
 use soroban_sdk::{symbol_short, testutils::Address as _, Env};
 
@@ -38,6 +40,7 @@ fn three_oracle_median_is_middle_value() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #3)")]
 fn deactivated_oracle_cannot_submit() {
     let (env, admin, cid) = setup();
     let c      = OracleVerifierClient::new(&env, &cid);
@@ -45,10 +48,7 @@ fn deactivated_oracle_cannot_submit() {
     c.add_oracle(&admin, &oracle, &wt(), &90u32);
     c.remove_oracle(&admin, &oracle, &wt());
 
-    let result = std::panic::catch_unwind(|| {
-        c.submit_data(&oracle, &wt(), &kk(), &10_000_000i128, &90u32, &1u64);
-    });
-    assert!(result.is_err(), "Expected panic after deactivation");
+    c.submit_data(&oracle, &wt(), &kk(), &10_000_000i128, &90u32, &1u64);
 }
 
 #[test]
@@ -76,8 +76,8 @@ fn even_count_median_is_average_of_middle_two() {
     let c  = OracleVerifierClient::new(&env, &cid);
     let o1 = Address::generate(&env);
     let o2 = Address::generate(&env);
-    c.add_oracle(&admin, &o1, &wt(), &90u32);
-    c.add_oracle(&admin, &o2, &wt(), &80u32);
+    c.add_oracle(&admin, &o1, &wt(), &50u32);
+    c.add_oracle(&admin, &o2, &wt(), &50u32);
 
     // sorted: [10, 30] → average = 20
     c.submit_data(&o1, &wt(), &kk(), &10_000_000i128, &90u32, &1u64);
@@ -85,6 +85,26 @@ fn even_count_median_is_average_of_middle_two() {
 
     let agg = c.get_aggregated(&wt(), &kk());
     assert_eq!(agg.median_value, 20_000_000i128);
+}
+
+#[test]
+fn test_weighted_median() {
+    let (env, admin, cid) = setup();
+    let c  = OracleVerifierClient::new(&env, &cid);
+    let o1 = Address::generate(&env);
+    let o2 = Address::generate(&env);
+    c.add_oracle(&admin, &o1, &wt(), &90u32);
+    c.add_oracle(&admin, &o2, &wt(), &10u32);
+
+    // o1 submits 100, o2 submits 50
+    c.submit_data(&o1, &wt(), &kk(), &100_000_000i128, &90u32, &1u64);
+    c.submit_data(&o2, &wt(), &kk(), &50_000_000i128, &90u32, &2u64);
+
+    // sorted: (50, 10), (100, 90) -> total 100, half 50.
+    // i=0: 10 < 50
+    // i=1: 100 > 50 -> return 100.
+    let agg = c.get_aggregated(&wt(), &kk());
+    assert_eq!(agg.median_value, 100_000_000i128);
 }
 
 #[test]

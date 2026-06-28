@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Bytes, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, Symbol};
 
 /// Current lifecycle state of a governance proposal.
 #[contracttype]
@@ -65,6 +65,7 @@ pub struct DaoConfig {
     pub gov_token:        Address,
     /// Minimum tokens needed to create a proposal (7-decimal).
     pub proposal_threshold: i128,
+    pub total_supply:     i128,
     /// Minimum % of total supply that must vote (basis points, e.g. 1000 = 10%).
     pub quorum_bps:       u32,
     /// Minimum % of cast votes that must be FOR (basis points, e.g. 5100 = 51%).

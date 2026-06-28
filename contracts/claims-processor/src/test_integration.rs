@@ -1,3 +1,4 @@
+#![allow(clippy::inconsistent_digit_grouping)]
 //! Extended integration tests for the Claims Processor.
 //! Covers batch processing, edge cases, and cross-contract error propagation.
 #![cfg(test)]
@@ -5,7 +6,7 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::Address as _,
     token, Address, Env,
 };
 
@@ -21,7 +22,6 @@ use crate::{ClaimsProcessor, ClaimsProcessorClient, ClaimResult};
 use soroban_sdk::{symbol_short, Symbol};
 
 fn weather() -> Symbol { symbol_short!("weather") }
-fn flight()  -> Symbol { symbol_short!("flight")  }
 
 struct TestEnv {
     env:      Env,
@@ -100,10 +100,10 @@ fn batch_processes_multiple_pending_claims() {
     );
 
     let p1 = policy_client.buy_policy(
-        &farmer1, &prod_id, &1_000_0000000i128, &symbol_short!("kis2606"), &30u32,
+        &farmer1, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
     );
     let p2 = policy_client.buy_policy(
-        &farmer2, &prod_id, &2_000_0000000i128, &symbol_short!("kis2606"), &30u32,
+        &farmer2, &prod_id, &2_000_0000000i128, &30u32, &symbol_short!("kis2606"),
     );
 
     claims_client.submit_claim(&farmer1, &p1);
@@ -138,7 +138,7 @@ fn batch_skips_non_pending_claims() {
     token::StellarAssetClient::new(&te.env, &te.usdc).mint(&te.policy, &1_000_000_0000000i128);
 
     let p1 = policy_client.buy_policy(
-        &farmer, &prod_id, &1_000_0000000i128, &symbol_short!("kis2606"), &30u32,
+        &farmer, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
     );
     let claim_id = claims_client.submit_claim(&farmer, &p1);
     // Process it once

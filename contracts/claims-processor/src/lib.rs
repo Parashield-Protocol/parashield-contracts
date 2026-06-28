@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
 //! Parashield Claims Processor
 //!
 //! Evaluates whether a policy's trigger condition has been met by querying the

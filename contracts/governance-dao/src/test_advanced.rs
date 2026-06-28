@@ -1,3 +1,4 @@
+#![allow(clippy::inconsistent_digit_grouping)]
 //! Advanced governance-dao tests: update_config, multi-voter scenarios.
 #![cfg(test)]
 
@@ -15,6 +16,7 @@ const VOTING_PERIOD: u64 = 7 * 24 * 3600;
 fn base_config(gov_token: Address) -> DaoConfig {
     DaoConfig {
         gov_token,
+        total_supply:       1_100_000_0000000i128,
         proposal_threshold: 10_000_0000000i128,
         quorum_bps:         1_000u32,
         majority_bps:       5_100u32,

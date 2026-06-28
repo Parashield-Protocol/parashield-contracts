@@ -1,10 +1,11 @@
+#![allow(clippy::inconsistent_digit_grouping)]
 //! Advanced risk-pool tests: multi-LP scenarios, yield accounting, LP count.
 #![cfg(test)]
 
 extern crate std;
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::Address as _,
     token, Address, Env, Symbol,
 };
 

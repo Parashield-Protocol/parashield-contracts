@@ -101,7 +101,7 @@ impl RiskPool {
             .get(&StorageKey::TotalShares).unwrap_or(0);
 
         let new_shares = if total_deposited == 0 || total_shares == 0 {
-            amount  // 1 share = 1 USDC at initialization
+            amount * 1_000_000_000  // 1 share = 1 USDC * 1e9 precision
         } else {
             amount * total_shares / total_deposited
         };
@@ -112,7 +112,7 @@ impl RiskPool {
 
         let now = env.ledger().timestamp();
         let lp_key = StorageKey::LpPosition(provider.clone());
-        let position: LpPosition = match env.storage().persistent().get(&lp_key) {
+        let position: LpPosition = match env.storage().persistent().get::<_, LpPosition>(&lp_key) {
             Some(mut pos) => {
                 pos.deposited += amount;
                 pos.shares    += new_shares;

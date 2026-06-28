@@ -1,13 +1,14 @@
+#![allow(clippy::inconsistent_digit_grouping)]
 #![cfg(test)]
 
 extern crate std;
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::Address as _,
     token, Address, Env, Symbol,
 };
 
-use crate::{Error, RiskPool, RiskPoolClient};
+use crate::{RiskPool, RiskPoolClient};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -36,9 +37,6 @@ fn setup() -> (Env, RiskPoolClient<'static>, Address, Address, Address, Address)
     (env, pool, usdc_id, admin, treasury, lp1)
 }
 
-fn ledger_ts(env: &Env) -> u64 {
-    env.ledger().timestamp()
-}
 
 // ── initialization ────────────────────────────────────────────────────────────
 
@@ -64,23 +62,23 @@ fn cannot_initialize_twice() {
 fn first_deposit_mints_one_to_one_shares() {
     let (_, pool, _, _, _, lp1) = setup();
     let shares = pool.deposit(&lp1, &500_000_0000000i128);
-    assert_eq!(shares, 500_000_0000000i128);
+    assert_eq!(shares, 500_000_0000000i128 * 1_000_000_000);
 
     let stats = pool.get_stats();
     assert_eq!(stats.total_deposited, 500_000_0000000i128);
-    assert_eq!(stats.total_shares,    500_000_0000000i128);
+    assert_eq!(stats.total_shares,    500_000_0000000i128 * 1_000_000_000);
 }
 
 #[test]
 fn second_deposit_proportional_shares() {
-    let (env, pool, usdc_id, admin, _, lp1) = setup();
+    let (env, pool, usdc_id, _admin, _, lp1) = setup();
     let lp2 = Address::generate(&env);
     token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &500_000_0000000i128);
 
     pool.deposit(&lp1, &500_000_0000000i128);
     let shares2 = pool.deposit(&lp2, &250_000_0000000i128);
     // shares2 should be half of lp1's shares
-    assert_eq!(shares2, 250_000_0000000i128);
+    assert_eq!(shares2, 250_000_0000000i128 * 1_000_000_000);
 }
 
 #[test]
@@ -105,6 +103,28 @@ fn withdraw_full_position() {
 }
 
 #[test]
+fn withdraw_partial_position_decrements_shares() {
+    let (_, pool, _, _, _, lp1) = setup();
+    let amount = 1000_0000000i128;
+    // deposit 1000 USDC
+    let shares = pool.deposit(&lp1, &amount);
+    
+    // withdraw half the shares
+    let half_shares = shares / 2;
+    let returned = pool.withdraw(&lp1, &half_shares);
+    assert_eq!(returned, amount / 2);
+
+    let stats = pool.get_stats();
+    // Verify total shares and total deposited are decremented by half
+    assert_eq!(stats.total_deposited, amount / 2);
+    assert_eq!(stats.total_shares, half_shares);
+
+    // Verify LP's position is decremented
+    let pos = pool.get_position(&lp1).unwrap();
+    assert_eq!(pos.shares, half_shares);
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #7)")]
 fn withdraw_without_position_fails() {
     let (env, pool, _, _, _, _) = setup();
@@ -115,7 +135,7 @@ fn withdraw_without_position_fails() {
 #[test]
 #[should_panic(expected = "Error(Contract, #11)")]
 fn withdraw_locked_capital_fails() {
-    let (env, pool, _, admin, _, lp1) = setup();
+    let (_env, pool, _, admin, _, lp1) = setup();
     let amount = 100_0000000i128;
     let shares = pool.deposit(&lp1, &amount);
 
@@ -140,7 +160,7 @@ fn receive_premium_adds_lp_share() {
 
 #[test]
 fn claim_yield_proportional_to_shares() {
-    let (env, pool, usdc_id, admin, _, lp1) = setup();
+    let (env, pool, usdc_id, _admin, _, lp1) = setup();
     let lp2 = Address::generate(&env);
     token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &1_000_0000000i128);
 
@@ -215,7 +235,7 @@ fn get_position_returns_correct_state() {
     pool.deposit(&lp1, &300_0000000i128);
     let pos = pool.get_position(&lp1).unwrap();
     assert_eq!(pos.deposited, 300_0000000i128);
-    assert_eq!(pos.shares,    300_0000000i128);
+    assert_eq!(pos.shares,    300_0000000i128 * 1_000_000_000);
     assert_eq!(pos.yield_claimed, 0);
 }
 
@@ -224,4 +244,23 @@ fn get_position_none_for_non_participant() {
     let (env, pool, _, _, _, _) = setup();
     let nobody = Address::generate(&env);
     assert!(pool.get_position(&nobody).is_none());
+}
+
+#[test]
+fn test_deposit_precision_loss_prevented() {
+    let (env, pool, usdc_id, _admin, _, lp1) = setup();
+    let lp2 = Address::generate(&env);
+    
+    // LP1 deposits 1000 USDC
+    pool.deposit(&lp1, &1000_0000000i128);
+
+    // LP2 deposits just 1 stroop (smallest possible unit)
+    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &1i128);
+    let shares = pool.deposit(&lp2, &1i128);
+
+    // Because of the 1e9 precision multiplier, 1 stroop yields 1e9 shares.
+    // This prevents truncation to 0 even if the pool's deposited amount grew 
+    // significantly out of proportion to shares in the future.
+    assert_eq!(shares, 1_000_000_000i128);
+    assert!(shares > 0);
 }
