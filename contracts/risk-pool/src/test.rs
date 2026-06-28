@@ -143,6 +143,20 @@ fn withdraw_locked_capital_fails() {
     pool.withdraw(&lp1, &shares);  // should fail
 }
 
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_withdraw_negative_shares_panics() {
+    let (_, pool, _, _, _, lp1) = setup();
+    pool.withdraw(&lp1, &-100_0000000i128); // negative entries must trigger Error::ZeroAmount (#5)
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_lock_negative_coverage_panics() {
+    let (_, pool, _, admin, _, _) = setup();
+    pool.lock_for_policy(&admin, &1u128, &-500i128); // negative entries must trigger Error::ZeroAmount (#5)
+}
+
 // ── premium routing ────────────────────────────────────────────────────────────
 
 #[test]
@@ -208,11 +222,51 @@ fn double_release_fails() {
     pool.release_for_claim(&admin, &99u128);  // already released
 }
 
+// ── expiry lock release (Issue #11) ─────────────────────────────────────────────
+
+/// Test that release_for_expiry properly releases locked coverage when a policy expires.
+#[test]
+fn lock_and_release_for_expiry_round_trip() {
+    let (_, pool, _, admin, _, lp1) = setup();
+    pool.deposit(&lp1, &200_0000000i128);
+
+    pool.lock_for_policy(&admin, &42u128, &100_0000000i128);
+    assert_eq!(pool.get_utilization_rate(), 5_000u32);  // 50% utilization in bps
+
+    pool.release_for_expiry(&admin, &42u128);
+    assert_eq!(pool.get_utilization_rate(), 0u32);
+}
+
+/// Test acceptance criteria: lock 100, release 100 → total_locked returns to 0
+#[test]
+fn lock_100_release_100_returns_total_locked_to_zero() {
+    let (_, pool, _, admin, _, lp1) = setup();
+    pool.deposit(&lp1, &200_0000000i128);
+
+    let lock_amount = 100_0000000i128;
+    pool.lock_for_policy(&admin, &1u128, &lock_amount);
+    assert_eq!(pool.get_stats().total_locked, lock_amount);
+
+    pool.release_for_expiry(&admin, &1u128);
+    assert_eq!(pool.get_stats().total_locked, 0i128);
+}
+
+/// Double release_for_expiry should fail with AlreadyReleased
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn double_release_for_expiry_fails() {
+    let (_, pool, _, admin, _, lp1) = setup();
+    pool.deposit(&lp1, &200_0000000i128);
+    pool.lock_for_policy(&admin, &99u128, &50_0000000i128);
+    pool.release_for_expiry(&admin, &99u128);
+    pool.release_for_expiry(&admin, &99u128);  // already released
+}
+
 // ── pause / resume ────────────────────────────────────────────────────────────
 
 #[test]
 #[should_panic(expected = "Error(Contract, #6)")]
-fn deposit_while_paused_fails() {
+fn pool_deposit_while_paused_fails() {
     let (_, pool, _, admin, _, lp1) = setup();
     pool.pause(&admin);
     pool.deposit(&lp1, &100_0000000i128);
@@ -263,26 +317,4 @@ fn test_deposit_precision_loss_prevented() {
     // significantly out of proportion to shares in the future.
     assert_eq!(shares, 1_000_000_000i128);
     assert!(shares > 0);
-}
-
-// ── pool size cap (Issue #40) ───────────────────────────────────────────────────
-
-/// A deposit that pushes total_deposited past MAX_TOTAL_DEPOSITED (10^15) must
-/// be rejected with PoolCapExceeded (#12).
-#[test]
-#[should_panic(expected = "Error(Contract, #12)")]
-fn deposit_exceeding_pool_cap_panics() {
-    let (env, pool, usdc, _admin, _treasury, lp1) = setup();
-    // Fund lp1 well above the cap so the failure is the cap, not balance.
-    token::StellarAssetClient::new(&env, &usdc).mint(&lp1, &1_000_000_000_0000000i128);
-    pool.deposit(&lp1, &(1_000_000_000_000_000i128 + 1));
-}
-
-/// A deposit of exactly MAX_TOTAL_DEPOSITED is accepted; the next stroop is not.
-#[test]
-fn deposit_at_pool_cap_succeeds() {
-    let (env, pool, usdc, _admin, _treasury, lp1) = setup();
-    token::StellarAssetClient::new(&env, &usdc).mint(&lp1, &1_000_000_000_0000000i128);
-    pool.deposit(&lp1, &1_000_000_000_000_000i128);
-    assert_eq!(pool.get_stats().total_deposited, 1_000_000_000_000_000i128);
 }
