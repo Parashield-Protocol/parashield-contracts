@@ -18,6 +18,7 @@
 //! to pay the policyholder when the oracle confirms a trigger.
 #![no_std]
 
+#[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
     token, Address, Env, Symbol, Vec,
@@ -71,13 +72,16 @@ pub enum Error {
     InvalidPremiumRate      = 13,
     InvalidTriggerThreshold = 14,
     DuplicateProductKey    = 15,
+    InvalidCoverageRange    = 16,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
+#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contract]
 pub struct PolicyEngine;
 
+#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contractimpl]
 impl PolicyEngine {
 
@@ -129,8 +133,8 @@ impl PolicyEngine {
         }
 
         // Check for duplicate (category, oracle_key) pair
-        let key = (params.category, params.oracle_key);
-        if env.storage().persistent().has(&StorageKey::ProductKey(key)) {
+        let key = (params.category.clone(), params.oracle_key.clone());
+        if env.storage().persistent().has(&StorageKey::ProductKey(key.clone())) {
             panic_with_error!(&env, Error::DuplicateProductKey);
         }
 

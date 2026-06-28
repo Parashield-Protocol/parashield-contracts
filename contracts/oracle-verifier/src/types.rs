@@ -70,3 +70,12 @@ pub struct OracleHealth {
     /// Timestamp of their most recent submission, or 0 if never.
     pub last_submitted: u64,
 }
+
+// ─── Events ──────────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaxDataAgeUpdated {
+    pub max_age: u64,
+}
+

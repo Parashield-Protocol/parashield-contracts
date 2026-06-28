@@ -266,9 +266,9 @@ fn test_address_validation_function_exists() {
     // The validation should succeed for valid addresses
     // We can't test invalid addresses because Address::from_string() would fail first
     let addr_str = valid_addr.to_string();
-    let bytes = addr_str.to_bytes();
+    assert_eq!(addr_str.len(), 56, "Stellar addresses are 56 characters");
     
-    // Verify valid address has expected properties
-    assert_eq!(bytes.len(), 56, "Stellar addresses are 56 characters");
-    assert_eq!(bytes[0], b'G', "Stellar public keys start with 'G'");
+    let mut buf = [0u8; 56];
+    addr_str.copy_into_slice(&mut buf);
+    assert!(buf[0] == b'G' || buf[0] == b'C', "Stellar addresses start with 'G' or 'C'");
 }

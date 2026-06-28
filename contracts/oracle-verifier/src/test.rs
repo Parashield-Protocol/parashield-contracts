@@ -456,3 +456,46 @@ fn test_oracle_cap_rejects_extra() {
     let extra = Address::generate(&env);
     client.add_oracle(&admin, &extra, &weather(), &100u32);
 }
+
+#[test]
+fn test_get_and_set_max_data_age() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+
+    // Default max data age (7 days)
+    assert_eq!(client.get_max_data_age(), 604_800);
+
+    // Admin updates it (1 day)
+    client.set_max_data_age(&admin, &86_400);
+    assert_eq!(client.get_max_data_age(), 86_400);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_verify_trigger_rejects_stale_data() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &100u32);
+
+    // T = t0 (1,000,000)
+    let t0 = 1_000_000u64;
+    env.ledger().with_mut(|l| l.timestamp = t0);
+    client.submit_data(&oracle, &weather(), &kisumu_key(), &30_000_000i128, &90u32, &t0);
+
+    let condition = TriggerCondition {
+        data_type: weather(),
+        key: kisumu_key(),
+        threshold: 50_000_000i128,
+        comparison: TriggerComparison::LessThan,
+    };
+    
+    // T = t0 + 1 hour: should pass
+    env.ledger().with_mut(|l| l.timestamp = t0 + 3600);
+    assert!(client.verify_trigger(&weather(), &kisumu_key(), &condition));
+
+    // T = t0 + 8 days (T0 + 691,200): must panic with NoDataAvailable (#6)
+    env.ledger().with_mut(|l| l.timestamp = t0 + 691_200);
+    client.verify_trigger(&weather(), &kisumu_key(), &condition);
+}
+

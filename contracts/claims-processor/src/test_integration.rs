@@ -62,6 +62,7 @@ fn create_drought_product(te: &TestEnv) -> u128 {
         &CreateProductParams {
             name:               symbol_short!("drght"),
             category:           symbol_short!("crop"),
+            oracle_key:         symbol_short!("kis2606"),
             trigger_type:       TriggerType::Threshold,
             oracle_data_type:   weather(),
             trigger_threshold:  500_000_000i128,

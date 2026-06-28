@@ -128,6 +128,7 @@ SHIELD token holders govern protocol parameters:
 
 - Admin keys should transition to Governance DAO after protocol launch
 - Oracle submissions are bounded by registered oracle set (not open)
+- Oracle verifier filters out stale data points older than the configurable `MAX_DATA_AGE` (default 7 days) during trigger verification and data queries to prevent stale readings from deciding policy payouts.
 - Policy Engine holds USDC in escrow: no admin withdrawal function
 - Claims Processor is the only address authorized to call `pay_claim` / `expire_policy`
 - All monetary arithmetic uses checked arithmetic (Soroban default with overflow-checks = true)
