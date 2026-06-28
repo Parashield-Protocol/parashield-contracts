@@ -143,6 +143,20 @@ fn withdraw_locked_capital_fails() {
     pool.withdraw(&lp1, &shares);  // should fail
 }
 
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_withdraw_negative_shares_panics() {
+    let (_, pool, _, _, _, lp1) = setup();
+    pool.withdraw(&lp1, &-100_0000000i128); // negative entries must trigger Error::ZeroAmount (#5)
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_lock_negative_coverage_panics() {
+    let (_, pool, _, admin, _, _) = setup();
+    pool.lock_for_policy(&admin, &1u128, &-500i128); // negative entries must trigger Error::ZeroAmount (#5)
+}
+
 // ── premium routing ────────────────────────────────────────────────────────────
 
 #[test]
@@ -212,7 +226,7 @@ fn double_release_fails() {
 
 #[test]
 #[should_panic(expected = "Error(Contract, #6)")]
-fn deposit_while_paused_fails() {
+fn pool_deposit_while_paused_fails() {
     let (_, pool, _, admin, _, lp1) = setup();
     pool.pause(&admin);
     pool.deposit(&lp1, &100_0000000i128);
