@@ -30,6 +30,16 @@ fn test_initialize_sets_admin() {
 }
 
 #[test]
+#[should_panic(expected = "invalid address")]
+fn test_initialize_rejects_invalid_admin_format() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let invalid_admin = Address::generate(&env);
+    let contract_id = env.register(OracleVerifier, ());
+    OracleVerifierClient::new(&env, &contract_id).initialize(&invalid_admin);
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #1)")]
 fn test_double_initialize_panics() {
     let (env, admin, contract_id) = setup();
@@ -219,6 +229,21 @@ fn test_duplicate_submission_overwrites() {
     let agg = client.get_aggregated(&weather(), &kisumu_key());
     assert_eq!(agg.oracle_count, 1);
     assert_eq!(agg.median_value, 28_000_000);
+}
+
+#[test]
+fn test_aggregated_confidence_uses_weighted_average() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle1 = Address::generate(&env);
+    let oracle2 = Address::generate(&env);
+    client.add_oracle(&admin, &oracle1, &weather(), &50u32);
+    client.add_oracle(&admin, &oracle2, &weather(), &50u32);
+    client.submit_data(&oracle1, &weather(), &kisumu_key(), &95_000_000i128, &95u32, &1748736000u64);
+    client.submit_data(&oracle2, &weather(), &kisumu_key(), &10_000_000i128, &10u32, &1748822400u64);
+
+    let agg = client.get_aggregated(&weather(), &kisumu_key());
+    assert_eq!(agg.confidence, 52);
 }
 
 // ── verify_trigger ────────────────────────────────────────────────────────────

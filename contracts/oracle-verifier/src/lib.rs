@@ -81,6 +81,11 @@ impl OracleVerifier {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
+        let admin_str = admin.to_string();
+        let admin_prefix = admin_str.to_string();
+        if !admin_prefix.starts_with('G') {
+            panic!("invalid address: admin must be an account address");
+        }
         admin.require_auth();
         env.storage().instance().set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
@@ -332,13 +337,26 @@ impl OracleVerifier {
         let median_value = Self::get_median_value(&env, &data_type, &key);
         let oracle_count = points.len();
         let mut min_confidence = 100u32;
+        let mut weighted_confidence_sum: u128 = 0;
+        let mut total_weight: u128 = 0;
         let mut last_updated = 0u64;
         for i in 0..oracle_count {
             let p = points.get_unchecked(i);
             if p.confidence < min_confidence { min_confidence = p.confidence; }
             if p.timestamp > last_updated { last_updated = p.timestamp; }
+
+            let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+            if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+                weighted_confidence_sum += (p.confidence as u128) * (entry.weight as u128);
+                total_weight += entry.weight as u128;
+            }
         }
-        AggregatedData { median_value, oracle_count, min_confidence, last_updated }
+        let confidence = if total_weight > 0 {
+            (weighted_confidence_sum / total_weight) as u32
+        } else {
+            0u32
+        };
+        AggregatedData { median_value, oracle_count, confidence, min_confidence, last_updated }
     }
 
     /// Like `verify_trigger` but panics with `StaleData` if the newest submission
