@@ -60,12 +60,72 @@ fn test_non_admin_cannot_add_oracle() {
 
 #[test]
 #[should_panic(expected = "Error(Contract, #5)")]
-fn test_cannot_add_same_oracle_twice() {
+fn test_cannot_reregister_oracle_with_different_weight() {
     let (env, admin, contract_id) = setup();
     let client = OracleVerifierClient::new(&env, &contract_id);
     let oracle = Address::generate(&env);
     client.add_oracle(&admin, &oracle, &weather(), &50u32);
+    client.add_oracle(&admin, &oracle, &weather(), &80u32);
+}
+
+#[test]
+fn test_update_oracle_weight_changes_aggregation() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle1 = Address::generate(&env);
+    let oracle2 = Address::generate(&env);
+    let oracle3 = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle1, &weather(), &60u32);
+    client.add_oracle(&admin, &oracle2, &weather(), &20u32);
+    client.add_oracle(&admin, &oracle3, &weather(), &20u32);
+    client.submit_data(&oracle1, &weather(), &kisumu_key(), &10i128, &100u32, &1u64);
+    client.submit_data(&oracle2, &weather(), &kisumu_key(), &20i128, &100u32, &1u64);
+    client.submit_data(&oracle3, &weather(), &kisumu_key(), &30i128, &100u32, &1u64);
+    assert_eq!(
+        client
+            .get_aggregated(&weather(), &kisumu_key())
+            .median_value,
+        10
+    );
+
+    client.update_oracle_weight(&admin, &oracle1, &weather(), &10u32);
+    assert_eq!(
+        client
+            .get_aggregated(&weather(), &kisumu_key())
+            .median_value,
+        20
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_cannot_update_unregistered_oracle_weight() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.update_oracle_weight(&admin, &oracle, &weather(), &80u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_cannot_update_oracle_to_invalid_weight() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
     client.add_oracle(&admin, &oracle, &weather(), &50u32);
+    client.update_oracle_weight(&admin, &oracle, &weather(), &0u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_non_admin_cannot_update_oracle_weight() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    let impostor = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &50u32);
+    client.update_oracle_weight(&impostor, &oracle, &weather(), &80u32);
 }
 
 #[test]
