@@ -92,6 +92,21 @@ impl PolicyEngine {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
+        let admin_str = admin.to_string();
+        let admin_prefix = admin_str.to_string();
+        if !admin_prefix.starts_with('G') {
+            panic!("invalid address: admin must be an account address");
+        }
+        let usdc_str = usdc_token.to_string();
+        let oracle_str = oracle_address.to_string();
+        let usdc_prefix = usdc_str.to_string();
+        let oracle_prefix = oracle_str.to_string();
+        if !usdc_prefix.starts_with('C') {
+            panic!("invalid address: usdc_token must be a contract address");
+        }
+        if !oracle_prefix.starts_with('C') {
+            panic!("invalid address: oracle_address must be a contract address");
+        }
         admin.require_auth();
         env.storage().instance().set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
@@ -124,8 +139,8 @@ impl PolicyEngine {
         }
 
         // Check for duplicate (category, oracle_key) pair
-        let key = (params.category, params.oracle_key);
-        if env.storage().persistent().has(&StorageKey::ProductKey(key)) {
+        let key = (params.category.clone(), params.oracle_key.clone());
+        if env.storage().persistent().has(&StorageKey::ProductKey(key.clone())) {
             panic_with_error!(&env, Error::DuplicateProductKey);
         }
 
