@@ -106,6 +106,12 @@ Target APY ranges:
   High-risk (DeFi exploit):      25–40%
 ```
 
+**Pool size limits.** Each pool caps cumulative deposits at
+`MAX_TOTAL_DEPOSITED = 10^15` stroops (7-decimal USDC). Deposits that would push
+`total_deposited` past this bound are rejected with `PoolCapExceeded`. The cap
+keeps `total_shares` within safe `i128` range and prevents per-share value from
+becoming infinitesimal under unbounded deposit growth.
+
 ## Governance DAO (v2)
 
 SHIELD token holders govern protocol parameters:

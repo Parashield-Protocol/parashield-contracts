@@ -23,6 +23,11 @@ use soroban_sdk::{
 pub mod types;
 pub use types::*;
 
+/// Maximum number of registered oracles. Bounds the median aggregation loop and
+/// the worst-case weighted sum (MAX_ORACLES * max_weight * max_value) so it
+/// cannot overflow i128.
+const MAX_ORACLES: u32 = 100;
+
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -54,6 +59,7 @@ pub enum Error {
     InvalidConfidence   = 7,
     InvalidWeight       = 8,
     StaleData           = 9,
+    TooManyOracles      = 10,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -111,7 +117,10 @@ impl OracleVerifier {
             .instance()
             .get(&StorageKey::OracleList)
             .unwrap_or_else(|| Vec::new(&env));
-        list.push_back(oracle.clone());
+        if list.len() >= MAX_ORACLES {
+            panic_with_error!(&env, Error::TooManyOracles);
+        }
+        list.push_back(oracle);
         env.storage().instance().set(&StorageKey::OracleList, &list);
 
         env.events().publish(

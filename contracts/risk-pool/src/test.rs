@@ -222,6 +222,46 @@ fn double_release_fails() {
     pool.release_for_claim(&admin, &99u128);  // already released
 }
 
+// ── expiry lock release (Issue #11) ─────────────────────────────────────────────
+
+/// Test that release_for_expiry properly releases locked coverage when a policy expires.
+#[test]
+fn lock_and_release_for_expiry_round_trip() {
+    let (_, pool, _, admin, _, lp1) = setup();
+    pool.deposit(&lp1, &200_0000000i128);
+
+    pool.lock_for_policy(&admin, &42u128, &100_0000000i128);
+    assert_eq!(pool.get_utilization_rate(), 5_000u32);  // 50% utilization in bps
+
+    pool.release_for_expiry(&admin, &42u128);
+    assert_eq!(pool.get_utilization_rate(), 0u32);
+}
+
+/// Test acceptance criteria: lock 100, release 100 → total_locked returns to 0
+#[test]
+fn lock_100_release_100_returns_total_locked_to_zero() {
+    let (_, pool, _, admin, _, lp1) = setup();
+    pool.deposit(&lp1, &200_0000000i128);
+
+    let lock_amount = 100_0000000i128;
+    pool.lock_for_policy(&admin, &1u128, &lock_amount);
+    assert_eq!(pool.get_stats().total_locked, lock_amount);
+
+    pool.release_for_expiry(&admin, &1u128);
+    assert_eq!(pool.get_stats().total_locked, 0i128);
+}
+
+/// Double release_for_expiry should fail with AlreadyReleased
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn double_release_for_expiry_fails() {
+    let (_, pool, _, admin, _, lp1) = setup();
+    pool.deposit(&lp1, &200_0000000i128);
+    pool.lock_for_policy(&admin, &99u128, &50_0000000i128);
+    pool.release_for_expiry(&admin, &99u128);
+    pool.release_for_expiry(&admin, &99u128);  // already released
+}
+
 // ── pause / resume ────────────────────────────────────────────────────────────
 
 #[test]

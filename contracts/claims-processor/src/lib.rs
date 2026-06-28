@@ -19,7 +19,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    Address, Env, Symbol, Vec,
+    Address, Env, Vec, Symbol,
 };
 
 pub mod types;
@@ -73,6 +73,7 @@ pub enum Error {
     PolicyNotActive    = 5,
     AlreadyClaimed     = 6,
     AlreadyProcessed   = 7,
+    InvalidAddress     = 8,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -96,6 +97,12 @@ impl ClaimsProcessor {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
         admin.require_auth();
+        
+        // Validate admin address format
+        Self::validate_stellar_address(&env, &admin);
+        Self::validate_stellar_address(&env, &policy_engine);
+        Self::validate_stellar_address(&env, &oracle_verifier);
+        
         env.storage().instance().set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
         env.storage().instance().set(&StorageKey::PolicyEngine, &policy_engine);
@@ -395,6 +402,23 @@ impl ClaimsProcessor {
             .get(&StorageKey::NextClaimId).unwrap_or(1);
         env.storage().instance().set(&StorageKey::NextClaimId, &(id + 1));
         id
+    }
+
+    /// Validate that an address is a valid Stellar public key format.
+    /// Stellar public keys (G-addresses) must be 56 characters and start with 'G'.
+    fn validate_stellar_address(env: &Env, address: &Address) {
+        let addr_str = address.to_string();
+        let bytes = addr_str.to_bytes();
+        
+        // Check length: Stellar public keys are exactly 56 characters
+        if bytes.len() != 56 {
+            panic_with_error!(env, Error::InvalidAddress);
+        }
+        
+        // Check that it starts with 'G' (public key prefix)
+        if bytes.get(0) != Some(&b'G') {
+            panic_with_error!(env, Error::InvalidAddress);
+        }
     }
 }
 

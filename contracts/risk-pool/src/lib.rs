@@ -24,6 +24,11 @@ pub use types::*;
 const PREMIUM_LP_BPS:    i128 = 8_000;  // 80% of premium to LP pool
 const PREMIUM_TREAS_BPS: i128 = 1_000;  // 10% to treasury
 
+/// Upper bound on cumulative deposits (7-decimal USDC stroops).
+/// 10^15 stroops == 100,000,000 USDC. Caps total pool size so share value
+/// cannot become infinitesimal and total_shares cannot overflow.
+const MAX_TOTAL_DEPOSITED: i128 = 1_000_000_000_000_000;
+
 #[contracttype]
 enum StorageKey {
     Initialized,
@@ -56,6 +61,7 @@ pub enum Error {
     LockNotFound        = 9,
     AlreadyReleased     = 10,
     Undercollateralized = 11,
+    PoolCapExceeded     = 12,
 }
 
 #[contract]
@@ -109,6 +115,11 @@ impl RiskPool {
             .get(&StorageKey::TotalDeposited).unwrap_or(0);
         let total_shares: i128 = env.storage().instance()
             .get(&StorageKey::TotalShares).unwrap_or(0);
+
+        // Enforce the global pool size cap before accepting new liquidity.
+        if total_deposited + amount > MAX_TOTAL_DEPOSITED {
+            panic_with_error!(&env, Error::PoolCapExceeded);
+        }
 
         let new_shares = if total_deposited == 0 || total_shares == 0 {
             amount * 1_000_000_000  // 1 share = 1 USDC * 1e9 precision
@@ -315,6 +326,18 @@ impl RiskPool {
                 amount: lock.amount,
             },
         );
+    }
+
+    pub fn release_for_expiry(env: Env, caller: Address, policy_id: u128) {
+        caller.require_auth();
+        let mut lock: CapitalLock = env.storage().persistent()
+            .get(&StorageKey::Lock(policy_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::LockNotFound));
+        if lock.released { panic_with_error!(&env, Error::AlreadyReleased); }
+        lock.released = true;
+        env.storage().persistent().set(&StorageKey::Lock(policy_id), &lock);
+        let total_locked: i128 = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
+        env.storage().instance().set(&StorageKey::TotalLocked, &(total_locked.saturating_sub(lock.amount)));
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
