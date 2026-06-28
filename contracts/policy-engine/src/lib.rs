@@ -122,6 +122,11 @@ impl PolicyEngine {
         {
             panic_with_error!(&env, Error::InvalidTriggerThreshold);
         }
+        // Coverage bounds must form a valid, positive range: 0 < min < max.
+        // Rejects free coverage (min == 0) and inverted ranges (min >= max).
+        if params.coverage_min <= 0 || params.coverage_min >= params.coverage_max {
+            panic_with_error!(&env, Error::InvalidCoverageRange);
+        }
 
         // Check for duplicate (category, oracle_key) pair
         let key = (params.category, params.oracle_key);
