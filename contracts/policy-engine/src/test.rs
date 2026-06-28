@@ -147,7 +147,7 @@ fn test_buy_policy_appears_in_user_list() {
     client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
     client.buy_policy(&buyer, &pid, &COVERAGE, &60u32, &symbol_short!("kis2607"));
 
-    let policies = client.get_user_policies(&buyer);
+    let policies = client.get_user_policies(&buyer, &0u32, &10u32);
     assert_eq!(policies.len(), 2);
 }
 
