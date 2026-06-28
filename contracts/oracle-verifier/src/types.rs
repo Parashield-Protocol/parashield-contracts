@@ -44,6 +44,9 @@ pub struct OracleDataPoint {
 pub struct AggregatedData {
     pub median_value: i128,
     pub oracle_count: u32,
+    /// Aggregated confidence is the weighted average of valid oracle confidences,
+    /// weighted by each oracle's configured registration weight and rounded down.
+    pub confidence: u32,
     pub min_confidence: u32,
     pub last_updated: u64,
 }
