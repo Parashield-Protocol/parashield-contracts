@@ -49,6 +49,7 @@ enum StorageKey {
     Paused,
     /// Maps (category, oracle_key) -> product_id for uniqueness constraint
     ProductKey((Symbol, Symbol)),
+    PendingAdmin,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -104,6 +105,8 @@ impl PolicyEngine {
         env.storage().instance().set(&StorageKey::NextProductId, &1u128);
         env.storage().instance().set(&StorageKey::NextPolicyId,  &1u128);
         env.storage().instance().set(&StorageKey::ActiveProducts, &Vec::<u128>::new(&env));
+        // No pending admin initially
+        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
 
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
@@ -259,7 +262,10 @@ impl PolicyEngine {
             panic_with_error!(&env, Error::DurationTooLong);
         }
 
-        let premium = coverage_amount * product.premium_rate_bps as i128 / 10_000;
+        // Premium calculation: premium = coverage * rate * duration_days / 365 / 10_000
+         // where coverage and premium are in USDC stroops (7 decimal places),
+         // premium_rate_bps is in basis points (e.g., 500 = 5%).
+         let premium = coverage_amount * product.premium_rate_bps as i128 * duration_days as i128 / 365 / 10_000;
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
 
         // Pull premium from buyer into this contract
@@ -447,10 +453,43 @@ impl PolicyEngine {
         env.storage().instance().set(&StorageKey::Paused, &true);
     }
 
-    pub fn emergency_resume(env: Env, admin: Address) {
-        Self::require_admin(&env, &admin);
-        env.storage().instance().set(&StorageKey::Paused, &false);
-    }
+pub fn emergency_resume(env: Env, admin: Address) {
+         Self::require_admin(&env, &admin);
+         env.storage().instance().set(&StorageKey::Paused, &false);
+     }
+
+     /// Propose a new admin. Only the current admin can call this.
+     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
+         Self::require_admin(&env, &admin);
+         // Store the proposed admin (zero address means no proposal)
+         env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
+     }
+
+     /// Accept the proposed admin. Only the proposed admin can call this.
+     pub fn accept_admin(env: Env, admin: Address) {
+         let pending_admin: Address = env.storage().instance()
+             .get(&StorageKey::PendingAdmin)
+             .unwrap_or_else(|| Address::from_uint(&env, 0));
+         // Only the pending admin can accept
+         if admin != pending_admin {
+             panic_with_error!(&env, Error::Unauthorized);
+         }
+         admin.require_auth();
+         let current_admin: Address = env.storage().instance()
+             .get(&StorageKey::Admin)
+             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+         // Update admin
+         env.storage().instance().set(&StorageKey::Admin, &admin);
+         // Clear the proposal
+         env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
+         // Emit event
+         env.events().publish(
+             (Symbol::new(&env, "admin_updated"),),
+             AdminUpdated {
+                 new_admin: admin,
+             },
+         );
+     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 

@@ -44,6 +44,7 @@ enum StorageKey {
     /// Global minimum confidence threshold (u32)
     MinConfidence,
     MaxDataAge,
+    PendingAdmin,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -85,6 +86,8 @@ impl OracleVerifier {
         env.storage().instance().set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
         env.storage().instance().set(&StorageKey::OracleList, &Vec::<Address>::new(&env));
+        // No pending admin initially
+        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
 
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
@@ -195,6 +198,39 @@ impl OracleVerifier {
         env.events().publish(
             (Symbol::new(&env, "max_data_age_updated"),),
             MaxDataAgeUpdated { max_age },
+        );
+    }
+
+    /// Propose a new admin. Only the current admin can call this.
+    pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
+        Self::require_admin(&env, &admin);
+        // Store the proposed admin (zero address means no proposal)
+        env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
+    }
+
+    /// Accept the proposed admin. Only the proposed admin can call this.
+    pub fn accept_admin(env: Env, admin: Address) {
+        let pending_admin: Address = env.storage().instance()
+            .get(&StorageKey::PendingAdmin)
+            .unwrap_or_else(|| Address::from_uint(&env, 0));
+        // Only the pending admin can accept
+        if admin != pending_admin {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        admin.require_auth();
+        let current_admin: Address = env.storage().instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        // Update admin
+        env.storage().instance().set(&StorageKey::Admin, &admin);
+        // Clear the proposal
+        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "admin_updated"),),
+            AdminUpdated {
+                new_admin: admin,
+            },
         );
     }
 
