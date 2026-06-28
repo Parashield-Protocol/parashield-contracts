@@ -54,19 +54,20 @@ enum StorageKey {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
-    AlreadyInitialized   = 1,
-    NotInitialized       = 2,
-    Unauthorized         = 3,
-    ProductNotFound      = 4,
-    ProductNotActive     = 5,
-    PolicyNotFound       = 6,
-    PolicyNotActive      = 7,
-    CoverageOutOfRange   = 8,
-    DurationTooLong      = 9,
-    InsufficientPool     = 10,
-    AlreadyClaimed       = 11,
-    AlreadyExpired       = 12,
-    InvalidPremiumRate   = 13,
+    AlreadyInitialized      = 1,
+    NotInitialized          = 2,
+    Unauthorized            = 3,
+    ProductNotFound         = 4,
+    ProductNotActive        = 5,
+    PolicyNotFound          = 6,
+    PolicyNotActive         = 7,
+    CoverageOutOfRange      = 8,
+    DurationTooLong         = 9,
+    InsufficientPool        = 10,
+    AlreadyClaimed          = 11,
+    AlreadyExpired          = 12,
+    InvalidPremiumRate      = 13,
+    InvalidTriggerThreshold = 14,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -111,6 +112,13 @@ impl PolicyEngine {
         if params.premium_rate_bps == 0 || params.premium_rate_bps > 10_000 {
             panic_with_error!(&env, Error::InvalidPremiumRate);
         }
+        // trigger_threshold must be positive and within the 7-decimal fixed-point
+        // range used across the protocol (1 unit = 0.0000001; max ≈ 1 quadrillion).
+        if params.trigger_threshold <= 0
+            || params.trigger_threshold > 1_000_000_000_000_000_000_000i128
+        {
+            panic_with_error!(&env, Error::InvalidTriggerThreshold);
+        }
 
         let id = Self::next_product_id(&env);
         let product = InsuranceProduct {
@@ -150,18 +158,19 @@ impl PolicyEngine {
         product.status = ProductStatus::Deprecated;
         env.storage().persistent().set(&StorageKey::Product(product_id), &product);
 
-        let mut active_products: Vec<u128> = env.storage().instance()
+        // Remove from the ActiveProducts list on deprecation
+        let mut products: Vec<u128> = env.storage().instance()
             .get(&StorageKey::ActiveProducts).unwrap_or_else(|| Vec::new(&env));
-        let mut idx = None;
-        for i in 0..active_products.len() {
-            if active_products.get_unchecked(i) == product_id {
+        let mut idx: Option<u32> = None;
+        for i in 0..products.len() {
+            if products.get_unchecked(i) == product_id {
                 idx = Some(i);
                 break;
             }
         }
         if let Some(i) = idx {
-            active_products.remove(i);
-            env.storage().instance().set(&StorageKey::ActiveProducts, &active_products);
+            products.remove(i);
+            env.storage().instance().set(&StorageKey::ActiveProducts, &products);
         }
     }
 
@@ -261,8 +270,11 @@ impl PolicyEngine {
     pub fn pay_claim(env: Env, caller: Address, policy_id: u128) {
         Self::require_claims_processor(&env, &caller);
         let mut policy: Policy = Self::load_policy(&env, policy_id);
-        if policy.status != PolicyStatus::Active {
-            panic_with_error!(&env, Error::PolicyNotActive);
+        match policy.status {
+            PolicyStatus::Claimed   => panic_with_error!(&env, Error::AlreadyClaimed),
+            PolicyStatus::Expired   => panic_with_error!(&env, Error::AlreadyExpired),
+            PolicyStatus::Cancelled => panic_with_error!(&env, Error::PolicyNotActive),
+            PolicyStatus::Active    => {}
         }
         policy.status = PolicyStatus::Claimed;
         env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
@@ -277,8 +289,11 @@ impl PolicyEngine {
     pub fn expire_policy(env: Env, caller: Address, policy_id: u128) {
         Self::require_claims_processor(&env, &caller);
         let mut policy: Policy = Self::load_policy(&env, policy_id);
-        if policy.status != PolicyStatus::Active {
-            panic_with_error!(&env, Error::PolicyNotActive);
+        match policy.status {
+            PolicyStatus::Claimed   => panic_with_error!(&env, Error::AlreadyClaimed),
+            PolicyStatus::Expired   => panic_with_error!(&env, Error::AlreadyExpired),
+            PolicyStatus::Cancelled => panic_with_error!(&env, Error::PolicyNotActive),
+            PolicyStatus::Active    => {}
         }
         policy.status = PolicyStatus::Expired;
         env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);

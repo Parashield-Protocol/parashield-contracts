@@ -49,7 +49,7 @@ fn deploy() -> World {
     // 3. Deploy claims processor
     let claims_id = env.register(ClaimsProcessor, ());
     ClaimsProcessorClient::new(&env, &claims_id)
-        .initialize(&admin, &policy_id, &oracle_id);
+        .initialize(&admin, &policy_id, &oracle_id, &604_800u64);
 
     // 4. Wire claims processor as authorized caller on policy engine
     PolicyEngineClient::new(&env, &policy_id)
