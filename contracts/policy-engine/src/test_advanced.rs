@@ -19,6 +19,7 @@ fn basic_params() -> CreateProductParams {
     CreateProductParams {
         name:               symbol_short!("crop"),
         category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("kis2606"),
         trigger_type:       TriggerType::Threshold,
         oracle_data_type:   symbol_short!("weather"),
         trigger_threshold:  500_000_000i128,

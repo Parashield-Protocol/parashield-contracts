@@ -45,6 +45,8 @@ pub struct InsuranceProduct {
     pub name: Symbol,
     /// "crop" | "flight" | "disaster" | "health" | "defi"
     pub category: Symbol,
+    /// Specific oracle measurement key, e.g. symbol_short!("kis2606")
+    pub oracle_key: Symbol,
     pub trigger_type: TriggerType,
     /// Oracle data category: "weather" | "flight" | "onchain"
     pub oracle_data_type: Symbol,
@@ -67,6 +69,7 @@ pub struct InsuranceProduct {
 pub struct CreateProductParams {
     pub name: Symbol,
     pub category: Symbol,
+    pub oracle_key: Symbol,
     pub trigger_type: TriggerType,
     pub oracle_data_type: Symbol,
     pub trigger_threshold: i128,
