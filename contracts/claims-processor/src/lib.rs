@@ -364,19 +364,19 @@ impl ClaimsProcessor {
         id
     }
 
-    /// Validate that an address is a valid Stellar public key format.
-    /// Stellar public keys (G-addresses) must be 56 characters and start with 'G'.
     fn validate_stellar_address(env: &Env, address: &Address) {
         let addr_str = address.to_string();
-        let bytes = addr_str.to_bytes();
         
-        // Check length: Stellar public keys are exactly 56 characters
-        if bytes.len() != 56 {
+        // Check length: Stellar addresses are exactly 56 characters
+        if addr_str.len() != 56 {
             panic_with_error!(env, Error::InvalidAddress);
         }
         
-        // Check that it starts with 'G' (public key prefix)
-        if bytes.get(0) != Some(&b'G') {
+        let mut buf = [0u8; 56];
+        addr_str.copy_into_slice(&mut buf);
+        
+        // Check prefix: G (Stellar account) or C (Stellar contract)
+        if buf[0] != b'G' && buf[0] != b'C' {
             panic_with_error!(env, Error::InvalidAddress);
         }
     }

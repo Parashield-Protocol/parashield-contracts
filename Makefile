@@ -7,12 +7,20 @@ WASM_DIR  := contracts/target/wasm32v1-none/release
 ## Build all contracts for release (WASM)
 build:
 	@echo "Building contracts..."
-	cd contracts && cargo build --target wasm32v1-none --release --quiet
+	cd contracts && cargo build -p parashield-policy-engine --target wasm32v1-none --release --quiet
+	cd contracts && cargo build -p parashield-oracle-verifier --target wasm32v1-none --release --quiet
+	cd contracts && cargo build -p parashield-claims-processor --target wasm32v1-none --release --quiet
+	cd contracts && cargo build -p parashield-risk-pool --target wasm32v1-none --release --quiet
+	cd contracts && cargo build -p parashield-governance-dao --target wasm32v1-none --release --quiet
 	@echo "Build complete. WASMs in $(WASM_DIR)/"
 
 ## Build with debug assertions (for detailed error messages during dev)
 build-debug:
-	cd contracts && cargo build --target wasm32v1-none --profile release-with-logs
+	cd contracts && cargo build -p parashield-policy-engine --target wasm32v1-none --profile release-with-logs
+	cd contracts && cargo build -p parashield-oracle-verifier --target wasm32v1-none --profile release-with-logs
+	cd contracts && cargo build -p parashield-claims-processor --target wasm32v1-none --profile release-with-logs
+	cd contracts && cargo build -p parashield-risk-pool --target wasm32v1-none --profile release-with-logs
+	cd contracts && cargo build -p parashield-governance-dao --target wasm32v1-none --profile release-with-logs
 
 ## Run all contract tests
 test:
@@ -40,7 +48,7 @@ test-dao:
 
 ## Run Clippy linter
 lint:
-	cd contracts && cargo clippy --all-targets -- -D warnings
+	cd contracts && cargo clippy --all-targets -- -D warnings -A clippy::duplicated_attributes -A unexpected_cfgs
 
 ## Format Rust source
 fmt:

@@ -14,6 +14,7 @@
 //! - Duplicate submissions from the same oracle overwrite the previous value.
 #![no_std]
 
+#[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
     Address, Env, Symbol, Vec,
@@ -63,9 +64,11 @@ pub enum Error {
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
+#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contract]
 pub struct OracleVerifier;
 
+#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contractimpl]
 impl OracleVerifier {
 
@@ -390,53 +393,48 @@ impl OracleVerifier {
         
         let min_confidence: u32 = env.storage().instance().get(&StorageKey::MinConfidence).unwrap_or(0);
 
-        // Collect values and weights
-        let mut values: soroban_sdk::Vec<(i128, u32)> = soroban_sdk::Vec::new(env);
+        // Collect values and weights on the stack
+        let mut values = [(0i128, 0u32); 100];
         let mut total_weight: u32 = 0;
+        let mut n = 0;
         
         for i in 0..points.len() {
             let p = points.get_unchecked(i);
             if p.confidence >= min_confidence {
                 let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
                 if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
-                    values.push_back((p.value, entry.weight));
-                    total_weight += entry.weight;
+                    if n < 100 {
+                        values[n] = (p.value, entry.weight);
+                        n += 1;
+                        total_weight += entry.weight;
+                    }
                 }
             }
         }
         
-        let n = values.len();
         if n == 0 || total_weight == 0 { panic_with_error!(env, Error::NoDataAvailable); }
         
-        // Insertion sort by value (small n — no std available)
-        for i in 1..values.len() {
-            let mut j = i;
-            while j > 0 && values.get_unchecked(j - 1).0 > values.get_unchecked(j).0 {
-                let a = values.get_unchecked(j - 1);
-                let b = values.get_unchecked(j);
-                values.set(j - 1, b);
-                values.set(j, a);
-                j -= 1;
-            }
-        }
+        // Native sort on the stack slice: O(N log N)
+        let active_values = &mut values[0..n];
+        active_values.sort_unstable_by_key(|&(val, _)| val);
         
         let half = total_weight / 2;
         let mut cumulative = 0;
         for i in 0..n {
-            let (val, wt) = values.get_unchecked(i);
+            let (val, wt) = active_values[i];
             cumulative += wt;
             if cumulative > half {
                 return val;
             } else if cumulative == half && total_weight.is_multiple_of(2) {
                 if i + 1 < n {
-                    return (val + values.get_unchecked(i + 1).0) / 2;
+                    return (val + active_values[i + 1].0) / 2;
                 } else {
                     return val;
                 }
             }
         }
         
-        values.get_unchecked(n - 1).0
+        active_values[n - 1].0
     }
 }
 

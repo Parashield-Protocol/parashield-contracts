@@ -127,6 +127,16 @@ fn get_user_policies_tracks_multiple_policies() {
     let prod_id = pe.create_product(&admin, &basic_params());
     pe.buy_policy(&user, &prod_id, &200_0000000i128, &30u32, &symbol_short!("kis2606"));
     pe.buy_policy(&user, &prod_id, &300_0000000i128, &30u32, &symbol_short!("kis2606"));
-    let policies = pe.get_user_policies(&user);
-    assert_eq!(policies.len(), 2);
+    // Verify first page (limit 1)
+    let p1 = pe.get_user_policies(&user, &0u32, &1u32);
+    assert_eq!(p1.len(), 1);
+    
+    // Verify second page (limit 1, offset 1)
+    let p2 = pe.get_user_policies(&user, &1u32, &1u32);
+    assert_eq!(p2.len(), 1);
+    assert_ne!(p1.get(0), p2.get(0));
+    
+    // Verify offset out of bounds
+    let p3 = pe.get_user_policies(&user, &2u32, &1u32);
+    assert_eq!(p3.len(), 0);
 }

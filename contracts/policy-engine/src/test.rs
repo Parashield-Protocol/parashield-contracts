@@ -147,7 +147,7 @@ fn test_buy_policy_appears_in_user_list() {
     client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
     client.buy_policy(&buyer, &pid, &COVERAGE, &60u32, &symbol_short!("kis2607"));
 
-    let policies = client.get_user_policies(&buyer);
+    let policies = client.get_user_policies(&buyer, &0u32, &10u32);
     assert_eq!(policies.len(), 2);
 }
 
@@ -348,7 +348,7 @@ fn test_duplicate_category_oracle_key_panics() {
 
     // Create product A with (category: "crop", oracle_key: "kis2606")
     client.create_product(&admin, &CreateProductParams {
-        name:               symbol_short!("crop_kisumu_a"),
+        name:               symbol_short!("crop_k_a"),
         category:           symbol_short!("crop"),
         oracle_key:         symbol_short!("kis2606"),
         trigger_type:       TriggerType::Threshold,
@@ -363,7 +363,7 @@ fn test_duplicate_category_oracle_key_panics() {
 
     // Attempt to create product B with same (category, oracle_key) — should panic
     client.create_product(&admin, &CreateProductParams {
-        name:               symbol_short!("crop_kisumu_b"),
+        name:               symbol_short!("crop_k_b"),
         category:           symbol_short!("crop"),
         oracle_key:         symbol_short!("kis2606"),  // ← duplicate key
         trigger_type:       TriggerType::Threshold,
@@ -385,7 +385,7 @@ fn test_different_oracle_keys_same_category_succeeds() {
 
     // Create product A with (category: "crop", oracle_key: "kis2606")
     client.create_product(&admin, &CreateProductParams {
-        name:               symbol_short!("crop_kisumu"),
+        name:               symbol_short!("crop_kis"),
         category:           symbol_short!("crop"),
         oracle_key:         symbol_short!("kis2606"),
         trigger_type:       TriggerType::Threshold,
@@ -400,7 +400,7 @@ fn test_different_oracle_keys_same_category_succeeds() {
 
     // Create product B with (category: "crop", oracle_key: "nak2607") — different key, should succeed
     client.create_product(&admin, &CreateProductParams {
-        name:               symbol_short!("crop_nakuru"),
+        name:               symbol_short!("crop_nak"),
         category:           symbol_short!("crop"),
         oracle_key:         symbol_short!("nak2607"),  // ← different key
         trigger_type:       TriggerType::Threshold,
@@ -424,7 +424,7 @@ fn test_deprecated_product_key_can_be_reused() {
 
     // Create product A with (category: "crop", oracle_key: "kis2606")
     let product_a_id = client.create_product(&admin, &CreateProductParams {
-        name:               symbol_short!("crop_kisumu_v1"),
+        name:               symbol_short!("crop_k_v1"),
         category:           symbol_short!("crop"),
         oracle_key:         symbol_short!("kis2606"),
         trigger_type:       TriggerType::Threshold,
@@ -442,7 +442,7 @@ fn test_deprecated_product_key_can_be_reused() {
 
     // Create product B with same (category, oracle_key) — should succeed after deprecation
     client.create_product(&admin, &CreateProductParams {
-        name:               symbol_short!("crop_kisumu_v2"),
+        name:               symbol_short!("crop_k_v2"),
         category:           symbol_short!("crop"),
         oracle_key:         symbol_short!("kis2606"),  // ← reused key
         trigger_type:       TriggerType::Threshold,

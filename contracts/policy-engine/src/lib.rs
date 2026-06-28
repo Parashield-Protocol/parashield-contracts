@@ -71,13 +71,16 @@ pub enum Error {
     InvalidPremiumRate      = 13,
     InvalidTriggerThreshold = 14,
     DuplicateProductKey    = 15,
+    InvalidCoverageRange    = 16,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
+#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contract]
 pub struct PolicyEngine;
 
+#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contractimpl]
 impl PolicyEngine {
 
@@ -129,8 +132,8 @@ impl PolicyEngine {
         }
 
         // Check for duplicate (category, oracle_key) pair
-        let key = (params.category, params.oracle_key);
-        if env.storage().persistent().has(&StorageKey::ProductKey(key)) {
+        let key = (params.category.clone(), params.oracle_key.clone());
+        if env.storage().persistent().has(&StorageKey::ProductKey(key.clone())) {
             panic_with_error!(&env, Error::DuplicateProductKey);
         }
 
@@ -331,10 +334,21 @@ impl PolicyEngine {
         Self::load_policy(&env, policy_id)
     }
 
-    pub fn get_user_policies(env: Env, user: Address) -> Vec<u128> {
-        env.storage().persistent()
+    pub fn get_user_policies(env: Env, user: Address, offset: u32, limit: u32) -> Vec<u128> {
+        let all: Vec<u128> = env.storage().persistent()
             .get(&StorageKey::UserPolicies(user))
-            .unwrap_or_else(|| Vec::new(&env))
+            .unwrap_or_else(|| Vec::new(&env));
+        
+        let mut paginated = Vec::new(&env);
+        let len = all.len();
+        if offset >= len {
+            return paginated;
+        }
+        let end = (offset + limit).min(len);
+        for i in offset..end {
+            paginated.push_back(all.get_unchecked(i));
+        }
+        paginated
     }
 
     pub fn get_active_products(env: Env) -> Vec<u128> {
