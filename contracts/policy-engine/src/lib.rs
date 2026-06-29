@@ -113,10 +113,10 @@ impl PolicyEngine {
             panic!("invalid address: oracle_address must be a contract address");
         }
         
-        let balance_res: Result<Result<i128, soroban_sdk::Error>, soroban_sdk::Error> = env.try_invoke_contract(
+        let balance_res = env.try_invoke_contract::<i128, soroban_sdk::Error>(
             &usdc_token,
             &Symbol::new(&env, "balance"),
-            soroban_sdk::vec![&env, env.current_contract_address().into_val(&env)],
+            soroban_sdk::vec![&env, env.current_contract_address().to_val()],
         );
         if balance_res.is_err() {
             panic_with_error!(&env, Error::InvalidToken);
