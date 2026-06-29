@@ -125,6 +125,12 @@ pub struct MaxDataAgeUpdated {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MinOracleCountUpdated {
+    pub min_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OracleDataSubmitted {
     pub oracle: Address,
     pub data_type: Symbol,
@@ -132,5 +138,11 @@ pub struct OracleDataSubmitted {
     pub value: i128,
     pub confidence: u32,
     pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminUpdated {
+    pub new_admin: Address,
 }
 

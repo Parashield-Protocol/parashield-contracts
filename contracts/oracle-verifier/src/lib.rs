@@ -46,6 +46,7 @@ enum StorageKey {
     /// Global minimum confidence threshold (u32)
     MinConfidence,
     MaxDataAge,
+    PendingAdmin,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -83,10 +84,21 @@ impl OracleVerifier {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
+        let admin_str = admin.to_string();
+        if admin_str.len() != 56 {
+            panic!("invalid address: admin must be an account or contract address");
+        }
+        let mut admin_buf = [0u8; 56];
+        admin_str.copy_into_slice(&mut admin_buf);
+        if admin_buf[0] != b'G' && admin_buf[0] != b'C' {
+            panic!("invalid address: admin must be an account or contract address");
+        }
         admin.require_auth();
         env.storage().instance().set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
         env.storage().instance().set(&StorageKey::OracleList, &Vec::<Address>::new(&env));
+        // No pending admin initially
+        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
 
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
@@ -200,9 +212,55 @@ impl OracleVerifier {
         );
     }
 
+    /// Propose a new admin. Only the current admin can call this.
+    pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
+        Self::require_admin(&env, &admin);
+        // Store the proposed admin (zero address means no proposal)
+        env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
+    }
+
+    /// Accept the proposed admin. Only the proposed admin can call this.
+    pub fn accept_admin(env: Env, admin: Address) {
+        let pending_admin: Address = env.storage().instance()
+            .get(&StorageKey::PendingAdmin)
+            .unwrap_or_else(|| Address::from_uint(&env, 0));
+        // Only the pending admin can accept
+        if admin != pending_admin {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        admin.require_auth();
+        let current_admin: Address = env.storage().instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        // Update admin
+        env.storage().instance().set(&StorageKey::Admin, &admin);
+        // Clear the proposal
+        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "admin_updated"),),
+            AdminUpdated {
+                new_admin: admin,
+            },
+        );
+    }
+
     /// Get the maximum data age in seconds (defaults to 7 days = 604,800 seconds).
     pub fn get_max_data_age(env: Env) -> u64 {
         env.storage().instance().get(&StorageKey::MaxDataAge).unwrap_or(604_800)
+    }
+
+    pub fn set_min_oracle_count(env: Env, admin: Address, min_count: u32) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&StorageKey::MinOracleCount, &min_count);
+        env.events().publish(
+            (Symbol::new(&env, "min_oracle_count_updated"),),
+            MinOracleCountUpdated { min_count },
+        );
+    }
+
+    pub fn get_min_oracle_count(env: Env) -> u32 {
+        env.storage().instance().get(&StorageKey::MinOracleCount).unwrap_or(1)
     }
 
     // ── Data Submission ───────────────────────────────────────────────────────
@@ -560,7 +618,10 @@ impl OracleVerifier {
             }
         }
         
-        if n == 0 || total_weight == 0 { panic_with_error!(env, Error::NoDataAvailable); }
+        let min_oracle_count: u32 = env.storage().instance().get(&StorageKey::MinOracleCount).unwrap_or(1);
+        if (n as u32) < min_oracle_count || n == 0 || total_weight == 0 {
+            panic_with_error!(env, Error::NoDataAvailable);
+        }
         
         // Native sort on the stack slice: O(N log N)
         let active_values = &mut values[0..n];

@@ -9,7 +9,7 @@ use soroban_sdk::{
     token, Address, Bytes, Env, Symbol,
 };
 
-use crate::{DaoConfig, GovernanceDao, GovernanceDaoClient, VoteChoice};
+use crate::{DaoConfig, GovernanceDao, GovernanceDaoClient, ProposalStatus, VoteChoice};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -44,6 +44,7 @@ fn setup() -> (Env, GovernanceDaoClient<'static>, Address, Address, Address, Add
             quorum_bps:          1_000u32,             // 10%
             majority_bps:        5_100u32,             // 51%
             voting_period:       VOTING_PERIOD,
+            proposal_timelock:   0,
         },
     );
 
@@ -77,6 +78,7 @@ fn cannot_initialize_twice() {
             quorum_bps:         0,
             majority_bps:       0,
             voting_period:      0,
+            proposal_timelock:  0,
         },
     );
 }
@@ -263,4 +265,68 @@ fn non_admin_cannot_cancel() {
         &Symbol::new(&env, "update"),
     );
     dao.cancel(&voter2, &pid);
+}
+
+#[test]
+fn test_proposal_timelock_execution() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin    = Address::generate(&env);
+    let voter1   = Address::generate(&env);
+    let target   = Address::generate(&env);
+    let gov_token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    
+    let gov_client = token::StellarAssetClient::new(&env, &gov_token_id);
+    gov_client.mint(&voter1, &1_000_000_0000000i128);
+
+    let dao_id = env.register(GovernanceDao, ());
+    let dao    = GovernanceDaoClient::new(&env, &dao_id);
+
+    // Timelock = 7 days (604800 seconds)
+    dao.initialize(
+        &admin,
+        &DaoConfig {
+            gov_token:           gov_token_id,
+            total_supply:        1_000_000_0000000i128,
+            proposal_threshold:  10_000_0000000i128,
+            quorum_bps:          1_000u32, // 10%
+            majority_bps:        5_100u32, // 51%
+            voting_period:       604800,
+            proposal_timelock:   604800,
+        },
+    );
+
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Upgrade Admin Address"),
+        &target,
+        &Symbol::new(&env, "upgrade"),
+    );
+
+    // Vote For
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+
+    // Fast forward to voting end (T = voting_period + 1)
+    env.ledger().with_mut(|l| l.timestamp = 604801);
+    dao.finalize(&pid);
+
+    // Assert proposal passed and execution time is set
+    let p = dao.get_proposal(&pid);
+    assert_eq!(p.status, ProposalStatus::Passed);
+    assert_eq!(p.execution_time, 604801 + 604800);
+
+    // Attempt to execute immediately at T = 604801 (timelock not expired)
+    let res = dao.try_execute(&pid);
+    assert!(res.is_err());
+
+    // Fast forward to T = 604801 + 604800 (exactly timelock end)
+    env.ledger().with_mut(|l| l.timestamp = 604801 + 604800);
+    
+    // Execution should now succeed
+    let res_ok = dao.try_execute(&pid);
+    assert!(res_ok.is_ok());
+    
+    let p_final = dao.get_proposal(&pid);
+    assert_eq!(p_final.status, ProposalStatus::Executed);
 }

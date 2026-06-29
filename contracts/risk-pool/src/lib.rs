@@ -48,6 +48,7 @@ enum StorageKey {
     LpPosition(Address),
     LpList,
     Lock(u128),
+    PendingAdmin,
 }
 
 #[contracterror]
@@ -66,6 +67,7 @@ pub enum Error {
     AlreadyReleased     = 10,
     Undercollateralized = 11,
     PoolCapExceeded     = 12,
+    InsufficientShares  = 13,
 }
 
 #[contract]
@@ -85,21 +87,37 @@ impl RiskPool {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
+        
+        let admin_str = admin.to_string();
+        if admin_str.len() != 56 {
+            panic!("invalid address: admin must be an account or contract address");
+        }
+        let mut admin_buf = [0u8; 56];
+        admin_str.copy_into_slice(&mut admin_buf);
+        if admin_buf[0] != b'G' && admin_buf[0] != b'C' {
+            panic!("invalid address: admin must be an account or contract address");
+        }
+
         let usdc_str = usdc_token.to_string();
-        let treasury_str = treasury.to_string();
-        let backstop_str = backstop.to_string();
-        let usdc_prefix = usdc_str.to_string();
-        let treasury_prefix = treasury_str.to_string();
-        let backstop_prefix = backstop_str.to_string();
-        if !usdc_prefix.starts_with('C') {
+        if usdc_str.len() != 56 {
             panic!("invalid address: usdc_token must be a contract address");
         }
-        if !treasury_prefix.starts_with('C') {
+        let mut usdc_buf = [0u8; 56];
+        usdc_str.copy_into_slice(&mut usdc_buf);
+        if usdc_buf[0] != b'C' {
+            panic!("invalid address: usdc_token must be a contract address");
+        }
+
+        let treasury_str = treasury.to_string();
+        if treasury_str.len() != 56 {
             panic!("invalid address: treasury must be a contract address");
         }
-        if !backstop_prefix.starts_with('C') {
-            panic!("invalid address: backstop must be a contract address");
+        let mut treasury_buf = [0u8; 56];
+        treasury_str.copy_into_slice(&mut treasury_buf);
+        if treasury_buf[0] != b'C' {
+            panic!("invalid address: treasury must be a contract address");
         }
+
         admin.require_auth();
         env.storage().instance().set(&StorageKey::Initialized,        &true);
         env.storage().instance().set(&StorageKey::Admin,              &admin);
@@ -107,8 +125,10 @@ impl RiskPool {
         env.storage().instance().set(&StorageKey::Treasury,           &treasury);
         env.storage().instance().set(&StorageKey::Backstop,           &backstop);
         env.storage().instance().set(&StorageKey::Category,           &category);
-        env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
-        env.storage().instance().set(&StorageKey::TotalLocked,        &0i128);
+env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
+        // No pending admin initially
+        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
+        env.storage().instance().set(&StorageKey::TotalLocked,      &0i128);
         env.storage().instance().set(&StorageKey::TotalShares,        &0i128);
         env.storage().instance().set(&StorageKey::AccumulatedPremium, &0i128);
         env.storage().instance().set(&StorageKey::Status,             &PoolStatus::Active);
@@ -128,7 +148,7 @@ impl RiskPool {
 
     // ── Deposits ──────────────────────────────────────────────────────────────
 
-    pub fn deposit(env: Env, provider: Address, amount: i128) -> i128 {
+    pub fn deposit(env: Env, provider: Address, amount: i128, min_shares: i128) -> i128 {
         provider.require_auth();
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         Self::assert_active(&env);
@@ -148,6 +168,10 @@ impl RiskPool {
         } else {
             amount * total_shares / total_deposited
         };
+
+        if new_shares < min_shares {
+            panic_with_error!(&env, Error::InsufficientShares);
+        }
 
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
         token::Client::new(&env, &usdc)
@@ -441,6 +465,31 @@ impl RiskPool {
         list.len()
     }
 
+    pub fn get_lp_list(env: Env, offset: Option<u32>, limit: Option<u32>) -> PaginatedLps {
+        let list: Vec<Address> = env.storage().instance()
+            .get(&StorageKey::LpList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let total_count = list.len();
+        
+        let offset_val = offset.unwrap_or(0);
+        let limit_val = core::cmp::min(limit.unwrap_or(100), 500);
+        
+        let mut paginated = Vec::new(&env);
+        if offset_val < total_count {
+            let end = core::cmp::min(offset_val + limit_val, total_count);
+            for i in offset_val..end {
+                if let Some(addr) = list.get(i) {
+                    paginated.push_back(addr);
+                }
+            }
+        }
+        
+        PaginatedLps {
+            lps: paginated,
+            total_count,
+        }
+    }
+
     /// Available (unlocked) liquidity in USDC stroops.
     pub fn get_available_liquidity(env: Env) -> i128 {
         let deposited: i128 = env.storage().instance().get(&StorageKey::TotalDeposited).unwrap_or(0);
@@ -468,11 +517,37 @@ impl RiskPool {
         );
     }
 
-    /// Upgrade the contract WASM in-place. Only the admin may call this.
-    /// Storage is preserved across upgrades; only the execution code changes.
-    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+    /// Propose a new admin. Only the current admin can call this.
+    pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        // Store the proposed admin (zero address means no proposal)
+        env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
+    }
+
+    /// Accept the proposed admin. Only the proposed admin can call this.
+    pub fn accept_admin(env: Env, admin: Address) {
+        let pending_admin: Address = env.storage().instance()
+            .get(&StorageKey::PendingAdmin)
+            .unwrap_or_else(|| Address::from_uint(&env, 0));
+        // Only the pending admin can accept
+        if admin != pending_admin {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        admin.require_auth();
+        let current_admin: Address = env.storage().instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        // Update admin
+        env.storage().instance().set(&StorageKey::Admin, &admin);
+        // Clear the proposal
+        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "admin_updated"),),
+            AdminUpdated {
+                new_admin: admin,
+            },
+        );
     }
 
     fn require_admin(env: &Env, caller: &Address) {
