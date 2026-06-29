@@ -31,6 +31,9 @@ const PREMIUM_BACKSTOP_BPS: i128 = 1_000;  // 10% to backstop fund
 /// cannot become infinitesimal and total_shares cannot overflow.
 const MAX_TOTAL_DEPOSITED: i128 = 1_000_000_000_000_000;
 
+/// Minimum deposit amount (1_000_000 stroops).
+const MIN_DEPOSIT: i128 = 1_000_000;
+
 /// Timelock duration for admin withdrawals: 7 days in seconds.
 const TIMELOCK_SECONDS: u64 = 7 * 24 * 60 * 60;
 
@@ -80,6 +83,7 @@ pub enum Error {
     TimelockPending     = 14,
     TimelockNotReady    = 15,
     NoPendingWithdrawal = 16,
+    DepositTooSmall     = 17,
 }
 
 #[contract]
@@ -171,6 +175,7 @@ impl RiskPool {
     pub fn deposit(env: Env, provider: Address, amount: i128, min_shares: i128) -> i128 {
         provider.require_auth();
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
+        if amount < MIN_DEPOSIT { panic_with_error!(&env, Error::DepositTooSmall); }
         Self::assert_active(&env);
 
         let total_deposited: i128 = env.storage().instance()

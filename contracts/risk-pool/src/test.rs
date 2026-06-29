@@ -68,6 +68,20 @@ fn cannot_initialize_twice() {
 // ── deposits ──────────────────────────────────────────────────────────────────
 
 #[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_deposit_too_small_panics() {
+    let (_, pool, _, _, _, lp1) = setup();
+    pool.deposit(&lp1, &999_999i128, &0i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_deposit_1_stroop_panics() {
+    let (_, pool, _, _, _, lp1) = setup();
+    pool.deposit(&lp1, &1i128, &0i128); // 1 stroop
+}
+
+#[test]
 fn first_deposit_mints_one_to_one_shares() {
     let (_, pool, _, _, _, lp1) = setup();
     let shares = pool.deposit(&lp1, &500_000_0000000i128, &0i128);
@@ -341,14 +355,12 @@ fn test_deposit_precision_loss_prevented() {
     // LP1 deposits 1000 USDC
     pool.deposit(&lp1, &1000_0000000i128, &0i128);
 
-    // LP2 deposits just 1 stroop (smallest possible unit)
-    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &1i128);
-    let shares = pool.deposit(&lp2, &1i128, &0i128);
+    // LP2 deposits the MIN_DEPOSIT (1_000_000 stroops)
+    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &1_000_000i128);
+    let shares = pool.deposit(&lp2, &1_000_000i128, &0i128);
 
-    // Because of the 1e9 precision multiplier, 1 stroop yields 1e9 shares.
-    // This prevents truncation to 0 even if the pool's deposited amount grew 
-    // significantly out of proportion to shares in the future.
-    assert_eq!(shares, 1_000_000_000i128);
+    // 1_000_000 stroops yields 1_000_000_000_000_000 shares (because 1 USDC = 1e9 shares).
+    assert_eq!(shares, 1_000_000_000_000_000i128);
     assert!(shares > 0);
 }
 
