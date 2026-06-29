@@ -7,7 +7,7 @@ use soroban_sdk::{
 };
 
 const COVERAGE: i128 = 1_000_000_000; // 100 USDC (7-decimal)
-const PREMIUM:  i128 =    50_000_000; //   5 USDC (5% rate)
+// const PREMIUM:  i128 =    50_000_000; //   5 USDC (5% rate) - now computed with duration
 
 fn setup() -> (Env, Address, Address, Address, Address) {
     let env = Env::default();
@@ -53,15 +53,17 @@ fn test_initialize_sets_admin_and_oracle() {
 }
 
 #[test]
-#[should_panic(expected = "invalid address")]
-fn test_initialize_rejects_invalid_address_formats() {
+fn test_initialize_accepts_any_address_type() {
+    // Soroban's Address type is inherently valid; no prefix validation needed.
     let env = Env::default();
     env.mock_all_auths();
-    let invalid_admin = Address::generate(&env);
+    let admin = Address::generate(&env);
     let usdc = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    let oracle = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
     let contract_id = env.register(PolicyEngine, ());
     PolicyEngineClient::new(&env, &contract_id)
-        .initialize(&invalid_admin, &usdc, &Address::generate(&env));
+        .initialize(&admin, &usdc, &oracle);
+    assert_eq!(PolicyEngineClient::new(&env, &contract_id).get_admin(), admin);
 }
 
 #[test]
@@ -133,13 +135,23 @@ fn test_buy_policy_transfers_premium() {
     StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
     let buyer_before = TokenClient::new(&env, &usdc).balance(&buyer);
 
-    client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+    let duration_days = 30u32;
+    let expected_premium = COVERAGE
+        .checked_mul(500i128) // premium_rate_bps = 500
+        .expect("overflow")
+        .checked_mul(duration_days as i128)
+        .expect("overflow")
+        .checked_div(365)
+        .expect("div by zero")
+        .checked_div(10_000)
+        .expect("div by zero");
+    client.buy_policy(&buyer, &pid, &COVERAGE, &duration_days, &symbol_short!("kis2606"));
 
     let buyer_after   = TokenClient::new(&env, &usdc).balance(&buyer);
     let contract_bal  = client.get_contract_balance();
 
-    assert_eq!(buyer_before - buyer_after, PREMIUM);
-    assert_eq!(contract_bal, PREMIUM);
+    assert_eq!(buyer_before - buyer_after, expected_premium);
+    assert_eq!(contract_bal, expected_premium);
 }
 
 #[test]
@@ -151,16 +163,27 @@ fn test_buy_policy_records_correct_fields() {
     let buyer = Address::generate(&env);
     StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
 
+    let duration_days = 30u32;
+    let expected_premium = COVERAGE
+        .checked_mul(500i128) // premium_rate_bps = 500
+        .expect("overflow")
+        .checked_mul(duration_days as i128)
+        .expect("overflow")
+        .checked_div(365)
+        .expect("div by zero")
+        .checked_div(10_000)
+        .expect("div by zero");
+
     env.ledger().with_mut(|l| l.timestamp = 1_748_736_000); // fixed timestamp
 
-    let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+    let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &duration_days, &symbol_short!("kis2606"));
     let policy    = client.get_policy(&policy_id);
 
     assert_eq!(policy.policyholder, buyer);
     assert_eq!(policy.coverage_amount, COVERAGE);
-    assert_eq!(policy.premium_paid, PREMIUM);
+    assert_eq!(policy.premium_paid, expected_premium);
     assert_eq!(policy.status, PolicyStatus::Active);
-    assert_eq!(policy.end_time, 1_748_736_000 + 30 * 86_400);
+    assert_eq!(policy.end_time, 1_748_736_000 + duration_days * 86_400);
 }
 
 #[test]
@@ -484,4 +507,83 @@ fn test_deprecated_product_key_can_be_reused() {
     });
 
     assert_eq!(client.get_active_products().len(), 1);
+    }
+
+    #[test]
+    fn test_premium_matches_formula() {
+        let (env, admin, _oracle, usdc, contract_id) = setup();
+#[test]
+fn test_premium_matches_formula() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+
+    let buyer = Address::generate(&env);
+    // 1000 USDC in stroops
+    let coverage = 10_000_000_000i128;
+    let rate_bps = 1000;
+    let duration_days = 30u32;
+    let expected_premium = coverage
+        .checked_mul(rate_bps as i128)
+        .expect("overflow")
+        .checked_mul(duration_days as i128)
+        .expect("overflow")
+        .checked_div(365)
+        .expect("div by zero")
+        .checked_div(10_000)
+        .expect("div by zero");
+    // Fund buyer with expected premium plus some extra
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &expected_premium + 1_000_000_000i128);
+
+    let buyer_before = TokenClient::new(&env, &usdc).balance(&buyer);
+
+    client.buy_policy(&buyer, &pid, &coverage, &duration_days, &symbol_short!("kis2606"));
+
+    let buyer_after = TokenClient::new(&env, &usdc).balance(&buyer);
+    let contract_bal = client.get_contract_balance();
+
+    assert_eq!(buyer_before - buyer_after, expected_premium);
+    assert_eq!(contract_bal, expected_premium);
+}
+}
+
+// ── Issue #58: atomic product ID generation ────────────────────────────────
+
+#[test]
+fn sequential_create_product_ids_are_unique_and_monotone() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+
+    let params = |n: u32| CreateProductParams {
+        name:               symbol_short!("prod"),
+        category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("key"),
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       100_000_000,
+        coverage_max:       10_000_000_000,
+        // Each call needs a distinct (category, oracle_key) pair to avoid DuplicateProductKey
+        premium_rate_bps:   500 + n,
+        max_duration_days:  365,
+    };
+
+    // Use distinct oracle_key per product to avoid DuplicateProductKey error
+    let id1 = client.create_product(&admin, &CreateProductParams {
+        oracle_key: symbol_short!("k1"), ..params(0)
+    });
+    let id2 = client.create_product(&admin, &CreateProductParams {
+        oracle_key: symbol_short!("k2"), ..params(1)
+    });
+    let id3 = client.create_product(&admin, &CreateProductParams {
+        oracle_key: symbol_short!("k3"), ..params(2)
+    });
+
+    // IDs must be unique
+    assert_ne!(id1, id2);
+    assert_ne!(id2, id3);
+    // IDs must be monotonically increasing (atomic increment property)
+    assert!(id2 > id1);
+    assert!(id3 > id2);
 }

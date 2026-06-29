@@ -17,11 +17,13 @@
 //! escrow: it holds USDC and the Claims Processor calls `token.transfer`
 //! to pay the policyholder when the oracle confirms a trigger.
 #![no_std]
+extern crate alloc;
+use alloc::string::ToString;
 
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    token, Address, Env, Symbol, Vec,
+    token, Address, BytesN, Env, Symbol, Vec,
 };
 
 pub mod types;
@@ -49,6 +51,7 @@ enum StorageKey {
     Paused,
     /// Maps (category, oracle_key) -> product_id for uniqueness constraint
     ProductKey((Symbol, Symbol)),
+    PendingAdmin,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -97,11 +100,21 @@ impl PolicyEngine {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
+        // require_auth() validates all addresses at the protocol level, so we
+        // do not need manual address format validation here.
         let admin_str = admin.to_string();
         //
         if false {
             panic!("invalid address: admin must be an account address");
+        if admin_str.len() != 56 {
+            panic!("invalid address: admin must be an account or contract address");
         }
+        let mut admin_buf = [0u8; 56];
+        admin_str.copy_into_slice(&mut admin_buf);
+        if admin_buf[0] != b'G' && admin_buf[0] != b'C' {
+            panic!("invalid address: admin must be an account or contract address");
+        }
+
         let usdc_str = usdc_token.to_string();
         let oracle_str = oracle_address.to_string();
         //
@@ -110,6 +123,22 @@ impl PolicyEngine {
             panic!("invalid address: usdc_token must be a contract address");
         }
         if false {
+        if usdc_str.len() != 56 {
+            panic!("invalid address: usdc_token must be a contract address");
+        }
+        let mut usdc_buf = [0u8; 56];
+        usdc_str.copy_into_slice(&mut usdc_buf);
+        if usdc_buf[0] != b'C' {
+            panic!("invalid address: usdc_token must be a contract address");
+        }
+
+        let oracle_str = oracle_address.to_string();
+        if oracle_str.len() != 56 {
+            panic!("invalid address: oracle_address must be a contract address");
+        }
+        let mut oracle_buf = [0u8; 56];
+        oracle_str.copy_into_slice(&mut oracle_buf);
+        if oracle_buf[0] != b'C' {
             panic!("invalid address: oracle_address must be a contract address");
         }
         
@@ -130,6 +159,8 @@ impl PolicyEngine {
         env.storage().instance().set(&StorageKey::NextProductId, &1u128);
         env.storage().instance().set(&StorageKey::NextPolicyId,  &1u128);
         env.storage().instance().set(&StorageKey::ActiveProducts, &Vec::<u128>::new(&env));
+        // No pending admin initially
+        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
 
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
@@ -274,6 +305,9 @@ impl PolicyEngine {
         oracle_key: Symbol,
     ) -> u128 {
         buyer.require_auth();
+        if env.storage().instance().get::<_, bool>(&StorageKey::Paused).unwrap_or(false) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
         let product = Self::load_product(&env, product_id);
         if product.status != ProductStatus::Active {
             panic_with_error!(&env, Error::ProductNotActive);
@@ -285,7 +319,10 @@ impl PolicyEngine {
             panic_with_error!(&env, Error::DurationTooLong);
         }
 
-        let premium = coverage_amount * product.premium_rate_bps as i128 / 10_000;
+        // Premium calculation: premium = coverage * rate * duration_days / 365 / 10_000
+         // where coverage and premium are in USDC stroops (7 decimal places),
+         // premium_rate_bps is in basis points (e.g., 500 = 5%).
+         let premium = coverage_amount * product.premium_rate_bps as i128 * duration_days as i128 / 365 / 10_000;
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
 
         // Pull premium from buyer into this contract
@@ -347,21 +384,36 @@ impl PolicyEngine {
         }
         policy.status = PolicyStatus::Cancelled;
         env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
+        Self::remove_policy_from_user(&env, &policyholder, policy_id);
 
-        // Refund premium
+        // Pro-rate the refund: only return the unearned portion of the premium.
+        // Earned = premium_paid * elapsed / total_duration; refund = premium_paid - earned.
+        let now = env.ledger().timestamp();
+        let elapsed = now.saturating_sub(policy.start_time);
+        let total_duration = policy.end_time.saturating_sub(policy.start_time);
+        let refund = if total_duration == 0 {
+            policy.premium_paid
+        } else {
+            let elapsed_capped = elapsed.min(total_duration);
+            let earned = policy.premium_paid * elapsed_capped as i128 / total_duration as i128;
+            policy.premium_paid.saturating_sub(earned)
+        };
+
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
-        token::Client::new(&env, &usdc)
-            .transfer(&env.current_contract_address(), &policyholder, &policy.premium_paid);
+        if refund > 0 {
+            token::Client::new(&env, &usdc)
+                .transfer(&env.current_contract_address(), &policyholder, &refund);
+        }
 
         env.events().publish(
             (Symbol::new(&env, "policy_cancelled"),),
             PolicyCancelled {
                 policy_id,
                 policyholder: policyholder.clone(),
-                refund_amount: policy.premium_paid,
+                refund_amount: refund,
             },
         );
-        policy.premium_paid
+        refund
     }
 
     // ── Status updates (called by Claims Processor) ──────────────────────────
@@ -377,12 +429,18 @@ impl PolicyEngine {
             PolicyStatus::Cancelled => panic_with_error!(&env, Error::PolicyNotActive),
             PolicyStatus::Active    => {}
         }
+        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+        let token_client = token::Client::new(&env, &usdc);
+        match token_client.try_transfer(&env.current_contract_address(), &policy.policyholder, &policy.coverage_amount) {
+            Ok(Ok(())) => {}
+            _ => {
+                panic_with_error!(&env, Error::InsufficientPool);
+            }
+        }
+
         policy.status = PolicyStatus::Claimed;
         env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
-
-        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
-        token::Client::new(&env, &usdc)
-            .transfer(&env.current_contract_address(), &policy.policyholder, &policy.coverage_amount);
+        Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
 
         env.events().publish(
             (Symbol::new(&env, "policy_claimed"),),
@@ -407,6 +465,7 @@ impl PolicyEngine {
         }
         policy.status = PolicyStatus::Expired;
         env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
+        Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
         env.events().publish(
             (Symbol::new(&env, "policy_expired"),),
             PolicyExpired { policy_id },
@@ -473,10 +532,43 @@ impl PolicyEngine {
         env.storage().instance().set(&StorageKey::Paused, &true);
     }
 
-    pub fn emergency_resume(env: Env, admin: Address) {
-        Self::require_admin(&env, &admin);
-        env.storage().instance().set(&StorageKey::Paused, &false);
-    }
+pub fn emergency_resume(env: Env, admin: Address) {
+         Self::require_admin(&env, &admin);
+         env.storage().instance().set(&StorageKey::Paused, &false);
+     }
+
+     /// Propose a new admin. Only the current admin can call this.
+     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
+         Self::require_admin(&env, &admin);
+         // Store the proposed admin (zero address means no proposal)
+         env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
+     }
+
+     /// Accept the proposed admin. Only the proposed admin can call this.
+     pub fn accept_admin(env: Env, admin: Address) {
+         let pending_admin: Address = env.storage().instance()
+             .get(&StorageKey::PendingAdmin)
+             .unwrap_or_else(|| Address::from_uint(&env, 0));
+         // Only the pending admin can accept
+         if admin != pending_admin {
+             panic_with_error!(&env, Error::Unauthorized);
+         }
+         admin.require_auth();
+         let current_admin: Address = env.storage().instance()
+             .get(&StorageKey::Admin)
+             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+         // Update admin
+         env.storage().instance().set(&StorageKey::Admin, &admin);
+         // Clear the proposal
+         env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
+         // Emit event
+         env.events().publish(
+             (Symbol::new(&env, "admin_updated"),),
+             AdminUpdated {
+                 new_admin: admin,
+             },
+         );
+     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
@@ -494,6 +586,24 @@ impl PolicyEngine {
         caller.require_auth();
     }
 
+    fn remove_policy_from_user(env: &Env, user: &Address, policy_id: u128) {
+        let key = StorageKey::UserPolicies(user.clone());
+        let mut user_policies: Vec<u128> = env.storage().persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut pos: Option<u32> = None;
+        for i in 0..user_policies.len() {
+            if user_policies.get_unchecked(i) == policy_id {
+                pos = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = pos {
+            user_policies.remove(i);
+            env.storage().persistent().set(&key, &user_policies);
+        }
+    }
+
     fn load_product(env: &Env, id: u128) -> InsuranceProduct {
         env.storage().persistent().get(&StorageKey::Product(id))
             .unwrap_or_else(|| panic_with_error!(env, Error::ProductNotFound))
@@ -504,18 +614,38 @@ impl PolicyEngine {
             .unwrap_or_else(|| panic_with_error!(env, Error::PolicyNotFound))
     }
 
+    /// Atomically fetch-and-increment the product ID counter.
+    /// Uses storage().update() to guarantee a single read-modify-write operation,
+    /// preventing two concurrent ledger entries from reading the same value.
     fn next_product_id(env: &Env) -> u128 {
-        let id: u128 = env.storage().instance()
-            .get(&StorageKey::NextProductId).unwrap_or(1);
-        env.storage().instance().set(&StorageKey::NextProductId, &(id + 1));
+        let mut id = 0u128;
+        env.storage().instance().update(
+            &StorageKey::NextProductId,
+            |v: Option<u128>| {
+                id = v.unwrap_or(1);
+                id + 1
+            },
+        );
         id
     }
 
     fn next_policy_id(env: &Env) -> u128 {
-        let id: u128 = env.storage().instance()
-            .get(&StorageKey::NextPolicyId).unwrap_or(1);
-        env.storage().instance().set(&StorageKey::NextPolicyId, &(id + 1));
+        let mut id = 0u128;
+        env.storage().instance().update(
+            &StorageKey::NextPolicyId,
+            |v: Option<u128>| {
+                id = v.unwrap_or(1);
+                id + 1
+            },
+        );
         id
+    }
+
+    /// Upgrade the contract WASM in-place. Only the admin may call this.
+    /// Storage is preserved across upgrades; only the execution code changes.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        Self::require_admin(&env, &admin);
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 }
 

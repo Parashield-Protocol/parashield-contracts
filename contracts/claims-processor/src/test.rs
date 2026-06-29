@@ -50,10 +50,17 @@ fn deploy() -> World {
     let claims_id = env.register(ClaimsProcessor, ());
     ClaimsProcessorClient::new(&env, &claims_id)
         .initialize(&admin, &policy_id, &oracle_id, &604_800u64);
+    // Authorize keeper on the claims processor
+    ClaimsProcessorClient::new(&env, &claims_id)
+        .add_keeper(&admin, &keeper);
 
     // 4. Wire claims processor as authorized caller on policy engine
     PolicyEngineClient::new(&env, &policy_id)
         .set_claims_processor(&admin, &claims_id);
+
+    // 4b. Register the keeper so it may settle claims
+    ClaimsProcessorClient::new(&env, &claims_id)
+        .add_keeper(&admin, &keeper);
 
     // 5. Pre-fund the policy engine with coverage capital (simulates risk pool in v1)
     //    In production the Risk Pool contract provides this capital.
@@ -248,6 +255,181 @@ fn test_manual_claim_flow() {
     assert!(claim.trigger_met);
 }
 
+// ── Keeper registry (Issue #79) ──────────────────────────────────────────────
+
+/// auto_process from an address that is not a registered keeper is rejected.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_auto_process_rejects_unregistered_keeper() {
+    let w        = deploy();
+    let pid      = create_crop_product(&w);
+    let buyer    = Address::generate(&w.env);
+    let stranger = Address::generate(&w.env);
+    let pol_id   = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    // `stranger` is not in the keeper registry → Unauthorized
+    ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .auto_process(&stranger, &pol_id);
+}
+
+/// process_claim from an unregistered address is rejected.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_process_claim_rejects_unregistered_keeper() {
+    let w        = deploy();
+    let pid      = create_crop_product(&w);
+    let buyer    = Address::generate(&w.env);
+    let stranger = Address::generate(&w.env);
+    let pol_id   = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    cp.process_claim(&stranger, &claim_id);
+}
+
+/// A revoked keeper can no longer settle claims.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_removed_keeper_cannot_process() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    cp.remove_keeper(&w.admin, &w.keeper);
+    cp.auto_process(&w.keeper, &pol_id);
+}
+
+/// Only the admin may register a keeper.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_non_admin_cannot_add_keeper() {
+    let w        = deploy();
+    let stranger = Address::generate(&w.env);
+    let new_keep = Address::generate(&w.env);
+    ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .add_keeper(&stranger, &new_keep);
+}
+
+// ── Pending queue lifecycle (Issues #76, #74) ────────────────────────────────
+
+/// auto_process makes the internal claim visible, then settlement clears it
+/// from the pending queue — the queue never accumulates settled claims.
+#[test]
+fn test_pending_queue_cleared_after_auto_process() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    assert_eq!(cp.get_pending_claims().len(), 0);
+
+    let result = cp.auto_process(&w.keeper, &pol_id);
+    assert_eq!(result, ClaimResult::Paid);
+
+    // Settled claim must not linger in the pending queue.
+    assert_eq!(cp.get_pending_claims().len(), 0, "settled claim left in queue");
+}
+
+/// submit_claim enqueues; process_claim settlement dequeues.
+#[test]
+fn test_pending_queue_cleared_after_process_claim() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 30_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    assert_eq!(cp.get_pending_claims().len(), 1);
+
+    cp.process_claim(&w.keeper, &claim_id);
+    assert_eq!(cp.get_pending_claims().len(), 0, "settled claim left in queue");
+}
+
+/// Disputing a still-pending claim removes it from the pending queue.
+#[test]
+fn test_dispute_pending_claim_dequeues() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 30_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    assert_eq!(cp.get_pending_claims().len(), 1);
+
+    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("disagree"));
+    assert_eq!(cp.get_claim(&claim_id).status, ClaimStatus::Disputed);
+    assert_eq!(cp.get_pending_claims().len(), 0, "disputed claim left in queue");
+}
+
+// ── Dispute status guard (Issue #78) ─────────────────────────────────────────
+
+/// A Paid claim cannot be flipped back to Disputed.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_cannot_dispute_paid_claim() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    cp.process_claim(&w.keeper, &claim_id);
+    assert_eq!(cp.get_claim(&claim_id).status, ClaimStatus::Paid);
+
+    // Attempting to dispute a settled/paid claim must panic.
+    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("reversal"));
+}
+
+/// A rejected claim may be disputed; re-disputing it then fails.
+#[test]
+fn test_rejected_claim_disputable_then_locked() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 72_000_000); // above threshold → rejected
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    let result = cp.process_claim(&w.keeper, &claim_id);
+    assert_eq!(result, ClaimResult::Rejected);
+
+    // First dispute on a Rejected claim succeeds.
+    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("disagree"));
+    assert_eq!(cp.get_claim(&claim_id).status, ClaimStatus::Disputed);
+}
+
+/// Re-disputing an already-Disputed claim is rejected (no dispute loop).
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_cannot_redispute_disputed_claim() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 72_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    cp.process_claim(&w.keeper, &claim_id);
+    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("disagree"));
+    // Second dispute → AlreadyProcessed
+    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("again"));
+}
+
 // ── Address validation (Issue #12) ───────────────────────────────────────────────
 
 /// Test that initialize accepts valid Stellar addresses (generated addresses are always valid)
@@ -288,4 +470,39 @@ fn test_address_validation_function_exists() {
     let mut buf = [0u8; 56];
     addr_str.copy_into_slice(&mut buf);
     assert!(buf[0] == b'G' || buf[0] == b'C', "Stellar addresses start with 'G' or 'C'");
+}
+
+// ── Keeper authorization ───────────────────────────────────────────────────────
+
+/// Non-keeper cannot call auto_process.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_non_keeper_cannot_auto_process() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    // A stranger that is not an authorized keeper tries to auto_process
+    let stranger = Address::generate(&w.env);
+    ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .auto_process(&stranger, &pol_id);
+}
+
+/// Non-keeper cannot call process_claim.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_non_keeper_cannot_process_claim() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+
+    let stranger = Address::generate(&w.env);
+    cp.process_claim(&stranger, &claim_id);
 }

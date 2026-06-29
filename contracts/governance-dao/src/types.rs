@@ -45,6 +45,8 @@ pub struct Proposal {
     pub created_at:   u64,
     /// Ledger timestamp when voting closes.
     pub vote_end:     u64,
+    /// Timelock expiration timestamp for execution.
+    pub execution_time: u64,
 }
 
 /// A single vote record stored per (proposal_id, voter) key.
@@ -72,6 +74,8 @@ pub struct DaoConfig {
     pub majority_bps:     u32,
     /// Voting period in seconds.
     pub voting_period:    u64,
+    /// Timelock period in seconds before an approved proposal can be executed.
+    pub proposal_timelock: u64,
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
@@ -127,5 +131,6 @@ pub struct DaoConfigUpdated {
     pub proposal_threshold: i128,
     pub total_supply: i128,
     pub voting_period: u64,
+    pub proposal_timelock: u64,
 }
 

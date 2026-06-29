@@ -1,4 +1,12 @@
-use soroban_sdk::{contracttype, Address, Symbol};
+use soroban_sdk::{contracttype, Address, Symbol, Vec};
+
+/// Paginated result from `get_lp_list`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaginatedLps {
+    pub lps:         Vec<Address>,
+    pub total_count: u32,
+}
 
 /// Status of a risk pool.
 #[contracttype]
@@ -40,12 +48,13 @@ pub struct CapitalLock {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolStats {
     /// Category: "crop" | "flight" | "disaster" | "defi"
-    pub category:        Symbol,
-    pub total_deposited: i128,
-    pub total_locked:    i128,
-    pub total_shares:    i128,
-    pub accumulated_premium: i128,
-    pub status:          PoolStatus,
+    pub category:             Symbol,
+    pub total_deposited:      i128,
+    pub total_locked:         i128,
+    pub total_shares:         i128,
+    pub accumulated_premium:  i128,
+    pub accumulated_backstop: i128,
+    pub status:               PoolStatus,
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
@@ -53,10 +62,13 @@ pub struct PoolStats {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Initialized {
-    pub admin: Address,
-    pub usdc_token: Address,
-    pub treasury: Address,
-    pub category: Symbol,
+    pub admin:             Address,
+    pub usdc_token:        Address,
+    pub treasury:          Address,
+    pub backstop:          Address,
+    pub category:          Symbol,
+    pub policy_engine:     Address,
+    pub claims_processor:  Address,
 }
 
 #[contracttype]
@@ -81,6 +93,21 @@ pub struct PremiumDistributed {
     pub amount: i128,
     pub lp_share: i128,
     pub treasury_share: i128,
+    pub backstop_share: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryFunded {
+    pub amount: i128,
+    pub recipient: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackstopFunded {
+    pub amount: i128,
+    pub recipient: Address,
 }
 
 #[contracttype]
@@ -114,6 +141,43 @@ pub struct PoolPaused {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolResumed {
     pub admin: Address,
+}
+
+/// A timelocked admin withdrawal request.
+/// Once created, the admin must wait TIMELOCK_SECONDS before executing.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminWithdrawalRequest {
+    pub amount: i128,
+    pub requested_at: u64,
+    pub executed: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminWithdrawalScheduled {
+    pub admin: Address,
+    pub amount: i128,
+    pub execute_after: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminWithdrawalExecuted {
+    pub admin: Address,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminWithdrawalCancelled {
+    pub admin: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminUpdated {
+    pub new_admin: Address,
 }
 
 
