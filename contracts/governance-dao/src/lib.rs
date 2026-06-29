@@ -48,6 +48,7 @@ pub enum Error {
     ProposalNotPassed    = 10,
     AlreadyExecuted      = 11,
     AlreadyCancelled     = 12,
+    TimelockNotExpired   = 13,
 }
 
 #[contract]
@@ -65,13 +66,22 @@ impl GovernanceDao {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
         let admin_str = admin.to_string();
-        let admin_prefix = admin_str.to_string();
-        if !admin_prefix.starts_with('G') {
-            panic!("invalid address: admin must be an account address");
+        if admin_str.len() != 56 {
+            panic!("invalid address: admin must be an account or contract address");
         }
+        let mut admin_buf = [0u8; 56];
+        admin_str.copy_into_slice(&mut admin_buf);
+        if admin_buf[0] != b'G' && admin_buf[0] != b'C' {
+            panic!("invalid address: admin must be an account or contract address");
+        }
+
         let gov_token_str = config.gov_token.to_string();
-        let gov_token_prefix = gov_token_str.to_string();
-        if !gov_token_prefix.starts_with('C') {
+        if gov_token_str.len() != 56 {
+            panic!("invalid address: gov_token must be a contract address");
+        }
+        let mut gov_token_buf = [0u8; 56];
+        gov_token_str.copy_into_slice(&mut gov_token_buf);
+        if gov_token_buf[0] != b'C' {
             panic!("invalid address: gov_token must be a contract address");
         }
         admin.require_auth();
@@ -124,6 +134,7 @@ impl GovernanceDao {
             votes_abstain: 0,
             created_at:    now,
             vote_end:      now + config.voting_period,
+            execution_time: 0,
         };
 
         env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
@@ -218,11 +229,12 @@ impl GovernanceDao {
             } else {
                 0
             };
-            proposal.status = if for_bps as u32 >= config.majority_bps {
-                ProposalStatus::Passed
+            if for_bps as u32 >= config.majority_bps {
+                proposal.status = ProposalStatus::Passed;
+                proposal.execution_time = env.ledger().timestamp() + config.proposal_timelock;
             } else {
-                ProposalStatus::Failed
-            };
+                proposal.status = ProposalStatus::Failed;
+            }
         }
 
         env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
@@ -249,6 +261,9 @@ impl GovernanceDao {
         }
         if proposal.status != ProposalStatus::Passed {
             panic_with_error!(&env, Error::ProposalNotPassed);
+        }
+        if env.ledger().timestamp() < proposal.execution_time {
+            panic_with_error!(&env, Error::TimelockNotExpired);
         }
 
         // Signal execution — actual cross-contract call is the caller's responsibility
@@ -322,6 +337,7 @@ impl GovernanceDao {
                 proposal_threshold: config.proposal_threshold,
                 total_supply: config.total_supply,
                 voting_period: config.voting_period,
+                proposal_timelock: config.proposal_timelock,
             },
         );
     }

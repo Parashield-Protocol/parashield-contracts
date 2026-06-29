@@ -115,18 +115,6 @@ fn withdraw_uses_available_liquidity_after_locks() {
 }
 
 #[test]
-fn withdraw_uses_available_liquidity_after_locks() {
-    let (_, pool, _, admin, _, lp1) = setup();
-    let amount = 1000_0000000i128;
-    let shares = pool.deposit(&lp1, &amount);
-
-    pool.lock_for_policy(&admin, &1u128, &300_0000000i128);
-    let returned = pool.withdraw(&lp1, &shares);
-
-    assert_eq!(returned, 700_0000000i128);
-}
-
-#[test]
 fn withdraw_partial_position_decrements_shares() {
     let (_, pool, _, _, _, lp1) = setup();
     let amount = 1000_0000000i128;
@@ -341,4 +329,24 @@ fn test_deposit_precision_loss_prevented() {
     // significantly out of proportion to shares in the future.
     assert_eq!(shares, 1_000_000_000i128);
     assert!(shares > 0);
+}
+
+#[test]
+fn test_get_lp_list_pagination() {
+    let (env, pool, usdc_id, _admin, _, lp1) = setup();
+    env.budget().reset_unlimited();
+    
+    let usdc_client = token::StellarAssetClient::new(&env, &usdc_id);
+    for _ in 0..200 {
+        let lp = Address::generate(&env);
+        usdc_client.mint(&lp, &10_000_000i128);
+        pool.deposit(&lp, &10_000_000i128);
+    }
+    
+    assert_eq!(pool.get_lp_count(), 200);
+    
+    // query offset=100, limit=50 (proves pagination works beyond default limit)
+    let paginated = pool.get_lp_list(&Some(100), &Some(50));
+    assert_eq!(paginated.total_count, 200);
+    assert_eq!(paginated.lps.len(), 50);
 }

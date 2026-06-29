@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Symbol};
+use soroban_sdk::{contracttype, Address, Symbol, Vec};
 
 /// Status of a risk pool.
 #[contracttype]
@@ -114,6 +114,13 @@ pub struct PoolPaused {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolResumed {
     pub admin: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaginatedLps {
+    pub lps: Vec<Address>,
+    pub total_count: u32,
 }
 
 
