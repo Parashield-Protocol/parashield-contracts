@@ -263,6 +263,9 @@ impl PolicyEngine {
         oracle_key: Symbol,
     ) -> u128 {
         buyer.require_auth();
+        if env.storage().instance().get::<_, bool>(&StorageKey::Paused).unwrap_or(false) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
         let product = Self::load_product(&env, product_id);
         if product.status != ProductStatus::Active {
             panic_with_error!(&env, Error::ProductNotActive);
