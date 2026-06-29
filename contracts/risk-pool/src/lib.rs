@@ -44,6 +44,7 @@ enum StorageKey {
     LpPosition(Address),
     LpList,
     Lock(u128),
+    PendingAdmin,
 }
 
 #[contracterror]
@@ -62,6 +63,7 @@ pub enum Error {
     AlreadyReleased     = 10,
     Undercollateralized = 11,
     PoolCapExceeded     = 12,
+    InsufficientShares  = 13,
 }
 
 #[contract]
@@ -117,8 +119,10 @@ impl RiskPool {
         env.storage().instance().set(&StorageKey::UsdcToken,          &usdc_token);
         env.storage().instance().set(&StorageKey::Treasury,           &treasury);
         env.storage().instance().set(&StorageKey::Category,           &category);
-        env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
-        env.storage().instance().set(&StorageKey::TotalLocked,        &0i128);
+env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
+        // No pending admin initially
+        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
+        env.storage().instance().set(&StorageKey::TotalLocked,      &0i128);
         env.storage().instance().set(&StorageKey::TotalShares,        &0i128);
         env.storage().instance().set(&StorageKey::AccumulatedPremium, &0i128);
         env.storage().instance().set(&StorageKey::Status,             &PoolStatus::Active);
@@ -137,7 +141,7 @@ impl RiskPool {
 
     // ── Deposits ──────────────────────────────────────────────────────────────
 
-    pub fn deposit(env: Env, provider: Address, amount: i128) -> i128 {
+    pub fn deposit(env: Env, provider: Address, amount: i128, min_shares: i128) -> i128 {
         provider.require_auth();
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         Self::assert_active(&env);
@@ -157,6 +161,10 @@ impl RiskPool {
         } else {
             amount * total_shares / total_deposited
         };
+
+        if new_shares < min_shares {
+            panic_with_error!(&env, Error::InsufficientShares);
+        }
 
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
         token::Client::new(&env, &usdc)
@@ -457,6 +465,39 @@ impl RiskPool {
         env.events().publish(
             (Symbol::new(&env, "pool_resumed"),),
             PoolResumed { admin: admin.clone() },
+        );
+    }
+
+    /// Propose a new admin. Only the current admin can call this.
+    pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
+        Self::require_admin(&env, &admin);
+        // Store the proposed admin (zero address means no proposal)
+        env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
+    }
+
+    /// Accept the proposed admin. Only the proposed admin can call this.
+    pub fn accept_admin(env: Env, admin: Address) {
+        let pending_admin: Address = env.storage().instance()
+            .get(&StorageKey::PendingAdmin)
+            .unwrap_or_else(|| Address::from_uint(&env, 0));
+        // Only the pending admin can accept
+        if admin != pending_admin {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        admin.require_auth();
+        let current_admin: Address = env.storage().instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        // Update admin
+        env.storage().instance().set(&StorageKey::Admin, &admin);
+        // Clear the proposal
+        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "admin_updated"),),
+            AdminUpdated {
+                new_admin: admin,
+            },
         );
     }
 

@@ -126,3 +126,9 @@ pub struct OracleDataSubmitted {
     pub timestamp: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminUpdated {
+    pub new_admin: Address,
+}
+

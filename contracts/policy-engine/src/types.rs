@@ -180,3 +180,9 @@ pub struct PolicyExpired {
     pub policy_id: u128,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminUpdated {
+    pub new_admin: Address,
+}
+

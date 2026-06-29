@@ -118,9 +118,8 @@ pub struct PoolResumed {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PaginatedLps {
-    pub lps: Vec<Address>,
-    pub total_count: u32,
+pub struct AdminUpdated {
+    pub new_admin: Address,
 }
 
 
