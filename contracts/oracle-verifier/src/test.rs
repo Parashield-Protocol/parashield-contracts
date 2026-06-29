@@ -6,10 +6,13 @@ use soroban_sdk::{symbol_short, testutils::{Address as _, Ledger}, Env, Symbol};
 fn setup() -> (Env, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 2_000_000_000);
     let admin  = Address::generate(&env);
     let _oracle = Address::generate(&env);
     let contract_id = env.register(OracleVerifier, ());
-    OracleVerifierClient::new(&env, &contract_id).initialize(&admin);
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    client.initialize(&admin);
+    client.set_max_data_age(&admin, &3_000_000_000);
     (env, admin, contract_id)
 }
 
@@ -143,10 +146,37 @@ fn test_non_admin_cannot_update_oracle_weight() {
 fn test_remove_oracle_deactivates() {
     let (env, admin, contract_id) = setup();
     let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle1 = Address::generate(&env);
+    let oracle2 = Address::generate(&env);
+    
+    client.add_oracle(&admin, &oracle1, &weather(), &80u32);
+    client.add_oracle(&admin, &oracle2, &weather(), &80u32);
+    
+    client.submit_data(&oracle1, &weather(), &kisumu_key(), &10_000_000i128, &90u32, &1748736000u64);
+    client.submit_data(&oracle2, &weather(), &kisumu_key(), &50_000_000i128, &90u32, &1748736000u64);
+    
+    let agg_before = client.get_aggregated(&weather(), &kisumu_key());
+    assert_eq!(agg_before.oracle_count, 2);
+    assert_eq!(agg_before.median_value, 30_000_000i128); // (10M + 50M) / 2
+    
+    // Remove oracle1
+    client.remove_oracle(&admin, &oracle1, &weather());
+    
+    // Aggregation should now only include oracle2
+    let agg_after = client.get_aggregated(&weather(), &kisumu_key());
+    assert_eq!(agg_after.oracle_count, 1);
+    assert_eq!(agg_after.median_value, 50_000_000i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_removed_oracle_cannot_submit() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
     let oracle = Address::generate(&env);
     client.add_oracle(&admin, &oracle, &weather(), &80u32);
     client.remove_oracle(&admin, &oracle, &weather());
-    // After removal, submit_data should panic (unauthorized)
+    client.submit_data(&oracle, &weather(), &kisumu_key(), &10_000_000i128, &90u32, &1748736000u64);
 }
 
 #[test]
@@ -488,7 +518,8 @@ fn test_get_and_set_max_data_age() {
     let (env, admin, contract_id) = setup();
     let client = OracleVerifierClient::new(&env, &contract_id);
 
-    // Default max data age (7 days)
+    // Default in our setup is 3_000_000_000, let's reset to default for this test
+    client.set_max_data_age(&admin, &604_800);
     assert_eq!(client.get_max_data_age(), 604_800);
 
     // Admin updates it (1 day)
@@ -501,6 +532,7 @@ fn test_get_and_set_max_data_age() {
 fn test_verify_trigger_rejects_stale_data() {
     let (env, admin, contract_id) = setup();
     let client = OracleVerifierClient::new(&env, &contract_id);
+    client.set_max_data_age(&admin, &604_800); // Reset back to default max age
     let oracle = Address::generate(&env);
     client.add_oracle(&admin, &oracle, &weather(), &100u32);
 
