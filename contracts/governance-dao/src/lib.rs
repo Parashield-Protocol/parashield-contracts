@@ -13,10 +13,12 @@
 //!
 //! v2 — full implementation; DAO is now deployable and testable.
 #![no_std]
+extern crate alloc;
+use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    token, Address, Bytes, Env, Symbol,
+    token, Address, Bytes, BytesN, Env, Symbol,
 };
 
 pub mod types;
@@ -340,6 +342,13 @@ impl GovernanceDao {
                 proposal_timelock: config.proposal_timelock,
             },
         );
+    }
+
+    /// Upgrade the contract WASM in-place. Only the admin may call this.
+    /// Storage is preserved across upgrades; only the execution code changes.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        Self::require_admin(&env, &admin);
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 
     fn require_admin(env: &Env, caller: &Address) {

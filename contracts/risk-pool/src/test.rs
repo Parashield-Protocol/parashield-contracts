@@ -20,7 +20,8 @@ fn setup() -> (Env, RiskPoolClient<'static>, Address, Address, Address, Address)
     let treasury = Address::generate(&env);
     let lp1      = Address::generate(&env);
 
-    let usdc_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let usdc_id    = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let backstop_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
     let pool_id = env.register(RiskPool, ());
     let pool    = RiskPoolClient::new(&env, &pool_id);
 
@@ -31,6 +32,7 @@ fn setup() -> (Env, RiskPoolClient<'static>, Address, Address, Address, Address)
         &admin,
         &usdc_id,
         &treasury,
+        &backstop_id,
         &Symbol::new(&env, "crop"),
     );
 
@@ -53,7 +55,8 @@ fn initialize_sets_state() {
 #[should_panic(expected = "Error(Contract, #1)")]
 fn cannot_initialize_twice() {
     let (env, pool, usdc, admin, treasury, _) = setup();
-    pool.initialize(&admin, &usdc, &treasury, &Symbol::new(&env, "crop"));
+    let backstop = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    pool.initialize(&admin, &usdc, &treasury, &backstop, &Symbol::new(&env, "crop"));
 }
 
 // ── deposits ──────────────────────────────────────────────────────────────────

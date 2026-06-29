@@ -16,10 +16,12 @@
 //! Once a policy is Claimed or Expired, further process/auto_process calls
 //! return the appropriate ClaimResult without writing again.
 #![no_std]
+extern crate alloc;
+use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    Address, Env, Vec, Symbol,
+    Address, BytesN, Env, Vec, Symbol,
 };
 
 pub mod types;
@@ -362,6 +364,16 @@ impl ClaimsProcessor {
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
+    }
+
+    /// Upgrade the contract WASM in-place. Only the admin may call this.
+    /// Storage is preserved across upgrades; only the execution code changes.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        let stored_admin: Address = env.storage().instance().get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        if admin != stored_admin { panic_with_error!(&env, Error::Unauthorized); }
+        admin.require_auth();
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────

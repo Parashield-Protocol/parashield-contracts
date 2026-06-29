@@ -17,11 +17,13 @@
 //! escrow: it holds USDC and the Claims Processor calls `token.transfer`
 //! to pay the policyholder when the oracle confirms a trigger.
 #![no_std]
+extern crate alloc;
+use alloc::string::ToString;
 
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    token, Address, Env, Symbol, Vec,
+    token, Address, BytesN, Env, Symbol, Vec,
 };
 
 pub mod types;
@@ -572,18 +574,38 @@ pub fn emergency_resume(env: Env, admin: Address) {
             .unwrap_or_else(|| panic_with_error!(env, Error::PolicyNotFound))
     }
 
+    /// Atomically fetch-and-increment the product ID counter.
+    /// Uses storage().update() to guarantee a single read-modify-write operation,
+    /// preventing two concurrent ledger entries from reading the same value.
     fn next_product_id(env: &Env) -> u128 {
-        let id: u128 = env.storage().instance()
-            .get(&StorageKey::NextProductId).unwrap_or(1);
-        env.storage().instance().set(&StorageKey::NextProductId, &(id + 1));
+        let mut id = 0u128;
+        env.storage().instance().update(
+            &StorageKey::NextProductId,
+            |v: Option<u128>| {
+                id = v.unwrap_or(1);
+                id + 1
+            },
+        );
         id
     }
 
     fn next_policy_id(env: &Env) -> u128 {
-        let id: u128 = env.storage().instance()
-            .get(&StorageKey::NextPolicyId).unwrap_or(1);
-        env.storage().instance().set(&StorageKey::NextPolicyId, &(id + 1));
+        let mut id = 0u128;
+        env.storage().instance().update(
+            &StorageKey::NextPolicyId,
+            |v: Option<u128>| {
+                id = v.unwrap_or(1);
+                id + 1
+            },
+        );
         id
+    }
+
+    /// Upgrade the contract WASM in-place. Only the admin may call this.
+    /// Storage is preserved across upgrades; only the execution code changes.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        Self::require_admin(&env, &admin);
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 }
 
