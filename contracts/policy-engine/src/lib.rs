@@ -7,7 +7,7 @@
 //! 1. Admin calls `create_product` to define a new insurance product.
 //! 2. User calls `buy_policy` — transfers premium to this contract,
 //!    and the contract locks coverage USDC from its pool balance.
-//! 3. The Claims Processor calls `mark_claimed` / `mark_expired` to update
+//! 3. The Claims Processor calls `pay_claim` / `expire_policy` to update
 //!    policy status after processing. It also performs the USDC transfer.
 //!
 //! Architecture note on Claimable Balances
@@ -141,7 +141,7 @@ impl PolicyEngine {
         env.storage().instance().set(&StorageKey::NextPolicyId,  &1u128);
         env.storage().instance().set(&StorageKey::ActiveProducts, &Vec::<u128>::new(&env));
         // No pending admin initially
-        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
+        env.storage().instance().remove(&StorageKey::PendingAdmin);
 
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
@@ -525,7 +525,7 @@ pub fn emergency_resume(env: Env, admin: Address) {
      /// Propose a new admin. Only the current admin can call this.
      pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
          Self::require_admin(&env, &admin);
-         // Store the proposed admin (zero address means no proposal)
+         // Store the proposed admin
          env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
      }
 
@@ -533,7 +533,7 @@ pub fn emergency_resume(env: Env, admin: Address) {
      pub fn accept_admin(env: Env, admin: Address) {
          let pending_admin: Address = env.storage().instance()
              .get(&StorageKey::PendingAdmin)
-             .unwrap_or_else(|| Address::from_uint(&env, 0));
+             .unwrap_or_else(|| panic_with_error!(&env, Error::Unauthorized));
          // Only the pending admin can accept
          if admin != pending_admin {
              panic_with_error!(&env, Error::Unauthorized);
@@ -545,7 +545,7 @@ pub fn emergency_resume(env: Env, admin: Address) {
          // Update admin
          env.storage().instance().set(&StorageKey::Admin, &admin);
          // Clear the proposal
-         env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
+         env.storage().instance().remove(&StorageKey::PendingAdmin);
          // Emit event
          env.events().publish(
              (Symbol::new(&env, "admin_updated"),),
