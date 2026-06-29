@@ -99,6 +99,8 @@ impl PolicyEngine {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
+        // require_auth() validates all addresses at the protocol level, so we
+        // do not need manual address format validation here.
         let admin_str = admin.to_string();
         if admin_str.len() != 56 {
             panic!("invalid address: admin must be an account or contract address");

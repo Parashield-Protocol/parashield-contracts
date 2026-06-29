@@ -50,6 +50,9 @@ fn deploy() -> World {
     let claims_id = env.register(ClaimsProcessor, ());
     ClaimsProcessorClient::new(&env, &claims_id)
         .initialize(&admin, &policy_id, &oracle_id, &604_800u64);
+    // Authorize keeper on the claims processor
+    ClaimsProcessorClient::new(&env, &claims_id)
+        .add_keeper(&admin, &keeper);
 
     // 4. Wire claims processor as authorized caller on policy engine
     PolicyEngineClient::new(&env, &policy_id)
@@ -467,4 +470,39 @@ fn test_address_validation_function_exists() {
     let mut buf = [0u8; 56];
     addr_str.copy_into_slice(&mut buf);
     assert!(buf[0] == b'G' || buf[0] == b'C', "Stellar addresses start with 'G' or 'C'");
+}
+
+// ── Keeper authorization ───────────────────────────────────────────────────────
+
+/// Non-keeper cannot call auto_process.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_non_keeper_cannot_auto_process() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    // A stranger that is not an authorized keeper tries to auto_process
+    let stranger = Address::generate(&w.env);
+    ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .auto_process(&stranger, &pol_id);
+}
+
+/// Non-keeper cannot call process_claim.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_non_keeper_cannot_process_claim() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+
+    let stranger = Address::generate(&w.env);
+    cp.process_claim(&stranger, &claim_id);
 }

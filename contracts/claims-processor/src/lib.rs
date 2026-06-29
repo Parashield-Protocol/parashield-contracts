@@ -60,6 +60,7 @@ enum StorageKey {
     PolicyClaim(u128),   // policy_id → claim_id (one claim per policy)
     NextClaimId,
     PendingClaims,       // Vec<u128>
+    Keepers,             // Vec<Address>, authorized keepers / operators
     Keeper(Address),     // keeper whitelist: address → bool
 }
 
@@ -129,8 +130,7 @@ impl ClaimsProcessor {
             panic!("invalid address: oracle_verifier must be a contract address");
         }
         admin.require_auth();
-        
-        // Validate admin address format
+
         Self::validate_stellar_address(&env, &admin);
         Self::validate_stellar_address(&env, &policy_engine);
         Self::validate_stellar_address(&env, &oracle_verifier);
@@ -246,6 +246,7 @@ impl ClaimsProcessor {
 
     /// Process an existing pending claim. Reads oracle data and pays out or rejects.
     pub fn process_claim(env: Env, keeper: Address, claim_id: u128) -> ClaimResult {
+        keeper.require_auth();
         Self::require_keeper(&env, &keeper);
         let mut claim: Claim = env.storage().persistent()
             .get(&StorageKey::Claim(claim_id))
@@ -261,6 +262,7 @@ impl ClaimsProcessor {
     /// This is the primary flow for parametric insurance.
     /// Returns AlreadyClaimed / Expired idempotently if policy is already settled.
     pub fn auto_process(env: Env, keeper: Address, policy_id: u128) -> ClaimResult {
+        keeper.require_auth();
         Self::require_keeper(&env, &keeper);
 
         // ─── IDEMPOTENCY GUARD ───
@@ -338,6 +340,7 @@ impl ClaimsProcessor {
     /// Returns a Vec of (claim_id, result) pairs for the processed claims.
     /// Skips any claim that is not in Pending status (idempotent).
     pub fn batch_auto_process(env: Env, caller: Address, limit: u32) -> Vec<(u128, ClaimResult)> {
+        caller.require_auth();
         Self::require_keeper(&env, &caller);
         let pending: Vec<u128> = env.storage().instance()
             .get(&StorageKey::PendingClaims)
@@ -413,6 +416,56 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
     }
 
+    // ── Keeper management ─────────────────────────────────────────────────────
+
+    pub fn add_keeper(env: Env, admin: Address, keeper: Address) {
+        Self::require_admin(&env, &admin);
+        let mut keepers: Vec<Address> = env.storage().instance()
+            .get(&StorageKey::Keepers)
+            .unwrap_or_else(|| Vec::new(&env));
+        // Avoid duplicates
+        for i in 0..keepers.len() {
+            if keepers.get_unchecked(i) == keeper {
+                return;
+            }
+        }
+        keepers.push_back(keeper.clone());
+        env.storage().instance().set(&StorageKey::Keepers, &keepers);
+    }
+
+    pub fn remove_keeper(env: Env, admin: Address, keeper: Address) {
+        Self::require_admin(&env, &admin);
+        let keepers: Vec<Address> = env.storage().instance()
+            .get(&StorageKey::Keepers)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut new_list: Vec<Address> = Vec::new(&env);
+        for i in 0..keepers.len() {
+            let k = keepers.get_unchecked(i);
+            if k != keeper {
+                new_list.push_back(k.clone());
+            }
+        }
+        env.storage().instance().set(&StorageKey::Keepers, &new_list);
+    }
+
+    fn require_keeper(env: &Env, caller: &Address) {
+        // Auth is already checked by the calling function (process_claim / auto_process / batch_auto_process)
+        let keepers: Vec<Address> = env.storage().instance()
+            .get(&StorageKey::Keepers)
+            .unwrap_or_else(|| Vec::new(&env));
+        for i in 0..keepers.len() {
+            if keepers.get_unchecked(i) == *caller {
+                return;
+            }
+        }
+        panic_with_error!(env, Error::Unauthorized);
+    }
+
+    fn require_admin(env: &Env, caller: &Address) {
+        let admin: Address = env.storage().instance().get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        if *caller != admin { panic_with_error!(env, Error::Unauthorized); }
+        caller.require_auth();
     /// Upgrade the contract WASM in-place. Only the admin may call this.
     /// Storage is preserved across upgrades; only the execution code changes.
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {

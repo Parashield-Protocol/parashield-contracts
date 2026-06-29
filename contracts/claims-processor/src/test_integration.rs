@@ -50,6 +50,9 @@ fn full_setup() -> TestEnv {
         .initialize(&admin, &usdc_id, &oracle_id);
     ClaimsProcessorClient::new(&env, &claims_id)
         .initialize(&admin, &policy_id, &oracle_id, &604_800u64);
+    // Authorize admin as a keeper for tests
+    ClaimsProcessorClient::new(&env, &claims_id)
+        .add_keeper(&admin, &admin);
     PolicyEngineClient::new(&env, &policy_id)
         .set_claims_processor(&admin, &claims_id);
     // The integration tests drive settlement through the admin address.
