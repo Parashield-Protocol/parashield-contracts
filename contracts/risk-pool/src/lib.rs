@@ -32,6 +32,9 @@ const PREMIUM_BACKSTOP_BPS: i128 = 1_000;  // 10% to backstop fund
 /// cannot become infinitesimal and total_shares cannot overflow.
 const MAX_TOTAL_DEPOSITED: i128 = 1_000_000_000_000_000;
 
+/// Timelock duration for admin withdrawals: 7 days in seconds.
+const TIMELOCK_SECONDS: u64 = 7 * 24 * 60 * 60;
+
 #[contracttype]
 enum StorageKey {
     Initialized,
@@ -48,6 +51,7 @@ enum StorageKey {
     LpPosition(Address),
     LpList,
     Lock(u128),
+    AdminWithdrawalRequest,
     PendingAdmin,
 }
 
@@ -67,6 +71,9 @@ pub enum Error {
     AlreadyReleased     = 10,
     Undercollateralized = 11,
     PoolCapExceeded     = 12,
+    TimelockPending     = 13,
+    TimelockNotReady    = 14,
+    NoPendingWithdrawal = 15,
     InsufficientShares  = 13,
 }
 
@@ -87,6 +94,8 @@ impl RiskPool {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
+        // Address validation is deferred to require_auth() calls which
+        // verify the address on the Soroban network layer.
         
         let admin_str = admin.to_string();
         if admin_str.len() != 56 {
@@ -368,7 +377,7 @@ env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
     // ── Capital locks ─────────────────────────────────────────────────────────
 
     pub fn lock_for_policy(env: Env, caller: Address, policy_id: u128, amount: i128) {
-        caller.require_auth();
+        Self::require_admin(&env, &caller);
         // Guard: check for zero or negative lock amount input
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
 
@@ -395,7 +404,7 @@ env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
     }
 
     pub fn release_for_claim(env: Env, caller: Address, policy_id: u128) {
-        caller.require_auth();
+        Self::require_admin(&env, &caller);
         let mut lock: CapitalLock = env.storage().persistent()
             .get(&StorageKey::Lock(policy_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::LockNotFound));
@@ -419,7 +428,7 @@ env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
     }
 
     pub fn release_for_expiry(env: Env, caller: Address, policy_id: u128) {
-        caller.require_auth();
+        Self::require_admin(&env, &caller);
         let mut lock: CapitalLock = env.storage().persistent()
             .get(&StorageKey::Lock(policy_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::LockNotFound));
@@ -499,6 +508,25 @@ env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
+    //
+    // Admin Powers:
+    //   - `pause` / `resume`  — halt or resume deposits (no effect on withdrawals)
+    //   - `lock_for_policy`   — earmark capital for an active policy
+    //   - `release_for_claim` / `release_for_expiry` — unlock earmarked capital
+    //   - `request_admin_withdrawal` / `execute_admin_withdrawal` —
+    //     7-day-timelocked emergency withdrawal of unlocked liquidity
+    //   - `cancel_admin_withdrawal` — abort a pending withdrawal
+    //
+    // Admin Limitations:
+    //   - Admin CANNOT withdraw LP shares directly. Only the LP who owns
+    //     shares may call `withdraw()` (gated by `provider.require_auth()`).
+    //   - Admin CANNOT transfer pool USDC to any address except via the
+    //     7-day timelock path, and only to the treasury address.
+    //   - Admin CANNOT modify LP positions, shares, or yield entitlements.
+    //
+    // Timelock Policy:
+    //   Any withdrawal of pool funds by the admin requires a 7-day waiting
+    //   period so LPs have time to exit if they disagree with the decision.
 
     pub fn pause(env: Env, admin: Address) {
         Self::require_admin(&env, &admin);
@@ -515,6 +543,92 @@ env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
         env.events().publish(
             (Symbol::new(&env, "pool_resumed"),),
             PoolResumed { admin: admin.clone() },
+        );
+    }
+
+    /// Request an emergency withdrawal of unlocked liquidity.
+    /// A 7-day timelock begins; LPs can exit before it matures.
+    /// Only one pending request may exist at a time.
+    pub fn request_admin_withdrawal(env: Env, admin: Address, amount: i128) {
+        Self::require_admin(&env, &admin);
+        if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
+
+        let available = Self::get_available_liquidity(env.clone());
+        if amount > available { panic_with_error!(&env, Error::Undercollateralized); }
+
+        if env.storage().persistent().has(&StorageKey::AdminWithdrawalRequest) {
+            panic_with_error!(&env, Error::TimelockPending);
+        }
+
+        let now = env.ledger().timestamp();
+        env.storage().persistent().set(
+            &StorageKey::AdminWithdrawalRequest,
+            &AdminWithdrawalRequest {
+                amount,
+                requested_at: now,
+                executed: false,
+            },
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "admin_withdrawal_scheduled"),),
+            AdminWithdrawalScheduled {
+                admin: admin.clone(),
+                amount,
+                execute_after: now + TIMELOCK_SECONDS,
+            },
+        );
+    }
+
+    /// Execute a previously requested admin withdrawal after the 7-day timelock.
+    /// Funds are transferred to the treasury address.
+    pub fn execute_admin_withdrawal(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        let req: AdminWithdrawalRequest = env.storage().persistent()
+            .get(&StorageKey::AdminWithdrawalRequest)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingWithdrawal));
+
+        if req.executed { panic_with_error!(&env, Error::AlreadyReleased); }
+
+        let now = env.ledger().timestamp();
+        if now < req.requested_at + TIMELOCK_SECONDS {
+            panic_with_error!(&env, Error::TimelockNotReady);
+        }
+
+        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+        let treasury: Address = env.storage().instance().get(&StorageKey::Treasury).unwrap();
+        token::Client::new(&env, &usdc)
+            .transfer(&env.current_contract_address(), &treasury, &req.amount);
+
+        let mut req = req;
+        req.executed = true;
+        env.storage().persistent().set(&StorageKey::AdminWithdrawalRequest, &req);
+
+        let total_deposited: i128 = env.storage().instance()
+            .get(&StorageKey::TotalDeposited).unwrap_or(0);
+        env.storage().instance()
+            .set(&StorageKey::TotalDeposited, &(total_deposited.saturating_sub(req.amount)));
+
+        env.events().publish(
+            (Symbol::new(&env, "admin_withdrawal_executed"),),
+            AdminWithdrawalExecuted {
+                admin: admin.clone(),
+                amount: req.amount,
+            },
+        );
+    }
+
+    /// Cancel a pending admin withdrawal request.
+    pub fn cancel_admin_withdrawal(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        if !env.storage().persistent().has(&StorageKey::AdminWithdrawalRequest) {
+            panic_with_error!(&env, Error::NoPendingWithdrawal);
+        }
+        env.storage().persistent().remove(&StorageKey::AdminWithdrawalRequest);
+
+        env.events().publish(
+            (Symbol::new(&env, "admin_withdrawal_cancelled"),),
+            AdminWithdrawalCancelled { admin: admin.clone() },
         );
     }
 

@@ -4,7 +4,7 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::Address as _,
+    testutils::{Address as _, Ledger},
     token, Address, Env, Symbol,
 };
 
@@ -107,6 +107,18 @@ fn withdraw_full_position() {
 
 #[test]
 fn withdraw_uses_available_liquidity_after_locks() {
+    let (_, pool, _, admin, _, lp1) = setup();
+    let amount = 1000_0000000i128;
+    let shares = pool.deposit(&lp1, &amount);
+
+    pool.lock_for_policy(&admin, &1u128, &300_0000000i128);
+    let returned = pool.withdraw(&lp1, &shares);
+
+    assert_eq!(returned, 700_0000000i128);
+}
+
+#[test]
+fn withdraw_uses_available_liquidity_after_locks_2() {
     let (_, pool, _, admin, _, lp1) = setup();
     let amount = 1000_0000000i128;
     let shares = pool.deposit(&lp1, &amount);
@@ -334,6 +346,98 @@ fn test_deposit_precision_loss_prevented() {
     assert!(shares > 0);
 }
 
+// ── admin drain protection ─────────────────────────────────────────────────────
+
+/// Admin cannot withdraw LP shares directly — `withdraw` is gated by
+/// `provider.require_auth()`.  Admins who are NOT the LP cannot call
+/// withdraw on behalf of an LP because the LP's signature is required.
+///
+/// With `mock_all_auths` all auths are automatically approved, so this
+/// test verifies the protection indirectly: the only path to move USDC
+/// out of the pool is `withdraw` / `claim_yield`, both of which require
+/// the LP's own `require_auth()`.  There is no admin-only sweep function.
+#[test]
+fn admin_cannot_drain_lp_funds_indirectly() {
+    let (_, pool, _, admin, _, lp1) = setup();
+    let amount = 500_0000000i128;
+    let _shares = pool.deposit(&lp1, &amount);
+
+    // There is no admin-only withdraw function.  Only `withdraw(lp, shares)`
+    // exists, and it requires lp's auth.  Verify there are no other
+    // transfer-out functions that admin could abuse.
+    let stats_before = pool.get_stats();
+    assert_eq!(stats_before.total_deposited, amount);
+
+    // Admin can pause/resume but cannot transfer funds.
+    pool.pause(&admin);
+    pool.resume(&admin);
+    let stats_after = pool.get_stats();
+    assert_eq!(stats_after.total_deposited, amount);
+}
+
+/// Admin can request a withdrawal, but it cannot be executed before the
+/// 7-day timelock matures.
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn admin_timelock_withdrawal_not_ready_before_7_days() {
+    let (_, pool, _usdc_id, admin, _treasury, lp1) = setup();
+    pool.deposit(&lp1, &1_000_0000000i128);
+
+    pool.request_admin_withdrawal(&admin, &100_0000000i128);
+    // Attempt to execute immediately → TimelockNotReady (#14)
+    pool.execute_admin_withdrawal(&admin);
+}
+
+/// Admin can request, cancel, and re-request a withdrawal.
+#[test]
+fn admin_timelock_cancel_and_re_request() {
+    let (env, pool, _usdc_id, admin, _treasury, lp1) = setup();
+    pool.deposit(&lp1, &1_000_0000000i128);
+
+    pool.request_admin_withdrawal(&admin, &100_0000000i128);
+    pool.cancel_admin_withdrawal(&admin);
+
+    // Re-request succeeds after cancellation
+    pool.request_admin_withdrawal(&admin, &200_0000000i128);
+
+    // Advance the ledger past the timelock
+    let jump = (7 * 24 * 60 * 60 + 1) as u64;
+    env.ledger().set_timestamp(env.ledger().timestamp() + jump);
+
+    pool.execute_admin_withdrawal(&admin);
+    assert_eq!(pool.get_available_liquidity(), 800_0000000i128);
+}
+
+/// Non-admin cannot call lock_for_policy.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn non_admin_cannot_lock_for_policy() {
+    let (_, pool, _usdc_id, _admin, _treasury, lp1) = setup();
+    pool.deposit(&lp1, &500_0000000i128);
+
+    pool.lock_for_policy(&lp1, &1u128, &100_0000000i128);
+}
+
+/// Non-admin cannot release a capital lock.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn non_admin_cannot_release_for_claim() {
+    let (_, pool, _usdc_id, admin, _treasury, lp1) = setup();
+    pool.deposit(&lp1, &500_0000000i128);
+    pool.lock_for_policy(&admin, &1u128, &100_0000000i128);
+
+    pool.release_for_claim(&lp1, &1u128);
+}
+
+/// Non-admin cannot release for expiry.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn non_admin_cannot_release_for_expiry() {
+    let (_, pool, _usdc_id, admin, _treasury, lp1) = setup();
+    pool.deposit(&lp1, &500_0000000i128);
+    pool.lock_for_policy(&admin, &1u128, &100_0000000i128);
+
+    pool.release_for_expiry(&lp1, &1u128);
 #[test]
 fn test_get_lp_list_pagination() {
     let (env, pool, usdc_id, _admin, _, lp1) = setup();

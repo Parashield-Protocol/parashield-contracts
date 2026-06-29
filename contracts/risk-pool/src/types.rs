@@ -132,6 +132,35 @@ pub struct PoolResumed {
     pub admin: Address,
 }
 
+/// A timelocked admin withdrawal request.
+/// Once created, the admin must wait TIMELOCK_SECONDS before executing.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminWithdrawalRequest {
+    pub amount: i128,
+    pub requested_at: u64,
+    pub executed: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminWithdrawalScheduled {
+    pub admin: Address,
+    pub amount: i128,
+    pub execute_after: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminWithdrawalExecuted {
+    pub admin: Address,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminWithdrawalCancelled {
+    pub admin: Address,
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminUpdated {
