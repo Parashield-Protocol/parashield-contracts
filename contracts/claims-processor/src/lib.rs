@@ -60,6 +60,7 @@ enum StorageKey {
     PolicyClaim(u128),   // policy_id → claim_id (one claim per policy)
     NextClaimId,
     PendingClaims,       // Vec<u128>
+    Keeper(Address),     // keeper whitelist: address → bool
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -153,6 +154,36 @@ impl ClaimsProcessor {
         );
     }
 
+    // ── Keeper Registry ──────────────────────────────────────────────────────
+
+    /// Admin-only: authorize `keeper` to call process_claim / auto_process /
+    /// batch_auto_process. Without this, no address can settle claims.
+    pub fn add_keeper(env: Env, admin: Address, keeper: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage().persistent().set(&StorageKey::Keeper(keeper.clone()), &true);
+        env.events().publish(
+            (Symbol::new(&env, "keeper_added"),),
+            keeper,
+        );
+    }
+
+    /// Admin-only: revoke a keeper's settlement authority.
+    pub fn remove_keeper(env: Env, admin: Address, keeper: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage().persistent().remove(&StorageKey::Keeper(keeper.clone()));
+        env.events().publish(
+            (Symbol::new(&env, "keeper_removed"),),
+            keeper,
+        );
+    }
+
+    /// Whether `keeper` is currently authorized to settle claims.
+    pub fn is_keeper(env: Env, keeper: Address) -> bool {
+        env.storage().persistent()
+            .get(&StorageKey::Keeper(keeper))
+            .unwrap_or(false)
+    }
+
     // ── Claim Submission ─────────────────────────────────────────────────────
 
     /// Manually submit a claim for a policy. Returns the new claim ID.
@@ -215,7 +246,7 @@ impl ClaimsProcessor {
 
     /// Process an existing pending claim. Reads oracle data and pays out or rejects.
     pub fn process_claim(env: Env, keeper: Address, claim_id: u128) -> ClaimResult {
-        keeper.require_auth();
+        Self::require_keeper(&env, &keeper);
         let mut claim: Claim = env.storage().persistent()
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
@@ -230,7 +261,7 @@ impl ClaimsProcessor {
     /// This is the primary flow for parametric insurance.
     /// Returns AlreadyClaimed / Expired idempotently if policy is already settled.
     pub fn auto_process(env: Env, keeper: Address, policy_id: u128) -> ClaimResult {
-        keeper.require_auth();
+        Self::require_keeper(&env, &keeper);
 
         // ─── IDEMPOTENCY GUARD ───
         // Check if an evaluation record already exists for this policy in our storage
@@ -286,6 +317,12 @@ impl ClaimsProcessor {
             };
             env.storage().persistent().set(&StorageKey::Claim(cid), &claim);
             env.storage().persistent().set(&StorageKey::PolicyClaim(policy_id), &cid);
+
+            // Make the new claim visible to batch processors and monitoring.
+            let mut pending: Vec<u128> = env.storage().instance()
+                .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(&env));
+            pending.push_back(cid);
+            env.storage().instance().set(&StorageKey::PendingClaims, &pending);
             cid
         };
 
@@ -301,7 +338,7 @@ impl ClaimsProcessor {
     /// Returns a Vec of (claim_id, result) pairs for the processed claims.
     /// Skips any claim that is not in Pending status (idempotent).
     pub fn batch_auto_process(env: Env, caller: Address, limit: u32) -> Vec<(u128, ClaimResult)> {
-        caller.require_auth();
+        Self::require_keeper(&env, &caller);
         let pending: Vec<u128> = env.storage().instance()
             .get(&StorageKey::PendingClaims)
             .unwrap_or_else(|| Vec::new(&env));
@@ -333,9 +370,19 @@ impl ClaimsProcessor {
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
         if claim.claimant != claimant { panic_with_error!(&env, Error::Unauthorized); }
+        // Only open (Pending) or rejected claims are disputable. A Paid claim is
+        // already settled (USDC transferred) and a Disputed claim is already open,
+        // so neither may be overwritten.
+        if claim.status != ClaimStatus::Pending && claim.status != ClaimStatus::Rejected {
+            panic_with_error!(&env, Error::AlreadyProcessed);
+        }
         claim.status = ClaimStatus::Disputed;
         claim.dispute_reason = Some(reason.clone());
         env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
+
+        // A disputed claim is no longer pending — drop it from the queue so it is
+        // not re-evaluated and does not grow the queue unboundedly.
+        Self::remove_from_pending(&env, claim_id);
 
         env.events().publish(
             (Symbol::new(&env, "claim_disputed"),),
@@ -425,6 +472,11 @@ impl ClaimsProcessor {
 
         env.storage().persistent().set(&StorageKey::Claim(claim.id), claim);
 
+        // The claim is now settled (Paid/Rejected) — drop it from the pending
+        // queue so it is neither re-evaluated nor allowed to grow the queue
+        // without bound.
+        Self::remove_from_pending(env, claim.id);
+
         env.events().publish(
             (Symbol::new(env, "claim_processed"),),
             ClaimProcessed {
@@ -436,6 +488,44 @@ impl ClaimsProcessor {
         );
 
         result
+    }
+
+    /// Remove a claim id from the pending queue, if present.
+    fn remove_from_pending(env: &Env, claim_id: u128) {
+        let pending: Vec<u128> = env.storage().instance()
+            .get(&StorageKey::PendingClaims)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut updated: Vec<u128> = Vec::new(env);
+        for id in pending.iter() {
+            if id != claim_id {
+                updated.push_back(id);
+            }
+        }
+        if updated.len() != pending.len() {
+            env.storage().instance().set(&StorageKey::PendingClaims, &updated);
+        }
+    }
+
+    /// Panic unless `admin` is the stored admin and authorizes the call.
+    fn require_admin(env: &Env, admin: &Address) {
+        let stored: Address = env.storage().instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        if *admin != stored {
+            panic_with_error!(env, Error::Unauthorized);
+        }
+        admin.require_auth();
+    }
+
+    /// Panic unless `caller` is a registered keeper and authorizes the call.
+    fn require_keeper(env: &Env, caller: &Address) {
+        let authorized: bool = env.storage().persistent()
+            .get(&StorageKey::Keeper(caller.clone()))
+            .unwrap_or(false);
+        if !authorized {
+            panic_with_error!(env, Error::Unauthorized);
+        }
+        caller.require_auth();
     }
 
     fn next_claim_id(env: &Env) -> u128 {

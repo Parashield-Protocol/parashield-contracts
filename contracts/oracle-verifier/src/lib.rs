@@ -406,10 +406,9 @@ impl OracleVerifier {
                 total_weight += entry.weight as u128;
             }
         }
-        let confidence = if total_weight > 0 {
-            (weighted_confidence_sum / total_weight) as u32
-        } else {
-            0u32
+        let confidence = match weighted_confidence_sum.checked_div(total_weight) {
+            Some(c) => c as u32,
+            None => 0u32,
         };
         AggregatedData { median_value, oracle_count, confidence, min_confidence, last_updated }
     }
