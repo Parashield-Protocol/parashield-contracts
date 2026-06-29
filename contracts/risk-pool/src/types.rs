@@ -116,4 +116,10 @@ pub struct PoolResumed {
     pub admin: Address,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminUpdated {
+    pub new_admin: Address,
+}
+
 
