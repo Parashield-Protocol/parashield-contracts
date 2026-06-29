@@ -73,6 +73,7 @@ pub enum Error {
     InvalidTriggerThreshold = 14,
     DuplicateProductKey    = 15,
     InvalidCoverageRange    = 16,
+    InvalidToken            = 17,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -111,6 +112,16 @@ impl PolicyEngine {
         if !oracle_prefix.starts_with('C') {
             panic!("invalid address: oracle_address must be a contract address");
         }
+        
+        let balance_res: Result<Result<i128, soroban_sdk::Error>, soroban_sdk::Error> = env.try_invoke_contract(
+            &usdc_token,
+            &Symbol::new(&env, "balance"),
+            soroban_sdk::vec![&env, env.current_contract_address().into_val(&env)],
+        );
+        if balance_res.is_err() {
+            panic_with_error!(&env, Error::InvalidToken);
+        }
+
         admin.require_auth();
         env.storage().instance().set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);

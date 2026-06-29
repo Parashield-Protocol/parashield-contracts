@@ -62,6 +62,7 @@ pub enum Error {
     AlreadyReleased     = 10,
     Undercollateralized = 11,
     PoolCapExceeded     = 12,
+    InvalidToken        = 13,
 }
 
 #[contract]
@@ -95,6 +96,16 @@ impl RiskPool {
         if !treasury_prefix.starts_with('C') {
             panic!("invalid address: treasury must be a contract address");
         }
+
+        let balance_res: Result<Result<i128, soroban_sdk::Error>, soroban_sdk::Error> = env.try_invoke_contract(
+            &usdc_token,
+            &Symbol::new(&env, "balance"),
+            soroban_sdk::vec![&env, env.current_contract_address().into_val(&env)],
+        );
+        if balance_res.is_err() {
+            panic_with_error!(&env, Error::InvalidToken);
+        }
+
         admin.require_auth();
         env.storage().instance().set(&StorageKey::Initialized,        &true);
         env.storage().instance().set(&StorageKey::Admin,              &admin);

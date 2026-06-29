@@ -56,6 +56,22 @@ fn cannot_initialize_twice() {
     pool.initialize(&admin, &usdc, &treasury, &Symbol::new(&env, "crop"));
 }
 
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_initialize_with_non_token_usdc() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    
+    // Register some random non-token contract and use it as USDC
+    let fake_usdc = env.register(RiskPool, ());
+    let pool_id = env.register(RiskPool, ());
+    let pool = RiskPoolClient::new(&env, &pool_id);
+    
+    pool.initialize(&admin, &fake_usdc, &treasury, &Symbol::new(&env, "crop"));
+}
+
 // ── deposits ──────────────────────────────────────────────────────────────────
 
 #[test]
