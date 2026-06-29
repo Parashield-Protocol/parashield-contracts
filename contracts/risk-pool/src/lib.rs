@@ -13,11 +13,10 @@
 //! v2 — full implementation; Risk Pool is now deployable and testable.
 #![no_std]
 extern crate alloc;
-use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    token, Address, BytesN, Env, Symbol, Vec,
+    token, Address, Env, Symbol, Vec,
 };
 
 pub mod types;
@@ -47,12 +46,16 @@ enum StorageKey {
     TotalLocked,
     TotalShares,
     AccumulatedPremium,
+    AccumulatedBackstop,
     Status,
     LpPosition(Address),
-    LpList,
+    LpCount,
+    LpAddress(u32),
     Lock(u128),
     AdminWithdrawalRequest,
     PendingAdmin,
+    PolicyEngine,
+    ClaimsProcessor,
 }
 
 #[contracterror]
@@ -71,10 +74,10 @@ pub enum Error {
     AlreadyReleased     = 10,
     Undercollateralized = 11,
     PoolCapExceeded     = 12,
-    TimelockPending     = 13,
-    TimelockNotReady    = 14,
-    NoPendingWithdrawal = 15,
     InsufficientShares  = 13,
+    TimelockPending     = 14,
+    TimelockNotReady    = 15,
+    NoPendingWithdrawal = 16,
 }
 
 #[contract]
@@ -90,6 +93,8 @@ impl RiskPool {
         treasury: Address,
         backstop: Address,
         category: Symbol,
+        policy_engine: Address,
+        claims_processor: Address,
     ) {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
@@ -128,29 +133,33 @@ impl RiskPool {
         }
 
         admin.require_auth();
-        env.storage().instance().set(&StorageKey::Initialized,        &true);
-        env.storage().instance().set(&StorageKey::Admin,              &admin);
-        env.storage().instance().set(&StorageKey::UsdcToken,          &usdc_token);
-        env.storage().instance().set(&StorageKey::Treasury,           &treasury);
-        env.storage().instance().set(&StorageKey::Backstop,           &backstop);
-        env.storage().instance().set(&StorageKey::Category,           &category);
-env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
-        // No pending admin initially
-        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
-        env.storage().instance().set(&StorageKey::TotalLocked,      &0i128);
-        env.storage().instance().set(&StorageKey::TotalShares,        &0i128);
-        env.storage().instance().set(&StorageKey::AccumulatedPremium, &0i128);
-        env.storage().instance().set(&StorageKey::Status,             &PoolStatus::Active);
-        env.storage().instance().set(&StorageKey::LpList,             &Vec::<Address>::new(&env));
+        env.storage().instance().set(&StorageKey::Initialized,          &true);
+        env.storage().instance().set(&StorageKey::Admin,                &admin);
+        env.storage().instance().set(&StorageKey::UsdcToken,            &usdc_token);
+        env.storage().instance().set(&StorageKey::Treasury,             &treasury);
+        env.storage().instance().set(&StorageKey::Backstop,             &backstop);
+        env.storage().instance().set(&StorageKey::Category,             &category);
+        env.storage().instance().set(&StorageKey::PolicyEngine,         &policy_engine);
+        env.storage().instance().set(&StorageKey::ClaimsProcessor,      &claims_processor);
+        env.storage().instance().set(&StorageKey::TotalDeposited,       &0i128);
+        env.storage().instance().set(&StorageKey::TotalLocked,          &0i128);
+        env.storage().instance().set(&StorageKey::TotalShares,          &0i128);
+        env.storage().instance().set(&StorageKey::AccumulatedPremium,   &0i128);
+        env.storage().instance().set(&StorageKey::AccumulatedBackstop,  &0i128);
+        env.storage().instance().set(&StorageKey::Status,               &PoolStatus::Active);
+        env.storage().instance().set(&StorageKey::LpCount,              &0u32);
+        // PendingAdmin is absent until propose_new_admin is called; no init needed.
 
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
             Initialized {
-                admin: admin.clone(),
-                usdc_token: usdc_token.clone(),
-                treasury: treasury.clone(),
-                backstop: backstop.clone(),
-                category: category.clone(),
+                admin:            admin.clone(),
+                usdc_token:       usdc_token.clone(),
+                treasury:         treasury.clone(),
+                backstop:         backstop.clone(),
+                category:         category.clone(),
+                policy_engine:    policy_engine.clone(),
+                claims_processor: claims_processor.clone(),
             },
         );
     }
@@ -195,10 +204,10 @@ env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
                 pos
             }
             None => {
-                let mut lp_list: Vec<Address> = env.storage().instance()
-                    .get(&StorageKey::LpList).unwrap_or_else(|| Vec::new(&env));
-                lp_list.push_back(provider.clone());
-                env.storage().instance().set(&StorageKey::LpList, &lp_list);
+                let count: u32 = env.storage().instance()
+                    .get(&StorageKey::LpCount).unwrap_or(0);
+                env.storage().persistent().set(&StorageKey::LpAddress(count), &provider);
+                env.storage().instance().set(&StorageKey::LpCount, &(count + 1));
                 LpPosition {
                     provider:         provider.clone(),
                     deposited:        amount,
@@ -229,6 +238,7 @@ env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
         provider.require_auth();
         // Guard: check for zero or negative shares input
         if shares <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
+        Self::assert_active(&env);
 
         let lp_key = StorageKey::LpPosition(provider.clone());
         let mut position: LpPosition = env.storage().persistent()
@@ -292,6 +302,10 @@ env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
         let acc: i128 = env.storage().instance()
             .get(&StorageKey::AccumulatedPremium).unwrap_or(0);
         env.storage().instance().set(&StorageKey::AccumulatedPremium, &(acc + lp_share));
+
+        let acc_backstop: i128 = env.storage().instance()
+            .get(&StorageKey::AccumulatedBackstop).unwrap_or(0);
+        env.storage().instance().set(&StorageKey::AccumulatedBackstop, &(acc_backstop + backstop_share));
 
         env.events().publish(
             (Symbol::new(&env, "premium_distributed"),),
@@ -377,7 +391,7 @@ env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
     // ── Capital locks ─────────────────────────────────────────────────────────
 
     pub fn lock_for_policy(env: Env, caller: Address, policy_id: u128, amount: i128) {
-        Self::require_admin(&env, &caller);
+        Self::require_protocol_caller(&env, &caller);
         // Guard: check for zero or negative lock amount input
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
 
@@ -404,7 +418,7 @@ env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
     }
 
     pub fn release_for_claim(env: Env, caller: Address, policy_id: u128) {
-        Self::require_admin(&env, &caller);
+        Self::require_protocol_caller(&env, &caller);
         let mut lock: CapitalLock = env.storage().persistent()
             .get(&StorageKey::Lock(policy_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::LockNotFound));
@@ -428,7 +442,7 @@ env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
     }
 
     pub fn release_for_expiry(env: Env, caller: Address, policy_id: u128) {
-        Self::require_admin(&env, &caller);
+        Self::require_protocol_caller(&env, &caller);
         let mut lock: CapitalLock = env.storage().persistent()
             .get(&StorageKey::Lock(policy_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::LockNotFound));
@@ -443,12 +457,13 @@ env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
 
     pub fn get_stats(env: Env) -> PoolStats {
         PoolStats {
-            category:            env.storage().instance().get(&StorageKey::Category).unwrap(),
-            total_deposited:     env.storage().instance().get(&StorageKey::TotalDeposited).unwrap_or(0),
-            total_locked:        env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0),
-            total_shares:        env.storage().instance().get(&StorageKey::TotalShares).unwrap_or(0),
-            accumulated_premium: env.storage().instance().get(&StorageKey::AccumulatedPremium).unwrap_or(0),
-            status:              env.storage().instance().get(&StorageKey::Status).unwrap_or(PoolStatus::Active),
+            category:             env.storage().instance().get(&StorageKey::Category).unwrap(),
+            total_deposited:      env.storage().instance().get(&StorageKey::TotalDeposited).unwrap_or(0),
+            total_locked:         env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0),
+            total_shares:         env.storage().instance().get(&StorageKey::TotalShares).unwrap_or(0),
+            accumulated_premium:  env.storage().instance().get(&StorageKey::AccumulatedPremium).unwrap_or(0),
+            accumulated_backstop: env.storage().instance().get(&StorageKey::AccumulatedBackstop).unwrap_or(0),
+            status:               env.storage().instance().get(&StorageKey::Status).unwrap_or(PoolStatus::Active),
         }
     }
 
@@ -469,31 +484,28 @@ env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
     }
 
     pub fn get_lp_count(env: Env) -> u32 {
-        let list: Vec<Address> = env.storage().instance()
-            .get(&StorageKey::LpList)
-            .unwrap_or_else(|| Vec::new(&env));
-        list.len()
+        env.storage().instance().get(&StorageKey::LpCount).unwrap_or(0)
     }
 
     pub fn get_lp_list(env: Env, offset: Option<u32>, limit: Option<u32>) -> PaginatedLps {
-        let list: Vec<Address> = env.storage().instance()
-            .get(&StorageKey::LpList)
-            .unwrap_or_else(|| Vec::new(&env));
-        let total_count = list.len();
-        
+        let total_count: u32 = env.storage().instance()
+            .get(&StorageKey::LpCount).unwrap_or(0);
+
         let offset_val = offset.unwrap_or(0);
         let limit_val = core::cmp::min(limit.unwrap_or(100), 500);
-        
+
         let mut paginated = Vec::new(&env);
         if offset_val < total_count {
             let end = core::cmp::min(offset_val + limit_val, total_count);
             for i in offset_val..end {
-                if let Some(addr) = list.get(i) {
+                if let Some(addr) = env.storage().persistent()
+                    .get::<_, Address>(&StorageKey::LpAddress(i))
+                {
                     paginated.push_back(addr);
                 }
             }
         }
-        
+
         PaginatedLps {
             lps: paginated,
             total_count,
@@ -643,19 +655,16 @@ env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
     pub fn accept_admin(env: Env, admin: Address) {
         let pending_admin: Address = env.storage().instance()
             .get(&StorageKey::PendingAdmin)
-            .unwrap_or_else(|| Address::from_uint(&env, 0));
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Unauthorized));
         // Only the pending admin can accept
         if admin != pending_admin {
             panic_with_error!(&env, Error::Unauthorized);
         }
         admin.require_auth();
-        let current_admin: Address = env.storage().instance()
-            .get(&StorageKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         // Update admin
         env.storage().instance().set(&StorageKey::Admin, &admin);
         // Clear the proposal
-        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
+        env.storage().instance().remove(&StorageKey::PendingAdmin);
         // Emit event
         env.events().publish(
             (Symbol::new(&env, "admin_updated"),),
@@ -663,6 +672,21 @@ env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
                 new_admin: admin,
             },
         );
+    }
+
+    /// Enforces that only admin, the registered policy engine, or the registered
+    /// claims processor may call capital-lock functions.
+    fn require_protocol_caller(env: &Env, caller: &Address) {
+        let admin: Address = env.storage().instance().get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        let pe: Address = env.storage().instance().get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        let cp: Address = env.storage().instance().get(&StorageKey::ClaimsProcessor)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        if *caller != admin && *caller != pe && *caller != cp {
+            panic_with_error!(env, Error::Unauthorized);
+        }
+        caller.require_auth();
     }
 
     fn require_admin(env: &Env, caller: &Address) {

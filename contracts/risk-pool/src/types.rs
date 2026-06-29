@@ -1,5 +1,13 @@
 use soroban_sdk::{contracttype, Address, Symbol, Vec};
 
+/// Paginated result from `get_lp_list`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaginatedLps {
+    pub lps:         Vec<Address>,
+    pub total_count: u32,
+}
+
 /// Status of a risk pool.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,12 +48,13 @@ pub struct CapitalLock {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolStats {
     /// Category: "crop" | "flight" | "disaster" | "defi"
-    pub category:        Symbol,
-    pub total_deposited: i128,
-    pub total_locked:    i128,
-    pub total_shares:    i128,
-    pub accumulated_premium: i128,
-    pub status:          PoolStatus,
+    pub category:             Symbol,
+    pub total_deposited:      i128,
+    pub total_locked:         i128,
+    pub total_shares:         i128,
+    pub accumulated_premium:  i128,
+    pub accumulated_backstop: i128,
+    pub status:               PoolStatus,
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
@@ -53,11 +62,13 @@ pub struct PoolStats {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Initialized {
-    pub admin: Address,
-    pub usdc_token: Address,
-    pub treasury: Address,
-    pub backstop: Address,
-    pub category: Symbol,
+    pub admin:             Address,
+    pub usdc_token:        Address,
+    pub treasury:          Address,
+    pub backstop:          Address,
+    pub category:          Symbol,
+    pub policy_engine:     Address,
+    pub claims_processor:  Address,
 }
 
 #[contracttype]
@@ -161,6 +172,8 @@ pub struct AdminWithdrawalExecuted {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminWithdrawalCancelled {
     pub admin: Address,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminUpdated {

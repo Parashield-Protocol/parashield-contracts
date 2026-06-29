@@ -1,12 +1,11 @@
-oracle-verifier.rs: no TTL on data points — arbitrarily old data used for triggers
+governance-dao.rs: execute_proposal does not verify proposal exists
 Repo Avatar
 Parashield-Protocol/parashield-contracts
-oracle-verifier.rs: get_latest_submission might return stale data silently — no TTL enforcement
+governance-dao.rs: proposal execution does not verify proposal exists — could execute phantom proposal
 
-Data is stored with a timestamp, but when verify_trigger queries it, there's no check that the data is recent. A 6-month-old rainfall submission could still be used to trigger claims.
+execute_proposal(proposal_id) does not check if the proposal was actually created. Executing a non-existent proposal_id would either panic or succeed silently depending on storage state.
 
 Acceptance criteria:
 
-Add MAX_DATA_AGE constant (e.g., 7 days)
-In verify_trigger, check: current_time - data_timestamp <= MAX_DATA_AGE, else return error
-Test: submit data, wait 8 days, call verify_trigger, expect error
+Guard: load the proposal and panic if not found
+Test: execute a proposal_id that was never created, expect error
