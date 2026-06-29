@@ -55,6 +55,9 @@ fn full_setup() -> TestEnv {
         .add_keeper(&admin, &admin);
     PolicyEngineClient::new(&env, &policy_id)
         .set_claims_processor(&admin, &claims_id);
+    // The integration tests drive settlement through the admin address.
+    ClaimsProcessorClient::new(&env, &claims_id)
+        .add_keeper(&admin, &admin);
 
     TestEnv { env, oracle: oracle_id, policy: policy_id, claims: claims_id, admin, usdc: usdc_id, oracle_node }
 }

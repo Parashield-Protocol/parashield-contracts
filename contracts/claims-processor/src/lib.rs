@@ -16,10 +16,12 @@
 //! Once a policy is Claimed or Expired, further process/auto_process calls
 //! return the appropriate ClaimResult without writing again.
 #![no_std]
+extern crate alloc;
+use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    Address, Env, Vec, Symbol,
+    Address, BytesN, Env, Vec, Symbol,
 };
 
 pub mod types;
@@ -59,6 +61,7 @@ enum StorageKey {
     NextClaimId,
     PendingClaims,       // Vec<u128>
     Keepers,             // Vec<Address>, authorized keepers / operators
+    Keeper(Address),     // keeper whitelist: address → bool
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -97,6 +100,35 @@ impl ClaimsProcessor {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
+        let admin_str = admin.to_string();
+        if admin_str.len() != 56 {
+            panic!("invalid address: admin must be an account or contract address");
+        }
+        let mut admin_buf = [0u8; 56];
+        admin_str.copy_into_slice(&mut admin_buf);
+        if admin_buf[0] != b'G' && admin_buf[0] != b'C' {
+            panic!("invalid address: admin must be an account or contract address");
+        }
+
+        let policy_engine_str = policy_engine.to_string();
+        if policy_engine_str.len() != 56 {
+            panic!("invalid address: policy_engine must be a contract address");
+        }
+        let mut policy_engine_buf = [0u8; 56];
+        policy_engine_str.copy_into_slice(&mut policy_engine_buf);
+        if policy_engine_buf[0] != b'C' {
+            panic!("invalid address: policy_engine must be a contract address");
+        }
+
+        let oracle_verifier_str = oracle_verifier.to_string();
+        if oracle_verifier_str.len() != 56 {
+            panic!("invalid address: oracle_verifier must be a contract address");
+        }
+        let mut oracle_verifier_buf = [0u8; 56];
+        oracle_verifier_str.copy_into_slice(&mut oracle_verifier_buf);
+        if oracle_verifier_buf[0] != b'C' {
+            panic!("invalid address: oracle_verifier must be a contract address");
+        }
         admin.require_auth();
 
         Self::validate_stellar_address(&env, &admin);
@@ -120,6 +152,36 @@ impl ClaimsProcessor {
                 staleness_threshold,
             },
         );
+    }
+
+    // ── Keeper Registry ──────────────────────────────────────────────────────
+
+    /// Admin-only: authorize `keeper` to call process_claim / auto_process /
+    /// batch_auto_process. Without this, no address can settle claims.
+    pub fn add_keeper(env: Env, admin: Address, keeper: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage().persistent().set(&StorageKey::Keeper(keeper.clone()), &true);
+        env.events().publish(
+            (Symbol::new(&env, "keeper_added"),),
+            keeper,
+        );
+    }
+
+    /// Admin-only: revoke a keeper's settlement authority.
+    pub fn remove_keeper(env: Env, admin: Address, keeper: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage().persistent().remove(&StorageKey::Keeper(keeper.clone()));
+        env.events().publish(
+            (Symbol::new(&env, "keeper_removed"),),
+            keeper,
+        );
+    }
+
+    /// Whether `keeper` is currently authorized to settle claims.
+    pub fn is_keeper(env: Env, keeper: Address) -> bool {
+        env.storage().persistent()
+            .get(&StorageKey::Keeper(keeper))
+            .unwrap_or(false)
     }
 
     // ── Claim Submission ─────────────────────────────────────────────────────
@@ -257,6 +319,12 @@ impl ClaimsProcessor {
             };
             env.storage().persistent().set(&StorageKey::Claim(cid), &claim);
             env.storage().persistent().set(&StorageKey::PolicyClaim(policy_id), &cid);
+
+            // Make the new claim visible to batch processors and monitoring.
+            let mut pending: Vec<u128> = env.storage().instance()
+                .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(&env));
+            pending.push_back(cid);
+            env.storage().instance().set(&StorageKey::PendingClaims, &pending);
             cid
         };
 
@@ -305,9 +373,19 @@ impl ClaimsProcessor {
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
         if claim.claimant != claimant { panic_with_error!(&env, Error::Unauthorized); }
+        // Only open (Pending) or rejected claims are disputable. A Paid claim is
+        // already settled (USDC transferred) and a Disputed claim is already open,
+        // so neither may be overwritten.
+        if claim.status != ClaimStatus::Pending && claim.status != ClaimStatus::Rejected {
+            panic_with_error!(&env, Error::AlreadyProcessed);
+        }
         claim.status = ClaimStatus::Disputed;
         claim.dispute_reason = Some(reason.clone());
         env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
+
+        // A disputed claim is no longer pending — drop it from the queue so it is
+        // not re-evaluated and does not grow the queue unboundedly.
+        Self::remove_from_pending(&env, claim_id);
 
         env.events().publish(
             (Symbol::new(&env, "claim_disputed"),),
@@ -388,6 +466,14 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         if *caller != admin { panic_with_error!(env, Error::Unauthorized); }
         caller.require_auth();
+    /// Upgrade the contract WASM in-place. Only the admin may call this.
+    /// Storage is preserved across upgrades; only the execution code changes.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        let stored_admin: Address = env.storage().instance().get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        if admin != stored_admin { panic_with_error!(&env, Error::Unauthorized); }
+        admin.require_auth();
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
@@ -439,6 +525,11 @@ impl ClaimsProcessor {
 
         env.storage().persistent().set(&StorageKey::Claim(claim.id), claim);
 
+        // The claim is now settled (Paid/Rejected) — drop it from the pending
+        // queue so it is neither re-evaluated nor allowed to grow the queue
+        // without bound.
+        Self::remove_from_pending(env, claim.id);
+
         env.events().publish(
             (Symbol::new(env, "claim_processed"),),
             ClaimProcessed {
@@ -450,6 +541,44 @@ impl ClaimsProcessor {
         );
 
         result
+    }
+
+    /// Remove a claim id from the pending queue, if present.
+    fn remove_from_pending(env: &Env, claim_id: u128) {
+        let pending: Vec<u128> = env.storage().instance()
+            .get(&StorageKey::PendingClaims)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut updated: Vec<u128> = Vec::new(env);
+        for id in pending.iter() {
+            if id != claim_id {
+                updated.push_back(id);
+            }
+        }
+        if updated.len() != pending.len() {
+            env.storage().instance().set(&StorageKey::PendingClaims, &updated);
+        }
+    }
+
+    /// Panic unless `admin` is the stored admin and authorizes the call.
+    fn require_admin(env: &Env, admin: &Address) {
+        let stored: Address = env.storage().instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        if *admin != stored {
+            panic_with_error!(env, Error::Unauthorized);
+        }
+        admin.require_auth();
+    }
+
+    /// Panic unless `caller` is a registered keeper and authorizes the call.
+    fn require_keeper(env: &Env, caller: &Address) {
+        let authorized: bool = env.storage().persistent()
+            .get(&StorageKey::Keeper(caller.clone()))
+            .unwrap_or(false);
+        if !authorized {
+            panic_with_error!(env, Error::Unauthorized);
+        }
+        caller.require_auth();
     }
 
     fn next_claim_id(env: &Env) -> u128 {

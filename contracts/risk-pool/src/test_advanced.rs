@@ -20,7 +20,8 @@ fn setup_multi() -> (Env, RiskPoolClient<'static>, Address, Address, Address, Ad
     let lp1      = Address::generate(&env);
     let lp2      = Address::generate(&env);
 
-    let usdc_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let usdc_id     = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let backstop_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
     let pool_id = env.register(RiskPool, ());
     let pool    = RiskPoolClient::new(&env, &pool_id);
 
@@ -30,7 +31,7 @@ fn setup_multi() -> (Env, RiskPoolClient<'static>, Address, Address, Address, Ad
     mint(&lp1);
     mint(&lp2);
 
-    pool.initialize(&admin, &usdc_id, &treasury, &Symbol::new(&env, "defi"));
+    pool.initialize(&admin, &usdc_id, &treasury, &backstop_id, &Symbol::new(&env, "defi"));
 
     (env, pool, usdc_id, admin, treasury, lp1, lp2)
 }
