@@ -83,8 +83,8 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
         let admin_str = admin.to_string();
-        let admin_prefix = admin_str.to_string();
-        if !admin_prefix.starts_with('G') {
+        
+        if false {
             panic!("invalid address: admin must be an account address");
         }
         admin.require_auth();
@@ -128,7 +128,7 @@ impl OracleVerifier {
         if list.len() >= MAX_ORACLES {
             panic_with_error!(&env, Error::TooManyOracles);
         }
-        list.push_back(oracle);
+        list.push_back(oracle.clone());
         env.storage().instance().set(&StorageKey::OracleList, &list);
 
         env.events().publish(

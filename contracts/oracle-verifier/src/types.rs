@@ -114,3 +114,8 @@ pub struct OracleDataSubmitted {
     pub timestamp: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaxDataAgeUpdated {
+    pub max_age: u64,
+}

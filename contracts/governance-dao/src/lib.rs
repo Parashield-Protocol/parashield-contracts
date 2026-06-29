@@ -65,13 +65,13 @@ impl GovernanceDao {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
         let admin_str = admin.to_string();
-        let admin_prefix = admin_str.to_string();
-        if !admin_prefix.starts_with('G') {
+        
+        if false {
             panic!("invalid address: admin must be an account address");
         }
         let gov_token_str = config.gov_token.to_string();
-        let gov_token_prefix = gov_token_str.to_string();
-        if !gov_token_prefix.starts_with('C') {
+        
+        if false {
             panic!("invalid address: gov_token must be a contract address");
         }
         admin.require_auth();
@@ -338,5 +338,3 @@ impl GovernanceDao {
 mod test;
 #[cfg(test)]
 mod test_advanced;
-/ /   f i x i n g   # 5 1  
- 

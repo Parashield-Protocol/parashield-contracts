@@ -89,7 +89,7 @@ fn batch_processes_multiple_pending_claims() {
     oracle_client.add_oracle(&te.admin, &te.oracle_node, &weather(), &90u32);
     oracle_client.submit_data(
         &te.oracle_node, &weather(), &symbol_short!("kis2606"),
-        &30_000_000i128, &95u32, &1_748_736_000u64,
+        &30_000_000i128, &95u32, &te.env.ledger().timestamp(),
     );
 
     let farmer1 = Address::generate(&te.env);
@@ -131,7 +131,7 @@ fn batch_skips_non_pending_claims() {
     oracle_client.add_oracle(&te.admin, &te.oracle_node, &weather(), &90u32);
     oracle_client.submit_data(
         &te.oracle_node, &weather(), &symbol_short!("kis2606"),
-        &30_000_000i128, &95u32, &1_748_736_000u64,
+        &30_000_000i128, &95u32, &te.env.ledger().timestamp(),
     );
 
     let farmer = Address::generate(&te.env);
@@ -202,6 +202,7 @@ fn test_fresh_oracle_data_accepted() {
 
     // Submit oracle data at timestamp 1_000_000
     let data_ts: u64 = 1_000_000;
+    te.env.ledger().with_mut(|l| l.timestamp = data_ts);
     oracle_client.submit_data(
         &te.oracle_node, &weather(), &symbol_short!("kis2606"),
         &30_000_000i128, &95u32, &data_ts,
@@ -250,6 +251,7 @@ fn test_equal_comparison() {
 
     oracle_client.add_oracle(&te.admin, &te.oracle_node, &weather(), &90u32);
     let data_ts: u64 = 1_000_000;
+    te.env.ledger().with_mut(|l| l.timestamp = data_ts);
     oracle_client.submit_data(
         &te.oracle_node, &weather(), &symbol_short!("flight1"),
         &100_000_000i128, &95u32, &data_ts,
@@ -268,4 +270,4 @@ fn test_equal_comparison() {
 
     let result = claims_client.auto_process(&te.admin, &pol_id);
     assert_eq!(result, ClaimResult::Paid);
-}
+}
