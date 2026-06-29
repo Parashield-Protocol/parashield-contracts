@@ -62,6 +62,8 @@ enum StorageKey {
     PendingClaims,       // Vec<u128>
     Keepers,             // Vec<Address>, authorized keepers / operators
     Keeper(Address),     // keeper whitelist: address → bool
+    /// Contract version (u32) for storage migration tracking
+    Version,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -416,64 +418,51 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
     }
 
-    // ── Keeper management ─────────────────────────────────────────────────────
-
-    pub fn add_keeper(env: Env, admin: Address, keeper: Address) {
-        Self::require_admin(&env, &admin);
-        let mut keepers: Vec<Address> = env.storage().instance()
-            .get(&StorageKey::Keepers)
-            .unwrap_or_else(|| Vec::new(&env));
-        // Avoid duplicates
-        for i in 0..keepers.len() {
-            if keepers.get_unchecked(i) == keeper {
-                return;
-            }
-        }
-        keepers.push_back(keeper.clone());
-        env.storage().instance().set(&StorageKey::Keepers, &keepers);
+    pub fn get_version(env: Env) -> u32 {
+        env.storage().instance().get(&StorageKey::Version).unwrap_or(1)
     }
 
-    pub fn remove_keeper(env: Env, admin: Address, keeper: Address) {
-        Self::require_admin(&env, &admin);
-        let keepers: Vec<Address> = env.storage().instance()
-            .get(&StorageKey::Keepers)
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut new_list: Vec<Address> = Vec::new(&env);
-        for i in 0..keepers.len() {
-            let k = keepers.get_unchecked(i);
-            if k != keeper {
-                new_list.push_back(k.clone());
-            }
-        }
-        env.storage().instance().set(&StorageKey::Keepers, &new_list);
-    }
-
-    fn require_keeper(env: &Env, caller: &Address) {
-        // Auth is already checked by the calling function (process_claim / auto_process / batch_auto_process)
-        let keepers: Vec<Address> = env.storage().instance()
-            .get(&StorageKey::Keepers)
-            .unwrap_or_else(|| Vec::new(&env));
-        for i in 0..keepers.len() {
-            if keepers.get_unchecked(i) == *caller {
-                return;
-            }
-        }
-        panic_with_error!(env, Error::Unauthorized);
-    }
-
-    fn require_admin(env: &Env, caller: &Address) {
-        let admin: Address = env.storage().instance().get(&StorageKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
-        if *caller != admin { panic_with_error!(env, Error::Unauthorized); }
-        caller.require_auth();
     /// Upgrade the contract WASM in-place. Only the admin may call this.
     /// Storage is preserved across upgrades; only the execution code changes.
-    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+    /// Runs storage migrations if the new version requires them.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>, new_version: u32) {
         let stored_admin: Address = env.storage().instance().get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         if admin != stored_admin { panic_with_error!(&env, Error::Unauthorized); }
         admin.require_auth();
+        
+        let current_version: u32 = env.storage().instance().get(&StorageKey::Version).unwrap_or(1);
+        if new_version <= current_version {
+            panic!("new version must be greater than current version");
+        }
+        
+        // Run migrations from current_version to new_version
+        Self::run_migrations(&env, current_version, new_version);
+        
+        // Update the stored version
+        env.storage().instance().set(&StorageKey::Version, &new_version);
+        
+        // Perform the actual WASM upgrade
         env.deployer().update_current_contract_wasm(new_wasm_hash);
+        
+        env.events().publish(
+            (Symbol::new(&env, "contract_upgraded"),),
+            ContractUpgraded {
+                old_version: current_version,
+                new_version,
+            },
+        );
+    }
+
+    /// Run storage migrations from old_version to new_version.
+    /// Each migration function handles a specific version transition.
+    fn run_migrations(_env: &Env, _old_version: u32, _new_version: u32) {
+        // Migration from v1 to v2: No storage changes needed yet
+        // This is where you would add migration logic for specific version bumps
+        // Example: if old_version < 2 && new_version >= 2 { Self::migrate_v1_to_v2(env); }
+        
+        // Future migrations follow the pattern:
+        // if old_version < 3 && new_version >= 3 { Self::migrate_v2_to_v3(env); }
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────

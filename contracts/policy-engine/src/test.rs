@@ -491,11 +491,8 @@ fn test_deprecated_product_key_can_be_reused() {
     });
 
     assert_eq!(client.get_active_products().len(), 1);
-    }
+}
 
-    #[test]
-    fn test_premium_matches_formula() {
-        let (env, admin, _oracle, usdc, contract_id) = setup();
 #[test]
 fn test_premium_matches_formula() {
     let (env, admin, _oracle, usdc, contract_id) = setup();
@@ -528,7 +525,6 @@ fn test_premium_matches_formula() {
 
     assert_eq!(buyer_before - buyer_after, expected_premium);
     assert_eq!(contract_bal, expected_premium);
-}
 }
 
 // ── Issue #58: atomic product ID generation ────────────────────────────────
@@ -570,4 +566,53 @@ fn sequential_create_product_ids_are_unique_and_monotone() {
     // IDs must be monotonically increasing (atomic increment property)
     assert!(id2 > id1);
     assert!(id3 > id2);
+}
+
+// ── Versioning tests ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_initial_version_is_one() {
+    let (env, _admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    assert_eq!(client.get_version(), 1);
+}
+
+#[test]
+#[should_panic(expected = "new version must be greater than current version")]
+fn test_upgrade_to_same_version_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    // Try to upgrade to same version (1)
+    client.upgrade(&admin, &BytesN::from_array(&env, &[0u8; 32]), &1);
+}
+
+#[test]
+#[should_panic(expected = "new version must be greater than current version")]
+fn test_upgrade_to_lower_version_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    // Try to upgrade to version 0 (lower than current 1)
+    client.upgrade(&admin, &BytesN::from_array(&env, &[0u8; 32]), &0);
+}
+
+#[test]
+fn test_upgrade_increments_version() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    
+    assert_eq!(client.get_version(), 1);
+    client.upgrade(&admin, &BytesN::from_array(&env, &[0u8; 32]), &2);
+    assert_eq!(client.get_version(), 2);
+}
+
+#[test]
+fn test_multiple_upgrades_track_version_correctly() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    
+    assert_eq!(client.get_version(), 1);
+    client.upgrade(&admin, &BytesN::from_array(&env, &[1u8; 32]), &2);
+    assert_eq!(client.get_version(), 2);
+    client.upgrade(&admin, &BytesN::from_array(&env, &[2u8; 32]), &3);
+    assert_eq!(client.get_version(), 3);
 }
