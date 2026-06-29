@@ -47,6 +47,7 @@ enum StorageKey {
     MinConfidence,
     MaxDataAge,
     PendingAdmin,
+    MinOracleCount,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -65,6 +66,7 @@ pub enum Error {
     InvalidWeight       = 8,
     StaleData           = 9,
     TooManyOracles      = 10,
+    InvalidTimestamp     = 11,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -138,8 +140,17 @@ impl OracleVerifier {
         if list.len() >= MAX_ORACLES {
             panic_with_error!(&env, Error::TooManyOracles);
         }
-        list.push_back(oracle.clone());
-        env.storage().instance().set(&StorageKey::OracleList, &list);
+        let mut already_present = false;
+        for i in 0..list.len() {
+            if list.get_unchecked(i) == oracle {
+                already_present = true;
+                break;
+            }
+        }
+        if !already_present {
+            list.push_back(oracle.clone());
+            env.storage().instance().set(&StorageKey::OracleList, &list);
+        }
 
         env.events().publish(
             (Symbol::new(&env, "oracle_added"),),
@@ -286,6 +297,11 @@ impl OracleVerifier {
         oracle.require_auth();
         if confidence == 0 || confidence > 100 {
             panic_with_error!(&env, Error::InvalidConfidence);
+        }
+
+        let now = env.ledger().timestamp();
+        if timestamp > now {
+            panic_with_error!(&env, Error::InvalidTimestamp);
         }
 
         // Verify oracle is registered and active for this data_type
@@ -467,6 +483,8 @@ impl OracleVerifier {
         for i in 0..submissions.len() {
             let (key, value, confidence, timestamp) = submissions.get_unchecked(i);
             if confidence == 0 || confidence > 100 { panic_with_error!(&env, Error::InvalidConfidence); }
+            let now = env.ledger().timestamp();
+            if timestamp > now { panic_with_error!(&env, Error::InvalidTimestamp); }
             let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
             let mut points: Vec<OracleDataPoint> = env.storage().persistent()
                 .get(&dp_key)
@@ -520,6 +538,10 @@ impl OracleVerifier {
             let sub = submissions.get_unchecked(i);
             if sub.confidence == 0 || sub.confidence > 100 {
                 panic_with_error!(&env, Error::InvalidConfidence);
+            }
+            let now = env.ledger().timestamp();
+            if sub.timestamp > now {
+                panic_with_error!(&env, Error::InvalidTimestamp);
             }
             let dp_key = StorageKey::DataPoints(data_type.clone(), sub.key.clone());
             let mut points: Vec<OracleDataPoint> = env.storage().persistent()
