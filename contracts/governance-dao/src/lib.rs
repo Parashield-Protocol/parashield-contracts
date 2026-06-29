@@ -67,6 +67,8 @@ impl GovernanceDao {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
+        // Address validation is deferred to require_auth() calls which
+        // verify the address on the Soroban network layer.
         let admin_str = admin.to_string();
         if admin_str.len() != 56 {
             panic!("invalid address: admin must be an account or contract address");
