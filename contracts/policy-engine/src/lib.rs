@@ -98,18 +98,32 @@ impl PolicyEngine {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
         let admin_str = admin.to_string();
-        let admin_prefix = admin_str.to_string();
-        if !admin_prefix.starts_with('G') {
-            panic!("invalid address: admin must be an account address");
+        if admin_str.len() != 56 {
+            panic!("invalid address: admin must be an account or contract address");
         }
+        let mut admin_buf = [0u8; 56];
+        admin_str.copy_into_slice(&mut admin_buf);
+        if admin_buf[0] != b'G' && admin_buf[0] != b'C' {
+            panic!("invalid address: admin must be an account or contract address");
+        }
+
         let usdc_str = usdc_token.to_string();
-        let oracle_str = oracle_address.to_string();
-        let usdc_prefix = usdc_str.to_string();
-        let oracle_prefix = oracle_str.to_string();
-        if !usdc_prefix.starts_with('C') {
+        if usdc_str.len() != 56 {
             panic!("invalid address: usdc_token must be a contract address");
         }
-        if !oracle_prefix.starts_with('C') {
+        let mut usdc_buf = [0u8; 56];
+        usdc_str.copy_into_slice(&mut usdc_buf);
+        if usdc_buf[0] != b'C' {
+            panic!("invalid address: usdc_token must be a contract address");
+        }
+
+        let oracle_str = oracle_address.to_string();
+        if oracle_str.len() != 56 {
+            panic!("invalid address: oracle_address must be a contract address");
+        }
+        let mut oracle_buf = [0u8; 56];
+        oracle_str.copy_into_slice(&mut oracle_buf);
+        if oracle_buf[0] != b'C' {
             panic!("invalid address: oracle_address must be a contract address");
         }
         admin.require_auth();
@@ -373,13 +387,18 @@ impl PolicyEngine {
             PolicyStatus::Cancelled => panic_with_error!(&env, Error::PolicyNotActive),
             PolicyStatus::Active    => {}
         }
+        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+        let token_client = token::Client::new(&env, &usdc);
+        match token_client.try_transfer(&env.current_contract_address(), &policy.policyholder, &policy.coverage_amount) {
+            Ok(Ok(())) => {}
+            _ => {
+                panic_with_error!(&env, Error::InsufficientPool);
+            }
+        }
+
         policy.status = PolicyStatus::Claimed;
         env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
         Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
-
-        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
-        token::Client::new(&env, &usdc)
-            .transfer(&env.current_contract_address(), &policy.policyholder, &policy.coverage_amount);
 
         env.events().publish(
             (Symbol::new(&env, "policy_claimed"),),

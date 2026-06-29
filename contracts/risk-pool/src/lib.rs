@@ -82,21 +82,37 @@ impl RiskPool {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
+        
         let admin_str = admin.to_string();
-        let admin_prefix = admin_str.to_string();
-        if !admin_prefix.starts_with('G') {
-            panic!("invalid address: admin must be an account address");
+        if admin_str.len() != 56 {
+            panic!("invalid address: admin must be an account or contract address");
         }
+        let mut admin_buf = [0u8; 56];
+        admin_str.copy_into_slice(&mut admin_buf);
+        if admin_buf[0] != b'G' && admin_buf[0] != b'C' {
+            panic!("invalid address: admin must be an account or contract address");
+        }
+
         let usdc_str = usdc_token.to_string();
-        let treasury_str = treasury.to_string();
-        let usdc_prefix = usdc_str.to_string();
-        let treasury_prefix = treasury_str.to_string();
-        if !usdc_prefix.starts_with('C') {
+        if usdc_str.len() != 56 {
             panic!("invalid address: usdc_token must be a contract address");
         }
-        if !treasury_prefix.starts_with('C') {
+        let mut usdc_buf = [0u8; 56];
+        usdc_str.copy_into_slice(&mut usdc_buf);
+        if usdc_buf[0] != b'C' {
+            panic!("invalid address: usdc_token must be a contract address");
+        }
+
+        let treasury_str = treasury.to_string();
+        if treasury_str.len() != 56 {
             panic!("invalid address: treasury must be a contract address");
         }
+        let mut treasury_buf = [0u8; 56];
+        treasury_str.copy_into_slice(&mut treasury_buf);
+        if treasury_buf[0] != b'C' {
+            panic!("invalid address: treasury must be a contract address");
+        }
+
         admin.require_auth();
         env.storage().instance().set(&StorageKey::Initialized,        &true);
         env.storage().instance().set(&StorageKey::Admin,              &admin);
@@ -398,6 +414,31 @@ env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
             .get(&StorageKey::LpList)
             .unwrap_or_else(|| Vec::new(&env));
         list.len()
+    }
+
+    pub fn get_lp_list(env: Env, offset: Option<u32>, limit: Option<u32>) -> PaginatedLps {
+        let list: Vec<Address> = env.storage().instance()
+            .get(&StorageKey::LpList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let total_count = list.len();
+        
+        let offset_val = offset.unwrap_or(0);
+        let limit_val = core::cmp::min(limit.unwrap_or(100), 500);
+        
+        let mut paginated = Vec::new(&env);
+        if offset_val < total_count {
+            let end = core::cmp::min(offset_val + limit_val, total_count);
+            for i in offset_val..end {
+                if let Some(addr) = list.get(i) {
+                    paginated.push_back(addr);
+                }
+            }
+        }
+        
+        PaginatedLps {
+            lps: paginated,
+            total_count,
+        }
     }
 
     /// Available (unlocked) liquidity in USDC stroops.

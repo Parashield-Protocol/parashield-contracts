@@ -140,3 +140,36 @@ fn get_user_policies_tracks_multiple_policies() {
     let p3 = pe.get_user_policies(&user, &2u32, &1u32);
     assert_eq!(p3.len(), 0);
 }
+
+#[test]
+fn test_pay_claim_insufficient_funds_reverts_policy_active() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin  = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let user   = Address::generate(&env);
+
+    let usdc = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    token::StellarAssetClient::new(&env, &usdc).mint(&user, &10_000_0000000i128);
+
+    let pe_id = env.register(PolicyEngine, ());
+    let pe    = PolicyEngineClient::new(&env, &pe_id);
+    pe.initialize(&admin, &usdc, &oracle);
+
+    let prod_id = pe.create_product(&admin, &basic_params());
+    let policy_id = pe.buy_policy(
+        &user, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+    );
+
+    let claims_processor = Address::generate(&env);
+    pe.set_claims_processor(&admin, &claims_processor);
+
+    // Call pay_claim from claims_processor. Should fail since contract has no payout funds.
+    let res = pe.try_pay_claim(&claims_processor, &policy_id);
+    assert!(res.is_err());
+
+    // Verify policy remains Active (reverted)
+    let policy = pe.get_policy(&policy_id);
+    assert_eq!(policy.status, crate::PolicyStatus::Active);
+}
