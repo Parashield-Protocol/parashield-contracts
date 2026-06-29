@@ -203,6 +203,7 @@ impl RiskPool {
         let available_liquidity = total_deposited.saturating_sub(total_locked);
         if available_liquidity <= 0 { panic_with_error!(&env, Error::Undercollateralized); }
         let amount = shares * available_liquidity / total_shares;
+        if amount == 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if amount > available_liquidity { panic_with_error!(&env, Error::Undercollateralized); }
 
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
