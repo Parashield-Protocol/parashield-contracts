@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Symbol};
+use soroban_sdk::{contracttype, Address, Symbol, Vec};
 
 /// Status of a risk pool.
 #[contracttype]
@@ -56,6 +56,7 @@ pub struct Initialized {
     pub admin: Address,
     pub usdc_token: Address,
     pub treasury: Address,
+    pub backstop: Address,
     pub category: Symbol,
 }
 
@@ -81,6 +82,21 @@ pub struct PremiumDistributed {
     pub amount: i128,
     pub lp_share: i128,
     pub treasury_share: i128,
+    pub backstop_share: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryFunded {
+    pub amount: i128,
+    pub recipient: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackstopFunded {
+    pub amount: i128,
+    pub recipient: Address,
 }
 
 #[contracttype]
@@ -114,6 +130,12 @@ pub struct PoolPaused {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolResumed {
     pub admin: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminUpdated {
+    pub new_admin: Address,
 }
 
 

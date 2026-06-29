@@ -30,6 +30,17 @@ fn test_initialize_sets_admin() {
 }
 
 #[test]
+fn test_initialize_allows_contract_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(OracleVerifier, ());
+    OracleVerifierClient::new(&env, &contract_id).initialize(&admin);
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #1)")]
 fn test_double_initialize_panics() {
     let (env, admin, contract_id) = setup();
@@ -512,5 +523,32 @@ fn test_verify_trigger_rejects_stale_data() {
     // T = t0 + 8 days (T0 + 691,200): must panic with NoDataAvailable (#6)
     env.ledger().with_mut(|l| l.timestamp = t0 + 691_200);
     client.verify_trigger(&weather(), &kisumu_key(), &condition);
+}
+
+#[test]
+fn test_min_oracle_count_enforcement() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle1 = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle1, &weather(), &100u32);
+
+    // Set MIN_ORACLE_COUNT to 3
+    client.set_min_oracle_count(&admin, &3u32);
+    assert_eq!(client.get_min_oracle_count(), 3);
+
+    // Submit from 1 oracle
+    client.submit_data(&oracle1, &weather(), &kisumu_key(), &30_000_000i128, &90u32, &env.ledger().timestamp());
+
+    let condition = TriggerCondition {
+        data_type: weather(),
+        key: kisumu_key(),
+        threshold: 50_000_000i128,
+        comparison: TriggerComparison::LessThan,
+    };
+
+    // Verify trigger should fail because 1 < 3
+    let res = client.try_verify_trigger(&weather(), &kisumu_key(), &condition);
+    assert!(res.is_err());
 }
 

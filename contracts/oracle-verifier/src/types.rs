@@ -25,6 +25,20 @@ pub struct TriggerCondition {
     pub comparison: TriggerComparison,
 }
 
+/// Input struct for a single reading inside a bulk `submit_data_batch` call.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleDataSubmission {
+    /// Specific measurement key — e.g., `symbol_short!("kis2606")`
+    pub key: Symbol,
+    /// Observed value in 7-decimal fixed point
+    pub value: i128,
+    /// Reliability score 0-100
+    pub confidence: u32,
+    /// Unix timestamp of the real-world observation
+    pub timestamp: u64,
+}
+
 /// A single data submission from one oracle.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,6 +125,12 @@ pub struct MaxDataAgeUpdated {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MinOracleCountUpdated {
+    pub min_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OracleDataSubmitted {
     pub oracle: Address,
     pub data_type: Symbol,
@@ -118,5 +138,11 @@ pub struct OracleDataSubmitted {
     pub value: i128,
     pub confidence: u32,
     pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminUpdated {
+    pub new_admin: Address,
 }
 
