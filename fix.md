@@ -1,11 +1,12 @@
-governance-dao.rs: execute_proposal does not verify proposal exists
+claims-processor.rs: no authorization checks on submit_claim / auto_process
 Repo Avatar
 Parashield-Protocol/parashield-contracts
-governance-dao.rs: proposal execution does not verify proposal exists — could execute phantom proposal
+claims-processor.rs: no check that caller is authorized — any address can submit or process claims
 
-execute_proposal(proposal_id) does not check if the proposal was actually created. Executing a non-existent proposal_id would either panic or succeed silently depending on storage state.
+submit_claim and auto_process do not verify that the caller is an authorized keeper or the policyholder. Anyone can submit claims for anyone else's policies.
 
 Acceptance criteria:
 
-Guard: load the proposal and panic if not found
-Test: execute a proposal_id that was never created, expect error
+submit_claim: verify caller is the policyholder (from policy.policyholder field)
+auto_process: verify caller is an authorized keeper or operator (stored in contract)
+Test: call submit_claim for someone else's policy, expect unauthorized error
