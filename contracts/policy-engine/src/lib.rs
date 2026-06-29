@@ -383,10 +383,16 @@ impl PolicyEngine {
             PolicyStatus::Cancelled => panic_with_error!(&env, Error::PolicyNotActive),
             PolicyStatus::Active    => {}
         }
+
+        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+        let balance = token::Client::new(&env, &usdc).balance(&env.current_contract_address());
+        if balance < policy.coverage_amount {
+            panic_with_error!(&env, Error::InsufficientPool);
+        }
+
         policy.status = PolicyStatus::Claimed;
         env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
 
-        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
         token::Client::new(&env, &usdc)
             .transfer(&env.current_contract_address(), &policy.policyholder, &policy.coverage_amount);
 
