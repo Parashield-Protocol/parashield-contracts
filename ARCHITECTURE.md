@@ -206,3 +206,47 @@ Topics format: `("proposal_created",)`, `("vote_cast",)`, etc.
 | `proposal_cancelled` | `ProposalCancelled { proposal_id: u64 }` | Fired when admin cancels an active proposal. |
 | `dao_config_updated` | `DaoConfigUpdated { gov_token: Address, proposal_threshold: i128, total_supply: i128, voting_period: u64 }` | Fired when DAO parameters change. |
 
+## Contract Upgrades
+
+All Parashield contracts support in-place WASM upgrades via Soroban's built-in
+`update_current_contract_wasm` mechanism. Storage is fully preserved across upgrades;
+only the execution code changes. This avoids the need to migrate state or re-deploy
+at a new address.
+
+### Upgrade Function
+
+Every contract exposes:
+
+```rust
+pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>)
+```
+
+Only the contract admin may call this function. The `new_wasm_hash` is the 32-byte
+SHA-256 hash of the new WASM binary as registered on Soroban.
+
+### Upgrade Procedure
+
+1. **Compile the new WASM** — `cargo build --target wasm32-unknown-unknown --release`
+2. **Install the WASM** — upload the binary to the network:
+   ```sh
+   stellar contract install --wasm target/wasm32-unknown-unknown/release/<contract>.wasm --network testnet
+   ```
+   This returns a WASM hash.
+3. **Call `upgrade`** — invoke the contract's `upgrade` function with the returned hash:
+   ```sh
+   stellar contract invoke --id <CONTRACT_ID> --network testnet \
+     -- upgrade --admin <ADMIN_ADDRESS> --new_wasm_hash <WASM_HASH>
+   ```
+4. **Verify** — confirm the contract responds correctly under the new WASM; storage
+   values are unchanged.
+
+### Safety Checklist
+
+- [ ] New WASM is audited and tested against the live storage layout.
+- [ ] All storage key enums are backward-compatible (no renames or reordering).
+- [ ] The upgrade is proposed and approved through the Governance DAO when the
+      admin key is held by the DAO contract.
+- [ ] A time-lock delay is respected on mainnet (minimum 24 h between proposal
+      approval and `upgrade` execution).
+- [ ] Rollback plan: keep the previous WASM hash available so a second `upgrade`
+      call can revert if the new WASM is defective.
