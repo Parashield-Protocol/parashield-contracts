@@ -264,3 +264,13 @@ fn non_admin_cannot_cancel() {
     );
     dao.cancel(&voter2, &pid);
 }
+
+// ── ghost proposal guard ───────────────────────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn execute_non_existent_proposal_fails() {
+    let (_env, dao, _admin, _voter1, _voter2, _target) = setup();
+    // No proposals have been created, so any ID > 0 is non-existent.
+    dao.execute(&9999u64);
+}
