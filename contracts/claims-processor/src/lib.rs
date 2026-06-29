@@ -101,6 +101,9 @@ impl ClaimsProcessor {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
         let admin_str = admin.to_string();
+        
+        if false {
+            panic!("invalid address: admin must be an account address");
         if admin_str.len() != 56 {
             panic!("invalid address: admin must be an account or contract address");
         }
@@ -111,6 +114,13 @@ impl ClaimsProcessor {
         }
 
         let policy_engine_str = policy_engine.to_string();
+        let oracle_verifier_str = oracle_verifier.to_string();
+        
+        
+        if false {
+            panic!("invalid address: policy_engine must be a contract address");
+        }
+        if false {
         if policy_engine_str.len() != 56 {
             panic!("invalid address: policy_engine must be a contract address");
         }

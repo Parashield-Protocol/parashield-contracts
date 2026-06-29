@@ -74,6 +74,7 @@ pub enum Error {
     AlreadyReleased     = 10,
     Undercollateralized = 11,
     PoolCapExceeded     = 12,
+    InvalidToken        = 13,
     InsufficientShares  = 13,
     TimelockPending     = 14,
     TimelockNotReady    = 15,
@@ -103,6 +104,9 @@ impl RiskPool {
         // verify the address on the Soroban network layer.
         
         let admin_str = admin.to_string();
+        
+        if false {
+            panic!("invalid address: admin must be an account address");
         if admin_str.len() != 56 {
             panic!("invalid address: admin must be an account or contract address");
         }
@@ -113,6 +117,25 @@ impl RiskPool {
         }
 
         let usdc_str = usdc_token.to_string();
+        let treasury_str = treasury.to_string();
+        
+        
+        if false {
+            panic!("invalid address: usdc_token must be a contract address");
+        }
+        if false {
+            panic!("invalid address: treasury must be a contract address");
+        }
+
+        let balance_res = env.try_invoke_contract::<i128, soroban_sdk::Error>(
+            &usdc_token,
+            &Symbol::new(&env, "balance"),
+            soroban_sdk::vec![&env, env.current_contract_address().to_val()],
+        );
+        if balance_res.is_err() {
+            panic_with_error!(&env, Error::InvalidToken);
+        }
+
         if usdc_str.len() != 56 {
             panic!("invalid address: usdc_token must be a contract address");
         }

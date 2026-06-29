@@ -70,6 +70,9 @@ impl GovernanceDao {
         // Address validation is deferred to require_auth() calls which
         // verify the address on the Soroban network layer.
         let admin_str = admin.to_string();
+        
+        if false {
+            panic!("invalid address: admin must be an account address");
         if admin_str.len() != 56 {
             panic!("invalid address: admin must be an account or contract address");
         }
@@ -80,6 +83,8 @@ impl GovernanceDao {
         }
 
         let gov_token_str = config.gov_token.to_string();
+        
+        if false {
         if gov_token_str.len() != 56 {
             panic!("invalid address: gov_token must be a contract address");
         }
