@@ -8,7 +8,7 @@
 //! Design notes
 //! ─────────────
 //! - Multiple oracles can submit the same key; the contract computes a
-//!   confidence-weighted median for aggregation.
+//!   weight-based median for aggregation (oracle weight, not submission confidence).
 //! - Only the admin can register/remove oracle addresses.
 //! - Any oracle already registered for a (data_type) may submit data.
 //! - Duplicate submissions from the same oracle overwrite the previous value.
