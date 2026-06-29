@@ -1,12 +1,12 @@
-claims-processor.rs: no authorization checks on submit_claim / auto_process
+oracle-verifier.rs: no TTL on data points — arbitrarily old data used for triggers
 Repo Avatar
 Parashield-Protocol/parashield-contracts
-claims-processor.rs: no check that caller is authorized — any address can submit or process claims
+oracle-verifier.rs: get_latest_submission might return stale data silently — no TTL enforcement
 
-submit_claim and auto_process do not verify that the caller is an authorized keeper or the policyholder. Anyone can submit claims for anyone else's policies.
+Data is stored with a timestamp, but when verify_trigger queries it, there's no check that the data is recent. A 6-month-old rainfall submission could still be used to trigger claims.
 
 Acceptance criteria:
 
-submit_claim: verify caller is the policyholder (from policy.policyholder field)
-auto_process: verify caller is an authorized keeper or operator (stored in contract)
-Test: call submit_claim for someone else's policy, expect unauthorized error
+Add MAX_DATA_AGE constant (e.g., 7 days)
+In verify_trigger, check: current_time - data_timestamp <= MAX_DATA_AGE, else return error
+Test: submit data, wait 8 days, call verify_trigger, expect error
