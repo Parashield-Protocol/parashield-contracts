@@ -67,6 +67,22 @@ fn test_initialize_accepts_any_address_type() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_initialize_with_non_token_usdc() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    
+    // Register some random non-token contract (e.g. PolicyEngine itself) and use it as USDC
+    let fake_usdc = env.register(PolicyEngine, ());
+    let oracle = env.register(PolicyEngine, ());
+    
+    let contract_id = env.register(PolicyEngine, ());
+    PolicyEngineClient::new(&env, &contract_id)
+        .initialize(&admin, &fake_usdc, &oracle);
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #1)")]
 fn test_double_initialize_panics() {
     let (env, admin, oracle, usdc, contract_id) = setup();
@@ -534,12 +550,11 @@ fn test_premium_matches_formula() {
     let pid = create_crop_product(&env, &client, &admin);
 
     let buyer = Address::generate(&env);
-    // 1000 USDC in stroops
     let coverage = 10_000_000_000i128;
-    let rate_bps = 500; // create_crop_product uses 500
+    let rate_bps = 500i128;
     let duration_days = 30u32;
     let expected_premium = coverage
-        .checked_mul(rate_bps as i128)
+        .checked_mul(rate_bps)
         .expect("overflow")
         .checked_mul(duration_days as i128)
         .expect("overflow")
@@ -549,7 +564,7 @@ fn test_premium_matches_formula() {
         .expect("div by zero");
     let amount = expected_premium + 1_000_000_000i128;
     StellarAssetClient::new(&env, &usdc).mint(&buyer, &amount);
-
+  
     let buyer_before = TokenClient::new(&env, &usdc).balance(&buyer);
 
     client.buy_policy(&buyer, &pid, &coverage, &duration_days, &symbol_short!("kis2606"));
