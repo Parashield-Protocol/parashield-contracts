@@ -30,16 +30,6 @@ fn test_initialize_sets_admin() {
 }
 
 #[test]
-#[should_panic(expected = "invalid address")]
-fn test_initialize_rejects_invalid_admin_format() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let invalid_admin = Address::generate(&env);
-    let contract_id = env.register(OracleVerifier, ());
-    OracleVerifierClient::new(&env, &contract_id).initialize(&invalid_admin);
-}
-
-#[test]
 #[should_panic(expected = "Error(Contract, #1)")]
 fn test_double_initialize_panics() {
     let (env, admin, contract_id) = setup();

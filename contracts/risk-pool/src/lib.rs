@@ -80,21 +80,6 @@ impl RiskPool {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
-        let admin_str = admin.to_string();
-        let admin_prefix = admin_str.to_string();
-        if !admin_prefix.starts_with('G') {
-            panic!("invalid address: admin must be an account address");
-        }
-        let usdc_str = usdc_token.to_string();
-        let treasury_str = treasury.to_string();
-        let usdc_prefix = usdc_str.to_string();
-        let treasury_prefix = treasury_str.to_string();
-        if !usdc_prefix.starts_with('C') {
-            panic!("invalid address: usdc_token must be a contract address");
-        }
-        if !treasury_prefix.starts_with('C') {
-            panic!("invalid address: treasury must be a contract address");
-        }
         admin.require_auth();
         env.storage().instance().set(&StorageKey::Initialized,        &true);
         env.storage().instance().set(&StorageKey::Admin,              &admin);

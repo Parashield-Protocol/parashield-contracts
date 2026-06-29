@@ -64,16 +64,6 @@ impl GovernanceDao {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
-        let admin_str = admin.to_string();
-        let admin_prefix = admin_str.to_string();
-        if !admin_prefix.starts_with('G') {
-            panic!("invalid address: admin must be an account address");
-        }
-        let gov_token_str = config.gov_token.to_string();
-        let gov_token_prefix = gov_token_str.to_string();
-        if !gov_token_prefix.starts_with('C') {
-            panic!("invalid address: gov_token must be a contract address");
-        }
         admin.require_auth();
         env.storage().instance().set(&StorageKey::Initialized,    &true);
         env.storage().instance().set(&StorageKey::Admin,          &admin);

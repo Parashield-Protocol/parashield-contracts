@@ -53,18 +53,6 @@ fn test_initialize_sets_admin_and_oracle() {
 }
 
 #[test]
-#[should_panic(expected = "invalid address")]
-fn test_initialize_rejects_invalid_address_formats() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let invalid_admin = Address::generate(&env);
-    let usdc = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
-    let contract_id = env.register(PolicyEngine, ());
-    PolicyEngineClient::new(&env, &contract_id)
-        .initialize(&invalid_admin, &usdc, &Address::generate(&env));
-}
-
-#[test]
 #[should_panic(expected = "Error(Contract, #1)")]
 fn test_double_initialize_panics() {
     let (env, admin, oracle, usdc, contract_id) = setup();

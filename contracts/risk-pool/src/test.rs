@@ -115,18 +115,6 @@ fn withdraw_uses_available_liquidity_after_locks() {
 }
 
 #[test]
-fn withdraw_uses_available_liquidity_after_locks() {
-    let (_, pool, _, admin, _, lp1) = setup();
-    let amount = 1000_0000000i128;
-    let shares = pool.deposit(&lp1, &amount);
-
-    pool.lock_for_policy(&admin, &1u128, &300_0000000i128);
-    let returned = pool.withdraw(&lp1, &shares);
-
-    assert_eq!(returned, 700_0000000i128);
-}
-
-#[test]
 fn withdraw_partial_position_decrements_shares() {
     let (_, pool, _, _, _, lp1) = setup();
     let amount = 1000_0000000i128;

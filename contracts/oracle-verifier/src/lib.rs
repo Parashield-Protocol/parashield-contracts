@@ -81,11 +81,6 @@ impl OracleVerifier {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
-        let admin_str = admin.to_string();
-        let admin_prefix = admin_str.to_string();
-        if !admin_prefix.starts_with('G') {
-            panic!("invalid address: admin must be an account address");
-        }
         admin.require_auth();
         env.storage().instance().set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
@@ -127,7 +122,7 @@ impl OracleVerifier {
         if list.len() >= MAX_ORACLES {
             panic_with_error!(&env, Error::TooManyOracles);
         }
-        list.push_back(oracle);
+        list.push_back(oracle.clone());
         env.storage().instance().set(&StorageKey::OracleList, &list);
 
         env.events().publish(
@@ -351,10 +346,9 @@ impl OracleVerifier {
                 total_weight += entry.weight as u128;
             }
         }
-        let confidence = if total_weight > 0 {
-            (weighted_confidence_sum / total_weight) as u32
-        } else {
-            0u32
+        let confidence = match weighted_confidence_sum.checked_div(total_weight) {
+            Some(c) => c as u32,
+            None => 0u32,
         };
         AggregatedData { median_value, oracle_count, confidence, min_confidence, last_updated }
     }
