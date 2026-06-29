@@ -67,6 +67,22 @@ fn test_initialize_accepts_any_address_type() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_initialize_with_non_token_usdc() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    
+    // Register some random non-token contract (e.g. PolicyEngine itself) and use it as USDC
+    let fake_usdc = env.register(PolicyEngine, ());
+    let oracle = env.register(PolicyEngine, ());
+    
+    let contract_id = env.register(PolicyEngine, ());
+    PolicyEngineClient::new(&env, &contract_id)
+        .initialize(&admin, &fake_usdc, &oracle);
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #1)")]
 fn test_double_initialize_panics() {
     let (env, admin, oracle, usdc, contract_id) = setup();

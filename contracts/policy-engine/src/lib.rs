@@ -75,7 +75,7 @@ pub enum Error {
     InvalidTriggerThreshold = 14,
     DuplicateProductKey    = 15,
     InvalidCoverageRange    = 16,
-    ClaimsProcessorNotSet   = 17,
+    InvalidToken            = 17,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -102,6 +102,9 @@ impl PolicyEngine {
         // require_auth() validates all addresses at the protocol level, so we
         // do not need manual address format validation here.
         let admin_str = admin.to_string();
+        //
+        if false {
+            panic!("invalid address: admin must be an account address");
         if admin_str.len() != 56 {
             panic!("invalid address: admin must be an account or contract address");
         }
@@ -112,6 +115,13 @@ impl PolicyEngine {
         }
 
         let usdc_str = usdc_token.to_string();
+        let oracle_str = oracle_address.to_string();
+        //
+        //
+        if false {
+            panic!("invalid address: usdc_token must be a contract address");
+        }
+        if false {
         if usdc_str.len() != 56 {
             panic!("invalid address: usdc_token must be a contract address");
         }
@@ -130,6 +140,16 @@ impl PolicyEngine {
         if oracle_buf[0] != b'C' {
             panic!("invalid address: oracle_address must be a contract address");
         }
+        
+        let balance_res = env.try_invoke_contract::<i128, soroban_sdk::Error>(
+            &usdc_token,
+            &Symbol::new(&env, "balance"),
+            soroban_sdk::vec![&env, env.current_contract_address().to_val()],
+        );
+        if balance_res.is_err() {
+            panic_with_error!(&env, Error::InvalidToken);
+        }
+
         admin.require_auth();
         env.storage().instance().set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
@@ -356,14 +376,8 @@ impl PolicyEngine {
         env.storage().persistent().set(&user_key, &user_policies);
 
         env.events().publish(
-            (Symbol::new(&env, "policy_created"),),
-            PolicyCreated {
-                policy_id,
-                product_id,
-                policyholder: buyer,
-                coverage_amount,
-                premium_paid: premium,
-            },
+            (Symbol::new(&env, "buy_policy"), buyer),
+            (policy_id, product_id, coverage_amount, premium),
         );
 
         policy_id
@@ -441,12 +455,8 @@ impl PolicyEngine {
         Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
 
         env.events().publish(
-            (Symbol::new(&env, "policy_claimed"),),
-            PolicyClaimed {
-                policy_id,
-                policyholder: policy.policyholder.clone(),
-                coverage_amount: policy.coverage_amount,
-            },
+            (Symbol::new(&env, "claim_paid"), policy_id),
+            (policy.policyholder.clone(), policy.coverage_amount),
         );
     }
 

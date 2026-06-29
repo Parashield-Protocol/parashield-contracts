@@ -142,6 +142,9 @@ pub struct OracleDataSubmitted {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaxDataAgeUpdated {
+    pub max_age: u64,
+}
 pub struct AdminUpdated {
     pub new_admin: Address,
 }
