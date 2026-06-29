@@ -62,6 +62,7 @@ pub enum Error {
     InvalidWeight       = 8,
     StaleData           = 9,
     TooManyOracles      = 10,
+    InvalidTimestamp    = 11,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -230,6 +231,16 @@ impl OracleVerifier {
         if confidence == 0 || confidence > 100 {
             panic_with_error!(&env, Error::InvalidConfidence);
         }
+
+        let now = env.ledger().timestamp();
+        if timestamp > now {
+            panic_with_error!(&env, Error::InvalidTimestamp);
+        }
+        let ninety_days = 90 * 24 * 60 * 60;
+        if timestamp < now.saturating_sub(ninety_days) {
+            panic_with_error!(&env, Error::InvalidTimestamp);
+        }
+
 
         // Verify oracle is registered and active for this data_type
         let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
@@ -411,6 +422,16 @@ impl OracleVerifier {
         for i in 0..submissions.len() {
             let (key, value, confidence, timestamp) = submissions.get_unchecked(i);
             if confidence == 0 || confidence > 100 { panic_with_error!(&env, Error::InvalidConfidence); }
+
+            let now = env.ledger().timestamp();
+            if timestamp > now {
+                panic_with_error!(&env, Error::InvalidTimestamp);
+            }
+            let ninety_days = 90 * 24 * 60 * 60;
+            if timestamp < now.saturating_sub(ninety_days) {
+                panic_with_error!(&env, Error::InvalidTimestamp);
+            }
+
             let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
             let mut points: Vec<OracleDataPoint> = env.storage().persistent()
                 .get(&dp_key)
