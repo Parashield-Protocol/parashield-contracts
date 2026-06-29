@@ -282,6 +282,9 @@ impl PolicyEngine {
         oracle_key: Symbol,
     ) -> u128 {
         buyer.require_auth();
+        if env.storage().instance().get::<_, bool>(&StorageKey::Paused).unwrap_or(false) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
         let product = Self::load_product(&env, product_id);
         if product.status != ProductStatus::Active {
             panic_with_error!(&env, Error::ProductNotActive);
@@ -360,20 +363,34 @@ impl PolicyEngine {
         env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
         Self::remove_policy_from_user(&env, &policyholder, policy_id);
 
-        // Refund premium
+        // Pro-rate the refund: only return the unearned portion of the premium.
+        // Earned = premium_paid * elapsed / total_duration; refund = premium_paid - earned.
+        let now = env.ledger().timestamp();
+        let elapsed = now.saturating_sub(policy.start_time);
+        let total_duration = policy.end_time.saturating_sub(policy.start_time);
+        let refund = if total_duration == 0 {
+            policy.premium_paid
+        } else {
+            let elapsed_capped = elapsed.min(total_duration);
+            let earned = policy.premium_paid * elapsed_capped as i128 / total_duration as i128;
+            policy.premium_paid.saturating_sub(earned)
+        };
+
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
-        token::Client::new(&env, &usdc)
-            .transfer(&env.current_contract_address(), &policyholder, &policy.premium_paid);
+        if refund > 0 {
+            token::Client::new(&env, &usdc)
+                .transfer(&env.current_contract_address(), &policyholder, &refund);
+        }
 
         env.events().publish(
             (Symbol::new(&env, "policy_cancelled"),),
             PolicyCancelled {
                 policy_id,
                 policyholder: policyholder.clone(),
-                refund_amount: policy.premium_paid,
+                refund_amount: refund,
             },
         );
-        policy.premium_paid
+        refund
     }
 
     // ── Status updates (called by Claims Processor) ──────────────────────────
