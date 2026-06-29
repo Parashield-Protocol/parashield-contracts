@@ -13,11 +13,13 @@
 //! - Any oracle already registered for a (data_type) may submit data.
 //! - Duplicate submissions from the same oracle overwrite the previous value.
 #![no_std]
+extern crate alloc;
+use alloc::string::ToString;
 
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    Address, Env, Symbol, Vec,
+    Address, BytesN, Env, Symbol, Vec,
 };
 
 pub mod types;
@@ -44,6 +46,7 @@ enum StorageKey {
     /// Global minimum confidence threshold (u32)
     MinConfidence,
     MaxDataAge,
+    PendingAdmin,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -82,14 +85,20 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
         let admin_str = admin.to_string();
-        let admin_prefix = admin_str.to_string();
-        if !admin_prefix.starts_with('G') {
-            panic!("invalid address: admin must be an account address");
+        if admin_str.len() != 56 {
+            panic!("invalid address: admin must be an account or contract address");
+        }
+        let mut admin_buf = [0u8; 56];
+        admin_str.copy_into_slice(&mut admin_buf);
+        if admin_buf[0] != b'G' && admin_buf[0] != b'C' {
+            panic!("invalid address: admin must be an account or contract address");
         }
         admin.require_auth();
         env.storage().instance().set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
         env.storage().instance().set(&StorageKey::OracleList, &Vec::<Address>::new(&env));
+        // No pending admin initially
+        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
 
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
@@ -127,7 +136,7 @@ impl OracleVerifier {
         if list.len() >= MAX_ORACLES {
             panic_with_error!(&env, Error::TooManyOracles);
         }
-        list.push_back(oracle);
+        list.push_back(oracle.clone());
         env.storage().instance().set(&StorageKey::OracleList, &list);
 
         env.events().publish(
@@ -203,9 +212,55 @@ impl OracleVerifier {
         );
     }
 
+    /// Propose a new admin. Only the current admin can call this.
+    pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
+        Self::require_admin(&env, &admin);
+        // Store the proposed admin (zero address means no proposal)
+        env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
+    }
+
+    /// Accept the proposed admin. Only the proposed admin can call this.
+    pub fn accept_admin(env: Env, admin: Address) {
+        let pending_admin: Address = env.storage().instance()
+            .get(&StorageKey::PendingAdmin)
+            .unwrap_or_else(|| Address::from_uint(&env, 0));
+        // Only the pending admin can accept
+        if admin != pending_admin {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        admin.require_auth();
+        let current_admin: Address = env.storage().instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        // Update admin
+        env.storage().instance().set(&StorageKey::Admin, &admin);
+        // Clear the proposal
+        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "admin_updated"),),
+            AdminUpdated {
+                new_admin: admin,
+            },
+        );
+    }
+
     /// Get the maximum data age in seconds (defaults to 7 days = 604,800 seconds).
     pub fn get_max_data_age(env: Env) -> u64 {
         env.storage().instance().get(&StorageKey::MaxDataAge).unwrap_or(604_800)
+    }
+
+    pub fn set_min_oracle_count(env: Env, admin: Address, min_count: u32) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&StorageKey::MinOracleCount, &min_count);
+        env.events().publish(
+            (Symbol::new(&env, "min_oracle_count_updated"),),
+            MinOracleCountUpdated { min_count },
+        );
+    }
+
+    pub fn get_min_oracle_count(env: Env) -> u32 {
+        env.storage().instance().get(&StorageKey::MinOracleCount).unwrap_or(1)
     }
 
     // ── Data Submission ───────────────────────────────────────────────────────
@@ -351,10 +406,9 @@ impl OracleVerifier {
                 total_weight += entry.weight as u128;
             }
         }
-        let confidence = if total_weight > 0 {
-            (weighted_confidence_sum / total_weight) as u32
-        } else {
-            0u32
+        let confidence = match weighted_confidence_sum.checked_div(total_weight) {
+            Some(c) => c as u32,
+            None => 0u32,
         };
         AggregatedData { median_value, oracle_count, confidence, min_confidence, last_updated }
     }
@@ -441,6 +495,72 @@ impl OracleVerifier {
         }
     }
 
+    /// Submit multiple data readings in a single invocation — avoids the cost
+    /// and latency of calling `submit_data` once per key.  All readings share
+    /// the same `oracle` and `data_type`; each carries its own key, value,
+    /// confidence, and timestamp.  Every reading is validated and persisted
+    /// atomically within the single transaction.
+    pub fn submit_data_batch(
+        env: Env,
+        oracle: Address,
+        data_type: Symbol,
+        submissions: Vec<OracleDataSubmission>,
+    ) {
+        oracle.require_auth();
+
+        let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
+        let entry: OracleEntry = env.storage().persistent()
+            .get(&oracle_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
+        if !entry.active { panic_with_error!(&env, Error::Unauthorized); }
+
+        for i in 0..submissions.len() {
+            let sub = submissions.get_unchecked(i);
+            if sub.confidence == 0 || sub.confidence > 100 {
+                panic_with_error!(&env, Error::InvalidConfidence);
+            }
+            let dp_key = StorageKey::DataPoints(data_type.clone(), sub.key.clone());
+            let mut points: Vec<OracleDataPoint> = env.storage().persistent()
+                .get(&dp_key)
+                .unwrap_or_else(|| Vec::new(&env));
+            let new_point = OracleDataPoint {
+                oracle: oracle.clone(),
+                value: sub.value,
+                confidence: sub.confidence,
+                timestamp: sub.timestamp,
+            };
+            let mut found = false;
+            for j in 0..points.len() {
+                if points.get_unchecked(j).oracle == oracle {
+                    points.set(j, new_point.clone());
+                    found = true;
+                    break;
+                }
+            }
+            if !found { points.push_back(new_point); }
+            env.storage().persistent().set(&dp_key, &points);
+
+            env.events().publish(
+                (Symbol::new(&env, "oracle_data_submitted"),),
+                OracleDataSubmitted {
+                    oracle: oracle.clone(),
+                    data_type: data_type.clone(),
+                    key: sub.key,
+                    value: sub.value,
+                    confidence: sub.confidence,
+                    timestamp: sub.timestamp,
+                },
+            );
+        }
+    }
+
+    /// Upgrade the contract WASM in-place. Only the admin may call this.
+    /// Storage is preserved across upgrades; only the execution code changes.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        Self::require_admin(&env, &admin);
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+    }
+
     /// List all registered oracle addresses.
     pub fn get_oracles(env: Env) -> Vec<Address> {
         env.storage()
@@ -497,7 +617,10 @@ impl OracleVerifier {
             }
         }
         
-        if n == 0 || total_weight == 0 { panic_with_error!(env, Error::NoDataAvailable); }
+        let min_oracle_count: u32 = env.storage().instance().get(&StorageKey::MinOracleCount).unwrap_or(1);
+        if (n as u32) < min_oracle_count || n == 0 || total_weight == 0 {
+            panic_with_error!(env, Error::NoDataAvailable);
+        }
         
         // Native sort on the stack slice: O(N log N)
         let active_values = &mut values[0..n];

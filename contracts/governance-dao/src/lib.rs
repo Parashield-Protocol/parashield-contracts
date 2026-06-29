@@ -13,10 +13,12 @@
 //!
 //! v2 — full implementation; DAO is now deployable and testable.
 #![no_std]
+extern crate alloc;
+use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    token, Address, Bytes, Env, Symbol,
+    token, Address, Bytes, BytesN, Env, Symbol,
 };
 
 pub mod types;
@@ -48,6 +50,7 @@ pub enum Error {
     ProposalNotPassed    = 10,
     AlreadyExecuted      = 11,
     AlreadyCancelled     = 12,
+    TimelockNotExpired   = 13,
 }
 
 #[contract]
@@ -66,6 +69,25 @@ impl GovernanceDao {
         }
         // Address validation is deferred to require_auth() calls which
         // verify the address on the Soroban network layer.
+        let admin_str = admin.to_string();
+        if admin_str.len() != 56 {
+            panic!("invalid address: admin must be an account or contract address");
+        }
+        let mut admin_buf = [0u8; 56];
+        admin_str.copy_into_slice(&mut admin_buf);
+        if admin_buf[0] != b'G' && admin_buf[0] != b'C' {
+            panic!("invalid address: admin must be an account or contract address");
+        }
+
+        let gov_token_str = config.gov_token.to_string();
+        if gov_token_str.len() != 56 {
+            panic!("invalid address: gov_token must be a contract address");
+        }
+        let mut gov_token_buf = [0u8; 56];
+        gov_token_str.copy_into_slice(&mut gov_token_buf);
+        if gov_token_buf[0] != b'C' {
+            panic!("invalid address: gov_token must be a contract address");
+        }
         admin.require_auth();
         env.storage().instance().set(&StorageKey::Initialized,    &true);
         env.storage().instance().set(&StorageKey::Admin,          &admin);
@@ -116,6 +138,7 @@ impl GovernanceDao {
             votes_abstain: 0,
             created_at:    now,
             vote_end:      now + config.voting_period,
+            execution_time: 0,
         };
 
         env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
@@ -210,11 +233,12 @@ impl GovernanceDao {
             } else {
                 0
             };
-            proposal.status = if for_bps as u32 >= config.majority_bps {
-                ProposalStatus::Passed
+            if for_bps as u32 >= config.majority_bps {
+                proposal.status = ProposalStatus::Passed;
+                proposal.execution_time = env.ledger().timestamp() + config.proposal_timelock;
             } else {
-                ProposalStatus::Failed
-            };
+                proposal.status = ProposalStatus::Failed;
+            }
         }
 
         env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
@@ -241,6 +265,9 @@ impl GovernanceDao {
         }
         if proposal.status != ProposalStatus::Passed {
             panic_with_error!(&env, Error::ProposalNotPassed);
+        }
+        if env.ledger().timestamp() < proposal.execution_time {
+            panic_with_error!(&env, Error::TimelockNotExpired);
         }
 
         // Signal execution — actual cross-contract call is the caller's responsibility
@@ -314,8 +341,16 @@ impl GovernanceDao {
                 proposal_threshold: config.proposal_threshold,
                 total_supply: config.total_supply,
                 voting_period: config.voting_period,
+                proposal_timelock: config.proposal_timelock,
             },
         );
+    }
+
+    /// Upgrade the contract WASM in-place. Only the admin may call this.
+    /// Storage is preserved across upgrades; only the execution code changes.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        Self::require_admin(&env, &admin);
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 
     fn require_admin(env: &Env, caller: &Address) {
