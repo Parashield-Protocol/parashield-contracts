@@ -337,14 +337,8 @@ impl PolicyEngine {
         env.storage().persistent().set(&user_key, &user_policies);
 
         env.events().publish(
-            (Symbol::new(&env, "policy_created"),),
-            PolicyCreated {
-                policy_id,
-                product_id,
-                policyholder: buyer,
-                coverage_amount,
-                premium_paid: premium,
-            },
+            (Symbol::new(&env, "buy_policy"), buyer),
+            (policy_id, product_id, coverage_amount, premium),
         );
 
         policy_id
@@ -422,12 +416,8 @@ impl PolicyEngine {
         Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
 
         env.events().publish(
-            (Symbol::new(&env, "policy_claimed"),),
-            PolicyClaimed {
-                policy_id,
-                policyholder: policy.policyholder.clone(),
-                coverage_amount: policy.coverage_amount,
-            },
+            (Symbol::new(&env, "claim_paid"), policy_id),
+            (policy.policyholder.clone(), policy.coverage_amount),
         );
     }
 

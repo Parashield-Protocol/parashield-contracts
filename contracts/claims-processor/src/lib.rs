@@ -531,13 +531,8 @@ impl ClaimsProcessor {
         Self::remove_from_pending(env, claim.id);
 
         env.events().publish(
-            (Symbol::new(env, "claim_processed"),),
-            ClaimProcessed {
-                claim_id: claim.id,
-                policy_id: claim.policy_id,
-                trigger_met: claim.trigger_met,
-                status: claim.status.clone(),
-            },
+            (Symbol::new(env, "claim_settled"), claim.id),
+            (claim.trigger_met, claim.coverage_amount),
         );
 
         result

@@ -223,12 +223,8 @@ impl RiskPool {
         env.storage().instance().set(&StorageKey::TotalShares,    &(total_shares + new_shares));
 
         env.events().publish(
-            (Symbol::new(&env, "liquidity_deposited"),),
-            LiquidityDeposited {
-                provider: provider.clone(),
-                amount,
-                shares_minted: new_shares,
-            },
+            (Symbol::new(&env, "deposit"), provider.clone()),
+            (amount, new_shares),
         );
 
         new_shares
@@ -267,12 +263,8 @@ impl RiskPool {
         env.storage().instance().set(&StorageKey::TotalShares,    &(total_shares - shares));
 
         env.events().publish(
-            (Symbol::new(&env, "liquidity_withdrawn"),),
-            LiquidityWithdrawn {
-                provider: provider.clone(),
-                shares_burned: shares,
-                amount_returned: amount,
-            },
+            (Symbol::new(&env, "withdraw"), provider.clone()),
+            (amount, shares),
         );
 
         amount
