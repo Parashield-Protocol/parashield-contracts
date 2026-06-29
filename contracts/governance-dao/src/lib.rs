@@ -126,6 +126,7 @@ impl GovernanceDao {
         if weight < config.proposal_threshold {
             panic_with_error!(&env, Error::InsufficientWeight);
         }
+        gov_token.transfer(&proposer, &env.current_contract_address(), &config.proposal_threshold);
 
         let proposal_id: u64 = env.storage().instance()
             .get(&StorageKey::NextProposalId).unwrap_or(0);
@@ -246,6 +247,9 @@ impl GovernanceDao {
             }
         }
 
+        let gov_token = token::Client::new(&env, &config.gov_token);
+        gov_token.transfer(&env.current_contract_address(), &proposal.proposer, &config.proposal_threshold);
+
         env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
 
         env.events().publish(
@@ -299,6 +303,10 @@ impl GovernanceDao {
 
         proposal.status = ProposalStatus::Cancelled;
         env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
+
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let gov_token = token::Client::new(&env, &config.gov_token);
+        gov_token.transfer(&env.current_contract_address(), &proposal.proposer, &config.proposal_threshold);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_cancelled"),),
