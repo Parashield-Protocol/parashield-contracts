@@ -30,13 +30,14 @@ fn test_initialize_sets_admin() {
 }
 
 #[test]
-#[should_panic(expected = "invalid address")]
-fn test_initialize_rejects_invalid_admin_format() {
+fn test_initialize_accepts_any_address_type() {
+    // Soroban's Address type is inherently valid; no prefix validation needed.
     let env = Env::default();
     env.mock_all_auths();
-    let invalid_admin = Address::generate(&env);
+    let admin = Address::generate(&env);
     let contract_id = env.register(OracleVerifier, ());
-    OracleVerifierClient::new(&env, &contract_id).initialize(&invalid_admin);
+    OracleVerifierClient::new(&env, &contract_id).initialize(&admin);
+    assert_eq!(OracleVerifierClient::new(&env, &contract_id).get_admin(), admin);
 }
 
 #[test]
@@ -522,5 +523,90 @@ fn test_verify_trigger_rejects_stale_data() {
     // T = t0 + 8 days (T0 + 691,200): must panic with NoDataAvailable (#6)
     env.ledger().with_mut(|l| l.timestamp = t0 + 691_200);
     client.verify_trigger(&weather(), &kisumu_key(), &condition);
+}
+
+// ── Issue #60: submit_data_batch ──────────────────────────────────────────────
+
+#[test]
+fn submit_data_batch_persists_all_100_readings() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+    env.cost_estimate().budget().reset_unlimited();
+
+    // Build 10 distinct keys (Soroban Symbol is max 9 chars)
+    let keys: soroban_sdk::Vec<soroban_sdk::Symbol> = {
+        let mut v = soroban_sdk::Vec::new(&env);
+        for i in 0u32..10 {
+            // prefix "k" + digit (1 char + 1 digit = ≤9 chars)
+            let s = match i {
+                0 => symbol_short!("k0"),
+                1 => symbol_short!("k1"),
+                2 => symbol_short!("k2"),
+                3 => symbol_short!("k3"),
+                4 => symbol_short!("k4"),
+                5 => symbol_short!("k5"),
+                6 => symbol_short!("k6"),
+                7 => symbol_short!("k7"),
+                8 => symbol_short!("k8"),
+                _ => symbol_short!("k9"),
+            };
+            v.push_back(s);
+        }
+        v
+    };
+
+    // Build 100 submissions (10 keys × 10 batches)
+    let mut all_submissions = soroban_sdk::Vec::<OracleDataSubmission>::new(&env);
+    for batch in 0u64..10 {
+        for ki in 0u32..10 {
+            all_submissions.push_back(OracleDataSubmission {
+                key: keys.get_unchecked(ki),
+                value: (batch * 10 + ki as u64) as i128 * 1_000_000,
+                confidence: 85,
+                timestamp: 1_000_000 + batch * 100 + ki as u64,
+            });
+        }
+    }
+
+    client.submit_data_batch(&oracle, &weather(), &all_submissions);
+
+    // Verify all 10 keys were persisted (last write wins per oracle per key)
+    for ki in 0u32..10 {
+        let key = keys.get_unchecked(ki);
+        let dp = client.get_data(&weather(), &key);
+        assert_eq!(dp.oracle, oracle);
+        assert_eq!(dp.confidence, 85);
+    }
+}
+
+#[test]
+fn submit_data_batch_single_invocation_replaces_existing() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+
+    let key = kisumu_key();
+
+    // First: single submit
+    client.submit_data(&oracle, &weather(), &key, &30_000_000i128, &90u32, &1_000_000u64);
+
+    // Batch: overwrite the same key
+    let mut subs = soroban_sdk::Vec::<OracleDataSubmission>::new(&env);
+    subs.push_back(OracleDataSubmission {
+        key: key.clone(),
+        value: 99_000_000i128,
+        confidence: 95,
+        timestamp: 2_000_000u64,
+    });
+    env.ledger().with_mut(|l| l.timestamp = 2_000_000u64);
+    client.submit_data_batch(&oracle, &weather(), &subs);
+
+    let dp = client.get_data(&weather(), &key);
+    assert_eq!(dp.value, 99_000_000i128);
+    assert_eq!(dp.confidence, 95);
 }
 

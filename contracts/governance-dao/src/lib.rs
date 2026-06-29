@@ -13,10 +13,12 @@
 //!
 //! v2 — full implementation; DAO is now deployable and testable.
 #![no_std]
+extern crate alloc;
+use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    token, Address, Bytes, Env, Symbol,
+    token, Address, Bytes, BytesN, Env, Symbol,
 };
 
 pub mod types;
@@ -63,11 +65,6 @@ impl GovernanceDao {
     ) {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
-        }
-        let admin_str = admin.to_string();
-        let admin_prefix = admin_str.to_string();
-        if !admin_prefix.starts_with('G') {
-            panic!("invalid address: admin must be an account address");
         }
         let gov_token_str = config.gov_token.to_string();
         let gov_token_prefix = gov_token_str.to_string();
@@ -324,6 +321,13 @@ impl GovernanceDao {
                 voting_period: config.voting_period,
             },
         );
+    }
+
+    /// Upgrade the contract WASM in-place. Only the admin may call this.
+    /// Storage is preserved across upgrades; only the execution code changes.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        Self::require_admin(&env, &admin);
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 
     fn require_admin(env: &Env, caller: &Address) {

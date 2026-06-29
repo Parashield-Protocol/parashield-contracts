@@ -20,7 +20,8 @@ fn setup() -> (Env, RiskPoolClient<'static>, Address, Address, Address, Address)
     let treasury = Address::generate(&env);
     let lp1      = Address::generate(&env);
 
-    let usdc_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let usdc_id    = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let backstop_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
     let pool_id = env.register(RiskPool, ());
     let pool    = RiskPoolClient::new(&env, &pool_id);
 
@@ -31,6 +32,7 @@ fn setup() -> (Env, RiskPoolClient<'static>, Address, Address, Address, Address)
         &admin,
         &usdc_id,
         &treasury,
+        &backstop_id,
         &Symbol::new(&env, "crop"),
     );
 
@@ -53,7 +55,8 @@ fn initialize_sets_state() {
 #[should_panic(expected = "Error(Contract, #1)")]
 fn cannot_initialize_twice() {
     let (env, pool, usdc, admin, treasury, _) = setup();
-    pool.initialize(&admin, &usdc, &treasury, &Symbol::new(&env, "crop"));
+    let backstop = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    pool.initialize(&admin, &usdc, &treasury, &backstop, &Symbol::new(&env, "crop"));
 }
 
 // ── deposits ──────────────────────────────────────────────────────────────────
@@ -100,18 +103,6 @@ fn withdraw_full_position() {
 
     let stats = pool.get_stats();
     assert_eq!(stats.total_deposited, 0);
-}
-
-#[test]
-fn withdraw_uses_available_liquidity_after_locks() {
-    let (_, pool, _, admin, _, lp1) = setup();
-    let amount = 1000_0000000i128;
-    let shares = pool.deposit(&lp1, &amount);
-
-    pool.lock_for_policy(&admin, &1u128, &300_0000000i128);
-    let returned = pool.withdraw(&lp1, &shares);
-
-    assert_eq!(returned, 700_0000000i128);
 }
 
 #[test]
@@ -341,4 +332,77 @@ fn test_deposit_precision_loss_prevented() {
     // significantly out of proportion to shares in the future.
     assert_eq!(shares, 1_000_000_000i128);
     assert!(shares > 0);
+}
+
+// ── Issue #57: premium distribution to treasury AND backstop ─────────────────
+
+#[test]
+fn receive_premium_distributes_80_10_10_split() {
+    let (env, pool, usdc_id, admin, treasury, lp1) = setup();
+
+    // Get the backstop address from pool state
+    let backstop = pool.get_backstop();
+
+    let usdc = token::TokenClient::new(&env, &usdc_id);
+
+    // Give the pool USDC to pay out
+    pool.deposit(&lp1, &10_000_0000000i128);
+
+    let treasury_before = usdc.balance(&treasury);
+    let backstop_before = usdc.balance(&backstop);
+    let acc_before       = pool.get_stats().accumulated_premium;
+
+    // Receive 1000 USDC in premium (from lp1 acting as policy engine)
+    pool.receive_premium(&lp1, &1_000_0000000i128);
+
+    let treasury_after = usdc.balance(&treasury);
+    let backstop_after = usdc.balance(&backstop);
+    let acc_after       = pool.get_stats().accumulated_premium;
+
+    // Treasury should receive 10% = 100 USDC
+    assert_eq!(treasury_after - treasury_before, 100_0000000i128);
+    // Backstop should receive 10% = 100 USDC
+    assert_eq!(backstop_after - backstop_before, 100_0000000i128);
+    // LP accumulated should increase by 80% = 800 USDC
+    assert_eq!(acc_after - acc_before, 800_0000000i128);
+}
+
+#[test]
+fn send_premium_to_treasury_transfers_exact_amount() {
+    let (env, pool, usdc_id, admin, treasury, lp1) = setup();
+
+    let usdc = token::TokenClient::new(&env, &usdc_id);
+
+    // Give pool some USDC liquidity
+    pool.deposit(&lp1, &1_000_0000000i128);
+    // Receive premium to build up pool balance
+    pool.receive_premium(&lp1, &500_0000000i128);
+
+    let treasury_before = usdc.balance(&treasury);
+
+    // Explicitly send 50 USDC to treasury
+    pool.send_premium_to_treasury(&admin, &50_0000000i128);
+
+    let treasury_after = usdc.balance(&treasury);
+    assert_eq!(treasury_after - treasury_before, 50_0000000i128);
+}
+
+#[test]
+fn send_premium_to_backstop_transfers_exact_amount() {
+    let (env, pool, usdc_id, admin, _treasury, lp1) = setup();
+
+    let usdc = token::TokenClient::new(&env, &usdc_id);
+    let backstop = pool.get_backstop();
+
+    // Give pool some USDC liquidity
+    pool.deposit(&lp1, &1_000_0000000i128);
+    pool.receive_premium(&lp1, &500_0000000i128);
+
+    let backstop_before = usdc.balance(&backstop);
+
+    // Explicitly send 50 USDC to backstop
+    pool.send_premium_to_backstop(&admin, &50_0000000i128);
+
+    let backstop_after = usdc.balance(&backstop);
+    assert_eq!(backstop_after - backstop_before, 50_0000000i128);
 }

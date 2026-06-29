@@ -16,13 +16,14 @@ fn setup() -> (Env, RiskPoolClient<'static>, Address, Address, Address) {
     let treasury = Address::generate(&env);
     let lp1      = Address::generate(&env);
 
-    let usdc_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let usdc_id     = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let backstop_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
     let pool_id = env.register(RiskPool, ());
     let pool    = RiskPoolClient::new(&env, &pool_id);
 
     token::StellarAssetClient::new(&env, &usdc_id).mint(&lp1, &100_000_0000000i128);
 
-    pool.initialize(&admin, &usdc_id, &treasury, &Symbol::new(&env, "crop"));
+    pool.initialize(&admin, &usdc_id, &treasury, &backstop_id, &Symbol::new(&env, "crop"));
 
     (env, pool, admin, treasury, lp1)
 }

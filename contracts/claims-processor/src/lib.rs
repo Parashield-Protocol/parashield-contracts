@@ -16,10 +16,12 @@
 //! Once a policy is Claimed or Expired, further process/auto_process calls
 //! return the appropriate ClaimResult without writing again.
 #![no_std]
+extern crate alloc;
+use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    Address, Env, Vec, Symbol,
+    Address, BytesN, Env, Vec, Symbol,
 };
 
 pub mod types;
@@ -95,11 +97,6 @@ impl ClaimsProcessor {
     ) {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
-        }
-        let admin_str = admin.to_string();
-        let admin_prefix = admin_str.to_string();
-        if !admin_prefix.starts_with('G') {
-            panic!("invalid address: admin must be an account address");
         }
         let policy_engine_str = policy_engine.to_string();
         let oracle_verifier_str = oracle_verifier.to_string();
@@ -348,6 +345,16 @@ impl ClaimsProcessor {
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
+    }
+
+    /// Upgrade the contract WASM in-place. Only the admin may call this.
+    /// Storage is preserved across upgrades; only the execution code changes.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        let stored_admin: Address = env.storage().instance().get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        if admin != stored_admin { panic_with_error!(&env, Error::Unauthorized); }
+        admin.require_auth();
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────

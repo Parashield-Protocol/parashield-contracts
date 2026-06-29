@@ -56,6 +56,7 @@ pub struct Initialized {
     pub admin: Address,
     pub usdc_token: Address,
     pub treasury: Address,
+    pub backstop: Address,
     pub category: Symbol,
 }
 
@@ -81,6 +82,21 @@ pub struct PremiumDistributed {
     pub amount: i128,
     pub lp_share: i128,
     pub treasury_share: i128,
+    pub backstop_share: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryFunded {
+    pub amount: i128,
+    pub recipient: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackstopFunded {
+    pub amount: i128,
+    pub recipient: Address,
 }
 
 #[contracttype]

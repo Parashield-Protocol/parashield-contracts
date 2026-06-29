@@ -13,11 +13,13 @@
 //! - Any oracle already registered for a (data_type) may submit data.
 //! - Duplicate submissions from the same oracle overwrite the previous value.
 #![no_std]
+extern crate alloc;
+use alloc::string::ToString;
 
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    Address, Env, Symbol, Vec,
+    Address, BytesN, Env, Symbol, Vec,
 };
 
 pub mod types;
@@ -81,11 +83,6 @@ impl OracleVerifier {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
-        let admin_str = admin.to_string();
-        let admin_prefix = admin_str.to_string();
-        if !admin_prefix.starts_with('G') {
-            panic!("invalid address: admin must be an account address");
-        }
         admin.require_auth();
         env.storage().instance().set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
@@ -127,7 +124,7 @@ impl OracleVerifier {
         if list.len() >= MAX_ORACLES {
             panic_with_error!(&env, Error::TooManyOracles);
         }
-        list.push_back(oracle);
+        list.push_back(oracle.clone());
         env.storage().instance().set(&StorageKey::OracleList, &list);
 
         env.events().publish(
@@ -439,6 +436,72 @@ impl OracleVerifier {
                 },
             );
         }
+    }
+
+    /// Submit multiple data readings in a single invocation — avoids the cost
+    /// and latency of calling `submit_data` once per key.  All readings share
+    /// the same `oracle` and `data_type`; each carries its own key, value,
+    /// confidence, and timestamp.  Every reading is validated and persisted
+    /// atomically within the single transaction.
+    pub fn submit_data_batch(
+        env: Env,
+        oracle: Address,
+        data_type: Symbol,
+        submissions: Vec<OracleDataSubmission>,
+    ) {
+        oracle.require_auth();
+
+        let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
+        let entry: OracleEntry = env.storage().persistent()
+            .get(&oracle_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
+        if !entry.active { panic_with_error!(&env, Error::Unauthorized); }
+
+        for i in 0..submissions.len() {
+            let sub = submissions.get_unchecked(i);
+            if sub.confidence == 0 || sub.confidence > 100 {
+                panic_with_error!(&env, Error::InvalidConfidence);
+            }
+            let dp_key = StorageKey::DataPoints(data_type.clone(), sub.key.clone());
+            let mut points: Vec<OracleDataPoint> = env.storage().persistent()
+                .get(&dp_key)
+                .unwrap_or_else(|| Vec::new(&env));
+            let new_point = OracleDataPoint {
+                oracle: oracle.clone(),
+                value: sub.value,
+                confidence: sub.confidence,
+                timestamp: sub.timestamp,
+            };
+            let mut found = false;
+            for j in 0..points.len() {
+                if points.get_unchecked(j).oracle == oracle {
+                    points.set(j, new_point.clone());
+                    found = true;
+                    break;
+                }
+            }
+            if !found { points.push_back(new_point); }
+            env.storage().persistent().set(&dp_key, &points);
+
+            env.events().publish(
+                (Symbol::new(&env, "oracle_data_submitted"),),
+                OracleDataSubmitted {
+                    oracle: oracle.clone(),
+                    data_type: data_type.clone(),
+                    key: sub.key,
+                    value: sub.value,
+                    confidence: sub.confidence,
+                    timestamp: sub.timestamp,
+                },
+            );
+        }
+    }
+
+    /// Upgrade the contract WASM in-place. Only the admin may call this.
+    /// Storage is preserved across upgrades; only the execution code changes.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        Self::require_admin(&env, &admin);
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 
     /// List all registered oracle addresses.

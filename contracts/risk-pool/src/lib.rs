@@ -12,17 +12,20 @@
 //!
 //! v2 — full implementation; Risk Pool is now deployable and testable.
 #![no_std]
+extern crate alloc;
+use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    token, Address, Env, Symbol, Vec,
+    token, Address, BytesN, Env, Symbol, Vec,
 };
 
 pub mod types;
 pub use types::*;
 
-const PREMIUM_LP_BPS:    i128 = 8_000;  // 80% of premium to LP pool
-const PREMIUM_TREAS_BPS: i128 = 1_000;  // 10% to treasury
+const PREMIUM_LP_BPS:       i128 = 8_000;  // 80% of premium to LP pool
+const PREMIUM_TREAS_BPS:    i128 = 1_000;  // 10% to treasury
+const PREMIUM_BACKSTOP_BPS: i128 = 1_000;  // 10% to backstop fund
 
 /// Upper bound on cumulative deposits (7-decimal USDC stroops).
 /// 10^15 stroops == 100,000,000 USDC. Caps total pool size so share value
@@ -34,6 +37,7 @@ enum StorageKey {
     Initialized,
     Admin,
     Treasury,
+    Backstop,
     UsdcToken,
     Category,
     TotalDeposited,
@@ -75,31 +79,33 @@ impl RiskPool {
         admin: Address,
         usdc_token: Address,
         treasury: Address,
+        backstop: Address,
         category: Symbol,
     ) {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
-        let admin_str = admin.to_string();
-        let admin_prefix = admin_str.to_string();
-        if !admin_prefix.starts_with('G') {
-            panic!("invalid address: admin must be an account address");
-        }
         let usdc_str = usdc_token.to_string();
         let treasury_str = treasury.to_string();
+        let backstop_str = backstop.to_string();
         let usdc_prefix = usdc_str.to_string();
         let treasury_prefix = treasury_str.to_string();
+        let backstop_prefix = backstop_str.to_string();
         if !usdc_prefix.starts_with('C') {
             panic!("invalid address: usdc_token must be a contract address");
         }
         if !treasury_prefix.starts_with('C') {
             panic!("invalid address: treasury must be a contract address");
         }
+        if !backstop_prefix.starts_with('C') {
+            panic!("invalid address: backstop must be a contract address");
+        }
         admin.require_auth();
         env.storage().instance().set(&StorageKey::Initialized,        &true);
         env.storage().instance().set(&StorageKey::Admin,              &admin);
         env.storage().instance().set(&StorageKey::UsdcToken,          &usdc_token);
         env.storage().instance().set(&StorageKey::Treasury,           &treasury);
+        env.storage().instance().set(&StorageKey::Backstop,           &backstop);
         env.storage().instance().set(&StorageKey::Category,           &category);
         env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
         env.storage().instance().set(&StorageKey::TotalLocked,        &0i128);
@@ -114,6 +120,7 @@ impl RiskPool {
                 admin: admin.clone(),
                 usdc_token: usdc_token.clone(),
                 treasury: treasury.clone(),
+                backstop: backstop.clone(),
                 category: category.clone(),
             },
         );
@@ -236,12 +243,17 @@ impl RiskPool {
         token::Client::new(&env, &usdc)
             .transfer(&caller, &env.current_contract_address(), &amount);
 
-        let lp_share    = amount * PREMIUM_LP_BPS    / 10_000;
-        let treas_share = amount * PREMIUM_TREAS_BPS / 10_000;
+        let lp_share       = amount * PREMIUM_LP_BPS       / 10_000;
+        let treas_share    = amount * PREMIUM_TREAS_BPS    / 10_000;
+        let backstop_share = amount * PREMIUM_BACKSTOP_BPS / 10_000;
 
         let treasury: Address = env.storage().instance().get(&StorageKey::Treasury).unwrap();
         token::Client::new(&env, &usdc)
             .transfer(&env.current_contract_address(), &treasury, &treas_share);
+
+        let backstop: Address = env.storage().instance().get(&StorageKey::Backstop).unwrap();
+        token::Client::new(&env, &usdc)
+            .transfer(&env.current_contract_address(), &backstop, &backstop_share);
 
         let acc: i128 = env.storage().instance()
             .get(&StorageKey::AccumulatedPremium).unwrap_or(0);
@@ -253,8 +265,45 @@ impl RiskPool {
                 amount,
                 lp_share,
                 treasury_share: treas_share,
+                backstop_share,
             },
         );
+    }
+
+    /// Send a specified amount of USDC from the pool to the treasury address.
+    /// Called by the backend after each policy purchase to distribute earned premiums.
+    pub fn send_premium_to_treasury(env: Env, caller: Address, amount: i128) {
+        Self::require_admin(&env, &caller);
+        if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
+        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+        let treasury: Address = env.storage().instance().get(&StorageKey::Treasury).unwrap();
+        token::Client::new(&env, &usdc)
+            .transfer(&env.current_contract_address(), &treasury, &amount);
+        env.events().publish(
+            (Symbol::new(&env, "treasury_funded"),),
+            TreasuryFunded { amount, recipient: treasury },
+        );
+    }
+
+    /// Send a specified amount of USDC from the pool to the backstop address.
+    /// Called by the backend after each policy purchase to distribute earned premiums.
+    pub fn send_premium_to_backstop(env: Env, caller: Address, amount: i128) {
+        Self::require_admin(&env, &caller);
+        if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
+        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+        let backstop: Address = env.storage().instance().get(&StorageKey::Backstop).unwrap();
+        token::Client::new(&env, &usdc)
+            .transfer(&env.current_contract_address(), &backstop, &amount);
+        env.events().publish(
+            (Symbol::new(&env, "backstop_funded"),),
+            BackstopFunded { amount, recipient: backstop },
+        );
+    }
+
+    /// Returns the configured backstop address.
+    pub fn get_backstop(env: Env) -> Address {
+        env.storage().instance().get(&StorageKey::Backstop)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized))
     }
 
     pub fn claim_yield(env: Env, provider: Address) -> i128 {
@@ -417,6 +466,13 @@ impl RiskPool {
             (Symbol::new(&env, "pool_resumed"),),
             PoolResumed { admin: admin.clone() },
         );
+    }
+
+    /// Upgrade the contract WASM in-place. Only the admin may call this.
+    /// Storage is preserved across upgrades; only the execution code changes.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        Self::require_admin(&env, &admin);
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 
     fn require_admin(env: &Env, caller: &Address) {
