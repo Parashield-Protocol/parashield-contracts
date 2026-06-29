@@ -63,6 +63,7 @@ pub enum Error {
     AlreadyReleased     = 10,
     Undercollateralized = 11,
     PoolCapExceeded     = 12,
+    InsufficientShares  = 13,
 }
 
 #[contract]
@@ -124,7 +125,7 @@ env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
 
     // ── Deposits ──────────────────────────────────────────────────────────────
 
-    pub fn deposit(env: Env, provider: Address, amount: i128) -> i128 {
+    pub fn deposit(env: Env, provider: Address, amount: i128, min_shares: i128) -> i128 {
         provider.require_auth();
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         Self::assert_active(&env);
@@ -144,6 +145,10 @@ env.storage().instance().set(&StorageKey::TotalDeposited,     &0i128);
         } else {
             amount * total_shares / total_deposited
         };
+
+        if new_shares < min_shares {
+            panic_with_error!(&env, Error::InsufficientShares);
+        }
 
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
         token::Client::new(&env, &usdc)

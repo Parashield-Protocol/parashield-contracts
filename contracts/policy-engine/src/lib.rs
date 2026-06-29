@@ -342,6 +342,7 @@ impl PolicyEngine {
         }
         policy.status = PolicyStatus::Cancelled;
         env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
+        Self::remove_policy_from_user(&env, &policyholder, policy_id);
 
         // Refund premium
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
@@ -374,6 +375,7 @@ impl PolicyEngine {
         }
         policy.status = PolicyStatus::Claimed;
         env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
+        Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
 
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
         token::Client::new(&env, &usdc)
@@ -402,6 +404,7 @@ impl PolicyEngine {
         }
         policy.status = PolicyStatus::Expired;
         env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
+        Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
         env.events().publish(
             (Symbol::new(&env, "policy_expired"),),
             PolicyExpired { policy_id },
@@ -520,6 +523,24 @@ pub fn emergency_resume(env: Env, admin: Address) {
             .unwrap_or_else(|| panic_with_error!(env, Error::Unauthorized));
         if *caller != cp { panic_with_error!(env, Error::Unauthorized); }
         caller.require_auth();
+    }
+
+    fn remove_policy_from_user(env: &Env, user: &Address, policy_id: u128) {
+        let key = StorageKey::UserPolicies(user.clone());
+        let mut user_policies: Vec<u128> = env.storage().persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut pos: Option<u32> = None;
+        for i in 0..user_policies.len() {
+            if user_policies.get_unchecked(i) == policy_id {
+                pos = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = pos {
+            user_policies.remove(i);
+            env.storage().persistent().set(&key, &user_policies);
+        }
     }
 
     fn load_product(env: &Env, id: u128) -> InsuranceProduct {

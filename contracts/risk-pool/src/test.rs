@@ -61,7 +61,7 @@ fn cannot_initialize_twice() {
 #[test]
 fn first_deposit_mints_one_to_one_shares() {
     let (_, pool, _, _, _, lp1) = setup();
-    let shares = pool.deposit(&lp1, &500_000_0000000i128);
+    let shares = pool.deposit(&lp1, &500_000_0000000i128, &0i128);
     assert_eq!(shares, 500_000_0000000i128 * 1_000_000_000);
 
     let stats = pool.get_stats();
@@ -75,8 +75,8 @@ fn second_deposit_proportional_shares() {
     let lp2 = Address::generate(&env);
     token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &500_000_0000000i128);
 
-    pool.deposit(&lp1, &500_000_0000000i128);
-    let shares2 = pool.deposit(&lp2, &250_000_0000000i128);
+    pool.deposit(&lp1, &500_000_0000000i128, &0i128);
+    let shares2 = pool.deposit(&lp2, &250_000_0000000i128, &0i128);
     // shares2 should be half of lp1's shares
     assert_eq!(shares2, 250_000_0000000i128 * 1_000_000_000);
 }
@@ -84,7 +84,7 @@ fn second_deposit_proportional_shares() {
 #[test]
 fn utilization_zero_before_locks() {
     let (_, pool, _, _, _, lp1) = setup();
-    pool.deposit(&lp1, &1_000_0000000i128);
+    pool.deposit(&lp1, &1_000_0000000i128, &0i128);
     assert_eq!(pool.get_utilization_rate(), 0);
 }
 
@@ -94,7 +94,7 @@ fn utilization_zero_before_locks() {
 fn withdraw_full_position() {
     let (_, pool, _, _, _, lp1) = setup();
     let amount = 400_0000000i128;
-    let shares = pool.deposit(&lp1, &amount);
+    let shares = pool.deposit(&lp1, &amount, &0i128);
     let returned = pool.withdraw(&lp1, &shares);
     assert_eq!(returned, amount);
 
@@ -131,7 +131,7 @@ fn withdraw_partial_position_decrements_shares() {
     let (_, pool, _, _, _, lp1) = setup();
     let amount = 1000_0000000i128;
     // deposit 1000 USDC
-    let shares = pool.deposit(&lp1, &amount);
+    let shares = pool.deposit(&lp1, &amount, &0i128);
     
     // withdraw half the shares
     let half_shares = shares / 2;
@@ -161,7 +161,7 @@ fn withdraw_without_position_fails() {
 fn withdraw_locked_capital_fails() {
     let (_env, pool, _, admin, _, lp1) = setup();
     let amount = 100_0000000i128;
-    let shares = pool.deposit(&lp1, &amount);
+    let shares = pool.deposit(&lp1, &amount, &0i128);
 
     pool.lock_for_policy(&admin, &1u128, &amount);  // lock all capital
     pool.withdraw(&lp1, &shares);  // should fail
@@ -186,7 +186,7 @@ fn test_lock_negative_coverage_panics() {
 #[test]
 fn receive_premium_adds_lp_share() {
     let (_, pool, _, _, _, lp1) = setup();
-    pool.deposit(&lp1, &1_000_0000000i128);
+    pool.deposit(&lp1, &1_000_0000000i128, &0i128);
 
     let before = pool.get_stats().accumulated_premium;
     pool.receive_premium(&lp1, &100_0000000i128);
@@ -202,8 +202,8 @@ fn claim_yield_proportional_to_shares() {
     let lp2 = Address::generate(&env);
     token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &1_000_0000000i128);
 
-    pool.deposit(&lp1, &500_0000000i128);
-    pool.deposit(&lp2, &500_0000000i128);
+    pool.deposit(&lp1, &500_0000000i128, &0i128);
+    pool.deposit(&lp2, &500_0000000i128, &0i128);
     pool.receive_premium(&lp1, &200_0000000i128);  // 160 USDC to LP accumulated
 
     let yield1 = pool.claim_yield(&lp1);
@@ -218,7 +218,7 @@ fn claim_yield_proportional_to_shares() {
 #[test]
 fn lock_and_release_round_trip() {
     let (_, pool, _, admin, _, lp1) = setup();
-    pool.deposit(&lp1, &200_0000000i128);
+    pool.deposit(&lp1, &200_0000000i128, &0i128);
 
     pool.lock_for_policy(&admin, &42u128, &100_0000000i128);
     assert_eq!(pool.get_utilization_rate(), 5_000u32);  // 50% utilization in bps
@@ -231,7 +231,7 @@ fn lock_and_release_round_trip() {
 #[should_panic(expected = "Error(Contract, #8)")]
 fn double_lock_fails() {
     let (_, pool, _, admin, _, lp1) = setup();
-    pool.deposit(&lp1, &200_0000000i128);
+    pool.deposit(&lp1, &200_0000000i128, &0i128);
     pool.lock_for_policy(&admin, &1u128, &50_0000000i128);
     pool.lock_for_policy(&admin, &1u128, &50_0000000i128);  // duplicate
 }
