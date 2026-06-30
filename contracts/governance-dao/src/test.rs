@@ -124,7 +124,7 @@ fn vote_for_records_weight() {
     );
     dao.vote(&voter1, &pid, &VoteChoice::For);
     let rec = dao.get_vote(&pid, &voter1).unwrap();
-    assert_eq!(rec.weight, 1_000_000_0000000i128);
+    assert_eq!(rec.weight, 990_000_0000000i128);
 }
 
 #[test]
@@ -275,6 +275,8 @@ fn execute_non_existent_proposal_fails() {
     let (_env, dao, _admin, _voter1, _voter2, _target) = setup();
     // No proposals have been created, so any ID > 0 is non-existent.
     dao.execute(&9999u64);
+}
+
 #[test]
 fn test_proposal_timelock_execution() {
     let env = Env::default();

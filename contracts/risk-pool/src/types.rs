@@ -29,6 +29,7 @@ pub struct LpPosition {
     pub shares:            i128,
     /// Total accumulated premium yield already claimed by this LP
     pub yield_claimed:     i128,
+    pub yield_debt:        i128,
     pub deposited_at:      u64,
     pub last_yield_claim:  u64,
 }

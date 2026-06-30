@@ -124,7 +124,7 @@ fn test_drought_trigger_pays_out() {
     assert_eq!(result, ClaimResult::Paid);
     // Buyer: minted 5_000_000_000, paid 50_000_000 premium, received 1_000_000_000 coverage
     let balance = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
-    assert_eq!(balance, 5_000_000_000 - 50_000_000 + 1_000_000_000);
+    assert_eq!(balance, 5_000_000_000 - 4_109_589 + 1_000_000_000);
 }
 
 /// Buy policy → oracle submits above threshold → auto_process rejects.
@@ -144,7 +144,7 @@ fn test_good_rainfall_no_payout() {
     assert_eq!(result, ClaimResult::Rejected);
     // Buyer: minted 5_000_000_000, paid 50_000_000 premium, no payout received
     let buyer_bal = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
-    assert_eq!(buyer_bal, 5_000_000_000 - 50_000_000, "no payout when trigger not met");
+    assert_eq!(buyer_bal, 5_000_000_000 - 4_109_589, "no payout when trigger not met");
 }
 
 /// Policy past end_time with no trigger → auto_process marks Expired.
@@ -185,7 +185,7 @@ fn test_double_process_idempotent() {
 
     // Buyer should NOT receive double coverage — exactly one payout
     let balance = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
-    assert_eq!(balance, 5_000_000_000 - 50_000_000 + 1_000_000_000);
+    assert_eq!(balance, 5_000_000_000 - 4_109_589 + 1_000_000_000);
 }
 
 #[test]

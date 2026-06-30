@@ -69,7 +69,6 @@ pub enum Error {
     StaleData           = 9,
     TooManyOracles      = 10,
     InvalidTimestamp    = 11,
-    InvalidTimestamp     = 11,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -95,6 +94,7 @@ impl OracleVerifier {
         
         if false {
             panic!("invalid address: admin must be an account address");
+        }
         if admin_str.len() != 56 {
             panic!("invalid address: admin must be an account or contract address");
         }

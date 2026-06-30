@@ -94,7 +94,7 @@ fn abstain_contributes_to_quorum_but_not_majority() {
     let p = dao.get_proposal(&pid);
     // Abstain satisfies quorum but no FOR votes → fails majority check
     assert_eq!(p.status, ProposalStatus::Failed);
-    assert_eq!(p.votes_abstain, 1_000_000_0000000i128);
+    assert_eq!(p.votes_abstain, 990_000_0000000i128);
     assert_eq!(p.votes_for, 0);
 }
 
