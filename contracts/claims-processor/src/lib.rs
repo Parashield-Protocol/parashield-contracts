@@ -29,6 +29,11 @@ pub use types::*;
 
 // ─── Cross-contract client interfaces ────────────────────────────────────────
 
+#[soroban_sdk::contractclient(name = "RiskPoolClient")]
+trait IRiskPool {
+    fn release_for_claim(env: Env, caller: Address, policy_id: u128);
+}
+
 #[soroban_sdk::contractclient(name = "PolicyEngineClient")]
 trait IPolicyEngine {
     fn get_policy(env: Env, policy_id: u128) -> parashield_policy_engine::Policy;
@@ -54,6 +59,7 @@ enum StorageKey {
     Initialized,
     Admin,
     PolicyEngine,
+    RiskPool,
     OracleVerifier,
     StalenessThreshold,  // u64 — max acceptable oracle data age in seconds
     Claim(u128),
@@ -94,6 +100,7 @@ impl ClaimsProcessor {
         env: Env,
         admin: Address,
         policy_engine: Address,
+        risk_pool: Address,
         oracle_verifier: Address,
         staleness_threshold: u64,
     ) {
@@ -143,11 +150,13 @@ impl ClaimsProcessor {
 
         Self::validate_stellar_address(&env, &admin);
         Self::validate_stellar_address(&env, &policy_engine);
+        Self::validate_stellar_address(&env, &risk_pool);
         Self::validate_stellar_address(&env, &oracle_verifier);
         
         env.storage().instance().set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
         env.storage().instance().set(&StorageKey::PolicyEngine, &policy_engine);
+        env.storage().instance().set(&StorageKey::RiskPool, &risk_pool);
         env.storage().instance().set(&StorageKey::OracleVerifier, &oracle_verifier);
         env.storage().instance().set(&StorageKey::StalenessThreshold, &staleness_threshold);
         env.storage().instance().set(&StorageKey::NextClaimId, &1u128);
@@ -158,6 +167,7 @@ impl ClaimsProcessor {
             Initialized {
                 admin: admin.clone(),
                 policy_engine: policy_engine.clone(),
+                risk_pool: risk_pool.clone(),
                 oracle_verifier: oracle_verifier.clone(),
                 staleness_threshold,
             },
@@ -489,11 +499,15 @@ impl ClaimsProcessor {
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     /// Core evaluation: check oracle, update claim record, instruct Policy Engine.
+    /// After successful claim payment, atomically releases the coverage lock on Risk Pool
+    /// to prevent coverage from remaining locked indefinitely.
     fn evaluate_and_settle(env: &Env, claim: &mut Claim) -> ClaimResult {
         let oracle_verifier: Address = env.storage().instance()
             .get(&StorageKey::OracleVerifier).unwrap();
         let policy_engine: Address = env.storage().instance()
             .get(&StorageKey::PolicyEngine).unwrap();
+        let risk_pool: Address = env.storage().instance()
+            .get(&StorageKey::RiskPool).unwrap();
         // Configurable staleness threshold (default 7 days = 604_800 s if not set)
         let staleness_threshold: u64 = env.storage().instance()
             .get(&StorageKey::StalenessThreshold)
@@ -527,6 +541,10 @@ impl ClaimsProcessor {
             claim.status = ClaimStatus::Paid;
             PolicyEngineClient::new(env, &policy_engine)
                 .pay_claim(&env.current_contract_address(), &claim.policy_id);
+            // Atomic lock release: release coverage lock after successful payment.
+            // If release fails, the entire transaction reverts, leaving state unchanged.
+            RiskPoolClient::new(env, &risk_pool)
+                .release_for_claim(&env.current_contract_address(), &claim.policy_id);
             ClaimResult::Paid
         } else {
             claim.status = ClaimStatus::Rejected;

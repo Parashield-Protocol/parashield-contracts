@@ -10,6 +10,7 @@ use parashield_policy_engine::{
     PolicyEngine, PolicyEngineClient,
     TriggerType, TriggerComparison, CreateProductParams,
 };
+use parashield_risk_pool::{RiskPool, RiskPoolClient};
 
 const COVERAGE: i128 = 1_000_000_000; // 100 USDC
 
@@ -17,11 +18,12 @@ struct World {
     env:       Env,
     admin:     Address,
     keeper:    Address,
-    oracle_w:  Address, // oracle wallet (submits data)
+    oracle_w:  Address,
     usdc:      Address,
-    oracle_id: Address, // oracle-verifier contract
-    policy_id: Address, // policy-engine contract
-    claims_id: Address, // claims-processor contract
+    oracle_id: Address,
+    policy_id: Address,
+    claims_id: Address,
+    pool_id:   Address,
 }
 
 fn deploy() -> World {
@@ -41,32 +43,44 @@ fn deploy() -> World {
     OracleVerifierClient::new(&env, &oracle_id)
         .add_oracle(&admin, &oracle_wallet, &symbol_short!("weather"), &90u32);
 
-    // 2. Deploy policy engine
+    // 2. Deploy risk pool (category: crop)
+    let backstop = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    let treasury = Address::generate(&env);
+    let pool_id = env.register(RiskPool, ());
+
+    // 3. Deploy policy engine (placeholder for risk pool init)
     let policy_id = env.register(PolicyEngine, ());
+    
+    // 4. Deploy claims processor (placeholder for risk pool init)
+    let claims_id = env.register(ClaimsProcessor, ());
+
+    // Initialize risk pool with correct addresses
+    RiskPoolClient::new(&env, &pool_id).initialize(
+        &admin,
+        &usdc,
+        &treasury,
+        &backstop,
+        &symbol_short!("crop"),
+        &policy_id,
+        &claims_id,
+    );
+
+    // Initialize other contracts
     PolicyEngineClient::new(&env, &policy_id)
         .initialize(&admin, &usdc, &oracle_id);
-
-    // 3. Deploy claims processor
-    let claims_id = env.register(ClaimsProcessor, ());
+    
     ClaimsProcessorClient::new(&env, &claims_id)
-        .initialize(&admin, &policy_id, &oracle_id, &604_800u64);
+        .initialize(&admin, &policy_id, &pool_id, &oracle_id, &604_800u64);
+    
     // Authorize keeper on the claims processor
     ClaimsProcessorClient::new(&env, &claims_id)
         .add_keeper(&admin, &keeper);
 
-    // 4. Wire claims processor as authorized caller on policy engine
+    // Wire claims processor as authorized caller on policy engine
     PolicyEngineClient::new(&env, &policy_id)
         .set_claims_processor(&admin, &claims_id);
 
-    // 4b. Register the keeper so it may settle claims
-    ClaimsProcessorClient::new(&env, &claims_id)
-        .add_keeper(&admin, &keeper);
-
-    // 5. Pre-fund the policy engine with coverage capital (simulates risk pool in v1)
-    //    In production the Risk Pool contract provides this capital.
-    StellarAssetClient::new(&env, &usdc).mint(&policy_id, &100_000_000_000i128);
-
-    World { env, admin, keeper, oracle_w: oracle_wallet, usdc, oracle_id, policy_id, claims_id }
+    World { env, admin, keeper, oracle_w: oracle_wallet, usdc, oracle_id, policy_id, claims_id, pool_id }
 }
 
 fn create_crop_product(w: &World) -> u128 {
@@ -90,8 +104,18 @@ fn create_crop_product(w: &World) -> u128 {
 
 fn buy_crop_policy(w: &World, buyer: &Address, product_id: u128) -> u128 {
     StellarAssetClient::new(&w.env, &w.usdc).mint(buyer, &5_000_000_000i128);
-    PolicyEngineClient::new(&w.env, &w.policy_id)
-        .buy_policy(buyer, &product_id, &COVERAGE, &30u32, &symbol_short!("kis2606"))
+    // Fund the pool with coverage capital
+    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.pool_id, &10_000_000_000i128);
+    // Deposit to pool and lock coverage for the policy
+    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&buyer, &1_000_000_000i128, &0i128);
+    
+    let policy_id = PolicyEngineClient::new(&w.env, &w.policy_id)
+        .buy_policy(buyer, &product_id, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+    
+    // Lock coverage in the pool for this policy
+    RiskPoolClient::new(&w.env, &w.pool_id).lock_for_policy(&w.admin, &policy_id, &COVERAGE);
+    
+    policy_id
 }
 
 fn submit_rainfall(w: &World, mm_7dec: i128) {
@@ -440,11 +464,12 @@ fn test_initialize_with_valid_addresses_succeeds() {
     
     let admin           = Address::generate(&env);
     let policy_engine   = Address::generate(&env);
+    let risk_pool       = Address::generate(&env);
     let oracle_verifier = Address::generate(&env);
     
     let claims_id = env.register(ClaimsProcessor, ());
     ClaimsProcessorClient::new(&env, &claims_id)
-        .initialize(&admin, &policy_engine, &oracle_verifier, &604_800u64);
+        .initialize(&admin, &policy_engine, &risk_pool, &oracle_verifier, &604_800u64);
     
     // Should succeed without panic
     let stored_admin = ClaimsProcessorClient::new(&env, &claims_id).get_admin();
