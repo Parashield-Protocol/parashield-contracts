@@ -11,9 +11,12 @@ fn setup() -> (Env, Address, Address) {
     let env = Env::default();
     env.ledger().with_mut(|l| l.timestamp = 1748736000u64);
     env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 2_000_000_000);
     let admin       = Address::generate(&env);
     let contract_id = env.register(OracleVerifier, ());
-    OracleVerifierClient::new(&env, &contract_id).initialize(&admin);
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    client.initialize(&admin);
+    client.set_max_data_age(&admin, &3_000_000_000);
     (env, admin, contract_id)
 }
 
