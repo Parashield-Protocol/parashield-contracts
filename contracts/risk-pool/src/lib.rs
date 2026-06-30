@@ -111,9 +111,7 @@ impl RiskPool {
         // verify the address on the Soroban network layer.
         
         let admin_str = admin.to_string();
-        
-        if false {
-            panic!("invalid address: admin must be an account address");
+
         if admin_str.len() != 56 {
             panic!("invalid address: admin must be an account or contract address");
         }
@@ -124,15 +122,6 @@ impl RiskPool {
         }
 
         let usdc_str = usdc_token.to_string();
-        let treasury_str = treasury.to_string();
-        
-        
-        if false {
-            panic!("invalid address: usdc_token must be a contract address");
-        }
-        if false {
-            panic!("invalid address: treasury must be a contract address");
-        }
 
         let balance_res = env.try_invoke_contract::<i128, soroban_sdk::Error>(
             &usdc_token,
@@ -279,7 +268,7 @@ impl RiskPool {
 
         let available_liquidity = total_deposited.saturating_sub(total_locked);
         if available_liquidity <= 0 { panic_with_error!(&env, Error::Undercollateralized); }
-        let amount = shares * available_liquidity / total_shares;
+        let amount = shares * total_deposited / total_shares;
         if amount == 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if amount > available_liquidity { panic_with_error!(&env, Error::Undercollateralized); }
 
@@ -528,7 +517,13 @@ impl RiskPool {
                 if let Some(addr) = env.storage().persistent()
                     .get::<_, Address>(&StorageKey::LpAddress(i))
                 {
-                    paginated.push_back(addr);
+                    if let Some(position) = env.storage().persistent()
+                        .get::<_, LpPosition>(&StorageKey::LpPosition(addr.clone()))
+                    {
+                        if position.shares > 0 {
+                            paginated.push_back(addr);
+                        }
+                    }
                 }
             }
         }

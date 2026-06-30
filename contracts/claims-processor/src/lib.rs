@@ -60,7 +60,6 @@ enum StorageKey {
     PolicyClaim(u128),   // policy_id → claim_id (one claim per policy)
     NextClaimId,
     PendingClaims,       // Vec<u128>
-    Keepers,             // Vec<Address>, authorized keepers / operators
     Keeper(Address),     // keeper whitelist: address → bool
     /// Contract version (u32) for storage migration tracking
     Version,
