@@ -187,6 +187,31 @@ fn test_lock_negative_coverage_panics() {
 // ── premium routing ────────────────────────────────────────────────────────────
 
 #[test]
+fn receive_premium_distributes_1000_usdc_80_10_10() {
+    let (env, pool, usdc_id, _, treasury, lp1) = setup();
+    let backstop = pool.get_backstop();
+    let usdc = token::Client::new(&env, &usdc_id);
+
+    pool.deposit(&lp1, &1_000_0000000i128, &0i128);
+
+    let treasury_before = usdc.balance(&treasury);
+    let backstop_before = usdc.balance(&backstop);
+    let lp_premium_before = pool.get_stats().accumulated_premium;
+
+    let premium = 1_000_0000000i128; // 1000 USDC
+    pool.receive_premium(&lp1, &premium);
+
+    let lp_share = pool.get_stats().accumulated_premium - lp_premium_before;
+    let treasury_share = usdc.balance(&treasury) - treasury_before;
+    let backstop_share = usdc.balance(&backstop) - backstop_before;
+
+    assert_eq!(lp_share, 800_0000000i128);
+    assert_eq!(treasury_share, 100_0000000i128);
+    assert_eq!(backstop_share, 100_0000000i128);
+    assert_eq!(lp_share + treasury_share + backstop_share, premium);
+}
+
+#[test]
 fn receive_premium_adds_lp_share() {
     let (_, pool, _, _, _, lp1) = setup();
     pool.deposit(&lp1, &1_000_0000000i128, &0i128);
@@ -438,6 +463,8 @@ fn non_admin_cannot_release_for_expiry() {
     pool.lock_for_policy(&admin, &1u128, &100_0000000i128);
 
     pool.release_for_expiry(&lp1, &1u128);
+}
+
 #[test]
 fn test_get_lp_list_pagination() {
     let (env, pool, usdc_id, _admin, _, lp1) = setup();

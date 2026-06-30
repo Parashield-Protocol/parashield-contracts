@@ -26,6 +26,7 @@ pub use types::*;
 const PREMIUM_LP_BPS:       i128 = 8_000;  // 80% of premium to LP pool
 const PREMIUM_TREAS_BPS:    i128 = 1_000;  // 10% to treasury
 const PREMIUM_BACKSTOP_BPS: i128 = 1_000;  // 10% to backstop fund
+const _: () = assert!(PREMIUM_LP_BPS + PREMIUM_TREAS_BPS + PREMIUM_BACKSTOP_BPS == 10_000);
 
 /// Upper bound on cumulative deposits (7-decimal USDC stroops).
 /// 10^15 stroops == 100,000,000 USDC. Caps total pool size so share value
