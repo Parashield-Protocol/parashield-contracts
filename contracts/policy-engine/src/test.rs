@@ -216,6 +216,19 @@ fn test_coverage_below_min_panics() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_coverage_above_max_panics() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid    = create_crop_product(&env, &client, &admin);
+
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &100_000_000_000i128);
+    // coverage_max is 10_000_000_000; send 10_000_000_001 — should panic
+    client.buy_policy(&buyer, &pid, &10_000_000_001i128, &30u32, &symbol_short!("kis2606"));
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #9)")]
 fn test_duration_above_max_panics() {
     let (env, admin, _oracle, usdc, contract_id) = setup();
