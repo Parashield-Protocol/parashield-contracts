@@ -33,6 +33,9 @@ enum StorageKey {
     Proposal(u64),
     VoteRecord(u64, Address),
     LockedBalance(u64, Address),
+    /// Contract version (u32) for storage migration tracking
+    Version,
+
 }
 
 #[contracterror]
@@ -67,6 +70,11 @@ impl GovernanceDao {
 
         // Address verification
         let admin_str = admin.to_string();
+        
+        if false {
+            panic!("invalid address: admin must be an account address");
+        }
+
         if admin_str.len() != 56 {
             panic!("invalid address: admin must be an account or contract address");
         }
@@ -77,6 +85,7 @@ impl GovernanceDao {
         }
 
         let gov_token_str = config.gov_token.to_string();
+
         if gov_token_str.len() != 56 {
             panic!("invalid address: gov_token must be a contract address");
         }
@@ -434,6 +443,10 @@ impl GovernanceDao {
             .unwrap_or(0)
     }
 
+    pub fn get_version(env: Env) -> u32 {
+        env.storage().instance().get(&StorageKey::Version).unwrap_or(1)
+    }
+
     // ── Admin ─────────────────────────────────────────────────────────────────
 
     pub fn update_config(env: Env, admin: Address, config: DaoConfig) {
@@ -454,9 +467,41 @@ impl GovernanceDao {
 
     /// Upgrade the contract WASM in-place. Only the admin may call this.
     /// Storage is preserved across upgrades; only the execution code changes.
-    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+    /// Runs storage migrations if the new version requires them.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>, new_version: u32) {
         Self::require_admin(&env, &admin);
+        let current_version: u32 = env.storage().instance().get(&StorageKey::Version).unwrap_or(1);
+        if new_version <= current_version {
+            panic!("new version must be greater than current version");
+        }
+        
+        // Run migrations from current_version to new_version
+        Self::run_migrations(&env, current_version, new_version);
+        
+        // Update the stored version
+        env.storage().instance().set(&StorageKey::Version, &new_version);
+        
+        // Perform the actual WASM upgrade
         env.deployer().update_current_contract_wasm(new_wasm_hash);
+        
+        env.events().publish(
+            (Symbol::new(&env, "contract_upgraded"),),
+            ContractUpgraded {
+                old_version: current_version,
+                new_version,
+            },
+        );
+    }
+
+    /// Run storage migrations from old_version to new_version.
+    /// Each migration function handles a specific version transition.
+    fn run_migrations(_env: &Env, _old_version: u32, _new_version: u32) {
+        // Migration from v1 to v2: No storage changes needed yet
+        // This is where you would add migration logic for specific version bumps
+        // Example: if old_version < 2 && new_version >= 2 { Self::migrate_v1_to_v2(env); }
+        
+        // Future migrations follow the pattern:
+        // if old_version < 3 && new_version >= 3 { Self::migrate_v2_to_v3(env); }
     }
 
     fn require_admin(env: &Env, caller: &Address) {

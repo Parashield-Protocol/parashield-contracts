@@ -10,7 +10,6 @@ use soroban_sdk::{
 fn setup() -> (Env, Address, Address) {
     let env = Env::default();
 
-    // Set mock ledger time to a point past or equal to your test data vectors
     env.ledger().set_timestamp(1748736000);
 
     env.mock_all_auths();
@@ -19,6 +18,7 @@ fn setup() -> (Env, Address, Address) {
     let contract_id = env.register(OracleVerifier, ());
 
     let client = OracleVerifierClient::new(&env, &contract_id);
+  
     client.initialize(&admin);
 
     (env, admin, contract_id)
@@ -27,6 +27,7 @@ fn setup() -> (Env, Address, Address) {
 fn weather() -> soroban_sdk::Symbol {
     symbol_short!("weather")
 }
+
 fn kisumu_key() -> soroban_sdk::Symbol {
     symbol_short!("kis2606") // "rainfall:kisumu:2026-06" compressed to 9 chars
 }
@@ -43,6 +44,7 @@ fn test_initialize_sets_admin() {
 #[test]
 fn test_initialize_allows_contract_admin() {
     let env = Env::default();
+    env.ledger().with_mut(|l| l.timestamp = 1748736000u64);
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let contract_id = env.register(OracleVerifier, ());
@@ -105,9 +107,9 @@ fn test_update_oracle_weight_changes_aggregation() {
     client.add_oracle(&admin, &oracle1, &weather(), &60u32);
     client.add_oracle(&admin, &oracle2, &weather(), &20u32);
     client.add_oracle(&admin, &oracle3, &weather(), &20u32);
-    client.submit_data(&oracle1, &weather(), &kisumu_key(), &10i128, &100u32, &1u64);
-    client.submit_data(&oracle2, &weather(), &kisumu_key(), &20i128, &100u32, &1u64);
-    client.submit_data(&oracle3, &weather(), &kisumu_key(), &30i128, &100u32, &1u64);
+    client.submit_data(&oracle1, &weather(), &kisumu_key(), &10i128, &100u32, &1748736000u64);
+    client.submit_data(&oracle2, &weather(), &kisumu_key(), &20i128, &100u32, &1748736000u64);
+    client.submit_data(&oracle3, &weather(), &kisumu_key(), &30i128, &100u32, &1748736000u64);
     assert_eq!(
         client
             .get_aggregated(&weather(), &kisumu_key())
@@ -158,10 +160,37 @@ fn test_non_admin_cannot_update_oracle_weight() {
 fn test_remove_oracle_deactivates() {
     let (env, admin, contract_id) = setup();
     let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle1 = Address::generate(&env);
+    let oracle2 = Address::generate(&env);
+    
+    client.add_oracle(&admin, &oracle1, &weather(), &80u32);
+    client.add_oracle(&admin, &oracle2, &weather(), &80u32);
+    
+    client.submit_data(&oracle1, &weather(), &kisumu_key(), &10_000_000i128, &90u32, &1748736000u64);
+    client.submit_data(&oracle2, &weather(), &kisumu_key(), &50_000_000i128, &90u32, &1748736000u64);
+    
+    let agg_before = client.get_aggregated(&weather(), &kisumu_key());
+    assert_eq!(agg_before.oracle_count, 2);
+    assert_eq!(agg_before.median_value, 30_000_000i128); // (10M + 50M) / 2
+    
+    // Remove oracle1
+    client.remove_oracle(&admin, &oracle1, &weather());
+    
+    // Aggregation should now only include oracle2
+    let agg_after = client.get_aggregated(&weather(), &kisumu_key());
+    assert_eq!(agg_after.oracle_count, 1);
+    assert_eq!(agg_after.median_value, 50_000_000i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_removed_oracle_cannot_submit() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
     let oracle = Address::generate(&env);
     client.add_oracle(&admin, &oracle, &weather(), &80u32);
     client.remove_oracle(&admin, &oracle, &weather());
-    // After removal, submit_data should panic (unauthorized)
+    client.submit_data(&oracle, &weather(), &kisumu_key(), &10_000_000i128, &90u32, &1748736000u64);
 }
 
 #[test]
@@ -266,22 +295,16 @@ fn test_duplicate_submission_overwrites() {
     let (env, admin, contract_id) = setup();
     let client = OracleVerifierClient::new(&env, &contract_id);
 
-    // 1. Generate the oracle address
     let oracle = Address::generate(&env);
 
-    // 2. Define your test payload keys
     let topic = soroban_sdk::Symbol::new(&env, "weather");
     let source = soroban_sdk::Symbol::new(&env, "kis2606");
     let timestamp: u64 = 1748822400;
 
-    // 3. Register the newly generated oracle to the contract first
-    // (Assuming a starting weight of 100 or whatever your contract requires)
     client.add_oracle(&admin, &oracle, &topic, &100u32);
 
-    // 4. Align host time to match the target payload
     env.ledger().set_timestamp(timestamp);
 
-    // 5. Submit initial data payload
     client.submit_data(
         &oracle,
         &topic,
@@ -291,8 +314,6 @@ fn test_duplicate_submission_overwrites() {
         &timestamp,
     );
 
-    // 6. Submit the duplicate payload to verify it overwrites successfully
-    // (e.g., updating the value to 32_000_000 and confidence to 90)
     client.submit_data(
         &oracle,
         &topic,
@@ -301,10 +322,6 @@ fn test_duplicate_submission_overwrites() {
         &90u32,
         &timestamp,
     );
-
-    // Optional: Add your assertions here to confirm the overwrite took effect
-    // let (stored_value, stored_conf) = client.get_data(&topic, &source);
-    // assert_eq!(stored_value, 32_000_000i128);
 }
 
 #[test]
@@ -318,6 +335,7 @@ fn test_aggregated_confidence_uses_weighted_average() {
     let oracle2 = Address::generate(&env);
     client.add_oracle(&admin, &oracle1, &weather(), &50u32);
     client.add_oracle(&admin, &oracle2, &weather(), &50u32);
+
     client.submit_data(
         &oracle1,
         &weather(),
@@ -688,7 +706,8 @@ fn test_get_and_set_max_data_age() {
     let (env, admin, contract_id) = setup();
     let client = OracleVerifierClient::new(&env, &contract_id);
 
-    // Default max data age (7 days)
+    // Default in our setup is 3_000_000_000, let's reset to default for this test
+    client.set_max_data_age(&admin, &604_800);
     assert_eq!(client.get_max_data_age(), 604_800);
 
     // Admin updates it (1 day)
@@ -701,6 +720,7 @@ fn test_get_and_set_max_data_age() {
 fn test_verify_trigger_rejects_stale_data() {
     let (env, admin, contract_id) = setup();
     let client = OracleVerifierClient::new(&env, &contract_id);
+    client.set_max_data_age(&admin, &604_800); // Reset back to default max age
     let oracle = Address::generate(&env);
     client.add_oracle(&admin, &oracle, &weather(), &100u32);
 

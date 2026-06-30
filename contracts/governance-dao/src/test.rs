@@ -319,7 +319,7 @@ fn non_admin_cannot_cancel() {
 fn execute_non_existent_proposal_fails() {
     let (_env, dao, _admin, _voter1, _voter2, _target) = setup();
     dao.execute(&9999u64);
-} // Fixed: Correctly closed out malformed brackets here
+}
 
 #[test]
 #[should_panic(expected = "Error(Contract, #13)")]

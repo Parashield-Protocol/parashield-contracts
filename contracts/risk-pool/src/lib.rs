@@ -25,11 +25,15 @@ pub use types::*;
 const PREMIUM_LP_BPS:       i128 = 8_000;  // 80% of premium to LP pool
 const PREMIUM_TREAS_BPS:    i128 = 1_000;  // 10% to treasury
 const PREMIUM_BACKSTOP_BPS: i128 = 1_000;  // 10% to backstop fund
+const _: () = assert!(PREMIUM_LP_BPS + PREMIUM_TREAS_BPS + PREMIUM_BACKSTOP_BPS == 10_000);
 
 /// Upper bound on cumulative deposits (7-decimal USDC stroops).
 /// 10^15 stroops == 100,000,000 USDC. Caps total pool size so share value
 /// cannot become infinitesimal and total_shares cannot overflow.
 const MAX_TOTAL_DEPOSITED: i128 = 1_000_000_000_000_000;
+
+/// Minimum deposit amount (1_000_000 stroops).
+const MIN_DEPOSIT: i128 = 1_000_000;
 
 /// Timelock duration for admin withdrawals: 7 days in seconds.
 const TIMELOCK_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -47,6 +51,7 @@ enum StorageKey {
     TotalShares,
     AccumulatedPremium,
     AccumulatedBackstop,
+    AccumulatedPerShare,
     Status,
     LpPosition(Address),
     LpCount,
@@ -56,6 +61,8 @@ enum StorageKey {
     PendingAdmin,
     PolicyEngine,
     ClaimsProcessor,
+    /// Contract version (u32) for storage migration tracking
+    Version,
 }
 
 #[contracterror]
@@ -75,10 +82,11 @@ pub enum Error {
     Undercollateralized = 11,
     PoolCapExceeded     = 12,
     InvalidToken        = 13,
-    InsufficientShares  = 13,
+    InsufficientShares  = 17,
     TimelockPending     = 14,
     TimelockNotReady    = 15,
     NoPendingWithdrawal = 16,
+    DepositTooSmall     = 17,
 }
 
 #[contract]
@@ -104,9 +112,7 @@ impl RiskPool {
         // verify the address on the Soroban network layer.
         
         let admin_str = admin.to_string();
-        
-        if false {
-            panic!("invalid address: admin must be an account address");
+
         if admin_str.len() != 56 {
             panic!("invalid address: admin must be an account or contract address");
         }
@@ -117,15 +123,6 @@ impl RiskPool {
         }
 
         let usdc_str = usdc_token.to_string();
-        let treasury_str = treasury.to_string();
-        
-        
-        if false {
-            panic!("invalid address: usdc_token must be a contract address");
-        }
-        if false {
-            panic!("invalid address: treasury must be a contract address");
-        }
 
         let balance_res = env.try_invoke_contract::<i128, soroban_sdk::Error>(
             &usdc_token,
@@ -169,6 +166,7 @@ impl RiskPool {
         env.storage().instance().set(&StorageKey::TotalShares,          &0i128);
         env.storage().instance().set(&StorageKey::AccumulatedPremium,   &0i128);
         env.storage().instance().set(&StorageKey::AccumulatedBackstop,  &0i128);
+        env.storage().instance().set(&StorageKey::AccumulatedPerShare,   &0i128);
         env.storage().instance().set(&StorageKey::Status,               &PoolStatus::Active);
         env.storage().instance().set(&StorageKey::LpCount,              &0u32);
         // PendingAdmin is absent until propose_new_admin is called; no init needed.
@@ -192,6 +190,7 @@ impl RiskPool {
     pub fn deposit(env: Env, provider: Address, amount: i128, min_shares: i128) -> i128 {
         provider.require_auth();
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
+        if amount < MIN_DEPOSIT { panic_with_error!(&env, Error::DepositTooSmall); }
         Self::assert_active(&env);
 
         let total_deposited: i128 = env.storage().instance()
@@ -210,6 +209,10 @@ impl RiskPool {
             amount * total_shares / total_deposited
         };
 
+        if new_shares == 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+
         if new_shares < min_shares {
             panic_with_error!(&env, Error::InsufficientShares);
         }
@@ -220,10 +223,12 @@ impl RiskPool {
 
         let now = env.ledger().timestamp();
         let lp_key = StorageKey::LpPosition(provider.clone());
-        let position: LpPosition = match env.storage().persistent().get::<_, LpPosition>(&lp_key) {
+        let mut position: LpPosition = match env.storage().persistent().get::<_, LpPosition>(&lp_key) {
             Some(mut pos) => {
+                Self::internal_claim_yield(&env, &mut pos);
                 pos.deposited += amount;
                 pos.shares    += new_shares;
+                pos.yield_debt = (env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0) * pos.shares) / 1_000_000_000_000;
                 pos
             }
             None => {
@@ -231,11 +236,13 @@ impl RiskPool {
                     .get(&StorageKey::LpCount).unwrap_or(0);
                 env.storage().persistent().set(&StorageKey::LpAddress(count), &provider);
                 env.storage().instance().set(&StorageKey::LpCount, &(count + 1));
+                let acc_per_share: i128 = env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0);
                 LpPosition {
                     provider:         provider.clone(),
                     deposited:        amount,
                     shares:           new_shares,
                     yield_claimed:    0,
+                    yield_debt:        (acc_per_share * new_shares) / 1_000_000_000_000,
                     deposited_at:     now,
                     last_yield_claim: now,
                 }
@@ -271,7 +278,7 @@ impl RiskPool {
 
         let available_liquidity = total_deposited.saturating_sub(total_locked);
         if available_liquidity <= 0 { panic_with_error!(&env, Error::Undercollateralized); }
-        let amount = shares * available_liquidity / total_shares;
+        let amount = shares * total_deposited / total_shares;
         if amount == 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if amount > available_liquidity { panic_with_error!(&env, Error::Undercollateralized); }
 
@@ -279,8 +286,10 @@ impl RiskPool {
         token::Client::new(&env, &usdc)
             .transfer(&env.current_contract_address(), &provider, &amount);
 
+        Self::internal_claim_yield(&env, &mut position);
         position.deposited = position.deposited.saturating_sub(amount);
         position.shares   -= shares;
+        position.yield_debt = (env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0) * position.shares) / 1_000_000_000_000;
         env.storage().persistent().set(&lp_key, &position);
         env.storage().instance().set(&StorageKey::TotalDeposited, &(total_deposited - amount));
         env.storage().instance().set(&StorageKey::TotalShares,    &(total_shares - shares));
@@ -317,6 +326,15 @@ impl RiskPool {
         let acc: i128 = env.storage().instance()
             .get(&StorageKey::AccumulatedPremium).unwrap_or(0);
         env.storage().instance().set(&StorageKey::AccumulatedPremium, &(acc + lp_share));
+
+        let total_shares: i128 = env.storage().instance()
+            .get(&StorageKey::TotalShares).unwrap_or(0);
+        if total_shares > 0 {
+            let acc_per_share: i128 = env.storage().instance()
+                .get(&StorageKey::AccumulatedPerShare).unwrap_or(0);
+            let increment = (lp_share * 1_000_000_000_000) / total_shares;
+            env.storage().instance().set(&StorageKey::AccumulatedPerShare, &(acc_per_share + increment));
+        }
 
         let acc_backstop: i128 = env.storage().instance()
             .get(&StorageKey::AccumulatedBackstop).unwrap_or(0);
@@ -376,31 +394,15 @@ impl RiskPool {
             .get(&lp_key)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
 
-        let total_shares: i128   = env.storage().instance().get(&StorageKey::TotalShares).unwrap_or(0);
-        let accumulated: i128    = env.storage().instance().get(&StorageKey::AccumulatedPremium).unwrap_or(0);
-        if total_shares == 0 { return 0; }
+        let old_claimed = position.yield_claimed;
+        Self::internal_claim_yield(&env, &mut position);
+        let claimed = position.yield_claimed - old_claimed;
 
-        let entitled  = accumulated * position.shares / total_shares;
-        let claimable = entitled.saturating_sub(position.yield_claimed);
-        if claimable == 0 { return 0; }
+        if claimed > 0 {
+            env.storage().persistent().set(&lp_key, &position);
+        }
 
-        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
-        token::Client::new(&env, &usdc)
-            .transfer(&env.current_contract_address(), &provider, &claimable);
-
-        position.yield_claimed   += claimable;
-        position.last_yield_claim = env.ledger().timestamp();
-        env.storage().persistent().set(&lp_key, &position);
-
-        env.events().publish(
-            (Symbol::new(&env, "yield_claimed"),),
-            YieldClaimed {
-                provider: provider.clone(),
-                amount: claimable,
-            },
-        );
-
-        claimable
+        claimed
     }
 
     // ── Capital locks ─────────────────────────────────────────────────────────
@@ -502,6 +504,10 @@ impl RiskPool {
         env.storage().instance().get(&StorageKey::LpCount).unwrap_or(0)
     }
 
+    pub fn get_version(env: Env) -> u32 {
+        env.storage().instance().get(&StorageKey::Version).unwrap_or(1)
+    }
+
     pub fn get_lp_list(env: Env, offset: Option<u32>, limit: Option<u32>) -> PaginatedLps {
         let total_count: u32 = env.storage().instance()
             .get(&StorageKey::LpCount).unwrap_or(0);
@@ -516,7 +522,13 @@ impl RiskPool {
                 if let Some(addr) = env.storage().persistent()
                     .get::<_, Address>(&StorageKey::LpAddress(i))
                 {
-                    paginated.push_back(addr);
+                    if let Some(position) = env.storage().persistent()
+                        .get::<_, LpPosition>(&StorageKey::LpPosition(addr.clone()))
+                    {
+                        if position.shares > 0 {
+                            paginated.push_back(addr);
+                        }
+                    }
                 }
             }
         }
@@ -659,6 +671,45 @@ impl RiskPool {
         );
     }
 
+    /// Upgrade the contract WASM in-place. Only the admin may call this.
+    /// Storage is preserved across upgrades; only the execution code changes.
+    /// Runs storage migrations if the new version requires them.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: soroban_sdk::BytesN<32>, new_version: u32) {
+        Self::require_admin(&env, &admin);
+        let current_version: u32 = env.storage().instance().get(&StorageKey::Version).unwrap_or(1);
+        if new_version <= current_version {
+            panic!("new version must be greater than current version");
+        }
+        
+        // Run migrations from current_version to new_version
+        Self::run_migrations(&env, current_version, new_version);
+        
+        // Update the stored version
+        env.storage().instance().set(&StorageKey::Version, &new_version);
+        
+        // Perform the actual WASM upgrade
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        
+        env.events().publish(
+            (Symbol::new(&env, "contract_upgraded"),),
+            ContractUpgraded {
+                old_version: current_version,
+                new_version,
+            },
+        );
+    }
+
+    /// Run storage migrations from old_version to new_version.
+    /// Each migration function handles a specific version transition.
+    fn run_migrations(_env: &Env, _old_version: u32, _new_version: u32) {
+        // Migration from v1 to v2: No storage changes needed yet
+        // This is where you would add migration logic for specific version bumps
+        // Example: if old_version < 2 && new_version >= 2 { Self::migrate_v1_to_v2(env); }
+        
+        // Future migrations follow the pattern:
+        // if old_version < 3 && new_version >= 3 { Self::migrate_v2_to_v3(env); }
+    }
+
     /// Propose a new admin. Only the current admin can call this.
     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
@@ -715,6 +766,34 @@ impl RiskPool {
         let status: PoolStatus = env.storage().instance()
             .get(&StorageKey::Status).unwrap_or(PoolStatus::Active);
         if status != PoolStatus::Active { panic_with_error!(env, Error::PoolNotActive); }
+    }
+
+    fn internal_claim_yield(env: &Env, position: &mut LpPosition) {
+        let total_shares: i128 = env.storage().instance().get(&StorageKey::TotalShares).unwrap_or(0);
+        let acc_per_share: i128 = env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0);
+        if total_shares == 0 {
+            return;
+        }
+
+        let entitled = (acc_per_share * position.shares) / 1_000_000_000_000;
+        let claimable = entitled.saturating_sub(position.yield_debt);
+        if claimable > 0 {
+            let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+            token::Client::new(env, &usdc)
+                .transfer(&env.current_contract_address(), &position.provider, &claimable);
+
+            position.yield_claimed += claimable;
+            position.last_yield_claim = env.ledger().timestamp();
+            position.yield_debt = entitled;
+
+            env.events().publish(
+                (Symbol::new(env, "yield_claimed"),),
+                YieldClaimed {
+                    provider: position.provider.clone(),
+                    amount: claimable,
+                },
+            );
+        }
     }
 }
 

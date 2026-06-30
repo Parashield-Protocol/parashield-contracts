@@ -200,4 +200,3 @@ fn verify_trigger_equal_with_tolerance_failure_outside_range() {
 
     assert!(!c.verify_trigger(&wt(), &kk(), &condition));
 }
-
