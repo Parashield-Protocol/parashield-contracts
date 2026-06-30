@@ -32,6 +32,7 @@ enum StorageKey {
     NextProposalId,
     Proposal(u64),
     VoteRecord(u64, Address),
+    LockedBalance(u64, Address),
 }
 
 #[contracterror]
@@ -195,10 +196,20 @@ impl GovernanceDao {
         }
 
         let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
-        let weight = token::Client::new(&env, &config.gov_token).balance(&voter);
+        let gov_token = token::Client::new(&env, &config.gov_token);
+
+        // 1. Capture voting balance weight
+        let weight = gov_token.balance(&voter);
         if weight <= 0 {
             panic_with_error!(&env, Error::InsufficientWeight);
         }
+
+        // 2. Lock tokens in the DAO contract to prevent token cycling / double-voting
+        gov_token.transfer(&voter, &env.current_contract_address(), &weight);
+
+        // Save the tracked locked balance for later retrieval
+        let lock_key = StorageKey::LockedBalance(proposal_id, voter.clone());
+        env.storage().persistent().set(&lock_key, &weight);
 
         match choice {
             VoteChoice::For => proposal.votes_for += weight,
@@ -226,6 +237,41 @@ impl GovernanceDao {
                 choice,
                 weight,
             },
+        );
+    }
+
+    pub fn withdraw_tokens(env: Env, voter: Address, proposal_id: u64) {
+        voter.require_auth();
+
+        let proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        // Prevent withdrawing while voting is still active
+        if proposal.status == ProposalStatus::Active {
+            panic_with_error!(&env, Error::ProposalNotActive);
+        }
+
+        let lock_key = StorageKey::LockedBalance(proposal_id, voter.clone());
+        let locked_amount: i128 = env.storage().persistent().get(&lock_key).unwrap_or(0);
+
+        if locked_amount <= 0 {
+            panic_with_error!(&env, Error::InsufficientWeight);
+        }
+
+        // Clear tracking storage entry to prevent double-withdrawals
+        env.storage().persistent().remove(&lock_key);
+
+        // Refund the tokens back to the voter
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let gov_token = token::Client::new(&env, &config.gov_token);
+        gov_token.transfer(&env.current_contract_address(), &voter, &locked_amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "tokens_withdrawn"),),
+            (proposal_id, voter, locked_amount),
         );
     }
 

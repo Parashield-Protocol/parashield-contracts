@@ -15,7 +15,7 @@ use crate::{DaoConfig, GovernanceDao, GovernanceDaoClient, ProposalStatus, VoteC
 
 const VOTING_PERIOD: u64 = 7 * 24 * 3600; // 7 days in seconds
 
-fn setup() -> (
+pub fn setup() -> (
     Env,
     GovernanceDaoClient<'static>,
     Address,

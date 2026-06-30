@@ -4,6 +4,8 @@
 
 extern crate std;
 
+use crate::test::setup;
+
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, Address, Bytes, Env, Symbol, Val, Vec,
@@ -152,4 +154,89 @@ fn execute_twice_fails() {
     dao.finalize(&pid);
     dao.execute(&pid);
     dao.execute(&pid); // second execute should panic
+}
+
+#[test]
+fn test_double_voting_attack_prevention() {
+    let (env, dao, _admin, voter1, _voter2, target) = setup();
+    let config = dao.get_config();
+    let gov_client = token::Client::new(&env, &config.gov_token);
+    let attacker_b = Address::generate(&env);
+
+    // Track original balance of voter1 post-setup (has 1_000_000_0000000 SHIELD)
+    let initial_balance = gov_client.balance(&voter1);
+    assert!(
+        initial_balance > 0,
+        "Attacker needs tokens to initiate attack"
+    );
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Malicious Proposal"),
+        &target,
+        &Symbol::new(&env, "drain"),
+        &args,
+    );
+
+    // 1. Attacker (voter1) votes FOR
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+
+    // 2. VERIFY LOCK: Attacker's liquid wallet balance must now be exactly 0
+    // because the voting weight tokens are securely escrowed by the DAO contract.
+    let post_vote_balance_a = gov_client.balance(&voter1);
+    assert_eq!(
+        post_vote_balance_a, 0,
+        "Tokens were not locked in the DAO contract!"
+    );
+
+    // 3. Attacker attempts to transfer tokens to Attacker B.
+    // This will panic or move 0 tokens because their liquid balance is empty.
+    let res_transfer = gov_client.try_transfer(&voter1, &attacker_b, &initial_balance);
+    assert!(
+        res_transfer.is_err(),
+        "Should not be able to transfer locked tokens"
+    );
+
+    // 4. Attacker B attempts to vote with an empty balance.
+    // This must fail with a contract panic due to 0 balance weight.
+    let res_vote = dao.try_vote(&attacker_b, &pid, &VoteChoice::For);
+    assert!(
+        res_vote.is_err(),
+        "Attack successful: Account B voted using cycled tokens!"
+    );
+}
+
+#[test]
+fn test_successful_token_withdrawal_post_finalize() {
+    let (env, dao, _admin, voter1, _voter2, target) = setup();
+    let config = dao.get_config();
+    let gov_client = token::Client::new(&env, &config.gov_token);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Legitimate Proposal"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+
+    // Vote to lock tokens in escrow
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+    assert_eq!(gov_client.balance(&voter1), 0);
+
+    // Fast-forward past voting period and finalize
+    env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
+    dao.finalize(&pid);
+
+    // Withdraw voting stake back to wallet
+    dao.withdraw_tokens(&voter1, &pid);
+
+    // Verify voter successfully reclaimed their locked voting stake
+    let final_balance = gov_client.balance(&voter1);
+    assert!(
+        final_balance > 0,
+        "Voter could not reclaim their locked stake"
+    );
 }
