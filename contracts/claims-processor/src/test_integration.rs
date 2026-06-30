@@ -50,6 +50,9 @@ fn full_setup() -> TestEnv {
         .initialize(&admin, &usdc_id, &oracle_id);
     ClaimsProcessorClient::new(&env, &claims_id)
         .initialize(&admin, &policy_id, &oracle_id, &604_800u64);
+    // Authorize admin as a keeper for tests
+    ClaimsProcessorClient::new(&env, &claims_id)
+        .add_keeper(&admin, &admin);
     PolicyEngineClient::new(&env, &policy_id)
         .set_claims_processor(&admin, &claims_id);
     // The integration tests drive settlement through the admin address.
@@ -92,7 +95,7 @@ fn batch_processes_multiple_pending_claims() {
     oracle_client.add_oracle(&te.admin, &te.oracle_node, &weather(), &90u32);
     oracle_client.submit_data(
         &te.oracle_node, &weather(), &symbol_short!("kis2606"),
-        &30_000_000i128, &95u32, &1_748_736_000u64,
+        &30_000_000i128, &95u32, &te.env.ledger().timestamp(),
     );
 
     let farmer1 = Address::generate(&te.env);
@@ -134,7 +137,7 @@ fn batch_skips_non_pending_claims() {
     oracle_client.add_oracle(&te.admin, &te.oracle_node, &weather(), &90u32);
     oracle_client.submit_data(
         &te.oracle_node, &weather(), &symbol_short!("kis2606"),
-        &30_000_000i128, &95u32, &1_748_736_000u64,
+        &30_000_000i128, &95u32, &te.env.ledger().timestamp(),
     );
 
     let farmer = Address::generate(&te.env);
@@ -205,6 +208,7 @@ fn test_fresh_oracle_data_accepted() {
 
     // Submit oracle data at timestamp 1_000_000
     let data_ts: u64 = 1_000_000;
+    te.env.ledger().with_mut(|l| l.timestamp = data_ts);
     oracle_client.submit_data(
         &te.oracle_node, &weather(), &symbol_short!("kis2606"),
         &30_000_000i128, &95u32, &data_ts,
@@ -223,6 +227,53 @@ fn test_fresh_oracle_data_accepted() {
     te.env.ledger().with_mut(|l| l.timestamp = fresh_now);
 
     // Should succeed and pay out (30mm < 500mm threshold triggers drought product)
+    let result = claims_client.auto_process(&te.admin, &pol_id);
+    assert_eq!(result, ClaimResult::Paid);
+}
+
+#[test]
+fn test_equal_comparison() {
+    let te = full_setup();
+    let claims_client = ClaimsProcessorClient::new(&te.env, &te.claims);
+    let policy_client = PolicyEngineClient::new(&te.env, &te.policy);
+    let oracle_client = OracleVerifierClient::new(&te.env, &te.oracle);
+
+    let prod_id = policy_client.create_product(
+        &te.admin,
+        &CreateProductParams {
+            name:               symbol_short!("equal"),
+            category:           symbol_short!("flight"),
+            oracle_key:         symbol_short!("flight1"),
+            trigger_type:       TriggerType::Threshold,
+            oracle_data_type:   weather(),
+            trigger_threshold:  100_000_000i128,
+            trigger_comparison: TriggerComparison::Equal,
+            coverage_min:       1_000_0000000i128,
+            coverage_max:       100_000_0000000i128,
+            premium_rate_bps:   300u32,
+            max_duration_days:  180u32,
+        },
+    );
+
+    oracle_client.add_oracle(&te.admin, &te.oracle_node, &weather(), &90u32);
+    let data_ts: u64 = 1_000_000;
+    te.env.ledger().with_mut(|l| l.timestamp = data_ts);
+    oracle_client.submit_data(
+        &te.oracle_node, &weather(), &symbol_short!("flight1"),
+        &100_000_000i128, &95u32, &data_ts,
+    );
+
+    let farmer = Address::generate(&te.env);
+    token::StellarAssetClient::new(&te.env, &te.usdc).mint(&farmer, &10_000_0000000i128);
+    token::StellarAssetClient::new(&te.env, &te.usdc).mint(&te.policy, &1_000_000_0000000i128);
+
+    let pol_id = policy_client.buy_policy(
+        &farmer, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("flight1"),
+    );
+
+    let fresh_now = data_ts + 3_600;
+    te.env.ledger().with_mut(|l| l.timestamp = fresh_now);
+
     let result = claims_client.auto_process(&te.admin, &pol_id);
     assert_eq!(result, ClaimResult::Paid);
 }

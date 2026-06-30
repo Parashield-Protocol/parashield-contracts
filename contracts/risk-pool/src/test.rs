@@ -16,14 +16,16 @@ fn setup() -> (Env, RiskPoolClient<'static>, Address, Address, Address, Address)
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin    = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let lp1      = Address::generate(&env);
+    let admin            = Address::generate(&env);
+    let treasury         = Address::generate(&env);
+    let lp1              = Address::generate(&env);
+    let policy_engine    = Address::generate(&env);
+    let claims_processor = Address::generate(&env);
 
-    let usdc_id    = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let usdc_id     = env.register_stellar_asset_contract_v2(admin.clone()).address();
     let backstop_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let pool_id = env.register(RiskPool, ());
-    let pool    = RiskPoolClient::new(&env, &pool_id);
+    let pool_id     = env.register(RiskPool, ());
+    let pool        = RiskPoolClient::new(&env, &pool_id);
 
     let usdc_admin_client = token::StellarAssetClient::new(&env, &usdc_id);
     usdc_admin_client.mint(&lp1, &1_000_000_000_0000000i128);
@@ -34,6 +36,8 @@ fn setup() -> (Env, RiskPoolClient<'static>, Address, Address, Address, Address)
         &treasury,
         &backstop_id,
         &Symbol::new(&env, "crop"),
+        &policy_engine,
+        &claims_processor,
     );
 
     (env, pool, usdc_id, admin, treasury, lp1)
@@ -55,8 +59,26 @@ fn initialize_sets_state() {
 #[should_panic(expected = "Error(Contract, #1)")]
 fn cannot_initialize_twice() {
     let (env, pool, usdc, admin, treasury, _) = setup();
-    let backstop = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    pool.initialize(&admin, &usdc, &treasury, &backstop, &Symbol::new(&env, "crop"));
+    let backstop         = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let policy_engine    = Address::generate(&env);
+    let claims_processor = Address::generate(&env);
+    pool.initialize(&admin, &usdc, &treasury, &backstop, &Symbol::new(&env, "crop"), &policy_engine, &claims_processor);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_initialize_with_non_token_usdc() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    
+    // Register some random non-token contract and use it as USDC
+    let fake_usdc = env.register(RiskPool, ());
+    let pool_id = env.register(RiskPool, ());
+    let pool = RiskPoolClient::new(&env, &pool_id);
+    
+    pool.initialize(&admin, &fake_usdc, &treasury, &Symbol::new(&env, "crop"));
 }
 
 // ── deposits ──────────────────────────────────────────────────────────────────
@@ -109,7 +131,7 @@ fn withdraw_full_position() {
 fn withdraw_uses_available_liquidity_after_locks() {
     let (_, pool, _, admin, _, lp1) = setup();
     let amount = 1000_0000000i128;
-    let shares = pool.deposit(&lp1, &amount);
+    let shares = pool.deposit(&lp1, &amount, &0i128);
 
     pool.lock_for_policy(&admin, &1u128, &300_0000000i128);
     let returned = pool.withdraw(&lp1, &shares);
@@ -121,7 +143,7 @@ fn withdraw_uses_available_liquidity_after_locks() {
 fn withdraw_uses_available_liquidity_after_locks_2() {
     let (_, pool, _, admin, _, lp1) = setup();
     let amount = 1000_0000000i128;
-    let shares = pool.deposit(&lp1, &amount);
+    let shares = pool.deposit(&lp1, &amount, &0i128);
 
     pool.lock_for_policy(&admin, &1u128, &300_0000000i128);
     let returned = pool.withdraw(&lp1, &shares);
@@ -268,7 +290,7 @@ fn double_lock_fails() {
 #[should_panic(expected = "Error(Contract, #10)")]
 fn double_release_fails() {
     let (_, pool, _, admin, _, lp1) = setup();
-    pool.deposit(&lp1, &200_0000000i128);
+    pool.deposit(&lp1, &200_0000000i128, &0i128);
     pool.lock_for_policy(&admin, &99u128, &50_0000000i128);
     pool.release_for_claim(&admin, &99u128);
     pool.release_for_claim(&admin, &99u128);  // already released
@@ -280,7 +302,7 @@ fn double_release_fails() {
 #[test]
 fn lock_and_release_for_expiry_round_trip() {
     let (_, pool, _, admin, _, lp1) = setup();
-    pool.deposit(&lp1, &200_0000000i128);
+    pool.deposit(&lp1, &200_0000000i128, &0i128);
 
     pool.lock_for_policy(&admin, &42u128, &100_0000000i128);
     assert_eq!(pool.get_utilization_rate(), 5_000u32);  // 50% utilization in bps
@@ -293,7 +315,7 @@ fn lock_and_release_for_expiry_round_trip() {
 #[test]
 fn lock_100_release_100_returns_total_locked_to_zero() {
     let (_, pool, _, admin, _, lp1) = setup();
-    pool.deposit(&lp1, &200_0000000i128);
+    pool.deposit(&lp1, &200_0000000i128, &0i128);
 
     let lock_amount = 100_0000000i128;
     pool.lock_for_policy(&admin, &1u128, &lock_amount);
@@ -308,7 +330,7 @@ fn lock_100_release_100_returns_total_locked_to_zero() {
 #[should_panic(expected = "Error(Contract, #10)")]
 fn double_release_for_expiry_fails() {
     let (_, pool, _, admin, _, lp1) = setup();
-    pool.deposit(&lp1, &200_0000000i128);
+    pool.deposit(&lp1, &200_0000000i128, &0i128);
     pool.lock_for_policy(&admin, &99u128, &50_0000000i128);
     pool.release_for_expiry(&admin, &99u128);
     pool.release_for_expiry(&admin, &99u128);  // already released
@@ -321,7 +343,7 @@ fn double_release_for_expiry_fails() {
 fn pool_deposit_while_paused_fails() {
     let (_, pool, _, admin, _, lp1) = setup();
     pool.pause(&admin);
-    pool.deposit(&lp1, &100_0000000i128);
+    pool.deposit(&lp1, &100_0000000i128, &0i128);
 }
 
 #[test]
@@ -329,7 +351,7 @@ fn resume_allows_deposit() {
     let (_, pool, _, admin, _, lp1) = setup();
     pool.pause(&admin);
     pool.resume(&admin);
-    let shares = pool.deposit(&lp1, &100_0000000i128);
+    let shares = pool.deposit(&lp1, &100_0000000i128, &0i128);
     assert!(shares > 0);
 }
 
@@ -338,7 +360,7 @@ fn resume_allows_deposit() {
 #[test]
 fn get_position_returns_correct_state() {
     let (_, pool, _, _, _, lp1) = setup();
-    pool.deposit(&lp1, &300_0000000i128);
+    pool.deposit(&lp1, &300_0000000i128, &0i128);
     let pos = pool.get_position(&lp1).unwrap();
     assert_eq!(pos.deposited, 300_0000000i128);
     assert_eq!(pos.shares,    300_0000000i128 * 1_000_000_000);
@@ -358,11 +380,11 @@ fn test_deposit_precision_loss_prevented() {
     let lp2 = Address::generate(&env);
     
     // LP1 deposits 1000 USDC
-    pool.deposit(&lp1, &1000_0000000i128);
+    pool.deposit(&lp1, &1000_0000000i128, &0i128);
 
     // LP2 deposits just 1 stroop (smallest possible unit)
     token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &1i128);
-    let shares = pool.deposit(&lp2, &1i128);
+    let shares = pool.deposit(&lp2, &1i128, &0i128);
 
     // Because of the 1e9 precision multiplier, 1 stroop yields 1e9 shares.
     // This prevents truncation to 0 even if the pool's deposited amount grew 
@@ -385,7 +407,7 @@ fn test_deposit_precision_loss_prevented() {
 fn admin_cannot_drain_lp_funds_indirectly() {
     let (_, pool, _, admin, _, lp1) = setup();
     let amount = 500_0000000i128;
-    let _shares = pool.deposit(&lp1, &amount);
+    let _shares = pool.deposit(&lp1, &amount, &0i128);
 
     // There is no admin-only withdraw function.  Only `withdraw(lp, shares)`
     // exists, and it requires lp's auth.  Verify there are no other
@@ -403,10 +425,10 @@ fn admin_cannot_drain_lp_funds_indirectly() {
 /// Admin can request a withdrawal, but it cannot be executed before the
 /// 7-day timelock matures.
 #[test]
-#[should_panic(expected = "Error(Contract, #14)")]
+#[should_panic(expected = "Error(Contract, #15)")]
 fn admin_timelock_withdrawal_not_ready_before_7_days() {
     let (_, pool, _usdc_id, admin, _treasury, lp1) = setup();
-    pool.deposit(&lp1, &1_000_0000000i128);
+    pool.deposit(&lp1, &1_000_0000000i128, &0i128);
 
     pool.request_admin_withdrawal(&admin, &100_0000000i128);
     // Attempt to execute immediately → TimelockNotReady (#14)
@@ -417,7 +439,7 @@ fn admin_timelock_withdrawal_not_ready_before_7_days() {
 #[test]
 fn admin_timelock_cancel_and_re_request() {
     let (env, pool, _usdc_id, admin, _treasury, lp1) = setup();
-    pool.deposit(&lp1, &1_000_0000000i128);
+    pool.deposit(&lp1, &1_000_0000000i128, &0i128);
 
     pool.request_admin_withdrawal(&admin, &100_0000000i128);
     pool.cancel_admin_withdrawal(&admin);
@@ -438,7 +460,7 @@ fn admin_timelock_cancel_and_re_request() {
 #[should_panic(expected = "Error(Contract, #3)")]
 fn non_admin_cannot_lock_for_policy() {
     let (_, pool, _usdc_id, _admin, _treasury, lp1) = setup();
-    pool.deposit(&lp1, &500_0000000i128);
+    pool.deposit(&lp1, &500_0000000i128, &0i128);
 
     pool.lock_for_policy(&lp1, &1u128, &100_0000000i128);
 }
@@ -448,7 +470,7 @@ fn non_admin_cannot_lock_for_policy() {
 #[should_panic(expected = "Error(Contract, #3)")]
 fn non_admin_cannot_release_for_claim() {
     let (_, pool, _usdc_id, admin, _treasury, lp1) = setup();
-    pool.deposit(&lp1, &500_0000000i128);
+    pool.deposit(&lp1, &500_0000000i128, &0i128);
     pool.lock_for_policy(&admin, &1u128, &100_0000000i128);
 
     pool.release_for_claim(&lp1, &1u128);
@@ -459,7 +481,7 @@ fn non_admin_cannot_release_for_claim() {
 #[should_panic(expected = "Error(Contract, #3)")]
 fn non_admin_cannot_release_for_expiry() {
     let (_, pool, _usdc_id, admin, _treasury, lp1) = setup();
-    pool.deposit(&lp1, &500_0000000i128);
+    pool.deposit(&lp1, &500_0000000i128, &0i128);
     pool.lock_for_policy(&admin, &1u128, &100_0000000i128);
 
     pool.release_for_expiry(&lp1, &1u128);
@@ -467,14 +489,14 @@ fn non_admin_cannot_release_for_expiry() {
 
 #[test]
 fn test_get_lp_list_pagination() {
-    let (env, pool, usdc_id, _admin, _, lp1) = setup();
+    let (env, pool, usdc_id, _admin, _, _lp1) = setup();
     env.budget().reset_unlimited();
     
     let usdc_client = token::StellarAssetClient::new(&env, &usdc_id);
     for _ in 0..200 {
         let lp = Address::generate(&env);
         usdc_client.mint(&lp, &10_000_000i128);
-        pool.deposit(&lp, &10_000_000i128);
+        pool.deposit(&lp, &10_000_000i128, &0i128);
     }
     
     assert_eq!(pool.get_lp_count(), 200);

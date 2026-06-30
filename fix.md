@@ -1,13 +1,11 @@
-risk-pool.rs: admin can drain pool — LP funds unprotected
+governance-dao.rs: execute_proposal does not verify proposal exists
 Repo Avatar
 Parashield-Protocol/parashield-contracts
-risk-pool.rs: emergency drain by admin — admin can always withdraw from pool, leaving LPs with nothing
+governance-dao.rs: proposal execution does not verify proposal exists — could execute phantom proposal
 
-The admin might call withdraw_all or similar to drain the pool. There's no multi-sig or timelock protecting LPs.
+execute_proposal(proposal_id) does not check if the proposal was actually created. Executing a non-existent proposal_id would either panic or succeed silently depending on storage state.
 
 Acceptance criteria:
 
-Admin cannot withdraw LP funds directly
-OR implement a 7-day timelock before withdrawal is allowed
-Document: admin powers and limitations
-Test: admin attempts to drain pool, verify LP funds are protected
+Guard: load the proposal and panic if not found
+Test: execute a proposal_id that was never created, expect error

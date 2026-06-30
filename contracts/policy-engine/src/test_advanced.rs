@@ -97,12 +97,14 @@ fn deprecate_product_removes_from_active_list() {
 }
 
 #[test]
-fn pause_product_changes_status_but_stays_in_active_list() {
+fn pause_product_removes_from_active_list() {
     let (_, pe, admin, _, _) = setup();
     let prod_id = pe.create_product(&admin, &basic_params());
+    assert_eq!(pe.get_active_products().len(), 1);
     pe.pause_product(&admin, &prod_id);
     let prod = pe.get_product(&prod_id);
     assert_eq!(prod.status, ProductStatus::Paused);
+    assert_eq!(pe.get_active_products().len(), 0);
 }
 
 // ── policy cancellation ────────────────────────────────────────────────────────

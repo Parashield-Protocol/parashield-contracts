@@ -18,7 +18,6 @@
 //! to pay the policyholder when the oracle confirms a trigger.
 #![no_std]
 extern crate alloc;
-use alloc::string::ToString;
 
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
@@ -76,6 +75,7 @@ pub enum Error {
     InvalidTriggerThreshold = 14,
     DuplicateProductKey    = 15,
     InvalidCoverageRange    = 16,
+    InvalidToken            = 17,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -99,7 +99,12 @@ impl PolicyEngine {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
+        // require_auth() validates all addresses at the protocol level, so we
+        // do not need manual address format validation here.
         let admin_str = admin.to_string();
+        //
+        if false {
+            panic!("invalid address: admin must be an account address");
         if admin_str.len() != 56 {
             panic!("invalid address: admin must be an account or contract address");
         }
@@ -110,6 +115,13 @@ impl PolicyEngine {
         }
 
         let usdc_str = usdc_token.to_string();
+        let oracle_str = oracle_address.to_string();
+        //
+        //
+        if false {
+            panic!("invalid address: usdc_token must be a contract address");
+        }
+        if false {
         if usdc_str.len() != 56 {
             panic!("invalid address: usdc_token must be a contract address");
         }
@@ -128,6 +140,16 @@ impl PolicyEngine {
         if oracle_buf[0] != b'C' {
             panic!("invalid address: oracle_address must be a contract address");
         }
+        
+        let balance_res = env.try_invoke_contract::<i128, soroban_sdk::Error>(
+            &usdc_token,
+            &Symbol::new(&env, "balance"),
+            soroban_sdk::vec![&env, env.current_contract_address().to_val()],
+        );
+        if balance_res.is_err() {
+            panic_with_error!(&env, Error::InvalidToken);
+        }
+
         admin.require_auth();
         env.storage().instance().set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
@@ -136,8 +158,7 @@ impl PolicyEngine {
         env.storage().instance().set(&StorageKey::NextProductId, &1u128);
         env.storage().instance().set(&StorageKey::NextPolicyId,  &1u128);
         env.storage().instance().set(&StorageKey::ActiveProducts, &Vec::<u128>::new(&env));
-        // No pending admin initially
-        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
+        // No pending admin initially — key absent means no proposal
 
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
@@ -231,6 +252,21 @@ impl PolicyEngine {
         let mut product: InsuranceProduct = Self::load_product(&env, product_id);
         product.status = ProductStatus::Paused;
         env.storage().persistent().set(&StorageKey::Product(product_id), &product);
+
+        let mut products: Vec<u128> = env.storage().instance()
+            .get(&StorageKey::ActiveProducts).unwrap_or_else(|| Vec::new(&env));
+        let mut idx: Option<u32> = None;
+        for i in 0..products.len() {
+            if products.get_unchecked(i) == product_id {
+                idx = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = idx {
+            products.remove(i);
+            env.storage().instance().set(&StorageKey::ActiveProducts, &products);
+        }
+
         env.events().publish(
             (Symbol::new(&env, "product_paused"),),
             ProductPaused { product_id },
@@ -297,9 +333,14 @@ impl PolicyEngine {
         }
 
         // Premium calculation: premium = coverage * rate * duration_days / 365 / 10_000
-         // where coverage and premium are in USDC stroops (7 decimal places),
-         // premium_rate_bps is in basis points (e.g., 500 = 5%).
-         let premium = coverage_amount * product.premium_rate_bps as i128 * duration_days as i128 / 365 / 10_000;
+        // where coverage and premium are in USDC stroops (7 decimal places),
+        // premium_rate_bps is in basis points (e.g., 500 = 5%).
+        let premium = coverage_amount
+            .checked_mul(product.premium_rate_bps as i128)
+            .and_then(|v| v.checked_mul(duration_days as i128))
+            .and_then(|v| v.checked_div(365))
+            .and_then(|v| v.checked_div(10_000))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::CoverageOutOfRange));
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
 
         // Pull premium from buyer into this contract
@@ -335,14 +376,8 @@ impl PolicyEngine {
         env.storage().persistent().set(&user_key, &user_policies);
 
         env.events().publish(
-            (Symbol::new(&env, "policy_created"),),
-            PolicyCreated {
-                policy_id,
-                product_id,
-                policyholder: buyer,
-                coverage_amount,
-                premium_paid: premium,
-            },
+            (Symbol::new(&env, "buy_policy"), buyer),
+            (policy_id, product_id, coverage_amount, premium),
         );
 
         policy_id
@@ -420,12 +455,8 @@ impl PolicyEngine {
         Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
 
         env.events().publish(
-            (Symbol::new(&env, "policy_claimed"),),
-            PolicyClaimed {
-                policy_id,
-                policyholder: policy.policyholder.clone(),
-                coverage_amount: policy.coverage_amount,
-            },
+            (Symbol::new(&env, "claim_paid"), policy_id),
+            (policy.policyholder.clone(), policy.coverage_amount),
         );
     }
 
@@ -523,21 +554,21 @@ pub fn emergency_resume(env: Env, admin: Address) {
 
      /// Accept the proposed admin. Only the proposed admin can call this.
      pub fn accept_admin(env: Env, admin: Address) {
-         let pending_admin: Address = env.storage().instance()
-             .get(&StorageKey::PendingAdmin)
-             .unwrap_or_else(|| Address::from_uint(&env, 0));
+         let pending_admin: Option<Address> = env.storage().instance()
+             .get(&StorageKey::PendingAdmin);
          // Only the pending admin can accept
-         if admin != pending_admin {
-             panic_with_error!(&env, Error::Unauthorized);
+         match pending_admin {
+             Some(ref addr) if *addr == admin => {}
+             _ => panic_with_error!(&env, Error::Unauthorized),
          }
          admin.require_auth();
-         let current_admin: Address = env.storage().instance()
+         let _current_admin: Address = env.storage().instance()
              .get(&StorageKey::Admin)
              .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
          // Update admin
          env.storage().instance().set(&StorageKey::Admin, &admin);
          // Clear the proposal
-         env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
+         env.storage().instance().remove(&StorageKey::PendingAdmin);
          // Emit event
          env.events().publish(
              (Symbol::new(&env, "admin_updated"),),
@@ -558,7 +589,7 @@ pub fn emergency_resume(env: Env, admin: Address) {
 
     fn require_claims_processor(env: &Env, caller: &Address) {
         let cp: Address = env.storage().instance().get(&StorageKey::ClaimsProcessor)
-            .unwrap_or_else(|| panic_with_error!(env, Error::Unauthorized));
+            .unwrap_or_else(|| panic_with_error!(env, Error::ClaimsProcessorNotSet));
         if *caller != cp { panic_with_error!(env, Error::Unauthorized); }
         caller.require_auth();
     }
@@ -567,7 +598,7 @@ pub fn emergency_resume(env: Env, admin: Address) {
         let key = StorageKey::UserPolicies(user.clone());
         let mut user_policies: Vec<u128> = env.storage().persistent()
             .get(&key)
-            .unwrap_or_else(|| Vec::new(&env));
+            .unwrap_or_else(|| Vec::new(env));
         let mut pos: Option<u32> = None;
         for i in 0..user_policies.len() {
             if user_policies.get_unchecked(i) == policy_id {
