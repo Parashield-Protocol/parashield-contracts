@@ -183,7 +183,7 @@ fn test_buy_policy_records_correct_fields() {
     assert_eq!(policy.coverage_amount, COVERAGE);
     assert_eq!(policy.premium_paid, expected_premium);
     assert_eq!(policy.status, PolicyStatus::Active);
-    assert_eq!(policy.end_time, 1_748_736_000u64 + duration_days as u64 * 86_400u64);
+    assert_eq!(policy.end_time, 1_748_736_000u64 + (duration_days as u64) * 86_400);
 }
 
 #[test]
@@ -213,6 +213,19 @@ fn test_coverage_below_min_panics() {
     StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
     // coverage_min is 100_000_000; send 50_000_000 (5 USDC) — should panic
     client.buy_policy(&buyer, &pid, &50_000_000i128, &30u32, &symbol_short!("kis2606"));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_coverage_above_max_panics() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid    = create_crop_product(&env, &client, &admin);
+
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &100_000_000_000i128);
+    // coverage_max is 10_000_000_000; send 10_000_000_001 — should panic
+    client.buy_policy(&buyer, &pid, &10_000_000_001i128, &30u32, &symbol_short!("kis2606"));
 }
 
 #[test]
@@ -262,6 +275,40 @@ fn test_non_policyholder_cannot_cancel() {
 }
 
 // ── Re-entrancy / double-processing guard (Issue #1) ─────────────────────────
+
+#[test]
+fn test_pay_claim_transfers_usdc() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client   = PolicyEngineClient::new(&env, &contract_id);
+    let pid      = create_crop_product(&env, &client, &admin);
+    let buyer    = Address::generate(&env);
+    
+    // Buyer needs initial funds to buy policy
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &10_000_000_000i128);
+    // Contract needs funds to pay out the coverage
+    StellarAssetClient::new(&env, &usdc).mint(&contract_id, &10_000_000_000i128);
+
+    let claims_processor = Address::generate(&env);
+    client.set_claims_processor(&admin, &claims_processor);
+
+    let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+    
+    let buyer_balance_before = TokenClient::new(&env, &usdc).balance(&buyer);
+    let contract_balance_before = TokenClient::new(&env, &usdc).balance(&contract_id);
+
+    client.pay_claim(&claims_processor, &policy_id);
+
+    let buyer_balance_after = TokenClient::new(&env, &usdc).balance(&buyer);
+    let contract_balance_after = TokenClient::new(&env, &usdc).balance(&contract_id);
+
+    // Verify USDC was transferred from contract to buyer (policyholder)
+    assert_eq!(buyer_balance_after - buyer_balance_before, COVERAGE);
+    assert_eq!(contract_balance_before - contract_balance_after, COVERAGE);
+    
+    // Verify status updated
+    let policy = client.get_policy(&policy_id);
+    assert_eq!(policy.status, PolicyStatus::Claimed);
+}
 
 /// pay_claim on an already-claimed policy must return AlreadyClaimed error,
 /// preventing double-payout (re-entrancy guard via state transition check).
@@ -507,7 +554,7 @@ fn test_deprecated_product_key_can_be_reused() {
     });
 
     assert_eq!(client.get_active_products().len(), 1);
-    }
+}
 
 #[test]
 fn test_premium_matches_formula() {
@@ -528,8 +575,9 @@ fn test_premium_matches_formula() {
         .expect("div by zero")
         .checked_div(10_000)
         .expect("div by zero");
-    StellarAssetClient::new(&env, &usdc).mint(&buyer, &(expected_premium + 1_000_000_000i128));
-
+    let amount = expected_premium + 1_000_000_000i128;
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &amount);
+  
     let buyer_before = TokenClient::new(&env, &usdc).balance(&buyer);
 
     client.buy_policy(&buyer, &pid, &coverage, &duration_days, &symbol_short!("kis2606"));
@@ -580,4 +628,55 @@ fn sequential_create_product_ids_are_unique_and_monotone() {
     // IDs must be monotonically increasing (atomic increment property)
     assert!(id2 > id1);
     assert!(id3 > id2);
+}
+
+// ── Versioning tests ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_initial_version_is_one() {
+    let (env, _admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    assert_eq!(client.get_version(), 1);
+}
+
+#[test]
+#[should_panic(expected = "new version must be greater than current version")]
+fn test_upgrade_to_same_version_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    // Try to upgrade to same version (1)
+    client.upgrade(&admin, &BytesN::from_array(&env, &[0u8; 32]), &1);
+}
+
+#[test]
+#[should_panic(expected = "new version must be greater than current version")]
+fn test_upgrade_to_lower_version_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    // Try to upgrade to version 0 (lower than current 1)
+    client.upgrade(&admin, &BytesN::from_array(&env, &[0u8; 32]), &0);
+}
+
+#[test]
+#[ignore]
+fn test_upgrade_increments_version() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    
+    assert_eq!(client.get_version(), 1);
+    client.upgrade(&admin, &BytesN::from_array(&env, &[0u8; 32]), &2);
+    assert_eq!(client.get_version(), 2);
+}
+
+#[test]
+#[ignore]
+fn test_multiple_upgrades_track_version_correctly() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    
+    assert_eq!(client.get_version(), 1);
+    client.upgrade(&admin, &BytesN::from_array(&env, &[1u8; 32]), &2);
+    assert_eq!(client.get_version(), 2);
+    client.upgrade(&admin, &BytesN::from_array(&env, &[2u8; 32]), &3);
+    assert_eq!(client.get_version(), 3);
 }

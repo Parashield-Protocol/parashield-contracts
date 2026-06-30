@@ -186,3 +186,10 @@ pub struct AdminUpdated {
     pub new_admin: Address,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUpgraded {
+    pub old_version: u32,
+    pub new_version: u32,
+}
+

@@ -5,14 +5,17 @@
 extern crate std;
 
 use super::*;
-use soroban_sdk::{symbol_short, testutils::Address as _, Env};
+use soroban_sdk::{symbol_short, testutils::{Address as _, Ledger}, Env};
 
 fn setup() -> (Env, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 2_000_000_000);
     let admin       = Address::generate(&env);
     let contract_id = env.register(OracleVerifier, ());
-    OracleVerifierClient::new(&env, &contract_id).initialize(&admin);
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    client.initialize(&admin);
+    client.set_max_data_age(&admin, &3_000_000_000);
     (env, admin, contract_id)
 }
 

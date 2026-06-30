@@ -25,11 +25,15 @@ pub use types::*;
 const PREMIUM_LP_BPS:       i128 = 8_000;  // 80% of premium to LP pool
 const PREMIUM_TREAS_BPS:    i128 = 1_000;  // 10% to treasury
 const PREMIUM_BACKSTOP_BPS: i128 = 1_000;  // 10% to backstop fund
+const _: () = assert!(PREMIUM_LP_BPS + PREMIUM_TREAS_BPS + PREMIUM_BACKSTOP_BPS == 10_000);
 
 /// Upper bound on cumulative deposits (7-decimal USDC stroops).
 /// 10^15 stroops == 100,000,000 USDC. Caps total pool size so share value
 /// cannot become infinitesimal and total_shares cannot overflow.
 const MAX_TOTAL_DEPOSITED: i128 = 1_000_000_000_000_000;
+
+/// Minimum deposit amount (1_000_000 stroops).
+const MIN_DEPOSIT: i128 = 1_000_000;
 
 /// Timelock duration for admin withdrawals: 7 days in seconds.
 const TIMELOCK_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -56,6 +60,8 @@ enum StorageKey {
     PendingAdmin,
     PolicyEngine,
     ClaimsProcessor,
+    /// Contract version (u32) for storage migration tracking
+    Version,
 }
 
 #[contracterror]
@@ -79,6 +85,7 @@ pub enum Error {
     TimelockPending     = 14,
     TimelockNotReady    = 15,
     NoPendingWithdrawal = 16,
+    DepositTooSmall     = 17,
 }
 
 #[contract]
@@ -181,6 +188,7 @@ impl RiskPool {
     pub fn deposit(env: Env, provider: Address, amount: i128, min_shares: i128) -> i128 {
         provider.require_auth();
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
+        if amount < MIN_DEPOSIT { panic_with_error!(&env, Error::DepositTooSmall); }
         Self::assert_active(&env);
 
         let total_deposited: i128 = env.storage().instance()
@@ -491,6 +499,10 @@ impl RiskPool {
         env.storage().instance().get(&StorageKey::LpCount).unwrap_or(0)
     }
 
+    pub fn get_version(env: Env) -> u32 {
+        env.storage().instance().get(&StorageKey::Version).unwrap_or(1)
+    }
+
     pub fn get_lp_list(env: Env, offset: Option<u32>, limit: Option<u32>) -> PaginatedLps {
         let total_count: u32 = env.storage().instance()
             .get(&StorageKey::LpCount).unwrap_or(0);
@@ -652,6 +664,45 @@ impl RiskPool {
             (Symbol::new(&env, "admin_withdrawal_cancelled"),),
             AdminWithdrawalCancelled { admin: admin.clone() },
         );
+    }
+
+    /// Upgrade the contract WASM in-place. Only the admin may call this.
+    /// Storage is preserved across upgrades; only the execution code changes.
+    /// Runs storage migrations if the new version requires them.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: soroban_sdk::BytesN<32>, new_version: u32) {
+        Self::require_admin(&env, &admin);
+        let current_version: u32 = env.storage().instance().get(&StorageKey::Version).unwrap_or(1);
+        if new_version <= current_version {
+            panic!("new version must be greater than current version");
+        }
+        
+        // Run migrations from current_version to new_version
+        Self::run_migrations(&env, current_version, new_version);
+        
+        // Update the stored version
+        env.storage().instance().set(&StorageKey::Version, &new_version);
+        
+        // Perform the actual WASM upgrade
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        
+        env.events().publish(
+            (Symbol::new(&env, "contract_upgraded"),),
+            ContractUpgraded {
+                old_version: current_version,
+                new_version,
+            },
+        );
+    }
+
+    /// Run storage migrations from old_version to new_version.
+    /// Each migration function handles a specific version transition.
+    fn run_migrations(_env: &Env, _old_version: u32, _new_version: u32) {
+        // Migration from v1 to v2: No storage changes needed yet
+        // This is where you would add migration logic for specific version bumps
+        // Example: if old_version < 2 && new_version >= 2 { Self::migrate_v1_to_v2(env); }
+        
+        // Future migrations follow the pattern:
+        // if old_version < 3 && new_version >= 3 { Self::migrate_v2_to_v3(env); }
     }
 
     /// Propose a new admin. Only the current admin can call this.
