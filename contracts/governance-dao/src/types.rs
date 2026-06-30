@@ -1,5 +1,7 @@
 use soroban_sdk::{contracttype, Address, Bytes, Symbol, Val, Vec};
 
+pub const FINALIZE_DELAY: u64 = 24 * 3600;
+
 /// Current lifecycle state of a governance proposal.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

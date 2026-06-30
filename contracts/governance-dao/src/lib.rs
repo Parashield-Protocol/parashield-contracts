@@ -52,6 +52,7 @@ pub enum Error {
     AlreadyExecuted = 11,
     AlreadyCancelled = 12,
     TimelockNotExpired = 13,
+    FinalizeDelayNotMet = 14,
 }
 
 #[contract]
@@ -285,8 +286,10 @@ impl GovernanceDao {
         if proposal.status != ProposalStatus::Active {
             panic_with_error!(&env, Error::ProposalNotActive);
         }
-        if env.ledger().timestamp() <= proposal.vote_end {
-            panic_with_error!(&env, Error::VotingStillOpen);
+
+        // Enforce the validation buffer delay to prevent immediate edge execution races
+        if env.ledger().timestamp() <= proposal.vote_end + FINALIZE_DELAY {
+            panic_with_error!(&env, Error::FinalizeDelayNotMet);
         }
 
         let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();

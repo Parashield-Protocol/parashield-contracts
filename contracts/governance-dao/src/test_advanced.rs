@@ -92,14 +92,13 @@ fn abstain_contributes_to_quorum_but_not_majority() {
         &args,
     );
     dao.vote(&voter, &pid, &VoteChoice::Abstain);
-    env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
     dao.finalize(&pid);
 
     let p = dao.get_proposal(&pid);
-    // Abstain satisfies quorum but no FOR votes → fails majority check
     assert_eq!(p.status, ProposalStatus::Failed);
-
-    // Account for the proposal threshold fee reduction
     assert_eq!(p.votes_abstain, 990_000_0000000i128);
     assert_eq!(p.votes_for, 0);
 }
@@ -112,7 +111,7 @@ fn proposal_count_increments_per_proposal() {
     env.mock_all_auths();
     let (dao, _, voter, target) = make_dao(&env);
 
-    let args: Vec<Val> = Vec::new(&env); // <--- Added
+    let args: Vec<Val> = Vec::new(&env);
     assert_eq!(dao.proposal_count(), 0);
     dao.create_proposal(
         &voter,
@@ -141,19 +140,22 @@ fn execute_twice_fails() {
     env.mock_all_auths();
     let (dao, _, voter, target) = make_dao(&env);
 
-    let args: Vec<Val> = Vec::new(&env); // <--- Added
+    let args: Vec<Val> = Vec::new(&env);
     let pid = dao.create_proposal(
         &voter,
         &Bytes::from_slice(&env, b"Execute twice"),
         &target,
         &Symbol::new(&env, "update"),
-        &args, // <--- Added
+        &args,
     );
     dao.vote(&voter, &pid, &VoteChoice::For);
-    env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
+
+    // Fast-forward past both voting period AND the 24-hour finalize delay buffer
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
     dao.finalize(&pid);
     dao.execute(&pid);
-    dao.execute(&pid); // second execute should panic
+    dao.execute(&pid);
 }
 
 #[test]
@@ -222,18 +224,15 @@ fn test_successful_token_withdrawal_post_finalize() {
         &args,
     );
 
-    // Vote to lock tokens in escrow
     dao.vote(&voter1, &pid, &VoteChoice::For);
     assert_eq!(gov_client.balance(&voter1), 0);
 
-    // Fast-forward past voting period and finalize
-    env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
     dao.finalize(&pid);
 
-    // Withdraw voting stake back to wallet
     dao.withdraw_tokens(&voter1, &pid);
 
-    // Verify voter successfully reclaimed their locked voting stake
     let final_balance = gov_client.balance(&voter1);
     assert!(
         final_balance > 0,

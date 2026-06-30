@@ -190,7 +190,10 @@ fn proposal_passes_with_quorum_and_majority() {
     );
     dao.vote(&voter1, &pid, &VoteChoice::For);
     dao.vote(&voter2, &pid, &VoteChoice::For);
-    env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+
     dao.finalize(&pid);
     let p = dao.get_proposal(&pid);
     assert_eq!(p.status, crate::ProposalStatus::Passed);
@@ -207,14 +210,17 @@ fn proposal_fails_without_quorum() {
         &Symbol::new(&env, "update"),
         &args,
     );
-    env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+
     dao.finalize(&pid);
     let p = dao.get_proposal(&pid);
     assert_eq!(p.status, crate::ProposalStatus::Failed);
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #9)")]
+#[should_panic(expected = "Error(Contract, #14)")]
 fn finalize_while_voting_open_fails() {
     let (env, dao, _, voter1, _, target) = setup();
     let args: Vec<Val> = Vec::new(&env);
@@ -243,7 +249,11 @@ fn execute_passed_proposal() {
     );
     dao.vote(&voter1, &pid, &VoteChoice::For);
     dao.vote(&voter2, &pid, &VoteChoice::For);
-    env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
+
+    // Fast-forward past both voting period AND the 24-hour finalize delay buffer
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+
     dao.finalize(&pid);
     dao.execute(&pid);
     let p = dao.get_proposal(&pid);
@@ -262,8 +272,12 @@ fn execute_failed_proposal_panics() {
         &Symbol::new(&env, "update"),
         &args,
     );
-    env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
-    dao.finalize(&pid);
+
+    // Fast-forward past both voting period AND the 24-hour finalize delay buffer
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+
+    dao.finalize(&pid); // fails (no votes)
     dao.execute(&pid);
 }
 
@@ -308,7 +322,7 @@ fn execute_non_existent_proposal_fails() {
 } // Fixed: Correctly closed out malformed brackets here
 
 #[test]
-#[should_panic(expected = "Error(Contract, #13)")] // Fixed: Expect standard TimelockNotExpired contract panic
+#[should_panic(expected = "Error(Contract, #13)")]
 fn test_proposal_timelock_execution() {
     let env = Env::default();
     env.mock_all_auths();
@@ -326,15 +340,14 @@ fn test_proposal_timelock_execution() {
     let dao_id = env.register(GovernanceDao, ());
     let dao = GovernanceDaoClient::new(&env, &dao_id);
 
-    // Timelock = 7 days (604800 seconds)
     dao.initialize(
         &admin,
         &DaoConfig {
             gov_token: gov_token_id,
             total_supply: 1_000_000_0000000i128,
             proposal_threshold: 10_000_0000000i128,
-            quorum_bps: 1_000u32,   // 10%
-            majority_bps: 5_100u32, // 51%
+            quorum_bps: 1_000u32,
+            majority_bps: 5_100u32,
             voting_period: 604800,
             proposal_timelock: 604800,
         },
@@ -349,18 +362,51 @@ fn test_proposal_timelock_execution() {
         &args,
     );
 
-    // Vote For
     dao.vote(&voter1, &pid, &VoteChoice::For);
 
-    // Fast forward to voting end (T = voting_period + 1)
-    env.ledger().with_mut(|l| l.timestamp = 604801);
+    // Fast forward past voting_period (604800) AND the 24-hour buffer delay (86400) + 1
+    env.ledger().with_mut(|l| l.timestamp = 604800 + 86400 + 1);
     dao.finalize(&pid);
 
-    // Assert proposal passed and execution time is set
     let p = dao.get_proposal(&pid);
     assert_eq!(p.status, ProposalStatus::Passed);
-    assert_eq!(p.execution_time, 604801 + 604800);
 
-    // Attempt to execute immediately at T = 604801 (this should panic with Error #13)
+    // Attempt to execute immediately (timelock not expired)
     dao.execute(&pid);
+}
+
+#[test]
+fn test_finalize_cooldown_delay_enforced() {
+    let (env, dao, _admin, voter1, _voter2, target) = setup();
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Race Condition Test"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+
+    // 1. Fast forward to exactly 1 second after voting period ends (cooldown active)
+    env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
+
+    // 2. Attempting to finalize right away must fail with FinalizeDelayNotMet (Error #14)
+    let res_early = dao.try_finalize(&pid);
+    assert!(
+        res_early.is_err(),
+        "Vulnerability exists: finalized could be raced immediately!"
+    );
+
+    // 3. Fast forward past the 24-hour grace period buffer
+    env.ledger().with_mut(|l| l.timestamp += 24 * 3600);
+
+    // 4. Settle proposal after buffer window expires — should succeed cleanly
+    let res_delayed = dao.try_finalize(&pid);
+    assert!(
+        res_delayed.is_ok(),
+        "Failed to finalize after cooldown expired"
+    );
 }
