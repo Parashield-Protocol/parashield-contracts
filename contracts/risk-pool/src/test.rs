@@ -78,7 +78,15 @@ fn test_initialize_with_non_token_usdc() {
     let pool_id = env.register(RiskPool, ());
     let pool = RiskPoolClient::new(&env, &pool_id);
     
-    pool.initialize(&admin, &fake_usdc, &treasury, &Symbol::new(&env, "crop"));
+    pool.initialize(
+        &admin,
+        &fake_usdc,
+        &treasury,
+        &Address::generate(&env), // backstop
+        &Symbol::new(&env, "crop"),
+        &Address::generate(&env), // policy_engine
+        &Address::generate(&env), // claims_processor
+    );
 }
 
 // ── deposits ──────────────────────────────────────────────────────────────────

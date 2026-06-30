@@ -5,6 +5,7 @@ use soroban_sdk::{symbol_short, testutils::{Address as _, Ledger}, Env, Symbol};
 
 fn setup() -> (Env, Address, Address) {
     let env = Env::default();
+    env.ledger().with_mut(|l| l.timestamp = 1748736000u64);
     env.mock_all_auths();
     let admin  = Address::generate(&env);
     let _oracle = Address::generate(&env);
@@ -32,6 +33,7 @@ fn test_initialize_sets_admin() {
 #[test]
 fn test_initialize_allows_contract_admin() {
     let env = Env::default();
+    env.ledger().with_mut(|l| l.timestamp = 1748736000u64);
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let contract_id = env.register(OracleVerifier, ());
@@ -90,9 +92,9 @@ fn test_update_oracle_weight_changes_aggregation() {
     client.add_oracle(&admin, &oracle1, &weather(), &60u32);
     client.add_oracle(&admin, &oracle2, &weather(), &20u32);
     client.add_oracle(&admin, &oracle3, &weather(), &20u32);
-    client.submit_data(&oracle1, &weather(), &kisumu_key(), &10i128, &100u32, &1u64);
-    client.submit_data(&oracle2, &weather(), &kisumu_key(), &20i128, &100u32, &1u64);
-    client.submit_data(&oracle3, &weather(), &kisumu_key(), &30i128, &100u32, &1u64);
+    client.submit_data(&oracle1, &weather(), &kisumu_key(), &10i128, &100u32, &1748736000u64);
+    client.submit_data(&oracle2, &weather(), &kisumu_key(), &20i128, &100u32, &1748736000u64);
+    client.submit_data(&oracle3, &weather(), &kisumu_key(), &30i128, &100u32, &1748736000u64);
     assert_eq!(
         client
             .get_aggregated(&weather(), &kisumu_key())
@@ -226,7 +228,7 @@ fn test_duplicate_submission_overwrites() {
     client.add_oracle(&admin, &oracle, &weather(), &90u32);
     client.submit_data(&oracle, &weather(), &kisumu_key(), &32_000_000i128, &90u32, &1748736000u64);
     // Second submission — value updates, count stays at 1
-    client.submit_data(&oracle, &weather(), &kisumu_key(), &28_000_000i128, &85u32, &1748822400u64);
+    client.submit_data(&oracle, &weather(), &kisumu_key(), &28_000_000i128, &85u32, &1748736000u64);
     let agg = client.get_aggregated(&weather(), &kisumu_key());
     assert_eq!(agg.oracle_count, 1);
     assert_eq!(agg.median_value, 28_000_000);
@@ -241,7 +243,7 @@ fn test_aggregated_confidence_uses_weighted_average() {
     client.add_oracle(&admin, &oracle1, &weather(), &50u32);
     client.add_oracle(&admin, &oracle2, &weather(), &50u32);
     client.submit_data(&oracle1, &weather(), &kisumu_key(), &95_000_000i128, &95u32, &1748736000u64);
-    client.submit_data(&oracle2, &weather(), &kisumu_key(), &10_000_000i128, &10u32, &1748822400u64);
+    client.submit_data(&oracle2, &weather(), &kisumu_key(), &10_000_000i128, &10u32, &1748736000u64);
 
     let agg = client.get_aggregated(&weather(), &kisumu_key());
     assert_eq!(agg.confidence, 52);
@@ -410,8 +412,8 @@ fn verify_trigger_fresh_rejects_stale_data() {
     let oracle = Address::generate(&env);
     client.add_oracle(&admin, &oracle, &weather(), &90u32);
     // Submit at t=100, ledger timestamp at t=100+86401 (>24h later)
-    client.submit_data(&oracle, &weather(), &kisumu_key(), &30_000_000i128, &95u32, &100u64);
-    env.ledger().with_mut(|l| l.timestamp = 100 + 86_401);
+    client.submit_data(&oracle, &weather(), &kisumu_key(), &30_000_000i128, &95u32, &1748736000u64);
+    env.ledger().with_mut(|l| l.timestamp = 1748736000 + 86_401);
     let condition = TriggerCondition {
         data_type:  weather(),
         key:        kisumu_key(),

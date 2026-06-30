@@ -67,7 +67,6 @@ pub enum Error {
     StaleData           = 9,
     TooManyOracles      = 10,
     InvalidTimestamp    = 11,
-    InvalidTimestamp     = 11,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -93,6 +92,7 @@ impl OracleVerifier {
         
         if false {
             panic!("invalid address: admin must be an account address");
+        }
         if admin_str.len() != 56 {
             panic!("invalid address: admin must be an account or contract address");
         }
@@ -105,8 +105,6 @@ impl OracleVerifier {
         env.storage().instance().set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
         env.storage().instance().set(&StorageKey::OracleList, &Vec::<Address>::new(&env));
-        // No pending admin initially
-        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
 
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
@@ -240,9 +238,10 @@ impl OracleVerifier {
 
     /// Accept the proposed admin. Only the proposed admin can call this.
     pub fn accept_admin(env: Env, admin: Address) {
-        let pending_admin: Address = env.storage().instance()
-            .get(&StorageKey::PendingAdmin)
-            .unwrap_or_else(|| Address::from_uint(&env, 0));
+        let pending_admin: Address = match env.storage().instance().get::<_, Address>(&StorageKey::PendingAdmin) {
+            Some(addr) => addr,
+            None => panic_with_error!(&env, Error::Unauthorized),
+        };
         // Only the pending admin can accept
         if admin != pending_admin {
             panic_with_error!(&env, Error::Unauthorized);
@@ -254,7 +253,7 @@ impl OracleVerifier {
         // Update admin
         env.storage().instance().set(&StorageKey::Admin, &admin);
         // Clear the proposal
-        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
+        env.storage().instance().remove(&StorageKey::PendingAdmin);
         // Emit event
         env.events().publish(
             (Symbol::new(&env, "admin_updated"),),

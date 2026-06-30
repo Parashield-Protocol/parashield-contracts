@@ -47,6 +47,7 @@ enum StorageKey {
     TotalShares,
     AccumulatedPremium,
     AccumulatedBackstop,
+    AccumulatedPerShare,
     Status,
     LpPosition(Address),
     LpCount,
@@ -75,7 +76,7 @@ pub enum Error {
     Undercollateralized = 11,
     PoolCapExceeded     = 12,
     InvalidToken        = 13,
-    InsufficientShares  = 13,
+    InsufficientShares  = 17,
     TimelockPending     = 14,
     TimelockNotReady    = 15,
     NoPendingWithdrawal = 16,
@@ -107,6 +108,7 @@ impl RiskPool {
         
         if false {
             panic!("invalid address: admin must be an account address");
+        }
         if admin_str.len() != 56 {
             panic!("invalid address: admin must be an account or contract address");
         }
@@ -169,6 +171,7 @@ impl RiskPool {
         env.storage().instance().set(&StorageKey::TotalShares,          &0i128);
         env.storage().instance().set(&StorageKey::AccumulatedPremium,   &0i128);
         env.storage().instance().set(&StorageKey::AccumulatedBackstop,  &0i128);
+        env.storage().instance().set(&StorageKey::AccumulatedPerShare,   &0i128);
         env.storage().instance().set(&StorageKey::Status,               &PoolStatus::Active);
         env.storage().instance().set(&StorageKey::LpCount,              &0u32);
         // PendingAdmin is absent until propose_new_admin is called; no init needed.
@@ -210,6 +213,10 @@ impl RiskPool {
             amount * total_shares / total_deposited
         };
 
+        if new_shares == 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+
         if new_shares < min_shares {
             panic_with_error!(&env, Error::InsufficientShares);
         }
@@ -220,10 +227,12 @@ impl RiskPool {
 
         let now = env.ledger().timestamp();
         let lp_key = StorageKey::LpPosition(provider.clone());
-        let position: LpPosition = match env.storage().persistent().get::<_, LpPosition>(&lp_key) {
+        let mut position: LpPosition = match env.storage().persistent().get::<_, LpPosition>(&lp_key) {
             Some(mut pos) => {
+                Self::internal_claim_yield(&env, &mut pos);
                 pos.deposited += amount;
                 pos.shares    += new_shares;
+                pos.yield_debt = (env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0) * pos.shares) / 1_000_000_000_000;
                 pos
             }
             None => {
@@ -231,11 +240,13 @@ impl RiskPool {
                     .get(&StorageKey::LpCount).unwrap_or(0);
                 env.storage().persistent().set(&StorageKey::LpAddress(count), &provider);
                 env.storage().instance().set(&StorageKey::LpCount, &(count + 1));
+                let acc_per_share: i128 = env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0);
                 LpPosition {
                     provider:         provider.clone(),
                     deposited:        amount,
                     shares:           new_shares,
                     yield_claimed:    0,
+                    yield_debt:        (acc_per_share * new_shares) / 1_000_000_000_000,
                     deposited_at:     now,
                     last_yield_claim: now,
                 }
@@ -279,8 +290,10 @@ impl RiskPool {
         token::Client::new(&env, &usdc)
             .transfer(&env.current_contract_address(), &provider, &amount);
 
+        Self::internal_claim_yield(&env, &mut position);
         position.deposited = position.deposited.saturating_sub(amount);
         position.shares   -= shares;
+        position.yield_debt = (env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0) * position.shares) / 1_000_000_000_000;
         env.storage().persistent().set(&lp_key, &position);
         env.storage().instance().set(&StorageKey::TotalDeposited, &(total_deposited - amount));
         env.storage().instance().set(&StorageKey::TotalShares,    &(total_shares - shares));
@@ -317,6 +330,15 @@ impl RiskPool {
         let acc: i128 = env.storage().instance()
             .get(&StorageKey::AccumulatedPremium).unwrap_or(0);
         env.storage().instance().set(&StorageKey::AccumulatedPremium, &(acc + lp_share));
+
+        let total_shares: i128 = env.storage().instance()
+            .get(&StorageKey::TotalShares).unwrap_or(0);
+        if total_shares > 0 {
+            let acc_per_share: i128 = env.storage().instance()
+                .get(&StorageKey::AccumulatedPerShare).unwrap_or(0);
+            let increment = (lp_share * 1_000_000_000_000) / total_shares;
+            env.storage().instance().set(&StorageKey::AccumulatedPerShare, &(acc_per_share + increment));
+        }
 
         let acc_backstop: i128 = env.storage().instance()
             .get(&StorageKey::AccumulatedBackstop).unwrap_or(0);
@@ -376,31 +398,15 @@ impl RiskPool {
             .get(&lp_key)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
 
-        let total_shares: i128   = env.storage().instance().get(&StorageKey::TotalShares).unwrap_or(0);
-        let accumulated: i128    = env.storage().instance().get(&StorageKey::AccumulatedPremium).unwrap_or(0);
-        if total_shares == 0 { return 0; }
+        let old_claimed = position.yield_claimed;
+        Self::internal_claim_yield(&env, &mut position);
+        let claimed = position.yield_claimed - old_claimed;
 
-        let entitled  = accumulated * position.shares / total_shares;
-        let claimable = entitled.saturating_sub(position.yield_claimed);
-        if claimable == 0 { return 0; }
+        if claimed > 0 {
+            env.storage().persistent().set(&lp_key, &position);
+        }
 
-        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
-        token::Client::new(&env, &usdc)
-            .transfer(&env.current_contract_address(), &provider, &claimable);
-
-        position.yield_claimed   += claimable;
-        position.last_yield_claim = env.ledger().timestamp();
-        env.storage().persistent().set(&lp_key, &position);
-
-        env.events().publish(
-            (Symbol::new(&env, "yield_claimed"),),
-            YieldClaimed {
-                provider: provider.clone(),
-                amount: claimable,
-            },
-        );
-
-        claimable
+        claimed
     }
 
     // ── Capital locks ─────────────────────────────────────────────────────────
@@ -715,6 +721,34 @@ impl RiskPool {
         let status: PoolStatus = env.storage().instance()
             .get(&StorageKey::Status).unwrap_or(PoolStatus::Active);
         if status != PoolStatus::Active { panic_with_error!(env, Error::PoolNotActive); }
+    }
+
+    fn internal_claim_yield(env: &Env, position: &mut LpPosition) {
+        let total_shares: i128 = env.storage().instance().get(&StorageKey::TotalShares).unwrap_or(0);
+        let acc_per_share: i128 = env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0);
+        if total_shares == 0 {
+            return;
+        }
+
+        let entitled = (acc_per_share * position.shares) / 1_000_000_000_000;
+        let claimable = entitled.saturating_sub(position.yield_debt);
+        if claimable > 0 {
+            let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+            token::Client::new(env, &usdc)
+                .transfer(&env.current_contract_address(), &position.provider, &claimable);
+
+            position.yield_claimed += claimable;
+            position.last_yield_claim = env.ledger().timestamp();
+            position.yield_debt = entitled;
+
+            env.events().publish(
+                (Symbol::new(env, "yield_claimed"),),
+                YieldClaimed {
+                    provider: position.provider.clone(),
+                    amount: claimable,
+                },
+            );
+        }
     }
 }
 

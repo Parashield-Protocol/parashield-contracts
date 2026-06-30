@@ -76,6 +76,7 @@ pub enum Error {
     DuplicateProductKey    = 15,
     InvalidCoverageRange    = 16,
     InvalidToken            = 17,
+    ClaimsProcessorNotSet   = 18,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -105,6 +106,7 @@ impl PolicyEngine {
         //
         if false {
             panic!("invalid address: admin must be an account address");
+        }
         if admin_str.len() != 56 {
             panic!("invalid address: admin must be an account or contract address");
         }
@@ -121,7 +123,6 @@ impl PolicyEngine {
         if false {
             panic!("invalid address: usdc_token must be a contract address");
         }
-        if false {
         if usdc_str.len() != 56 {
             panic!("invalid address: usdc_token must be a contract address");
         }
