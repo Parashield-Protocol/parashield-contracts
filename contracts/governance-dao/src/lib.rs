@@ -17,8 +17,8 @@ extern crate alloc;
 use alloc::string::ToString;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror, panic_with_error,
-    token, Address, Bytes, BytesN, Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
+    BytesN, Env, Symbol, Val, Vec,
 };
 
 pub mod types;
@@ -38,19 +38,19 @@ enum StorageKey {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
-    AlreadyInitialized   = 1,
-    NotInitialized       = 2,
-    Unauthorized         = 3,
-    InsufficientWeight   = 4,
-    ProposalNotFound     = 5,
-    ProposalNotActive    = 6,
-    AlreadyVoted         = 7,
-    VotingClosed         = 8,
-    VotingStillOpen      = 9,
-    ProposalNotPassed    = 10,
-    AlreadyExecuted      = 11,
-    AlreadyCancelled     = 12,
-    TimelockNotExpired   = 13,
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    InsufficientWeight = 4,
+    ProposalNotFound = 5,
+    ProposalNotActive = 6,
+    AlreadyVoted = 7,
+    VotingClosed = 8,
+    VotingStillOpen = 9,
+    ProposalNotPassed = 10,
+    AlreadyExecuted = 11,
+    AlreadyCancelled = 12,
+    TimelockNotExpired = 13,
 }
 
 #[contract]
@@ -58,21 +58,13 @@ pub struct GovernanceDao;
 
 #[contractimpl]
 impl GovernanceDao {
-
-    pub fn initialize(
-        env: Env,
-        admin: Address,
-        config: DaoConfig,
-    ) {
+    pub fn initialize(env: Env, admin: Address, config: DaoConfig) {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
-        // Address validation is deferred to require_auth() calls which
-        // verify the address on the Soroban network layer.
+
+        // Address verification
         let admin_str = admin.to_string();
-        
-        if false {
-            panic!("invalid address: admin must be an account address");
         if admin_str.len() != 56 {
             panic!("invalid address: admin must be an account or contract address");
         }
@@ -83,8 +75,6 @@ impl GovernanceDao {
         }
 
         let gov_token_str = config.gov_token.to_string();
-        
-        if false {
         if gov_token_str.len() != 56 {
             panic!("invalid address: gov_token must be a contract address");
         }
@@ -93,11 +83,15 @@ impl GovernanceDao {
         if gov_token_buf[0] != b'C' {
             panic!("invalid address: gov_token must be a contract address");
         }
-        admin.require_auth();
-        env.storage().instance().set(&StorageKey::Initialized,    &true);
-        env.storage().instance().set(&StorageKey::Admin,          &admin);
-        env.storage().instance().set(&StorageKey::Config,         &config);
-        env.storage().instance().set(&StorageKey::NextProposalId, &0u64);
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::Initialized, &true);
+        env.storage().instance().set(&StorageKey::Admin, &admin);
+        env.storage().instance().set(&StorageKey::Config, &config);
+        env.storage()
+            .instance()
+            .set(&StorageKey::NextProposalId, &0u64);
 
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
@@ -116,9 +110,13 @@ impl GovernanceDao {
         title: Bytes,
         target: Address,
         function: Symbol,
+        args: Vec<Val>, // <--- ADD THIS ARGUMENT
     ) -> u64 {
         proposer.require_auth();
-        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config)
+        let config: DaoConfig = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Config)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
 
         let gov_token = token::Client::new(&env, &config.gov_token);
@@ -126,30 +124,43 @@ impl GovernanceDao {
         if weight < config.proposal_threshold {
             panic_with_error!(&env, Error::InsufficientWeight);
         }
-        gov_token.transfer(&proposer, &env.current_contract_address(), &config.proposal_threshold);
+        gov_token.transfer(
+            &proposer,
+            &env.current_contract_address(),
+            &config.proposal_threshold,
+        );
 
-        let proposal_id: u64 = env.storage().instance()
-            .get(&StorageKey::NextProposalId).unwrap_or(0);
+        let proposal_id: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::NextProposalId)
+            .unwrap_or(0);
         let now = env.ledger().timestamp();
 
         let proposal = Proposal {
-            id:            proposal_id,
-            proposer:      proposer.clone(),
+            id: proposal_id,
+            proposer: proposer.clone(),
             title,
-            target:        target.clone(),
-            function:      function.clone(),
-            status:        ProposalStatus::Active,
-            votes_for:     0,
+            target: target.clone(),
+            function: function.clone(),
+            args, // <--- BIND TO STRUCT
+            status: ProposalStatus::Active,
+            votes_for: 0,
             votes_against: 0,
             votes_abstain: 0,
-            created_at:    now,
-            vote_end:      now + config.voting_period,
+            created_at: now,
+            vote_end: now + config.voting_period,
             execution_time: 0,
         };
 
-        env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
-        env.storage().instance().set(&StorageKey::NextProposalId, &(proposal_id + 1));
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Proposal(proposal_id), &proposal);
+        env.storage()
+            .instance()
+            .set(&StorageKey::NextProposalId, &(proposal_id + 1));
 
+        // Note: You can append `args` to your event payload if necessary
         env.events().publish(
             (Symbol::new(&env, "proposal_created"),),
             ProposalCreated {
@@ -163,15 +174,12 @@ impl GovernanceDao {
         proposal_id
     }
 
-    pub fn vote(
-        env: Env,
-        voter: Address,
-        proposal_id: u64,
-        choice: VoteChoice,
-    ) {
+    pub fn vote(env: Env, voter: Address, proposal_id: u64, choice: VoteChoice) {
         voter.require_auth();
 
-        let mut proposal: Proposal = env.storage().persistent()
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
             .get(&StorageKey::Proposal(proposal_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
 
@@ -188,20 +196,27 @@ impl GovernanceDao {
 
         let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
         let weight = token::Client::new(&env, &config.gov_token).balance(&voter);
-        if weight <= 0 { panic_with_error!(&env, Error::InsufficientWeight); }
+        if weight <= 0 {
+            panic_with_error!(&env, Error::InsufficientWeight);
+        }
 
         match choice {
-            VoteChoice::For     => proposal.votes_for     += weight,
+            VoteChoice::For => proposal.votes_for += weight,
             VoteChoice::Against => proposal.votes_against += weight,
             VoteChoice::Abstain => proposal.votes_abstain += weight,
         }
 
-        env.storage().persistent().set(&vote_key, &VoteRecord {
-            voter: voter.clone(),
-            choice: choice.clone(),
-            weight,
-        });
-        env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
+        env.storage().persistent().set(
+            &vote_key,
+            &VoteRecord {
+                voter: voter.clone(),
+                choice: choice.clone(),
+                weight,
+            },
+        );
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Proposal(proposal_id), &proposal);
 
         env.events().publish(
             (Symbol::new(&env, "vote_cast"),),
@@ -215,7 +230,9 @@ impl GovernanceDao {
     }
 
     pub fn finalize(env: Env, proposal_id: u64) {
-        let mut proposal: Proposal = env.storage().persistent()
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
             .get(&StorageKey::Proposal(proposal_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
 
@@ -228,7 +245,7 @@ impl GovernanceDao {
 
         let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
         let total_supply = config.total_supply;
-        let total_votes  = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
+        let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
         let quorum_needed = total_supply * config.quorum_bps as i128 / 10_000;
 
         if total_votes < quorum_needed {
@@ -248,9 +265,15 @@ impl GovernanceDao {
         }
 
         let gov_token = token::Client::new(&env, &config.gov_token);
-        gov_token.transfer(&env.current_contract_address(), &proposal.proposer, &config.proposal_threshold);
+        gov_token.transfer(
+            &env.current_contract_address(),
+            &proposal.proposer,
+            &config.proposal_threshold,
+        );
 
-        env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Proposal(proposal_id), &proposal);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_finalized"),),
@@ -262,7 +285,9 @@ impl GovernanceDao {
     }
 
     pub fn execute(env: Env, proposal_id: u64) {
-        let mut proposal: Proposal = env.storage().persistent()
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
             .get(&StorageKey::Proposal(proposal_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
 
@@ -282,7 +307,9 @@ impl GovernanceDao {
         // Signal execution — actual cross-contract call is the caller's responsibility
         // (they build the Auth tree) to avoid this contract needing admin on targets.
         proposal.status = ProposalStatus::Executed;
-        env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Proposal(proposal_id), &proposal);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_executed"),),
@@ -293,7 +320,9 @@ impl GovernanceDao {
     pub fn cancel(env: Env, admin: Address, proposal_id: u64) {
         Self::require_admin(&env, &admin);
 
-        let mut proposal: Proposal = env.storage().persistent()
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
             .get(&StorageKey::Proposal(proposal_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
 
@@ -302,11 +331,17 @@ impl GovernanceDao {
         }
 
         proposal.status = ProposalStatus::Cancelled;
-        env.storage().persistent().set(&StorageKey::Proposal(proposal_id), &proposal);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Proposal(proposal_id), &proposal);
 
         let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
         let gov_token = token::Client::new(&env, &config.gov_token);
-        gov_token.transfer(&env.current_contract_address(), &proposal.proposer, &config.proposal_threshold);
+        gov_token.transfer(
+            &env.current_contract_address(),
+            &proposal.proposer,
+            &config.proposal_threshold,
+        );
 
         env.events().publish(
             (Symbol::new(&env, "proposal_cancelled"),),
@@ -317,28 +352,37 @@ impl GovernanceDao {
     // ── Queries ───────────────────────────────────────────────────────────────
 
     pub fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
-        env.storage().persistent()
+        env.storage()
+            .persistent()
             .get(&StorageKey::Proposal(proposal_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound))
     }
 
     pub fn get_vote(env: Env, proposal_id: u64, voter: Address) -> Option<VoteRecord> {
-        env.storage().persistent()
+        env.storage()
+            .persistent()
             .get(&StorageKey::VoteRecord(proposal_id, voter))
     }
 
     pub fn get_config(env: Env) -> DaoConfig {
-        env.storage().instance().get(&StorageKey::Config)
+        env.storage()
+            .instance()
+            .get(&StorageKey::Config)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
     }
 
     pub fn get_admin(env: Env) -> Address {
-        env.storage().instance().get(&StorageKey::Admin)
+        env.storage()
+            .instance()
+            .get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
     }
 
     pub fn proposal_count(env: Env) -> u64 {
-        env.storage().instance().get(&StorageKey::NextProposalId).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&StorageKey::NextProposalId)
+            .unwrap_or(0)
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
@@ -367,9 +411,14 @@ impl GovernanceDao {
     }
 
     fn require_admin(env: &Env, caller: &Address) {
-        let admin: Address = env.storage().instance().get(&StorageKey::Admin)
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
-        if *caller != admin { panic_with_error!(env, Error::Unauthorized); }
+        if *caller != admin {
+            panic_with_error!(env, Error::Unauthorized);
+        }
         caller.require_auth();
     }
 }

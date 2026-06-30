@@ -6,7 +6,7 @@ extern crate std;
 
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, Address, Bytes, Env, Symbol,
+    token, Address, Bytes, Env, Symbol, Val, Vec,
 };
 
 use crate::{DaoConfig, GovernanceDao, GovernanceDaoClient, ProposalStatus, VoteChoice};
@@ -16,28 +16,28 @@ const VOTING_PERIOD: u64 = 7 * 24 * 3600;
 fn base_config(gov_token: Address) -> DaoConfig {
     DaoConfig {
         gov_token,
-        total_supply:       1_100_000_0000000i128,
+        total_supply: 1_100_000_0000000i128,
         proposal_threshold: 10_000_0000000i128,
-        quorum_bps:         1_000u32,
-        majority_bps:       5_100u32,
-        voting_period:      VOTING_PERIOD,
-        proposal_timelock:  0,
+        quorum_bps: 1_000u32,
+        majority_bps: 5_100u32,
+        voting_period: VOTING_PERIOD,
+        proposal_timelock: 0,
     }
 }
 
 fn make_dao(env: &Env) -> (GovernanceDaoClient<'static>, Address, Address, Address) {
-    let admin  = Address::generate(env);
-    let voter  = Address::generate(env);
+    let admin = Address::generate(env);
+    let voter = Address::generate(env);
     let target = Address::generate(env);
 
-    let gov_token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    token::StellarAssetClient::new(env, &gov_token_id)
-        .mint(&voter, &1_000_000_0000000i128);
-    token::StellarAssetClient::new(env, &gov_token_id)
-        .mint(&admin, &100_000_0000000i128);
+    let gov_token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    token::StellarAssetClient::new(env, &gov_token_id).mint(&voter, &1_000_000_0000000i128);
+    token::StellarAssetClient::new(env, &gov_token_id).mint(&admin, &100_000_0000000i128);
 
     let dao_id = env.register(GovernanceDao, ());
-    let dao    = GovernanceDaoClient::new(env, &dao_id);
+    let dao = GovernanceDaoClient::new(env, &dao_id);
     dao.initialize(&admin, &base_config(gov_token_id));
 
     (dao, admin, voter, target)
@@ -53,13 +53,13 @@ fn admin_can_update_config() {
 
     let cfg_before = dao.get_config();
     let new_cfg = DaoConfig {
-        quorum_bps:    2_000u32,
-        majority_bps:  6_000u32,
+        quorum_bps: 2_000u32,
+        majority_bps: 6_000u32,
         ..cfg_before.clone()
     };
     dao.update_config(&admin, &new_cfg);
     let cfg_after = dao.get_config();
-    assert_eq!(cfg_after.quorum_bps,  2_000);
+    assert_eq!(cfg_after.quorum_bps, 2_000);
     assert_eq!(cfg_after.majority_bps, 6_000);
 }
 
@@ -81,11 +81,13 @@ fn abstain_contributes_to_quorum_but_not_majority() {
     env.mock_all_auths();
     let (dao, _, voter, target) = make_dao(&env);
 
+    let args: Vec<Val> = Vec::new(&env);
     let pid = dao.create_proposal(
         &voter,
         &Bytes::from_slice(&env, b"Abstain test"),
         &target,
         &Symbol::new(&env, "update"),
+        &args,
     );
     dao.vote(&voter, &pid, &VoteChoice::Abstain);
     env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
@@ -94,7 +96,9 @@ fn abstain_contributes_to_quorum_but_not_majority() {
     let p = dao.get_proposal(&pid);
     // Abstain satisfies quorum but no FOR votes → fails majority check
     assert_eq!(p.status, ProposalStatus::Failed);
-    assert_eq!(p.votes_abstain, 1_000_000_0000000i128);
+
+    // Account for the proposal threshold fee reduction
+    assert_eq!(p.votes_abstain, 990_000_0000000i128);
     assert_eq!(p.votes_for, 0);
 }
 
@@ -106,10 +110,23 @@ fn proposal_count_increments_per_proposal() {
     env.mock_all_auths();
     let (dao, _, voter, target) = make_dao(&env);
 
+    let args: Vec<Val> = Vec::new(&env); // <--- Added
     assert_eq!(dao.proposal_count(), 0);
-    dao.create_proposal(&voter, &Bytes::from_slice(&env, b"P1"), &target, &Symbol::new(&env, "fn1"));
+    dao.create_proposal(
+        &voter,
+        &Bytes::from_slice(&env, b"P1"),
+        &target,
+        &Symbol::new(&env, "fn1"),
+        &args,
+    ); // <--- Added args
     assert_eq!(dao.proposal_count(), 1);
-    dao.create_proposal(&voter, &Bytes::from_slice(&env, b"P2"), &target, &Symbol::new(&env, "fn2"));
+    dao.create_proposal(
+        &voter,
+        &Bytes::from_slice(&env, b"P2"),
+        &target,
+        &Symbol::new(&env, "fn2"),
+        &args,
+    ); // <--- Added args
     assert_eq!(dao.proposal_count(), 2);
 }
 
@@ -122,15 +139,17 @@ fn execute_twice_fails() {
     env.mock_all_auths();
     let (dao, _, voter, target) = make_dao(&env);
 
+    let args: Vec<Val> = Vec::new(&env); // <--- Added
     let pid = dao.create_proposal(
         &voter,
         &Bytes::from_slice(&env, b"Execute twice"),
         &target,
         &Symbol::new(&env, "update"),
+        &args, // <--- Added
     );
     dao.vote(&voter, &pid, &VoteChoice::For);
     env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
     dao.finalize(&pid);
     dao.execute(&pid);
-    dao.execute(&pid);  // second execute should panic
+    dao.execute(&pid); // second execute should panic
 }
