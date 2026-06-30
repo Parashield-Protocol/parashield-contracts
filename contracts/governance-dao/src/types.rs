@@ -134,3 +134,10 @@ pub struct DaoConfigUpdated {
     pub proposal_timelock: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUpgraded {
+    pub old_version: u32,
+    pub new_version: u32,
+}
+
