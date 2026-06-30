@@ -10,6 +10,8 @@ pub enum TriggerComparison {
     GreaterThan,
     /// Trigger fires when observed == threshold (binary events)
     Equal,
+    /// Matches if |median - threshold| <= tolerance
+    EqualWithTolerance,
 }
 
 /// A trigger condition evaluated by the Claims Processor.
@@ -23,6 +25,9 @@ pub struct TriggerCondition {
     /// Threshold in 7-decimal fixed point
     pub threshold: i128,
     pub comparison: TriggerComparison,
+    /// The maximum acceptable absolute variance.
+    /// Set to 0 if utilizing standard LessThan/GreaterThan/Equal.
+    pub tolerance: i128,
 }
 
 /// Input struct for a single reading inside a bulk `submit_data_batch` call.
@@ -142,10 +147,6 @@ pub struct OracleDataSubmitted {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaxDataAgeUpdated {
-    pub max_age: u64,
-}
 pub struct AdminUpdated {
     pub new_admin: Address,
 }
-

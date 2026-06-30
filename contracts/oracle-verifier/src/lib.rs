@@ -18,8 +18,8 @@ use alloc::string::ToString;
 
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror, panic_with_error,
-    Address, BytesN, Env, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, BytesN, Env,
+    Symbol, Vec,
 };
 
 pub mod types;
@@ -56,18 +56,17 @@ enum StorageKey {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
-    AlreadyInitialized  = 1,
-    NotInitialized      = 2,
-    Unauthorized        = 3,
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
     OracleNotRegistered = 4,
     OracleAlreadyExists = 5,
-    NoDataAvailable     = 6,
-    InvalidConfidence   = 7,
-    InvalidWeight       = 8,
-    StaleData           = 9,
-    TooManyOracles      = 10,
-    InvalidTimestamp    = 11,
-    InvalidTimestamp     = 11,
+    NoDataAvailable = 6,
+    InvalidConfidence = 7,
+    InvalidWeight = 8,
+    StaleData = 9,
+    TooManyOracles = 10,
+    InvalidTimestamp = 11,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -79,7 +78,6 @@ pub struct OracleVerifier;
 #[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contractimpl]
 impl OracleVerifier {
-
     // ── Lifecycle ────────────────────────────────────────────────────────────
 
     /// One-time initialisation. Caller becomes admin.
@@ -87,30 +85,31 @@ impl OracleVerifier {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
+
         // require_auth() validates the address at the protocol level, so we do
-        // not need manual address format validation here.
-        let admin_str = admin.to_string();
-        
-        if false {
-            panic!("invalid address: admin must be an account address");
-        if admin_str.len() != 56 {
-            panic!("invalid address: admin must be an account or contract address");
-        }
-        let mut admin_buf = [0u8; 56];
-        admin_str.copy_into_slice(&mut admin_buf);
-        if admin_buf[0] != b'G' && admin_buf[0] != b'C' {
-            panic!("invalid address: admin must be an account or contract address");
-        }
+        // not need manual address format string validation here.
         admin.require_auth();
-        env.storage().instance().set(&StorageKey::Initialized, &true);
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
-        env.storage().instance().set(&StorageKey::OracleList, &Vec::<Address>::new(&env));
+        env.storage()
+            .instance()
+            .set(&StorageKey::OracleList, &Vec::<Address>::new(&env));
+
         // No pending admin initially
-        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
+        let pending_admin = env
+            .storage()
+            .instance()
+            .get::<_, Option<Address>>(&StorageKey::PendingAdmin) // Explicitly type the lookup
+            .unwrap_or(None);
 
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
-            Initialized { admin: admin.clone() },
+            Initialized {
+                admin: admin.clone(),
+            },
         );
     }
 
@@ -118,13 +117,7 @@ impl OracleVerifier {
 
     /// Register an oracle address for a given data type with a relative weight.
     /// `weight` is 1-100; higher-weight oracles contribute more to the median.
-    pub fn add_oracle(
-        env: Env,
-        admin: Address,
-        oracle: Address,
-        data_type: Symbol,
-        weight: u32,
-    ) {
+    pub fn add_oracle(env: Env, admin: Address, oracle: Address, data_type: Symbol, weight: u32) {
         Self::require_admin(&env, &admin);
         if weight == 0 || weight > 100 {
             panic_with_error!(&env, Error::InvalidWeight);
@@ -133,7 +126,12 @@ impl OracleVerifier {
         if env.storage().persistent().has(&key) {
             panic_with_error!(&env, Error::OracleAlreadyExists);
         }
-        let entry = OracleEntry { oracle: oracle.clone(), data_type: data_type.clone(), weight, active: true };
+        let entry = OracleEntry {
+            oracle: oracle.clone(),
+            data_type: data_type.clone(),
+            weight,
+            active: true,
+        };
         env.storage().persistent().set(&key, &entry);
 
         let mut list: Vec<Address> = env
@@ -160,7 +158,11 @@ impl OracleVerifier {
 
         env.events().publish(
             (Symbol::new(&env, "oracle_added"),),
-            OracleAdded { oracle, data_type, weight },
+            OracleAdded {
+                oracle,
+                data_type,
+                weight,
+            },
         );
     }
 
@@ -214,7 +216,9 @@ impl OracleVerifier {
         if threshold > 100 {
             panic_with_error!(&env, Error::InvalidConfidence);
         }
-        env.storage().instance().set(&StorageKey::MinConfidence, &threshold);
+        env.storage()
+            .instance()
+            .set(&StorageKey::MinConfidence, &threshold);
         env.events().publish(
             (Symbol::new(&env, "min_confidence_updated"),),
             MinConfidenceUpdated { threshold },
@@ -224,7 +228,9 @@ impl OracleVerifier {
     /// Set the maximum data age in seconds.
     pub fn set_max_data_age(env: Env, admin: Address, max_age: u64) {
         Self::require_admin(&env, &admin);
-        env.storage().instance().set(&StorageKey::MaxDataAge, &max_age);
+        env.storage()
+            .instance()
+            .set(&StorageKey::MaxDataAge, &max_age);
         env.events().publish(
             (Symbol::new(&env, "max_data_age_updated"),),
             MaxDataAgeUpdated { max_age },
@@ -235,43 +241,62 @@ impl OracleVerifier {
     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
         // Store the proposed admin (zero address means no proposal)
-        env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::PendingAdmin, &new_admin);
     }
 
     /// Accept the proposed admin. Only the proposed admin can call this.
     pub fn accept_admin(env: Env, admin: Address) {
-        let pending_admin: Address = env.storage().instance()
+        // Correct way to read an Optional field from Soroban instance storage
+        let pending_admin_opt: Option<Address> = env
+            .storage()
+            .instance()
             .get(&StorageKey::PendingAdmin)
-            .unwrap_or_else(|| Address::from_uint(&env, 0));
-        // Only the pending admin can accept
+            .unwrap_or(None); // If key doesn't exist, evaluates to None
+
+        let pending_admin = match pending_admin_opt {
+            Some(addr) => addr,
+            None => panic_with_error!(&env, Error::Unauthorized),
+        };
+
         if admin != pending_admin {
             panic_with_error!(&env, Error::Unauthorized);
         }
+
         admin.require_auth();
-        let current_admin: Address = env.storage().instance()
-            .get(&StorageKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
-        // Update admin
+
+        if !env.storage().instance().has(&StorageKey::Initialized) {
+            panic_with_error!(&env, Error::NotInitialized);
+        }
+
         env.storage().instance().set(&StorageKey::Admin, &admin);
-        // Clear the proposal
-        env.storage().instance().set(&StorageKey::PendingAdmin, &Address::from_uint(&env, 0));
-        // Emit event
+
+        // Clear the slot explicitly using a clean None type hint
+        let no_pending: Option<Address> = None;
+        env.storage()
+            .instance()
+            .set(&StorageKey::PendingAdmin, &no_pending);
+
         env.events().publish(
             (Symbol::new(&env, "admin_updated"),),
-            AdminUpdated {
-                new_admin: admin,
-            },
+            AdminUpdated { new_admin: admin },
         );
     }
 
     /// Get the maximum data age in seconds (defaults to 7 days = 604,800 seconds).
     pub fn get_max_data_age(env: Env) -> u64 {
-        env.storage().instance().get(&StorageKey::MaxDataAge).unwrap_or(604_800)
+        env.storage()
+            .instance()
+            .get(&StorageKey::MaxDataAge)
+            .unwrap_or(604_800)
     }
 
     pub fn set_min_oracle_count(env: Env, admin: Address, min_count: u32) {
         Self::require_admin(&env, &admin);
-        env.storage().instance().set(&StorageKey::MinOracleCount, &min_count);
+        env.storage()
+            .instance()
+            .set(&StorageKey::MinOracleCount, &min_count);
         env.events().publish(
             (Symbol::new(&env, "min_oracle_count_updated"),),
             MinOracleCountUpdated { min_count },
@@ -279,7 +304,10 @@ impl OracleVerifier {
     }
 
     pub fn get_min_oracle_count(env: Env) -> u32 {
-        env.storage().instance().get(&StorageKey::MinOracleCount).unwrap_or(1)
+        env.storage()
+            .instance()
+            .get(&StorageKey::MinOracleCount)
+            .unwrap_or(1)
     }
 
     // ── Data Submission ───────────────────────────────────────────────────────
@@ -314,7 +342,6 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::InvalidTimestamp);
         }
 
-
         // Verify oracle is registered and active for this data_type
         let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         let entry: OracleEntry = env
@@ -335,7 +362,12 @@ impl OracleVerifier {
             .unwrap_or_else(|| Vec::new(&env));
 
         // Overwrite existing submission from this oracle; append if new
-        let new_point = OracleDataPoint { oracle: oracle.clone(), value, confidence, timestamp };
+        let new_point = OracleDataPoint {
+            oracle: oracle.clone(),
+            value,
+            confidence,
+            timestamp,
+        };
         let mut found = false;
         for i in 0..points.len() {
             if points.get_unchecked(i).oracle == oracle {
@@ -375,9 +407,13 @@ impl OracleVerifier {
     ) -> bool {
         let median = Self::get_median_value(&env, &data_type, &key);
         match condition.comparison {
-            TriggerComparison::LessThan    => median < condition.threshold,
+            TriggerComparison::LessThan => median < condition.threshold,
             TriggerComparison::GreaterThan => median > condition.threshold,
-            TriggerComparison::Equal       => median == condition.threshold,
+            TriggerComparison::Equal => median == condition.threshold,
+            TriggerComparison::EqualWithTolerance => {
+                let diff = median.saturating_sub(condition.threshold);
+                diff.abs() <= condition.tolerance
+            }
         }
     }
 
@@ -400,7 +436,11 @@ impl OracleVerifier {
                 latest = p;
             }
         }
-        let max_data_age: u64 = env.storage().instance().get(&StorageKey::MaxDataAge).unwrap_or(604_800);
+        let max_data_age: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MaxDataAge)
+            .unwrap_or(604_800);
         let now = env.ledger().timestamp();
         if now.saturating_sub(latest.timestamp) > max_data_age {
             panic_with_error!(&env, Error::NoDataAvailable);
@@ -426,11 +466,19 @@ impl OracleVerifier {
         let mut last_updated = 0u64;
         for i in 0..oracle_count {
             let p = points.get_unchecked(i);
-            if p.confidence < min_confidence { min_confidence = p.confidence; }
-            if p.timestamp > last_updated { last_updated = p.timestamp; }
+            if p.confidence < min_confidence {
+                min_confidence = p.confidence;
+            }
+            if p.timestamp > last_updated {
+                last_updated = p.timestamp;
+            }
 
             let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
-            if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<_, OracleEntry>(&oracle_key)
+            {
                 weighted_confidence_sum += (p.confidence as u128) * (entry.weight as u128);
                 total_weight += entry.weight as u128;
             }
@@ -439,7 +487,13 @@ impl OracleVerifier {
             Some(c) => c as u32,
             None => 0u32,
         };
-        AggregatedData { median_value, oracle_count, confidence, min_confidence, last_updated }
+        AggregatedData {
+            median_value,
+            oracle_count,
+            confidence,
+            min_confidence,
+            last_updated,
+        }
     }
 
     /// Like `verify_trigger` but panics with `StaleData` if the newest submission
@@ -453,16 +507,22 @@ impl OracleVerifier {
         max_age_seconds: u64,
     ) -> bool {
         let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
-        let points: Vec<OracleDataPoint> = env.storage().persistent()
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
             .get(&dp_key)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NoDataAvailable));
-        if points.is_empty() { panic_with_error!(&env, Error::NoDataAvailable); }
+        if points.is_empty() {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
 
         let now = env.ledger().timestamp();
         let mut latest_ts = 0u64;
         for i in 0..points.len() {
             let ts = points.get_unchecked(i).timestamp;
-            if ts > latest_ts { latest_ts = ts; }
+            if ts > latest_ts {
+                latest_ts = ts;
+            }
         }
         if now.saturating_sub(latest_ts) > max_age_seconds {
             panic_with_error!(&env, Error::StaleData);
@@ -470,9 +530,13 @@ impl OracleVerifier {
 
         let median = Self::get_median_value(&env, &data_type, &key);
         match condition.comparison {
-            TriggerComparison::LessThan    => median < condition.threshold,
+            TriggerComparison::LessThan => median < condition.threshold,
             TriggerComparison::GreaterThan => median > condition.threshold,
-            TriggerComparison::Equal       => median == condition.threshold,
+            TriggerComparison::Equal => median == condition.threshold,
+            TriggerComparison::EqualWithTolerance => {
+                let diff = median.saturating_sub(condition.threshold);
+                diff.abs() <= condition.tolerance
+            }
         }
     }
 
@@ -486,14 +550,20 @@ impl OracleVerifier {
     ) {
         oracle.require_auth();
         let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
-        let entry: OracleEntry = env.storage().persistent()
+        let entry: OracleEntry = env
+            .storage()
+            .persistent()
             .get(&oracle_key)
             .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
-        if !entry.active { panic_with_error!(&env, Error::Unauthorized); }
+        if !entry.active {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
 
         for i in 0..submissions.len() {
             let (key, value, confidence, timestamp) = submissions.get_unchecked(i);
-            if confidence == 0 || confidence > 100 { panic_with_error!(&env, Error::InvalidConfidence); }
+            if confidence == 0 || confidence > 100 {
+                panic_with_error!(&env, Error::InvalidConfidence);
+            }
 
             let now = env.ledger().timestamp();
             if timestamp > now {
@@ -505,12 +575,21 @@ impl OracleVerifier {
             }
 
             let now = env.ledger().timestamp();
-            if timestamp > now { panic_with_error!(&env, Error::InvalidTimestamp); }
+            if timestamp > now {
+                panic_with_error!(&env, Error::InvalidTimestamp);
+            }
             let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
-            let mut points: Vec<OracleDataPoint> = env.storage().persistent()
+            let mut points: Vec<OracleDataPoint> = env
+                .storage()
+                .persistent()
                 .get(&dp_key)
                 .unwrap_or_else(|| Vec::new(&env));
-            let new_point = OracleDataPoint { oracle: oracle.clone(), value, confidence, timestamp };
+            let new_point = OracleDataPoint {
+                oracle: oracle.clone(),
+                value,
+                confidence,
+                timestamp,
+            };
             let mut found = false;
             for j in 0..points.len() {
                 if points.get_unchecked(j).oracle == oracle {
@@ -519,7 +598,9 @@ impl OracleVerifier {
                     break;
                 }
             }
-            if !found { points.push_back(new_point); }
+            if !found {
+                points.push_back(new_point);
+            }
             env.storage().persistent().set(&dp_key, &points);
 
             env.events().publish(
@@ -550,10 +631,14 @@ impl OracleVerifier {
         oracle.require_auth();
 
         let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
-        let entry: OracleEntry = env.storage().persistent()
+        let entry: OracleEntry = env
+            .storage()
+            .persistent()
             .get(&oracle_key)
             .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
-        if !entry.active { panic_with_error!(&env, Error::Unauthorized); }
+        if !entry.active {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
 
         for i in 0..submissions.len() {
             let sub = submissions.get_unchecked(i);
@@ -565,7 +650,9 @@ impl OracleVerifier {
                 panic_with_error!(&env, Error::InvalidTimestamp);
             }
             let dp_key = StorageKey::DataPoints(data_type.clone(), sub.key.clone());
-            let mut points: Vec<OracleDataPoint> = env.storage().persistent()
+            let mut points: Vec<OracleDataPoint> = env
+                .storage()
+                .persistent()
                 .get(&dp_key)
                 .unwrap_or_else(|| Vec::new(&env));
             let new_point = OracleDataPoint {
@@ -582,7 +669,9 @@ impl OracleVerifier {
                     break;
                 }
             }
-            if !found { points.push_back(new_point); }
+            if !found {
+                points.push_back(new_point);
+            }
             env.storage().persistent().set(&dp_key, &points);
 
             env.events().publish(
@@ -615,14 +704,19 @@ impl OracleVerifier {
     }
 
     pub fn get_admin(env: Env) -> Address {
-        env.storage().instance().get(&StorageKey::Admin)
+        env.storage()
+            .instance()
+            .get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     fn require_admin(env: &Env, caller: &Address) {
-        let admin: Address = env.storage().instance().get(&StorageKey::Admin)
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         if *caller != admin {
             panic_with_error!(env, Error::Unauthorized);
@@ -637,22 +731,36 @@ impl OracleVerifier {
             .persistent()
             .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
             .unwrap_or_else(|| panic_with_error!(env, Error::NoDataAvailable));
-        if points.is_empty() { panic_with_error!(env, Error::NoDataAvailable); }
-        
-        let max_data_age: u64 = env.storage().instance().get(&StorageKey::MaxDataAge).unwrap_or(604_800);
+        if points.is_empty() {
+            panic_with_error!(env, Error::NoDataAvailable);
+        }
+
+        let max_data_age: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MaxDataAge)
+            .unwrap_or(604_800);
         let now = env.ledger().timestamp();
-        let min_confidence: u32 = env.storage().instance().get(&StorageKey::MinConfidence).unwrap_or(0);
+        let min_confidence: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
 
         // Collect values and weights on the stack
         let mut values = [(0i128, 0u32); 100];
         let mut total_weight: u32 = 0;
         let mut n = 0;
-        
+
         for i in 0..points.len() {
             let p = points.get_unchecked(i);
             if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence {
                 let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
-                if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+                if let Some(entry) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, OracleEntry>(&oracle_key)
+                {
                     if n < 100 {
                         values[n] = (p.value, entry.weight);
                         n += 1;
@@ -661,16 +769,20 @@ impl OracleVerifier {
                 }
             }
         }
-        
-        let min_oracle_count: u32 = env.storage().instance().get(&StorageKey::MinOracleCount).unwrap_or(1);
+
+        let min_oracle_count: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinOracleCount)
+            .unwrap_or(1);
         if (n as u32) < min_oracle_count || n == 0 || total_weight == 0 {
             panic_with_error!(env, Error::NoDataAvailable);
         }
-        
+
         // Native sort on the stack slice: O(N log N)
         let active_values = &mut values[0..n];
         active_values.sort_unstable_by_key(|&(val, _)| val);
-        
+
         let half = total_weight / 2;
         let mut cumulative = 0;
         for i in 0..n {
@@ -686,7 +798,7 @@ impl OracleVerifier {
                 }
             }
         }
-        
+
         active_values[n - 1].0
     }
 }

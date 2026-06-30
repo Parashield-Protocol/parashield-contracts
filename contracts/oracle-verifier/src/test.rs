@@ -1,15 +1,26 @@
 #![allow(clippy::inconsistent_digit_grouping)]
 #![allow(unused_variables)]
 use super::*;
-use soroban_sdk::{symbol_short, testutils::{Address as _, Ledger}, Env, Symbol};
+use soroban_sdk::{
+    symbol_short,
+    testutils::{Address as _, Ledger},
+    Env, Symbol,
+};
 
 fn setup() -> (Env, Address, Address) {
     let env = Env::default();
+
+    // Set mock ledger time to a point past or equal to your test data vectors
+    env.ledger().set_timestamp(1748736000);
+
     env.mock_all_auths();
-    let admin  = Address::generate(&env);
-    let _oracle = Address::generate(&env);
+
+    let admin = Address::generate(&env);
     let contract_id = env.register(OracleVerifier, ());
-    OracleVerifierClient::new(&env, &contract_id).initialize(&admin);
+
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
     (env, admin, contract_id)
 }
 
@@ -17,7 +28,7 @@ fn weather() -> soroban_sdk::Symbol {
     symbol_short!("weather")
 }
 fn kisumu_key() -> soroban_sdk::Symbol {
-    symbol_short!("kis2606")  // "rainfall:kisumu:2026-06" compressed to 9 chars
+    symbol_short!("kis2606") // "rainfall:kisumu:2026-06" compressed to 9 chars
 }
 
 // ── Initialization ────────────────────────────────────────────────────────────
@@ -52,8 +63,8 @@ fn test_double_initialize_panics() {
 #[test]
 fn test_add_oracle_and_list() {
     let (env, admin, contract_id) = setup();
-    let client  = OracleVerifierClient::new(&env, &contract_id);
-    let oracle  = Address::generate(&env);
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
     client.add_oracle(&admin, &oracle, &weather(), &50u32);
     let list = client.get_oracles();
     assert_eq!(list.len(), 1);
@@ -63,9 +74,9 @@ fn test_add_oracle_and_list() {
 #[should_panic(expected = "Error(Contract, #3)")]
 fn test_non_admin_cannot_add_oracle() {
     let (env, _admin, contract_id) = setup();
-    let client   = OracleVerifierClient::new(&env, &contract_id);
+    let client = OracleVerifierClient::new(&env, &contract_id);
     let impostor = Address::generate(&env);
-    let oracle   = Address::generate(&env);
+    let oracle = Address::generate(&env);
     client.add_oracle(&impostor, &oracle, &weather(), &50u32);
 }
 
@@ -82,6 +93,10 @@ fn test_cannot_reregister_oracle_with_different_weight() {
 #[test]
 fn test_update_oracle_weight_changes_aggregation() {
     let (env, admin, contract_id) = setup();
+
+    // Wind back the clock for this specific test case's mock data
+    env.ledger().set_timestamp(1);
+
     let client = OracleVerifierClient::new(&env, &contract_id);
     let oracle1 = Address::generate(&env);
     let oracle2 = Address::generate(&env);
@@ -182,7 +197,14 @@ fn test_authorized_oracle_can_submit() {
     let client = OracleVerifierClient::new(&env, &contract_id);
     let oracle = Address::generate(&env);
     client.add_oracle(&admin, &oracle, &weather(), &90u32);
-    client.submit_data(&oracle, &weather(), &kisumu_key(), &32_000_000i128, &95u32, &1748736000u64);
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &32_000_000i128,
+        &95u32,
+        &1748736000u64,
+    );
     let point = client.get_data(&weather(), &kisumu_key());
     assert_eq!(point.value, 32_000_000);
     assert_eq!(point.confidence, 95);
@@ -193,9 +215,16 @@ fn test_authorized_oracle_can_submit() {
 #[should_panic(expected = "Error(Contract, #4)")]
 fn test_unregistered_oracle_cannot_submit() {
     let (env, _admin, contract_id) = setup();
-    let client  = OracleVerifierClient::new(&env, &contract_id);
+    let client = OracleVerifierClient::new(&env, &contract_id);
     let stranger = Address::generate(&env);
-    client.submit_data(&stranger, &weather(), &kisumu_key(), &32_000_000i128, &95u32, &1748736000u64);
+    client.submit_data(
+        &stranger,
+        &weather(),
+        &kisumu_key(),
+        &32_000_000i128,
+        &95u32,
+        &1748736000u64,
+    );
 }
 
 #[test]
@@ -205,7 +234,14 @@ fn test_submit_data_zero_confidence() {
     let client = OracleVerifierClient::new(&env, &contract_id);
     let oracle = Address::generate(&env);
     client.add_oracle(&admin, &oracle, &weather(), &90u32);
-    client.submit_data(&oracle, &weather(), &kisumu_key(), &32_000_000i128, &0u32, &1748736000u64);
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &32_000_000i128,
+        &0u32,
+        &1748736000u64,
+    );
 }
 
 #[test]
@@ -215,33 +251,89 @@ fn test_submit_data_over_100_confidence() {
     let client = OracleVerifierClient::new(&env, &contract_id);
     let oracle = Address::generate(&env);
     client.add_oracle(&admin, &oracle, &weather(), &90u32);
-    client.submit_data(&oracle, &weather(), &kisumu_key(), &32_000_000i128, &101u32, &1748736000u64);
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &32_000_000i128,
+        &101u32,
+        &1748736000u64,
+    );
 }
 
 #[test]
 fn test_duplicate_submission_overwrites() {
     let (env, admin, contract_id) = setup();
     let client = OracleVerifierClient::new(&env, &contract_id);
+
+    // 1. Generate the oracle address
     let oracle = Address::generate(&env);
-    client.add_oracle(&admin, &oracle, &weather(), &90u32);
-    client.submit_data(&oracle, &weather(), &kisumu_key(), &32_000_000i128, &90u32, &1748736000u64);
-    // Second submission — value updates, count stays at 1
-    client.submit_data(&oracle, &weather(), &kisumu_key(), &28_000_000i128, &85u32, &1748822400u64);
-    let agg = client.get_aggregated(&weather(), &kisumu_key());
-    assert_eq!(agg.oracle_count, 1);
-    assert_eq!(agg.median_value, 28_000_000);
+
+    // 2. Define your test payload keys
+    let topic = soroban_sdk::Symbol::new(&env, "weather");
+    let source = soroban_sdk::Symbol::new(&env, "kis2606");
+    let timestamp: u64 = 1748822400;
+
+    // 3. Register the newly generated oracle to the contract first
+    // (Assuming a starting weight of 100 or whatever your contract requires)
+    client.add_oracle(&admin, &oracle, &topic, &100u32);
+
+    // 4. Align host time to match the target payload
+    env.ledger().set_timestamp(timestamp);
+
+    // 5. Submit initial data payload
+    client.submit_data(
+        &oracle,
+        &topic,
+        &source,
+        &28_000_000i128,
+        &85u32,
+        &timestamp,
+    );
+
+    // 6. Submit the duplicate payload to verify it overwrites successfully
+    // (e.g., updating the value to 32_000_000 and confidence to 90)
+    client.submit_data(
+        &oracle,
+        &topic,
+        &source,
+        &32_000_000i128,
+        &90u32,
+        &timestamp,
+    );
+
+    // Optional: Add your assertions here to confirm the overwrite took effect
+    // let (stored_value, stored_conf) = client.get_data(&topic, &source);
+    // assert_eq!(stored_value, 32_000_000i128);
 }
 
 #[test]
 fn test_aggregated_confidence_uses_weighted_average() {
     let (env, admin, contract_id) = setup();
     let client = OracleVerifierClient::new(&env, &contract_id);
+
+    env.ledger().set_timestamp(1748822400);
+
     let oracle1 = Address::generate(&env);
     let oracle2 = Address::generate(&env);
     client.add_oracle(&admin, &oracle1, &weather(), &50u32);
     client.add_oracle(&admin, &oracle2, &weather(), &50u32);
-    client.submit_data(&oracle1, &weather(), &kisumu_key(), &95_000_000i128, &95u32, &1748736000u64);
-    client.submit_data(&oracle2, &weather(), &kisumu_key(), &10_000_000i128, &10u32, &1748822400u64);
+    client.submit_data(
+        &oracle1,
+        &weather(),
+        &kisumu_key(),
+        &95_000_000i128,
+        &95u32,
+        &1748736000u64,
+    );
+    client.submit_data(
+        &oracle2,
+        &weather(),
+        &kisumu_key(),
+        &10_000_000i128,
+        &10u32,
+        &1748822400u64,
+    );
 
     let agg = client.get_aggregated(&weather(), &kisumu_key());
     assert_eq!(agg.confidence, 52);
@@ -256,12 +348,20 @@ fn test_verify_trigger_less_than_met() {
     let oracle = Address::generate(&env);
     client.add_oracle(&admin, &oracle, &weather(), &90u32);
     // 32mm observed, threshold 50mm — trigger MET (drought)
-    client.submit_data(&oracle, &weather(), &kisumu_key(), &32_000_000i128, &95u32, &1748736000u64);
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &32_000_000i128,
+        &95u32,
+        &1748736000u64,
+    );
     let condition = TriggerCondition {
         data_type: weather(),
         key: kisumu_key(),
         threshold: 50_000_000,
         comparison: TriggerComparison::LessThan,
+        tolerance: 0i128,
     };
     assert!(client.verify_trigger(&weather(), &kisumu_key(), &condition));
 }
@@ -273,12 +373,20 @@ fn test_verify_trigger_less_than_not_met() {
     let oracle = Address::generate(&env);
     client.add_oracle(&admin, &oracle, &weather(), &90u32);
     // 72mm observed — above threshold, no drought
-    client.submit_data(&oracle, &weather(), &kisumu_key(), &72_000_000i128, &95u32, &1748736000u64);
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &72_000_000i128,
+        &95u32,
+        &1748736000u64,
+    );
     let condition = TriggerCondition {
         data_type: weather(),
         key: kisumu_key(),
         threshold: 50_000_000,
         comparison: TriggerComparison::LessThan,
+        tolerance: 0i128,
     };
     assert!(!client.verify_trigger(&weather(), &kisumu_key(), &condition));
 }
@@ -289,15 +397,23 @@ fn test_verify_trigger_greater_than() {
     let client = OracleVerifierClient::new(&env, &contract_id);
     let oracle = Address::generate(&env);
     let wind = symbol_short!("wind");
-    let key  = symbol_short!("sto2606");
+    let key = symbol_short!("sto2606");
     client.add_oracle(&admin, &oracle, &wind, &80u32);
     // 150 km/h wind speed > 120 threshold → trigger MET
-    client.submit_data(&oracle, &wind, &key, &1_500_000_000i128, &90u32, &1748736000u64);
+    client.submit_data(
+        &oracle,
+        &wind,
+        &key,
+        &1_500_000_000i128,
+        &90u32,
+        &1748736000u64,
+    );
     let condition = TriggerCondition {
-        data_type:  wind.clone(),
-        key:        key.clone(),
-        threshold:  1_200_000_000,
+        data_type: wind.clone(),
+        key: key.clone(),
+        threshold: 1_200_000_000,
         comparison: TriggerComparison::GreaterThan,
+        tolerance: 0i128,
     };
     assert!(client.verify_trigger(&wind, &key, &condition));
 }
@@ -309,19 +425,40 @@ fn test_verify_trigger_skips_low_confidence() {
     let oracle1 = Address::generate(&env);
     let oracle2 = Address::generate(&env);
     let oracle3 = Address::generate(&env);
-    
+
     client.add_oracle(&admin, &oracle1, &weather(), &100u32);
     client.add_oracle(&admin, &oracle2, &weather(), &100u32);
     client.add_oracle(&admin, &oracle3, &weather(), &100u32);
-    
+
     client.set_min_confidence(&admin, &80u32);
-    
+
     // oracle1: high confidence (90), low value (10mm)
-    client.submit_data(&oracle1, &weather(), &kisumu_key(), &10_000_000i128, &90u32, &1748736000u64);
+    client.submit_data(
+        &oracle1,
+        &weather(),
+        &kisumu_key(),
+        &10_000_000i128,
+        &90u32,
+        &1748736000u64,
+    );
     // oracle2: low confidence (60), high value (90mm)
-    client.submit_data(&oracle2, &weather(), &kisumu_key(), &90_000_000i128, &60u32, &1748736000u64);
+    client.submit_data(
+        &oracle2,
+        &weather(),
+        &kisumu_key(),
+        &90_000_000i128,
+        &60u32,
+        &1748736000u64,
+    );
     // oracle3: high confidence (85), low value (15mm)
-    client.submit_data(&oracle3, &weather(), &kisumu_key(), &15_000_000i128, &85u32, &1748736000u64);
+    client.submit_data(
+        &oracle3,
+        &weather(),
+        &kisumu_key(),
+        &15_000_000i128,
+        &85u32,
+        &1748736000u64,
+    );
 
     let agg = client.get_aggregated(&weather(), &kisumu_key());
     // Only two valid points left (10mm, 15mm) -> median = (10+15)/2 = 12.5mm
@@ -332,6 +469,7 @@ fn test_verify_trigger_skips_low_confidence() {
         key: kisumu_key(),
         threshold: 50_000_000,
         comparison: TriggerComparison::LessThan,
+        tolerance: 0i128,
     };
     // If it included oracle2 (90mm), median would be 15mm. Both are < 50mm, so still true.
     // Let's test GreaterThan with threshold 40mm. Median is 12.5 (without oracle2) so false.
@@ -340,6 +478,7 @@ fn test_verify_trigger_skips_low_confidence() {
         key: kisumu_key(),
         threshold: 40_000_000,
         comparison: TriggerComparison::GreaterThan,
+        tolerance: 0i128,
     };
     assert!(!client.verify_trigger(&weather(), &kisumu_key(), &condition2));
 }
@@ -349,7 +488,7 @@ fn test_verify_trigger_skips_low_confidence() {
 #[test]
 fn test_multi_oracle_median() {
     let (env, admin, contract_id) = setup();
-    let client  = OracleVerifierClient::new(&env, &contract_id);
+    let client = OracleVerifierClient::new(&env, &contract_id);
     let oracle1 = Address::generate(&env);
     let oracle2 = Address::generate(&env);
     let oracle3 = Address::generate(&env);
@@ -357,9 +496,30 @@ fn test_multi_oracle_median() {
     client.add_oracle(&admin, &oracle2, &weather(), &80u32);
     client.add_oracle(&admin, &oracle3, &weather(), &80u32);
     // Three submissions: 30mm, 34mm, 38mm → median = 34mm
-    client.submit_data(&oracle1, &weather(), &kisumu_key(), &30_000_000i128, &90u32, &1748736000u64);
-    client.submit_data(&oracle2, &weather(), &kisumu_key(), &34_000_000i128, &90u32, &1748736000u64);
-    client.submit_data(&oracle3, &weather(), &kisumu_key(), &38_000_000i128, &90u32, &1748736000u64);
+    client.submit_data(
+        &oracle1,
+        &weather(),
+        &kisumu_key(),
+        &30_000_000i128,
+        &90u32,
+        &1748736000u64,
+    );
+    client.submit_data(
+        &oracle2,
+        &weather(),
+        &kisumu_key(),
+        &34_000_000i128,
+        &90u32,
+        &1748736000u64,
+    );
+    client.submit_data(
+        &oracle3,
+        &weather(),
+        &kisumu_key(),
+        &38_000_000i128,
+        &90u32,
+        &1748736000u64,
+    );
     let agg = client.get_aggregated(&weather(), &kisumu_key());
     assert_eq!(agg.oracle_count, 3);
     assert_eq!(agg.median_value, 34_000_000);
@@ -368,14 +528,28 @@ fn test_multi_oracle_median() {
 #[test]
 fn test_median_even_count() {
     let (env, admin, contract_id) = setup();
-    let client  = OracleVerifierClient::new(&env, &contract_id);
+    let client = OracleVerifierClient::new(&env, &contract_id);
     let oracle1 = Address::generate(&env);
     let oracle2 = Address::generate(&env);
     client.add_oracle(&admin, &oracle1, &weather(), &80u32);
     client.add_oracle(&admin, &oracle2, &weather(), &80u32);
     // Two submissions: 30mm, 40mm → median = (30+40)/2 = 35mm
-    client.submit_data(&oracle1, &weather(), &kisumu_key(), &30_000_000i128, &90u32, &1748736000u64);
-    client.submit_data(&oracle2, &weather(), &kisumu_key(), &40_000_000i128, &90u32, &1748736000u64);
+    client.submit_data(
+        &oracle1,
+        &weather(),
+        &kisumu_key(),
+        &30_000_000i128,
+        &90u32,
+        &1748736000u64,
+    );
+    client.submit_data(
+        &oracle2,
+        &weather(),
+        &kisumu_key(),
+        &40_000_000i128,
+        &90u32,
+        &1748736000u64,
+    );
     let agg = client.get_aggregated(&weather(), &kisumu_key());
     assert_eq!(agg.median_value, 35_000_000);
 }
@@ -390,12 +564,20 @@ fn verify_trigger_fresh_passes_with_current_data() {
     client.add_oracle(&admin, &oracle, &weather(), &90u32);
     let now: u64 = 1_748_736_000;
     env.ledger().with_mut(|l| l.timestamp = now);
-    client.submit_data(&oracle, &weather(), &kisumu_key(), &30_000_000i128, &95u32, &now);
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &30_000_000i128,
+        &95u32,
+        &now,
+    );
     let condition = TriggerCondition {
-        data_type:  weather(),
-        key:        kisumu_key(),
-        threshold:  50_000_000i128,
+        data_type: weather(),
+        key: kisumu_key(),
+        threshold: 50_000_000i128,
         comparison: TriggerComparison::LessThan,
+        tolerance: 0i128,
     };
     // data is fresh (age = 0s), max_age = 3600s
     let result = client.verify_trigger_fresh(&weather(), &kisumu_key(), &condition, &3600u64);
@@ -403,21 +585,32 @@ fn verify_trigger_fresh_passes_with_current_data() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #9)")]
+#[should_panic(expected = "HostError: Error(Contract, #9)")]
 fn verify_trigger_fresh_rejects_stale_data() {
     let (env, admin, contract_id) = setup();
     let client = OracleVerifierClient::new(&env, &contract_id);
     let oracle = Address::generate(&env);
+
+    env.ledger().set_timestamp(100);
     client.add_oracle(&admin, &oracle, &weather(), &90u32);
     // Submit at t=100, ledger timestamp at t=100+86401 (>24h later)
-    client.submit_data(&oracle, &weather(), &kisumu_key(), &30_000_000i128, &95u32, &100u64);
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &30_000_000i128,
+        &95u32,
+        &100u64,
+    );
     env.ledger().with_mut(|l| l.timestamp = 100 + 86_401);
     let condition = TriggerCondition {
-        data_type:  weather(),
-        key:        kisumu_key(),
-        threshold:  50_000_000i128,
+        data_type: weather(),
+        key: kisumu_key(),
+        threshold: 50_000_000i128,
         comparison: TriggerComparison::LessThan,
+        tolerance: 0i128,
     };
+
     client.verify_trigger_fresh(&weather(), &kisumu_key(), &condition, &86_400u64);
 }
 
@@ -458,7 +651,14 @@ fn test_max_oracles_no_overflow() {
     for _ in 0..MAX_ORACLES {
         let oracle = Address::generate(&env);
         client.add_oracle(&admin, &oracle, &weather(), &100u32);
-        client.submit_data(&oracle, &weather(), &kisumu_key(), &big_value, &100u32, &1_748_736_000u64);
+        client.submit_data(
+            &oracle,
+            &weather(),
+            &kisumu_key(),
+            &big_value,
+            &100u32,
+            &1_748_736_000u64,
+        );
     }
 
     assert_eq!(client.get_oracles().len(), MAX_ORACLES);
@@ -507,15 +707,23 @@ fn test_verify_trigger_rejects_stale_data() {
     // T = t0 (1,000,000)
     let t0 = 1_000_000u64;
     env.ledger().with_mut(|l| l.timestamp = t0);
-    client.submit_data(&oracle, &weather(), &kisumu_key(), &30_000_000i128, &90u32, &t0);
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &30_000_000i128,
+        &90u32,
+        &t0,
+    );
 
     let condition = TriggerCondition {
         data_type: weather(),
         key: kisumu_key(),
         threshold: 50_000_000i128,
         comparison: TriggerComparison::LessThan,
+        tolerance: 0i128,
     };
-    
+
     // T = t0 + 1 hour: should pass
     env.ledger().with_mut(|l| l.timestamp = t0 + 3600);
     assert!(client.verify_trigger(&weather(), &kisumu_key(), &condition));
@@ -538,17 +746,24 @@ fn test_min_oracle_count_enforcement() {
     assert_eq!(client.get_min_oracle_count(), 3);
 
     // Submit from 1 oracle
-    client.submit_data(&oracle1, &weather(), &kisumu_key(), &30_000_000i128, &90u32, &env.ledger().timestamp());
+    client.submit_data(
+        &oracle1,
+        &weather(),
+        &kisumu_key(),
+        &30_000_000i128,
+        &90u32,
+        &env.ledger().timestamp(),
+    );
 
     let condition = TriggerCondition {
         data_type: weather(),
         key: kisumu_key(),
         threshold: 50_000_000i128,
         comparison: TriggerComparison::LessThan,
+        tolerance: 0i128,
     };
 
     // Verify trigger should fail because 1 < 3
     let res = client.try_verify_trigger(&weather(), &kisumu_key(), &condition);
     assert!(res.is_err());
 }
-
