@@ -50,6 +50,7 @@ pub struct Claim {
 pub struct Initialized {
     pub admin: Address,
     pub policy_engine: Address,
+    pub risk_pool: Address,
     pub oracle_verifier: Address,
     pub staleness_threshold: u64,
 }
