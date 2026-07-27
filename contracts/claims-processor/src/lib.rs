@@ -535,7 +535,7 @@ impl ClaimsProcessor {
     /// Core evaluation: check oracle, update claim record, instruct Policy Engine.
     /// After successful claim payment, atomically releases the coverage lock on Risk Pool
     /// to prevent coverage from remaining locked indefinitely.
-    fn evaluate_and_settle(env: &Env, claim: &mut Claim) -> ClaimResult {
+    fn evaluate_and_settle(env: &Env, claim: &mut Claim, policy: &parashield_policy_engine::Policy) -> ClaimResult {
         let oracle_verifier: Address = env.storage().instance()
             .get(&StorageKey::OracleVerifier)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
