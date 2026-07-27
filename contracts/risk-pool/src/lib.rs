@@ -87,6 +87,7 @@ pub enum Error {
     NoPendingWithdrawal = 16,
     InsufficientShares  = 17,
     DepositTooSmall     = 18,
+    Overflow            = 19,
 }
 
 #[contract]
@@ -332,7 +333,10 @@ impl RiskPool {
         if total_shares > 0 {
             let acc_per_share: i128 = env.storage().instance()
                 .get(&StorageKey::AccumulatedPerShare).unwrap_or(0);
-            let increment = (lp_share * 1_000_000_000_000) / total_shares;
+            let increment = lp_share
+                .checked_mul(1_000_000_000_000)
+                .and_then(|v| v.checked_div(total_shares))
+                .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
             env.storage().instance().set(&StorageKey::AccumulatedPerShare, &(acc_per_share + increment));
         }
 

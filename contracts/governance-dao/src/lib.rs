@@ -56,6 +56,7 @@ pub enum Error {
     AlreadyCancelled = 12,
     TimelockNotExpired = 13,
     FinalizeDelayNotMet = 14,
+    VersionNotNewer = 15,
 }
 
 #[contract]
@@ -484,7 +485,7 @@ impl GovernanceDao {
         Self::require_admin(&env, &admin);
         let current_version: u32 = env.storage().instance().get(&StorageKey::Version).unwrap_or(1);
         if new_version <= current_version {
-            panic!("new version must be greater than current version");
+            panic_with_error!(&env, Error::VersionNotNewer);
         }
         
         // Run migrations from current_version to new_version
