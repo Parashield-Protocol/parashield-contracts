@@ -288,3 +288,34 @@ fn test_equal_comparison() {
     let result = claims_client.auto_process(&te.admin, &pol_id);
     assert_eq!(result, ClaimResult::Paid);
 }
+
+/// Disputing a pending claim must drop it from the PendingClaims queue so the
+/// queue cannot grow without bound with stuck entries.
+#[test]
+fn dispute_removes_claim_from_pending_queue() {
+    let te = full_setup();
+    let claims_client = ClaimsProcessorClient::new(&te.env, &te.claims);
+    let policy_client = PolicyEngineClient::new(&te.env, &te.policy);
+
+    let prod_id = create_drought_product(&te);
+
+    let farmer = Address::generate(&te.env);
+    token::StellarAssetClient::new(&te.env, &te.usdc).mint(&farmer, &10_000_0000000i128);
+    token::StellarAssetClient::new(&te.env, &te.usdc).mint(&te.policy, &1_000_000_0000000i128);
+
+    let pol_id = policy_client.buy_policy(
+        &farmer, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+    );
+
+    // Submit enqueues the claim.
+    let claim_id = claims_client.submit_claim(&farmer, &pol_id);
+    assert_eq!(claims_client.get_pending_claims().len(), 1);
+
+    // Disputing it must remove it from the pending queue.
+    claims_client.dispute_claim(&farmer, &claim_id, &symbol_short!("baddata"));
+    assert_eq!(
+        claims_client.get_pending_claims().len(),
+        0,
+        "disputed claim must leave the pending queue",
+    );
+}

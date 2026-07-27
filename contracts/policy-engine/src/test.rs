@@ -344,6 +344,29 @@ fn test_cancel_policy_refunds_premium() {
     assert_eq!(client.get_policy(&policy_id).status, PolicyStatus::Cancelled);
 }
 
+/// Cancelling after the full coverage window has elapsed refunds nothing —
+/// the entire premium has been earned.
+#[test]
+fn test_cancel_after_full_duration_refunds_nothing() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid    = create_crop_product(&env, &client, &admin);
+
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    env.ledger().with_mut(|l| l.timestamp = 0);
+    let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+
+    // Jump to the policy end time — the full premium is now earned.
+    let policy = client.get_policy(&policy_id);
+    env.ledger().with_mut(|l| l.timestamp = policy.end_time);
+
+    let refund = client.cancel_policy(&buyer, &policy_id);
+    assert_eq!(refund, 0, "fully-elapsed policy must refund nothing");
+    assert_eq!(client.get_policy(&policy_id).status, PolicyStatus::Cancelled);
+}
+
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn test_non_policyholder_cannot_cancel() {
