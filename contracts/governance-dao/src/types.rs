@@ -50,6 +50,9 @@ pub struct Proposal {
     pub vote_end: u64,
     /// Timelock expiration timestamp for execution.
     pub execution_time: u64,
+    /// Total supply captured at proposal creation time for quorum calculation.
+    /// This prevents admin manipulation of total_supply during active votes.
+    pub total_supply: i128,
 }
 
 /// A single vote record stored per (proposal_id, voter) key.
