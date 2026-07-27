@@ -310,7 +310,10 @@ impl GovernanceDao {
         let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
         let total_supply = proposal.total_supply;
         let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
-        let quorum_needed = total_supply * config.quorum_bps as i128 / 10_000;
+        let quorum_needed = total_supply
+            .checked_mul(config.quorum_bps as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .unwrap_or(i128::MAX);
 
         if total_votes < quorum_needed {
             proposal.status = ProposalStatus::Failed;
@@ -320,7 +323,7 @@ impl GovernanceDao {
             } else {
                 0
             };
-            if for_bps as u32 >= config.majority_bps {
+            if for_bps >= config.majority_bps as i128 {
                 proposal.status = ProposalStatus::Passed;
                 proposal.execution_time = env.ledger().timestamp() + config.proposal_timelock;
             } else {
