@@ -62,7 +62,17 @@ pub struct OracleDataPoint {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregatedData {
     pub median_value: i128,
+    /// Number of data submissions currently stored for this (data_type, key) —
+    /// NOT the number of currently-registered active oracles for the
+    /// data_type (see `active_oracle_count`). Kept for backward
+    /// compatibility with existing callers of this field.
     pub oracle_count: u32,
+    /// Number of oracles currently registered and active for this
+    /// data_type, independent of whether they have submitted data for
+    /// this specific key. Use this (not `oracle_count`) as a proxy for
+    /// oracle diversity/registration health — `oracle_count` conflates
+    /// submission count with registration count (issue #136).
+    pub active_oracle_count: u32,
     /// Aggregated confidence is the weighted average of valid oracle confidences,
     /// weighted by each oracle's configured registration weight and rounded down.
     pub confidence: u32,

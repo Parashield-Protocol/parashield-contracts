@@ -462,3 +462,84 @@ fn test_execute_rejected_proposal_panics() {
     // Attempt to execute a failed proposal - should panic
     dao.execute(&pid);
 }
+
+// ── Issue #137: finalize() must refund the deposit locked at creation ─────────
+
+/// Admin lowers proposal_threshold after a proposal is created but before
+/// finalize() runs. The proposer must still get back exactly what they
+/// locked at creation time, not the new (lower) live threshold.
+#[test]
+fn test_finalize_refunds_deposit_locked_at_creation_not_live_config() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+
+    let deposit_before: i128 = 10_000_0000000i128; // matches setup()'s proposal_threshold
+    let balance_before = token::Client::new(&env, &dao.get_config().gov_token).balance(&voter1);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Deposit refund test"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+
+    // Deposit was actually taken.
+    let gov_token = token::Client::new(&env, &dao.get_config().gov_token);
+    assert_eq!(gov_token.balance(&voter1), balance_before - deposit_before);
+
+    // Admin lowers the live threshold to 1 stroop before finalize.
+    let mut new_config = dao.get_config();
+    new_config.proposal_threshold = 1;
+    dao.update_config(&admin, &new_config);
+
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+
+    dao.finalize(&pid);
+
+    // Must have gotten back the full original deposit (10k SHIELD), not
+    // the live (lowered) threshold of 1 stroop.
+    assert_eq!(gov_token.balance(&voter1), balance_before);
+
+    let p = dao.get_proposal(&pid);
+    assert_eq!(p.deposit, deposit_before);
+}
+
+/// Admin raises proposal_threshold after creation. finalize() must still
+/// only move the amount actually locked at creation, not attempt to pull
+/// the new higher threshold out of the contract's balance.
+#[test]
+fn test_finalize_does_not_pull_raised_live_threshold() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+
+    let deposit_before: i128 = 10_000_0000000i128;
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Deposit overpull test"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+
+    // Admin raises the live threshold well above what the contract holds.
+    let mut new_config = dao.get_config();
+    new_config.proposal_threshold = 10_000_000_0000000i128;
+    dao.update_config(&admin, &new_config);
+
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+
+    // Must succeed — refunds the original deposit, not the raised threshold.
+    dao.finalize(&pid);
+
+    let p = dao.get_proposal(&pid);
+    assert_eq!(p.deposit, deposit_before);
+    assert_eq!(p.status, ProposalStatus::Passed);
+}
