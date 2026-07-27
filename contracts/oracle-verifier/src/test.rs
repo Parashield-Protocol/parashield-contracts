@@ -841,3 +841,68 @@ fn test_min_oracle_count_enforcement() {
     let res = client.try_verify_trigger(&weather(), &kisumu_key(), &condition);
     assert!(res.is_err());
 }
+
+// ── Issue #162: reject readings when fewer than min_oracle_count submit ──────────
+
+/// Submit from 2 out of 3 required oracles and verify aggregation correctly
+/// rejects the result. This is the core safety invariant of the oracle system:
+/// a trigger must not fire when insufficient oracle diversity is met.
+#[test]
+fn test_reject_when_fewer_than_min_oracle_count_submit() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle1 = Address::generate(&env);
+    let oracle2 = Address::generate(&env);
+    let oracle3 = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle1, &weather(), &80u32);
+    client.add_oracle(&admin, &oracle2, &weather(), &80u32);
+    client.add_oracle(&admin, &oracle3, &weather(), &80u32);
+
+    // Require at least 3 oracle submissions
+    client.set_min_oracle_count(&admin, &3u32);
+
+    // Only 2 of 3 oracles submit data — below threshold
+    client.submit_data(
+        &oracle1,
+        &weather(),
+        &kisumu_key(),
+        &30_000_000i128,
+        &90u32,
+        &env.ledger().timestamp(),
+    );
+    client.submit_data(
+        &oracle2,
+        &weather(),
+        &kisumu_key(),
+        &35_000_000i128,
+        &90u32,
+        &env.ledger().timestamp(),
+    );
+
+    let condition = TriggerCondition {
+        data_type: weather(),
+        key: kisumu_key(),
+        threshold: 50_000_000,
+        comparison: TriggerComparison::LessThan,
+        tolerance: 0i128,
+    };
+
+    // Aggregation must reject because 2 < 3 (min_oracle_count)
+    let res = client.try_verify_trigger(&weather(), &kisumu_key(), &condition);
+    assert!(res.is_err());
+
+    // Now the 3rd oracle submits — aggregation should succeed
+    client.submit_data(
+        &oracle3,
+        &weather(),
+        &kisumu_key(),
+        &40_000_000i128,
+        &90u32,
+        &env.ledger().timestamp(),
+    );
+
+    // With 3 submissions, the median should be 35mm (30, 35, 40) < 50mm → true
+    let result = client.verify_trigger(&weather(), &kisumu_key(), &condition);
+    assert!(result);
+}
