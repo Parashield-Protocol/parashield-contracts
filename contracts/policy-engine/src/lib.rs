@@ -80,6 +80,7 @@ pub enum Error {
     InvalidToken            = 17,
     ClaimsProcessorNotSet   = 18,
     InvalidDurationRange    = 19,
+    InvalidOracleKey        = 20,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -210,6 +211,17 @@ impl PolicyEngine {
         // Rejects 0-day policies and unrealistically long durations
         if params.max_duration_days == 0 || params.max_duration_days > 3650 {
             panic_with_error!(&env, Error::InvalidDurationRange);
+        }
+        // oracle_key must be at least 3 characters — defense-in-depth against
+        // trivially unresolvable keys that the oracle-verifier can never match.
+        // Soroban Symbol only accepts [a-zA-Z0-9_], so character-set is already
+        // enforced by the type; this adds a minimum-length semantic guard.
+        {
+            const MIN_LEN: usize = 3;
+            let key_repr = params.oracle_key.to_string();
+            if key_repr.len() < MIN_LEN {
+                panic_with_error!(&env, Error::InvalidOracleKey);
+            }
         }
 
         // Check for duplicate (category, oracle_key) pair
