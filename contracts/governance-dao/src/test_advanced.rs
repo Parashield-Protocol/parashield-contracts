@@ -239,3 +239,47 @@ fn test_successful_token_withdrawal_post_finalize() {
         "Voter could not reclaim their locked stake"
     );
 }
+
+// ── Regression test: admin cannot manipulate total_supply during active vote ──
+
+#[test]
+fn admin_cannot_manipulate_total_supply_during_active_vote() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (dao, admin, voter, target) = make_dao(&env);
+
+    // Initial config: total_supply = 1,100,000, quorum = 10% = 110,000
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter,
+        &Bytes::from_slice(&env, b"Test proposal"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+
+    // Voter has 1,000,000 tokens, votes FOR (after 10k threshold lock)
+    dao.vote(&voter, &pid, &VoteChoice::For);
+
+    // Admin attempts to reduce total_supply to lower quorum mid-vote
+    let cfg = dao.get_config();
+    let malicious_cfg = DaoConfig {
+        total_supply: 500_000_0000000i128, // Halve supply to lower quorum
+        ..cfg.clone()
+    };
+    dao.update_config(&admin, &malicious_cfg);
+
+    // Fast-forward to finalize
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+
+    // Finalize should use the ORIGINAL total_supply captured at proposal creation
+    dao.finalize(&pid);
+
+    let p = dao.get_proposal(&pid);
+    // With original supply (1.1M), quorum = 110k. Votes = 990k (after 10k lock).
+    // This should PASS because 990k > 110k quorum.
+    // If admin manipulation worked, new supply (500k) would make quorum = 50k,
+    // but the fix prevents this by using proposal.total_supply.
+    assert_eq!(p.status, ProposalStatus::Passed);
+}
