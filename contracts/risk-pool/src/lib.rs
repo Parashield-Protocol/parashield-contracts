@@ -414,7 +414,8 @@ impl RiskPool {
 
         let total_deposited: i128 = env.storage().instance().get(&StorageKey::TotalDeposited).unwrap_or(0);
         let total_locked: i128    = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
-        if total_deposited - total_locked < amount { panic_with_error!(&env, Error::Undercollateralized); }
+        let available = total_deposited.saturating_sub(total_locked);
+        if available < amount { panic_with_error!(&env, Error::Undercollateralized); }
         if env.storage().persistent().has(&StorageKey::Lock(policy_id)) { panic_with_error!(&env, Error::AlreadyLocked); }
 
         env.storage().persistent().set(&StorageKey::Lock(policy_id), &CapitalLock {

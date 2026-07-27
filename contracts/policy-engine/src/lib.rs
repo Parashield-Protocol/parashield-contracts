@@ -358,7 +358,11 @@ impl PolicyEngine {
             .transfer(&buyer, &env.current_contract_address(), &premium);
 
         let now        = env.ledger().timestamp();
-        let end_time   = now + (duration_days as u64) * 86_400;
+        let duration_secs = (duration_days as u64)
+            .checked_mul(86_400)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::CoverageOutOfRange));
+        let end_time   = now.checked_add(duration_secs)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::CoverageOutOfRange));
         let policy_id  = Self::next_policy_id(&env);
 
         let policy = Policy {
