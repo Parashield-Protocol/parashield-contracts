@@ -202,6 +202,27 @@ impl OracleVerifier {
         entry.active = false;
         env.storage().persistent().set(&key, &entry);
 
+        // Prune the address from the flat OracleList so get_oracles() and
+        // instance storage don't accumulate deactivated addresses forever
+        // (issue #135). Note: OracleList is a single cross-data_type list —
+        // if this address is still separately registered+active for a
+        // different data_type, it is removed from this shared list anyway.
+        // That's a pre-existing limitation of the flat-list design (not
+        // introduced here); scoping OracleList per data_type would be a
+        // separate, larger change.
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::OracleList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut pruned: Vec<Address> = Vec::new(&env);
+        for addr in list.iter() {
+            if addr != oracle {
+                pruned.push_back(addr);
+            }
+        }
+        env.storage().instance().set(&StorageKey::OracleList, &pruned);
+
         env.events().publish(
             (Symbol::new(&env, "oracle_removed"),),
             OracleRemoved { oracle, data_type },
@@ -487,9 +508,30 @@ impl OracleVerifier {
             Some(c) => c as u32,
             None => 0u32,
         };
+
+        // Count oracles currently registered+active for this data_type,
+        // independent of whether they've submitted data for this specific
+        // key (issue #136) — this is what monitoring/governance tooling
+        // should use as a diversity signal, not oracle_count above.
+        let oracle_list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::OracleList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut active_oracle_count: u32 = 0;
+        for addr in oracle_list.iter() {
+            let oracle_key = StorageKey::Oracle(data_type.clone(), addr.clone());
+            if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+                if entry.active {
+                    active_oracle_count += 1;
+                }
+            }
+        }
+
         AggregatedData {
             median_value,
             oracle_count,
+            active_oracle_count,
             confidence,
             min_confidence,
             last_updated,
