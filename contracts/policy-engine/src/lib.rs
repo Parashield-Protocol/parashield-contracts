@@ -351,7 +351,8 @@ impl PolicyEngine {
             .and_then(|v| v.checked_div(365))
             .and_then(|v| v.checked_div(10_000))
             .unwrap_or_else(|| panic_with_error!(&env, Error::CoverageOutOfRange));
-        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
 
         // Pull premium from buyer into this contract
         token::Client::new(&env, &usdc)
@@ -425,7 +426,8 @@ impl PolicyEngine {
             policy.premium_paid.saturating_sub(earned)
         };
 
-        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         if refund > 0 {
             token::Client::new(&env, &usdc)
                 .transfer(&env.current_contract_address(), &policyholder, &refund);
@@ -455,7 +457,8 @@ impl PolicyEngine {
             PolicyStatus::Cancelled => panic_with_error!(&env, Error::PolicyNotActive),
             PolicyStatus::Active    => {}
         }
-        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         let token_client = token::Client::new(&env, &usdc);
         match token_client.try_transfer(&env.current_contract_address(), &policy.policyholder, &policy.coverage_amount) {
             Ok(Ok(())) => {}
@@ -528,7 +531,8 @@ impl PolicyEngine {
     }
 
     pub fn get_contract_balance(env: Env) -> i128 {
-        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         token::Client::new(&env, &usdc).balance(&env.current_contract_address())
     }
 
