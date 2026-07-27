@@ -67,6 +67,7 @@ enum StorageKey {
     NextClaimId,
     PendingClaims,       // Vec<u128>
     Keeper(Address),     // keeper whitelist: address → bool
+    Paused,              // bool — emergency pause state
     /// Contract version (u32) for storage migration tracking
     Version,
 }
@@ -85,6 +86,7 @@ pub enum Error {
     AlreadyClaimed     = 6,
     AlreadyProcessed   = 7,
     InvalidAddress     = 8,
+    Paused             = 9,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -159,6 +161,7 @@ impl ClaimsProcessor {
         env.storage().instance().set(&StorageKey::StalenessThreshold, &staleness_threshold);
         env.storage().instance().set(&StorageKey::NextClaimId, &1u128);
         env.storage().instance().set(&StorageKey::PendingClaims, &Vec::<u128>::new(&env));
+        env.storage().instance().set(&StorageKey::Paused, &false);
 
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
@@ -208,6 +211,7 @@ impl ClaimsProcessor {
     /// Only the policyholder may submit; only one claim per policy.
     pub fn submit_claim(env: Env, claimant: Address, policy_id: u128) -> u128 {
         claimant.require_auth();
+        Self::require_not_paused(&env);
 
         // Guard: one claim per policy
         if env.storage().persistent().has(&StorageKey::PolicyClaim(policy_id)) {
@@ -265,6 +269,7 @@ impl ClaimsProcessor {
     /// Process an existing pending claim. Reads oracle data and pays out or rejects.
     pub fn process_claim(env: Env, keeper: Address, claim_id: u128) -> ClaimResult {
         Self::require_keeper(&env, &keeper);
+        Self::require_not_paused(&env);
         let mut claim: Claim = env.storage().persistent()
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
@@ -286,6 +291,7 @@ impl ClaimsProcessor {
     /// Returns AlreadyClaimed / Expired idempotently if policy is already settled.
     pub fn auto_process(env: Env, keeper: Address, policy_id: u128) -> ClaimResult {
         Self::require_keeper(&env, &keeper);
+        Self::require_not_paused(&env);
 
         // ─── IDEMPOTENCY GUARD ───
         // Check if an evaluation record already exists for this policy in our storage
@@ -363,6 +369,7 @@ impl ClaimsProcessor {
     /// Skips any claim that is not in Pending status (idempotent).
     pub fn batch_auto_process(env: Env, caller: Address, limit: u32) -> Vec<(u128, ClaimResult)> {
         Self::require_keeper(&env, &caller);
+        Self::require_not_paused(&env);
         let pending: Vec<u128> = env.storage().instance()
             .get(&StorageKey::PendingClaims)
             .unwrap_or_else(|| Vec::new(&env));
@@ -449,6 +456,31 @@ impl ClaimsProcessor {
 
     pub fn get_version(env: Env) -> u32 {
         env.storage().instance().get(&StorageKey::Version).unwrap_or(1)
+    }
+
+    /// Admin-only: pause all claim submissions and processing.
+    pub fn pause(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&StorageKey::Paused, &true);
+        env.events().publish(
+            (Symbol::new(&env, "paused"),),
+            admin,
+        );
+    }
+
+    /// Admin-only: resume claim submissions and processing.
+    pub fn resume(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&StorageKey::Paused, &false);
+        env.events().publish(
+            (Symbol::new(&env, "resumed"),),
+            admin,
+        );
+    }
+
+    /// Check whether the contract is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage().instance().get(&StorageKey::Paused).unwrap_or(false)
     }
 
     /// Upgrade the contract WASM in-place. Only the admin may call this.
@@ -586,6 +618,27 @@ impl ClaimsProcessor {
             panic_with_error!(env, Error::Unauthorized);
         }
         caller.require_auth();
+    }
+
+    /// Panic unless `caller` is the admin and authorizes the call.
+    fn require_admin(env: &Env, caller: &Address) {
+        let admin: Address = env.storage().instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        if *caller != admin {
+            panic_with_error!(env, Error::Unauthorized);
+        }
+        caller.require_auth();
+    }
+
+    /// Panic if the contract is currently paused.
+    fn require_not_paused(env: &Env) {
+        let paused: bool = env.storage().instance()
+            .get(&StorageKey::Paused)
+            .unwrap_or(false);
+        if paused {
+            panic_with_error!(env, Error::Paused);
+        }
     }
 
     fn next_claim_id(env: &Env) -> u128 {
