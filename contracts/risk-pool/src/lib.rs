@@ -82,11 +82,11 @@ pub enum Error {
     Undercollateralized = 11,
     PoolCapExceeded     = 12,
     InvalidToken        = 13,
-    InsufficientShares  = 17,
     TimelockPending     = 14,
     TimelockNotReady    = 15,
     NoPendingWithdrawal = 16,
-    DepositTooSmall     = 17,
+    InsufficientShares  = 17,
+    DepositTooSmall     = 18,
 }
 
 #[contract]
