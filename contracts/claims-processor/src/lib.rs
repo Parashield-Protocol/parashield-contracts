@@ -555,6 +555,7 @@ impl ClaimsProcessor {
             key:         policy.oracle_key.clone(),
             threshold:   policy.trigger_threshold,
             comparison:  map_comparison(&policy.trigger_comparison),
+            tolerance:   0,  // Standard comparison without tolerance
         };
 
         // verify_trigger_fresh re-queries the oracle and rejects stale data
