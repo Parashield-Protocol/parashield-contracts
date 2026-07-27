@@ -40,6 +40,11 @@ pub struct Proposal {
     /// Function name to invoke on execution (max 9 chars — Soroban Symbol).
     pub function: Symbol,
     pub args: Vec<Val>,
+    /// gov_token amount actually locked from the proposer at creation.
+    /// Refunded verbatim at finalize() — never re-read from the live
+    /// DaoConfig, since config.proposal_threshold can change between
+    /// proposal creation and finalization.
+    pub deposit: i128,
     pub status: ProposalStatus,
     pub votes_for: i128,
     pub votes_against: i128,

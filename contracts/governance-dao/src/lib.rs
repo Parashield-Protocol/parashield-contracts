@@ -135,10 +135,14 @@ impl GovernanceDao {
         if weight < config.proposal_threshold {
             panic_with_error!(&env, Error::InsufficientWeight);
         }
+        // Lock the threshold as it stands right now; this exact amount
+        // (not whatever config.proposal_threshold reads as later) is what
+        // finalize() must refund, so it's captured on the Proposal below.
+        let deposit = config.proposal_threshold;
         gov_token.transfer(
             &proposer,
             &env.current_contract_address(),
-            &config.proposal_threshold,
+            &deposit,
         );
 
         let proposal_id: u64 = env
@@ -155,6 +159,7 @@ impl GovernanceDao {
             target: target.clone(),
             function: function.clone(),
             args, // <--- BIND TO STRUCT
+            deposit,
             status: ProposalStatus::Active,
             votes_for: 0,
             votes_against: 0,
@@ -323,10 +328,13 @@ impl GovernanceDao {
         }
 
         let gov_token = token::Client::new(&env, &config.gov_token);
+        // Refund exactly what was locked at creation — never re-read the
+        // live config, which the admin can change after the proposer
+        // deposited (issue #137).
         gov_token.transfer(
             &env.current_contract_address(),
             &proposal.proposer,
-            &config.proposal_threshold,
+            &proposal.deposit,
         );
 
         env.storage()
