@@ -631,3 +631,5 @@ fn map_comparison(
 mod test;
 #[cfg(test)]
 mod test_integration;
+#[cfg(test)]
+mod test_advanced;

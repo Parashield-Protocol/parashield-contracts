@@ -410,3 +410,55 @@ fn test_finalize_cooldown_delay_enforced() {
         "Failed to finalize after cooldown expired"
     );
 }
+
+// ── Issue #45: execute_proposal approval verification ─────────────────────────
+
+/// Test that an Active proposal (not yet voted on) cannot be executed.
+/// This prevents malicious executors from executing proposals that were never approved.
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_execute_active_proposal_without_voting_panics() {
+    let (env, dao, _, voter1, _, target) = setup();
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Unapproved proposal"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+
+    // Attempt to execute without any voting - should panic with ProposalNotPassed
+    dao.execute(&pid);
+}
+
+/// Test that a proposal with votes_against > votes_for cannot be executed
+/// even after the voting period ends (it will be Failed, not Passed).
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_execute_rejected_proposal_panics() {
+    let (env, dao, _, voter1, voter2, target) = setup();
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Rejected proposal"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+
+    // Vote against the proposal
+    dao.vote(&voter1, &pid, &VoteChoice::Against);
+    dao.vote(&voter2, &pid, &VoteChoice::Against);
+
+    // Fast-forward past voting period and finalize delay
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+
+    dao.finalize(&pid);
+    let p = dao.get_proposal(&pid);
+    assert_eq!(p.status, crate::ProposalStatus::Failed);
+
+    // Attempt to execute a failed proposal - should panic
+    dao.execute(&pid);
+}

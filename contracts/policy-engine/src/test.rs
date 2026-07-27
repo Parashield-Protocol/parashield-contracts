@@ -241,6 +241,89 @@ fn test_duration_above_max_panics() {
     client.buy_policy(&buyer, &pid, &COVERAGE, &400u32, &symbol_short!("kis2606"));
 }
 
+// ── Issue #46: max_duration_days validation ─────────────────────────────────────
+
+/// max_duration_days of 0 must be rejected with InvalidDurationRange (#19).
+#[test]
+#[should_panic(expected = "Error(Contract, #19)")]
+fn test_create_product_zero_duration_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.create_product(&admin, &CreateProductParams {
+        name:               symbol_short!("bad"),
+        category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("kis2606"),
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       100_000_000,
+        coverage_max:       10_000_000_000,
+        premium_rate_bps:   500,
+        max_duration_days:  0,  // ← invalid: zero
+    });
+}
+
+/// max_duration_days > 3650 (10 years) must be rejected with InvalidDurationRange (#19).
+#[test]
+#[should_panic(expected = "Error(Contract, #19)")]
+fn test_create_product_duration_too_long_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.create_product(&admin, &CreateProductParams {
+        name:               symbol_short!("bad"),
+        category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("kis2606"),
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       100_000_000,
+        coverage_max:       10_000_000_000,
+        premium_rate_bps:   500,
+        max_duration_days:  3651,  // ← invalid: exceeds 10 years
+    });
+}
+
+/// Valid max_duration_days values (1-3650) should be accepted.
+#[test]
+fn test_create_product_valid_duration_succeeds() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+
+    // Test minimum valid duration (1 day)
+    let id1 = client.create_product(&admin, &CreateProductParams {
+        name:               symbol_short!("min"),
+        category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("kis2606"),
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       100_000_000,
+        coverage_max:       10_000_000_000,
+        premium_rate_bps:   500,
+        max_duration_days:  1,
+    });
+    assert_eq!(id1, 1);
+
+    // Test maximum valid duration (3650 days = 10 years)
+    let id2 = client.create_product(&admin, &CreateProductParams {
+        name:               symbol_short!("max"),
+        category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("kis2607"),
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       100_000_000,
+        coverage_max:       10_000_000_000,
+        premium_rate_bps:   500,
+        max_duration_days:  3650,
+    });
+    assert_eq!(id2, 2);
+}
+
 // ── Policy cancellation ───────────────────────────────────────────────────────
 
 #[test]

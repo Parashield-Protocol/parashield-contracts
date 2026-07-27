@@ -79,6 +79,7 @@ pub enum Error {
     InvalidCoverageRange    = 16,
     InvalidToken            = 17,
     ClaimsProcessorNotSet   = 18,
+    InvalidDurationRange    = 19,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -204,6 +205,11 @@ impl PolicyEngine {
         // Rejects free coverage (min == 0) and inverted ranges (min >= max).
         if params.coverage_min <= 0 || params.coverage_min >= params.coverage_max {
             panic_with_error!(&env, Error::InvalidCoverageRange);
+        }
+        // max_duration_days must be positive and less than 3650 (up to 10 years)
+        // Rejects 0-day policies and unrealistically long durations
+        if params.max_duration_days == 0 || params.max_duration_days > 3650 {
+            panic_with_error!(&env, Error::InvalidDurationRange);
         }
 
         // Check for duplicate (category, oracle_key) pair
