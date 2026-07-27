@@ -448,6 +448,28 @@ fn test_concurrent_claim_submissions() {
     assert_eq!(res3, ClaimResult::Paid);
 }
 
+/// The PendingClaims queue must not grow without bound: once a claim is settled
+/// it is removed from the queue, keeping instance storage from ballooning.
+#[test]
+fn test_pending_queue_drained_after_settlement() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    // Submitting a claim enqueues it.
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    assert_eq!(cp.get_pending_claims().len(), 1);
+
+    // Settling it (trigger met → Paid) must drain it from the queue.
+    submit_rainfall(&w, 20_000_000);
+    let result = cp.process_claim(&w.keeper, claim_id);
+    assert_eq!(result, ClaimResult::Paid);
+    assert_eq!(cp.get_pending_claims().len(), 0, "settled claim must leave the pending queue");
+}
+
 /// Test version tracking for upgrade path.
 #[test]
 fn test_initial_version_tracking() {
