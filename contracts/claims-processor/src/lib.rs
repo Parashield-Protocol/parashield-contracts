@@ -672,6 +672,16 @@ impl ClaimsProcessor {
             panic_with_error!(env, Error::InvalidAddress);
         }
     }
+
+    fn require_admin(env: &Env, caller: &Address) {
+        let admin: Address = env.storage().instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        if *caller != admin {
+            panic_with_error!(env, Error::Unauthorized);
+        }
+        caller.require_auth();
+    }
 }
 
 /// Map policy-engine TriggerComparison to oracle-verifier TriggerComparison.

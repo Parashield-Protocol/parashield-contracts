@@ -695,6 +695,33 @@ fn test_premium_matches_formula() {
     assert_eq!(contract_bal, expected_premium);
 }
 
+// ── Issue #161: buy_policy with zero premium (premium_rate_bps = 0) ─────────────
+
+/// Creating a product with `premium_rate_bps = 0` is rejected with
+/// `InvalidPremiumRate`. This is the safety invariant that prevents free
+/// (zero-cost) policies from being issued — the premium calculation requires
+/// a positive rate to produce a non-zero transfer, and `create_product`
+/// validates this at creation time.
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_create_product_zero_premium_rate_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.create_product(&admin, &CreateProductParams {
+        name:               symbol_short!("free_pol"),
+        category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("kis2606"),
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       100_000_000,
+        coverage_max:       10_000_000_000,
+        premium_rate_bps:   0,  // ← zero premium: must be rejected
+        max_duration_days:  365,
+    });
+}
+
 // ── Issue #58: atomic product ID generation ────────────────────────────────
 
 #[test]

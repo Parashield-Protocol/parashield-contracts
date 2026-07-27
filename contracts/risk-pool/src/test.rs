@@ -526,3 +526,37 @@ fn test_get_lp_list_pagination() {
     assert_eq!(paginated.total_count, 200);
     assert_eq!(paginated.lps.len(), 50);
 }
+
+// ── Issue #163: withdraw with amount exactly equal to available balance ──────────
+
+/// Withdraw the exact unlocked (available) balance after a partial lock and
+/// verify zero remaining: no underflow, no rounding error, total_deposited
+/// correctly decremented to the locked portion only.
+#[test]
+fn withdraw_exact_available_balance_leaves_zero_remaining() {
+    let (_, pool, _, admin, _, lp1) = setup();
+    let total = 1_000_0000000i128; // 1000 USDC
+    let locked_amount = 300_0000000i128; // 300 USDC locked for policy
+
+    let shares = pool.deposit(&lp1, &total, &0i128);
+    pool.lock_for_policy(&admin, &1u128, &locked_amount);
+
+    // Available = total - locked = 700 USDC
+    let available = pool.get_available_liquidity();
+    assert_eq!(available, 700_0000000i128);
+
+    // Withdraw the exact available amount (convert USDC → shares)
+    let available_shares = available * total_shares(total) / total;
+    let returned = pool.withdraw(&lp1, &available_shares);
+
+    assert_eq!(returned, available);
+    assert_eq!(pool.get_available_liquidity(), 0);
+
+    // total_deposited should be exactly the locked amount
+    let stats = pool.get_stats();
+    assert_eq!(stats.total_deposited, locked_amount);
+}
+
+fn total_shares(deposited: i128) -> i128 {
+    deposited * 1_000_000_000
+}
