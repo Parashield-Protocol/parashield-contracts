@@ -182,6 +182,60 @@ fn test_remove_oracle_deactivates() {
     assert_eq!(agg_after.median_value, 50_000_000i128);
 }
 
+// ── Issue #135: OracleList must not retain soft-deleted addresses ─────────────
+
+#[test]
+fn test_remove_oracle_prunes_oracle_list() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle1 = Address::generate(&env);
+    let oracle2 = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle1, &weather(), &80u32);
+    client.add_oracle(&admin, &oracle2, &weather(), &80u32);
+    assert_eq!(client.get_oracles().len(), 2);
+
+    client.remove_oracle(&admin, &oracle1, &weather());
+
+    // get_oracles() must no longer report the deactivated address.
+    let remaining = client.get_oracles();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining.get_unchecked(0), oracle2);
+}
+
+// ── Issue #136: active_oracle_count vs oracle_count (submissions) ─────────────
+
+#[test]
+fn test_active_oracle_count_reflects_registrations_not_submissions() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle1 = Address::generate(&env);
+    let oracle2 = Address::generate(&env);
+    let oracle3 = Address::generate(&env);
+
+    // 3 oracles registered, but only 2 submit data for this key.
+    client.add_oracle(&admin, &oracle1, &weather(), &80u32);
+    client.add_oracle(&admin, &oracle2, &weather(), &80u32);
+    client.add_oracle(&admin, &oracle3, &weather(), &80u32);
+
+    client.submit_data(&oracle1, &weather(), &kisumu_key(), &10_000_000i128, &90u32, &1748736000u64);
+    client.submit_data(&oracle2, &weather(), &kisumu_key(), &50_000_000i128, &90u32, &1748736000u64);
+
+    let agg = client.get_aggregated(&weather(), &kisumu_key());
+    assert_eq!(agg.oracle_count, 2, "oracle_count is submissions for this key");
+    assert_eq!(
+        agg.active_oracle_count, 3,
+        "active_oracle_count is all active registrations for the data_type"
+    );
+
+    // Deactivating a registered-but-not-submitted oracle drops active_oracle_count
+    // without touching oracle_count (submissions for this key are unaffected).
+    client.remove_oracle(&admin, &oracle3, &weather());
+    let agg_after = client.get_aggregated(&weather(), &kisumu_key());
+    assert_eq!(agg_after.oracle_count, 2);
+    assert_eq!(agg_after.active_oracle_count, 2);
+}
+
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn test_removed_oracle_cannot_submit() {
