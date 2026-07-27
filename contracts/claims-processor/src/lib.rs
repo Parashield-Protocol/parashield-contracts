@@ -220,7 +220,8 @@ impl ClaimsProcessor {
 
         // Verify policy is Active via Policy Engine
         let policy_engine: Address = env.storage().instance()
-            .get(&StorageKey::PolicyEngine).unwrap();
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         let policy = PolicyEngineClient::new(&env, &policy_engine)
             .get_policy(&policy_id);
 
@@ -279,7 +280,8 @@ impl ClaimsProcessor {
         }
 
         let policy_engine: Address = env.storage().instance()
-            .get(&StorageKey::PolicyEngine).unwrap();
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         let policy = PolicyEngineClient::new(&env, &policy_engine)
             .get_policy(&claim.policy_id);
 
@@ -307,7 +309,8 @@ impl ClaimsProcessor {
         }
 
         let policy_engine: Address = env.storage().instance()
-            .get(&StorageKey::PolicyEngine).unwrap();
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         let policy = PolicyEngineClient::new(&env, &policy_engine)
             .get_policy(&policy_id);
 
@@ -378,7 +381,8 @@ impl ClaimsProcessor {
         let process_count = if pending.len() < limit { pending.len() } else { limit };
 
         let policy_engine: Address = env.storage().instance()
-            .get(&StorageKey::PolicyEngine).unwrap();
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
 
         for i in 0..process_count {
             let claim_id = pending.get_unchecked(i);
@@ -533,11 +537,14 @@ impl ClaimsProcessor {
     /// to prevent coverage from remaining locked indefinitely.
     fn evaluate_and_settle(env: &Env, claim: &mut Claim) -> ClaimResult {
         let oracle_verifier: Address = env.storage().instance()
-            .get(&StorageKey::OracleVerifier).unwrap();
+            .get(&StorageKey::OracleVerifier)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         let policy_engine: Address = env.storage().instance()
-            .get(&StorageKey::PolicyEngine).unwrap();
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         let risk_pool: Address = env.storage().instance()
-            .get(&StorageKey::RiskPool).unwrap();
+            .get(&StorageKey::RiskPool)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         // Configurable staleness threshold (default 7 days = 604_800 s if not set)
         let staleness_threshold: u64 = env.storage().instance()
             .get(&StorageKey::StalenessThreshold)
