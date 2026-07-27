@@ -82,11 +82,11 @@ pub enum Error {
     Undercollateralized = 11,
     PoolCapExceeded     = 12,
     InvalidToken        = 13,
-    InsufficientShares  = 17,
     TimelockPending     = 14,
     TimelockNotReady    = 15,
     NoPendingWithdrawal = 16,
-    DepositTooSmall     = 17,
+    InsufficientShares  = 17,
+    DepositTooSmall     = 18,
 }
 
 #[contract]
@@ -409,6 +409,7 @@ impl RiskPool {
 
     pub fn lock_for_policy(env: Env, caller: Address, policy_id: u128, amount: i128) {
         Self::require_protocol_caller(&env, &caller);
+        Self::assert_active(&env);
         // Guard: check for zero or negative lock amount input
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
 
@@ -493,7 +494,15 @@ impl RiskPool {
         let deposited: i128 = env.storage().instance().get(&StorageKey::TotalDeposited).unwrap_or(0);
         let locked: i128    = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
         if deposited == 0 { return 0; }
-        (locked * 10_000 / deposited) as u32
+        let util_bps = locked.checked_mul(10_000)
+            .and_then(|v| v.checked_div(deposited))
+            .unwrap_or(0);
+        // Saturate to u32::MAX if the result exceeds u32 range
+        if util_bps > u32::MAX as i128 {
+            u32::MAX
+        } else {
+            util_bps as u32
+        }
     }
 
     pub fn get_admin(env: Env) -> Address {
