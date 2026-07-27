@@ -499,7 +499,7 @@ impl ClaimsProcessor {
     /// Core evaluation: check oracle, update claim record, instruct Policy Engine.
     /// After successful claim payment, atomically releases the coverage lock on Risk Pool
     /// to prevent coverage from remaining locked indefinitely.
-    fn evaluate_and_settle(env: &Env, claim: &mut Claim) -> ClaimResult {
+    fn evaluate_and_settle(env: &Env, claim: &mut Claim, policy: &parashield_policy_engine::Policy) -> ClaimResult {
         let oracle_verifier: Address = env.storage().instance()
             .get(&StorageKey::OracleVerifier).unwrap();
         let policy_engine: Address = env.storage().instance()
@@ -516,6 +516,7 @@ impl ClaimsProcessor {
             key:         policy.oracle_key.clone(),
             threshold:   policy.trigger_threshold,
             comparison:  map_comparison(&policy.trigger_comparison),
+            tolerance:   0i128,
         };
 
         // verify_trigger_fresh re-queries the oracle and rejects stale data
@@ -610,6 +611,16 @@ impl ClaimsProcessor {
         if buf[0] != b'G' && buf[0] != b'C' {
             panic_with_error!(env, Error::InvalidAddress);
         }
+    }
+
+    fn require_admin(env: &Env, caller: &Address) {
+        let admin: Address = env.storage().instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        if *caller != admin {
+            panic_with_error!(env, Error::Unauthorized);
+        }
+        caller.require_auth();
     }
 }
 

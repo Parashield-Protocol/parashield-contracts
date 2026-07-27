@@ -531,3 +531,35 @@ fn test_non_keeper_cannot_process_claim() {
     let stranger = Address::generate(&w.env);
     cp.process_claim(&stranger, &claim_id);
 }
+
+// ── Issue #160: double-processing the same claim via process_claim ──────────────
+
+/// Calling `process_claim` twice on the same claim_id in quick succession must
+/// return `AlreadyProcessed` on the second call rather than re-invoking the
+/// oracle and paying out again. This tests the idempotency guard at the
+/// process_claim level (PolicyClaim check at line 292 of lib.rs).
+#[test]
+fn test_process_claim_double_processing_returns_already_processed() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+
+    // Submit low rainfall so the trigger is met
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+
+    // First call settles the claim (Paid)
+    let first = cp.process_claim(&w.keeper, &claim_id);
+    assert_eq!(first, ClaimResult::Paid);
+
+    // Second call on same claim returns AlreadyProcessed
+    let second = cp.process_claim(&w.keeper, &claim_id);
+    assert_eq!(second, ClaimResult::AlreadyProcessed);
+
+    // Balance confirms exactly one payout — no double-spend
+    let balance = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
+    assert_eq!(balance, 5_000_000_000 - 4_109_589 + 1_000_000_000);
+}
