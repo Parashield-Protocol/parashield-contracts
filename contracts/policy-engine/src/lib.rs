@@ -572,9 +572,8 @@ pub fn emergency_resume(env: Env, admin: Address) {
              .get(&StorageKey::PendingAdmin)
              .unwrap_or_else(|| panic_with_error!(&env, Error::Unauthorized));
          // Only the pending admin can accept
-         match pending_admin {
-             Some(ref addr) if *addr == admin => {}
-             _ => panic_with_error!(&env, Error::Unauthorized),
+         if pending_admin != admin {
+             panic_with_error!(&env, Error::Unauthorized);
          }
          admin.require_auth();
          let _current_admin: Address = env.storage().instance()
