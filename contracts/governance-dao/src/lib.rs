@@ -354,6 +354,7 @@ impl GovernanceDao {
         if total_votes < quorum_needed {
             proposal.status = ProposalStatus::Failed;
         } else {
+            // Guard: prevent division by zero if total_votes == 0
             let for_bps = if total_votes > 0 {
                 proposal.votes_for.checked_mul(10_000).map(|v| v / total_votes).unwrap_or(0)
             } else {

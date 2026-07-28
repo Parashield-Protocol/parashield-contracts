@@ -292,6 +292,9 @@ impl RiskPool {
         let total_shares: i128    = env.storage().instance().get(&StorageKey::TotalShares).unwrap_or(0);
         let total_locked: i128    = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
 
+        // Guard: prevent division by zero if total_shares == 0
+        if total_shares == 0 { panic_with_error!(&env, Error::NoShares); }
+
         let available_liquidity = total_deposited.saturating_sub(total_locked);
         if available_liquidity <= 0 { panic_with_error!(&env, Error::Undercollateralized); }
         let amount = shares * total_deposited / total_shares;
