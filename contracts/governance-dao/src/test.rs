@@ -463,6 +463,45 @@ fn test_execute_rejected_proposal_panics() {
     dao.execute(&pid);
 }
 
+// ── Issue #165: tied vote boundary ────────────────────────────────────────────
+
+/// When votes_for == votes_against exactly, `for_bps` lands at 50% which is
+/// below `majority_bps` (51%), so the proposal must be marked Failed — not
+/// Passed. This pins down the exact-tie boundary behavior of finalize().
+#[test]
+fn finalize_with_exactly_tied_votes_fails() {
+    let (env, dao, _, voter1, _, target) = setup();
+    let gov_token_id = dao.get_config().gov_token;
+
+    // Two fresh voters with identical weight, voting on opposite sides.
+    let voter_a = Address::generate(&env);
+    let voter_b = Address::generate(&env);
+    let tied_weight = 300_000_0000000i128;
+    let gov_asset_client = token::StellarAssetClient::new(&env, &gov_token_id);
+    gov_asset_client.mint(&voter_a, &tied_weight);
+    gov_asset_client.mint(&voter_b, &tied_weight);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Tied vote test"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+
+    dao.vote(&voter_a, &pid, &VoteChoice::For);
+    dao.vote(&voter_b, &pid, &VoteChoice::Against);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+
+    dao.finalize(&pid);
+    let p = dao.get_proposal(&pid);
+    assert_eq!(p.votes_for, p.votes_against);
+    assert_eq!(p.status, ProposalStatus::Failed);
+}
+
 // ── Issue #137: finalize() must refund the deposit locked at creation ─────────
 
 /// Admin lowers proposal_threshold after a proposal is created but before
