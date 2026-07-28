@@ -22,6 +22,7 @@ extern crate alloc;
 use alloc::string::ToString;
 
 #[cfg_attr(feature = "library", allow(unused_imports))]
+use crate::alloc::string::ToString;
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
     token, Address, BytesN, Env, Symbol, Vec,
@@ -94,6 +95,7 @@ pub enum Error {
     ClaimsProcessorNotSet   = 18,
     InvalidDurationRange    = 19,
     InvalidOracleKey        = 20,
+    Overflow               = 21,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -470,7 +472,9 @@ impl PolicyEngine {
             policy.premium_paid
         } else {
             let elapsed_capped = elapsed.min(total_duration);
-            let earned = policy.premium_paid * elapsed_capped as i128 / total_duration as i128;
+            let earned = policy.premium_paid.checked_mul(elapsed_capped as i128)
+                .and_then(|v| v.checked_div(total_duration as i128))
+                .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
             policy.premium_paid.saturating_sub(earned)
         };
 
