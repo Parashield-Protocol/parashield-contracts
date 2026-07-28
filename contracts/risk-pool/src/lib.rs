@@ -38,6 +38,19 @@ const MIN_DEPOSIT: i128 = 1_000_000;
 /// Timelock duration for admin withdrawals: 7 days in seconds.
 const TIMELOCK_SECONDS: u64 = 7 * 24 * 60 * 60;
 
+/// Approximate Stellar ledger close time in seconds, used to convert
+/// wall-clock TTL windows into ledger counts for `extend_ttl`.
+const LEDGER_SECONDS: u64 = 5;
+
+/// Capital locks must outlive the underlying policy until `release_for_claim`
+/// / `release_for_expiry` runs; 365 days comfortably covers policy-engine's
+/// longest policy durations plus a settlement buffer.
+const LOCK_RETENTION_SECONDS: u64 = 365 * 24 * 60 * 60;
+
+/// Admin withdrawal requests must survive the timelock plus a buffer for
+/// `execute_admin_withdrawal` to actually run.
+const WITHDRAWAL_RETENTION_SECONDS: u64 = TIMELOCK_SECONDS + 30 * 24 * 60 * 60;
+
 #[contracttype]
 enum StorageKey {
     Initialized,
@@ -240,7 +253,9 @@ impl RiskPool {
             None => {
                 let count: u32 = env.storage().instance()
                     .get(&StorageKey::LpCount).unwrap_or(0);
-                env.storage().persistent().set(&StorageKey::LpAddress(count), &provider);
+                let lp_address_key = StorageKey::LpAddress(count);
+                env.storage().persistent().set(&lp_address_key, &provider);
+                Self::extend_to_max(&env, &lp_address_key);
                 env.storage().instance().set(&StorageKey::LpCount, &(count + 1));
                 let acc_per_share: i128 = env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0);
                 LpPosition {
@@ -255,6 +270,7 @@ impl RiskPool {
             }
         };
         env.storage().persistent().set(&lp_key, &position);
+        Self::extend_to_max(&env, &lp_key);
         env.storage().instance().set(&StorageKey::TotalDeposited, &(total_deposited + amount));
         env.storage().instance().set(&StorageKey::TotalShares,    &(total_shares + new_shares));
 
@@ -300,6 +316,7 @@ impl RiskPool {
         position.shares   -= shares;
         position.yield_debt = (env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0) * position.shares) / 1_000_000_000_000;
         env.storage().persistent().set(&lp_key, &position);
+        Self::extend_to_max(&env, &lp_key);
         env.storage().instance().set(&StorageKey::TotalDeposited, &(total_deposited - amount));
         env.storage().instance().set(&StorageKey::TotalShares,    &(total_shares - shares));
 
@@ -416,6 +433,7 @@ impl RiskPool {
 
         if claimed > 0 {
             env.storage().persistent().set(&lp_key, &position);
+            Self::extend_to_max(&env, &lp_key);
         }
 
         claimed
@@ -438,12 +456,14 @@ impl RiskPool {
         if available < amount { panic_with_error!(&env, Error::Undercollateralized); }
         if env.storage().persistent().has(&StorageKey::Lock(policy_id)) { panic_with_error!(&env, Error::AlreadyLocked); }
 
-        env.storage().persistent().set(&StorageKey::Lock(policy_id), &CapitalLock {
+        let lock_key = StorageKey::Lock(policy_id);
+        env.storage().persistent().set(&lock_key, &CapitalLock {
             policy_id,
             amount,
             locked_at: env.ledger().timestamp(),
             released:  false,
         });
+        Self::extend_lock_ttl(&env, &lock_key);
         env.storage().instance().set(&StorageKey::TotalLocked, &(total_locked + amount));
 
         env.events().publish(
@@ -652,6 +672,7 @@ impl RiskPool {
                 executed: false,
             },
         );
+        Self::extend_withdrawal_ttl(&env, &StorageKey::AdminWithdrawalRequest);
 
         env.events().publish(
             (Symbol::new(&env, "admin_withdrawal_scheduled"),),
@@ -804,6 +825,30 @@ impl RiskPool {
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         if *caller != admin { panic_with_error!(env, Error::Unauthorized); }
         caller.require_auth();
+    }
+
+    /// Extend a persistent entry's TTL to the network maximum. Used for
+    /// LP position/address records, which must survive for as long as an LP
+    /// holds shares — an indefinite, not policy-bound, duration.
+    fn extend_to_max(env: &Env, key: &StorageKey) {
+        let max_ttl = env.storage().max_ttl();
+        env.storage().persistent().extend_ttl(key, max_ttl, max_ttl);
+    }
+
+    /// Extend a `Lock` entry's TTL to cover `LOCK_RETENTION_SECONDS`
+    /// (clamped to the network's max TTL).
+    fn extend_lock_ttl(env: &Env, key: &StorageKey) {
+        let desired_ledgers = (LOCK_RETENTION_SECONDS / LEDGER_SECONDS) as u32;
+        let extend_to = desired_ledgers.min(env.storage().max_ttl());
+        env.storage().persistent().extend_ttl(key, extend_to, extend_to);
+    }
+
+    /// Extend the `AdminWithdrawalRequest` entry's TTL to cover
+    /// `WITHDRAWAL_RETENTION_SECONDS` (clamped to the network's max TTL).
+    fn extend_withdrawal_ttl(env: &Env, key: &StorageKey) {
+        let desired_ledgers = (WITHDRAWAL_RETENTION_SECONDS / LEDGER_SECONDS) as u32;
+        let extend_to = desired_ledgers.min(env.storage().max_ttl());
+        env.storage().persistent().extend_ttl(key, extend_to, extend_to);
     }
 
     fn assert_active(env: &Env) {

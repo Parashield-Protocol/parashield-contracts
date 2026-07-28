@@ -18,6 +18,7 @@
 //! to pay the policyholder when the oracle confirms a trigger.
 #![no_std]
 extern crate alloc;
+use alloc::string::ToString;
 
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
@@ -54,6 +55,17 @@ enum StorageKey {
     /// Contract version (u32) for storage migration tracking
     Version,
 }
+
+/// Approximate Stellar ledger close time in seconds, used to convert
+/// wall-clock TTL windows into ledger counts for `extend_ttl`.
+#[allow(dead_code)]
+const LEDGER_SECONDS: u64 = 5;
+
+/// Extra time added on top of a policy's own duration when extending the TTL
+/// of its `Policy` entry, so the Claims Processor still has time to evaluate
+/// and settle a claim after the policy's `end_time` (issue #186).
+#[allow(dead_code)]
+const POLICY_CLAIMS_BUFFER_SECONDS: u64 = 90 * 24 * 60 * 60;
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
@@ -252,10 +264,14 @@ impl PolicyEngine {
             status:             ProductStatus::Active,
             created_at:         env.ledger().timestamp(),
         };
-        env.storage().persistent().set(&StorageKey::Product(id), &product);
+        let product_key = StorageKey::Product(id);
+        env.storage().persistent().set(&product_key, &product);
+        Self::extend_to_max(&env, &product_key);
 
         // Store the (category, oracle_key) -> product_id mapping for uniqueness
-        env.storage().persistent().set(&StorageKey::ProductKey(key), &id);
+        let product_lookup_key = StorageKey::ProductKey(key);
+        env.storage().persistent().set(&product_lookup_key, &id);
+        Self::extend_to_max(&env, &product_lookup_key);
 
         let mut products: Vec<u128> = env.storage().instance()
             .get(&StorageKey::ActiveProducts).unwrap_or_else(|| Vec::new(&env));
@@ -402,7 +418,9 @@ impl PolicyEngine {
             status: PolicyStatus::Active,
             created_at: now,
         };
-        env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
+        let policy_key = StorageKey::Policy(policy_id);
+        env.storage().persistent().set(&policy_key, &policy);
+        Self::extend_policy_ttl(&env, &policy_key, duration_secs);
 
         // Append to user's policy list
         let user_key = StorageKey::UserPolicies(buyer.clone());
@@ -410,6 +428,7 @@ impl PolicyEngine {
             .get(&user_key).unwrap_or_else(|| Vec::new(&env));
         user_policies.push_back(policy_id);
         env.storage().persistent().set(&user_key, &user_policies);
+        Self::extend_to_max(&env, &user_key);
 
         env.events().publish(
             (Symbol::new(&env, "buy_policy"), buyer),
@@ -662,7 +681,27 @@ pub fn emergency_resume(env: Env, admin: Address) {
         if let Some(i) = pos {
             user_policies.remove(i);
             env.storage().persistent().set(&key, &user_policies);
+            Self::extend_to_max(env, &key);
         }
+    }
+
+    /// Extend a persistent entry's TTL to the network maximum. Used for
+    /// Product/ProductKey/UserPolicies records, which are admin- or
+    /// user-index data with no natural expiry.
+    fn extend_to_max(env: &Env, key: &StorageKey) {
+        let max_ttl = env.storage().max_ttl();
+        env.storage().persistent().extend_ttl(key, max_ttl, max_ttl);
+    }
+
+    /// Extend a `Policy` entry's TTL to cover its own coverage duration plus
+    /// `POLICY_CLAIMS_BUFFER_SECONDS` (clamped to the network's max TTL), so
+    /// `get_policy`/`pay_claim`/`expire_policy` can still find it even if it
+    /// is only ever written once, at purchase time (issue #186).
+    fn extend_policy_ttl(env: &Env, key: &StorageKey, duration_secs: u64) {
+        let ttl_seconds = duration_secs.saturating_add(POLICY_CLAIMS_BUFFER_SECONDS);
+        let desired_ledgers = (ttl_seconds / LEDGER_SECONDS) as u32;
+        let extend_to = desired_ledgers.min(env.storage().max_ttl());
+        env.storage().persistent().extend_ttl(key, extend_to, extend_to);
     }
 
     fn load_product(env: &Env, id: u128) -> InsuranceProduct {

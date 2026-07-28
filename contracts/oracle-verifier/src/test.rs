@@ -906,3 +906,32 @@ fn test_reject_when_fewer_than_min_oracle_count_submit() {
     let result = client.verify_trigger(&weather(), &kisumu_key(), &condition);
     assert!(result);
 }
+
+// ── Storage TTL (issue #184 / #186) ─────────────────────────────────────────
+
+/// A DataPoints entry written by `submit_data` must survive ledger time
+/// advancing past the default `min_persistent_entry_ttl` (4096 ledgers) that
+/// a persistent entry gets when no `extend_ttl` is ever called. Without the
+/// fix, reading the entry after this advancement would panic on an expired
+/// entry; with the fix, `get_data` still returns the reading.
+#[test]
+fn test_data_points_ttl_survives_ledger_advancement() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &50u32);
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &10_000_000i128,
+        &90u32,
+        &1748736000u64,
+    );
+
+    // Advance well past the default 4096-ledger min persistent TTL.
+    env.ledger().with_mut(|l| l.sequence_number += 10_000);
+
+    let data = client.get_data(&weather(), &kisumu_key());
+    assert_eq!(data.value, 10_000_000i128);
+}

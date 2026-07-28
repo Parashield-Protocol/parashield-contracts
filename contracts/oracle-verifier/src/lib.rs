@@ -31,6 +31,20 @@ pub use types::*;
 #[allow(dead_code)]
 const MAX_ORACLES: u32 = 100;
 
+/// Approximate Stellar ledger close time in seconds, used to convert
+/// wall-clock TTL windows into ledger counts for `extend_ttl`.
+#[allow(dead_code)]
+const LEDGER_SECONDS: u64 = 5;
+
+/// Oracle readings must outlive the longest active policy period so that
+/// `verify_trigger` can still find them when a claim is finally evaluated —
+/// even if the (data_type, key) never receives another submission after its
+/// observation window closes (issue #184). 120 days covers typical
+/// parametric policy coverage windows plus a claims-processing buffer; it is
+/// capped to the network's max TTL at call time so `extend_ttl` never panics.
+#[allow(dead_code)]
+const DATA_RETENTION_SECONDS: u64 = 120 * 24 * 60 * 60;
+
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -405,6 +419,7 @@ impl OracleVerifier {
         }
 
         env.storage().persistent().set(&dp_key, &points);
+        Self::extend_data_points_ttl(&env, &dp_key);
 
         env.events().publish(
             (Symbol::new(&env, "oracle_data_submitted"),),
@@ -647,6 +662,7 @@ impl OracleVerifier {
                 points.push_back(new_point);
             }
             env.storage().persistent().set(&dp_key, &points);
+            Self::extend_data_points_ttl(&env, &dp_key);
 
             env.events().publish(
                 (Symbol::new(&env, "oracle_data_submitted"),),
@@ -718,6 +734,7 @@ impl OracleVerifier {
                 points.push_back(new_point);
             }
             env.storage().persistent().set(&dp_key, &points);
+            Self::extend_data_points_ttl(&env, &dp_key);
 
             env.events().publish(
                 (Symbol::new(&env, "oracle_data_submitted"),),
@@ -768,6 +785,16 @@ impl OracleVerifier {
             panic_with_error!(env, Error::Unauthorized);
         }
         caller.require_auth();
+    }
+
+    /// Extend the TTL of a `DataPoints` entry to cover `DATA_RETENTION_SECONDS`
+    /// (clamped to the network's max TTL), so a reading submitted once for a
+    /// (data_type, key) that never receives another submission still survives
+    /// long enough for `verify_trigger`/`get_data` to find it (issue #184).
+    fn extend_data_points_ttl(env: &Env, key: &StorageKey) {
+        let desired_ledgers = (DATA_RETENTION_SECONDS / LEDGER_SECONDS) as u32;
+        let extend_to = desired_ledgers.min(env.storage().max_ttl());
+        env.storage().persistent().extend_ttl(key, extend_to, extend_to);
     }
 
     /// Compute the simple median of all submitted values for (data_type, key).

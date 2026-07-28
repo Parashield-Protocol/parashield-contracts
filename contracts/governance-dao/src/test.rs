@@ -582,3 +582,32 @@ fn test_finalize_does_not_pull_raised_live_threshold() {
     assert_eq!(p.deposit, deposit_before);
     assert_eq!(p.status, ProposalStatus::Passed);
 }
+
+// ── Storage TTL (issue #185 / #186) ─────────────────────────────────────────
+
+/// Proposal, VoteRecord, and LockedBalance entries must survive ledger time
+/// advancing past the default `min_persistent_entry_ttl` (4096 ledgers) that
+/// a persistent entry gets when no `extend_ttl` is ever called. Without the
+/// fix, reading these entries after this advancement would panic on an
+/// expired entry.
+#[test]
+fn test_proposal_and_vote_ttl_survive_ledger_advancement() {
+    let (env, dao, _admin, voter1, _voter2, target) = setup();
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"ttl test proposal"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+
+    // Advance well past the default 4096-ledger min persistent TTL.
+    env.ledger().with_mut(|l| l.sequence_number += 10_000);
+
+    let proposal = dao.get_proposal(&pid);
+    assert_eq!(proposal.id, pid);
+    let vote = dao.get_vote(&pid, &voter1);
+    assert!(vote.is_some());
+}

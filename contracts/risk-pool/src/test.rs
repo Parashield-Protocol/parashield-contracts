@@ -570,3 +570,26 @@ fn withdraw_exact_available_balance_leaves_zero_remaining() {
 fn total_shares(deposited: i128) -> i128 {
     deposited * 1_000_000_000
 }
+
+// ── Storage TTL (issue #186) ─────────────────────────────────────────────────
+
+/// LpPosition and Lock entries must survive ledger time advancing past the
+/// default `min_persistent_entry_ttl` (4096 ledgers) that a persistent entry
+/// gets when no `extend_ttl` is ever called. Without the fix, reading these
+/// entries after this advancement would panic on an expired entry.
+#[test]
+fn test_lp_position_and_lock_ttl_survive_ledger_advancement() {
+    let (env, pool, _usdc, admin, _treasury, lp1) = setup();
+    pool.deposit(&lp1, &500_000_0000000i128, &0i128);
+    pool.lock_for_policy(&admin, &1u128, &1_000_0000000i128);
+
+    // Advance well past the default 4096-ledger min persistent TTL.
+    env.ledger().with_mut(|l| l.sequence_number += 10_000);
+
+    let position = pool.get_position(&lp1);
+    assert!(position.is_some());
+    assert_eq!(position.unwrap().deposited, 500_000_0000000i128);
+
+    // release_for_claim only succeeds if the Lock entry is still readable.
+    pool.release_for_claim(&admin, &1u128);
+}

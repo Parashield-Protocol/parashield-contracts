@@ -1,26 +1,80 @@
-# Close test-coverage and doc gaps: #164, #165, #166, #167
+# Fix storage TTL expiry on oracle readings, proposals, and votes: #184, #185, #186
 
 ## Summary
 
-- **#164 (policy-engine)**: Added `cancel_policy_refund_matches_hand_calculated_value_at_known_elapsed`, which cancels a policy at a known elapsed duration (10 of 30 days) and asserts the exact `premium_paid` and refund amounts against hand-calculated values, catching off-by-one/integer-division bugs the existing approximate midpoint test would miss.
-- **#165 (governance-dao)**: Added `finalize_with_exactly_tied_votes_fails`, which drives `votes_for == votes_against` via two equal-weight voters on opposite sides and asserts `finalize()` marks the proposal `Failed` (50% for-share is below the 51% majority threshold).
-- **#166 (risk-pool)**: Added `lock_for_policy_on_empty_pool_fails_undercollateralized`, which calls `lock_for_policy` on a pool with zero deposits and asserts it rejects with `Undercollateralized` (#11).
-- **#167 (governance-dao)**: Added rustdoc to all 14 previously-undocumented public functions (`initialize`, `create_proposal`, `vote`, `withdraw_tokens`, `finalize`, `execute`, `cancel`, `get_proposal`, `get_vote`, `get_config`, `get_admin`, `proposal_count`, `get_version`, `update_config`), explaining the token-locking mechanism during voting, the quorum/majority math in `finalize()`, and the timelock behavior of `execute()`.
+Fixes three storage-TTL bugs where persistent Soroban storage entries had no
+`extend_ttl` call, meaning they could expire (and become unreadable) while
+still logically "in use" by the protocol:
 
-## Incidental fix
+- **#184 (oracle-verifier)**: `submit_data` (and the `batch_submit_data` /
+  `submit_data_batch` variants) never extended the TTL of the `DataPoints`
+  entry. A reading submitted once for a (data_type, key) that never receives
+  another submission could expire before `claims-processor` calls
+  `verify_trigger`, causing a spurious rejection on a legitimate claim. Fixed
+  by extending each `DataPoints` entry's TTL to a 120-day retention window
+  (clamped to the network's max TTL) on every write.
 
-While compiling to verify the new tests, found that `risk-pool`'s `Error` enum assigned discriminant `17` to both `InsufficientShares` and `DepositTooSmall`, which fails to compile under `#[repr(u32)]`. This silently blocked the entire `risk-pool` crate (including its full existing test suite) from ever building. Fixed by giving `InsufficientShares` its own discriminant (`18`); `DepositTooSmall` keeps `17` to match existing tests asserting `Error(Contract, #17)`.
+- **#185 (governance-dao)**: `Proposal`, `VoteRecord`, and `LockedBalance`
+  entries were never TTL-extended. A proposal with a long voting period +
+  timelock could have its record — and any votes/locked tokens — expire
+  before `finalize`/`execute`/`withdraw_tokens` ran, losing the audit trail.
+  Fixed by extending each entry's TTL to cover
+  `voting_period + finalize_delay + proposal_timelock + a 30-day buffer`
+  (clamped to the network's max TTL) whenever the entry is written.
 
-## Note on pre-existing failures (not in scope, left as-is)
+- **#186 (all 5 contracts)**: no test exercised TTL expiry/extension
+  behavior. Added one test per contract that advances the ledger sequence
+  number past the default 4096-ledger `min_persistent_entry_ttl` and asserts
+  the relevant entries are still readable. Since the other three contracts
+  (`claims-processor`, `risk-pool`, `policy-engine`) had no `extend_ttl`
+  calls either, the same class of bug is fixed there too, on their
+  long-lived persistent entries (`Claim`/`PolicyClaim`,
+  `LpPosition`/`Lock`/`LpAddress`/`AdminWithdrawalRequest`,
+  `Policy`/`Product`/`ProductKey`/`UserPolicies`).
 
-Once `risk-pool` could compile, two pre-existing failures surfaced that are unrelated to the four issues above and were not introduced by this change (verified against unmodified `main`):
-- `risk-pool::test::withdraw_uses_available_liquidity_after_locks` and its duplicate `_2`
-- `governance-dao::test::test_finalize_refunds_deposit_locked_at_creation_not_live_config`
+## Incidental fixes
 
-These look like real bugs (e.g. `vote()` locks a voter's entire token balance, but `finalize()` only refunds the `create_proposal` deposit, not the voting lock) but are out of scope for this PR and are flagged here for a separate fix.
+The workspace didn't compile/test at all before this change (unrelated to
+TTL), which had to be fixed to add and run the new tests:
+
+- `claims-processor`: removed a duplicate `require_admin` function definition
+  (hard compile error).
+- `policy-engine`: added the missing `use alloc::string::ToString;` import
+  needed by `Symbol::to_string()` in `create_product` (compile error under
+  default features).
+- `claims-processor/src/test_advanced.rs`: fixed a bad `*result` deref and
+  three missing `&` on `process_claim(&keeper, claim_id)` calls (compile
+  errors in the test target).
+
+## Known pre-existing issues (out of scope, not touched)
+
+Running the full suite surfaced several pre-existing, unrelated bugs, never
+previously caught because the crates didn't compile:
+
+- `oracle-verifier`: `add_oracle` double-pushes the oracle address onto
+  `OracleList`; `test_update_oracle_weight_changes_aggregation` sets the
+  ledger clock to timestamp `1` but submits data timestamped in 2025.
+- `governance-dao`: `test_finalize_refunds_deposit_locked_at_creation_not_live_config`
+  asserts a voter's full balance is restored at `finalize()` without ever
+  calling `withdraw_tokens()` to release their locked voting weight.
+- `policy-engine`: `sequential_create_product_ids_are_unique_and_monotone`
+  uses a 2-character `oracle_key`, which fails the `MIN_LEN = 3` validation
+  added for a previous issue.
+- `claims-processor`: several integration tests fund `pool_id` with USDC
+  instead of `policy_id`, so `pay_claim`'s payout transfer (which spends the
+  Policy Engine's own balance) fails with `InsufficientPool`; some
+  `test_integration.rs` tests never call `lock_for_policy`, so
+  `release_for_claim` fails with `LockNotFound`.
+
+These are fund-flow/test-fixture bugs unrelated to storage TTL and are left
+untouched here.
 
 ## Test plan
 
-- [x] `cargo test -p parashield-policy-engine` — all pass
-- [x] `cargo test -p parashield-governance-dao` — all pass except the pre-existing, unrelated `test_finalize_refunds_deposit_locked_at_creation_not_live_config`
-- [x] `cargo test -p parashield-risk-pool` — all pass except the pre-existing, unrelated `withdraw_uses_available_liquidity_after_locks[_2]`
+- [x] `cargo check --workspace` — no errors
+- [x] `cargo test -p parashield-oracle-verifier` — new TTL test passes
+- [x] `cargo test -p parashield-governance-dao` — new TTL test passes
+- [x] `cargo test -p parashield-risk-pool` — new TTL test passes
+- [x] `cargo test -p parashield-policy-engine` — new TTL test passes
+- [x] `cargo test -p parashield-claims-processor` — new TTL test passes
+  (pre-existing unrelated failures noted above still fail, as expected)

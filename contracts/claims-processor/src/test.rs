@@ -563,3 +563,27 @@ fn test_process_claim_double_processing_returns_already_processed() {
     let balance = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
     assert_eq!(balance, 5_000_000_000 - 4_109_589 + 1_000_000_000);
 }
+
+// ── Storage TTL (issue #186) ─────────────────────────────────────────────────
+
+/// Claim and PolicyClaim entries must survive ledger time advancing past the
+/// default `min_persistent_entry_ttl` (4096 ledgers) that a persistent entry
+/// gets when no `extend_ttl` is ever called. Without the fix, reading these
+/// entries after this advancement would panic on an expired entry.
+#[test]
+fn test_claim_ttl_survives_ledger_advancement() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+
+    // Advance well past the default 4096-ledger min persistent TTL.
+    w.env.ledger().with_mut(|l| l.sequence_number += 10_000);
+
+    let claim = cp.get_claim(&claim_id);
+    assert_eq!(claim.id, claim_id);
+    assert_eq!(cp.get_claim_id_for_policy(&pol_id), Some(claim_id));
+}

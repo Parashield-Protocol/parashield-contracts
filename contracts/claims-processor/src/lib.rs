@@ -89,6 +89,17 @@ pub enum Error {
     Paused             = 9,
 }
 
+/// Approximate Stellar ledger close time in seconds, used to convert
+/// wall-clock TTL windows into ledger counts for `extend_ttl`.
+const LEDGER_SECONDS: u64 = 5;
+
+/// Claim and PolicyClaim entries must survive from submission until the
+/// claim is finally settled (Paid/Rejected) — including disputes, which have
+/// no automatic timeout. 365 days comfortably covers policy-engine's longest
+/// policy durations plus dispute-resolution time; capped to the network's
+/// max TTL at call time so `extend_ttl` never panics.
+const CLAIM_RETENTION_SECONDS: u64 = 365 * 24 * 60 * 60;
+
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -249,8 +260,12 @@ impl ClaimsProcessor {
             processed_at: None,
             dispute_reason: None,
         };
-        env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
-        env.storage().persistent().set(&StorageKey::PolicyClaim(policy_id), &claim_id);
+        let claim_key = StorageKey::Claim(claim_id);
+        let policy_claim_key = StorageKey::PolicyClaim(policy_id);
+        env.storage().persistent().set(&claim_key, &claim);
+        env.storage().persistent().set(&policy_claim_key, &claim_id);
+        Self::extend_claim_ttl(&env, &claim_key);
+        Self::extend_claim_ttl(&env, &policy_claim_key);
 
         let mut pending: Vec<u128> = env.storage().instance()
             .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(&env));
@@ -351,8 +366,12 @@ impl ClaimsProcessor {
                 processed_at: None,
                 dispute_reason: None,
             };
-            env.storage().persistent().set(&StorageKey::Claim(cid), &claim);
-            env.storage().persistent().set(&StorageKey::PolicyClaim(policy_id), &cid);
+            let claim_key = StorageKey::Claim(cid);
+            let policy_claim_key = StorageKey::PolicyClaim(policy_id);
+            env.storage().persistent().set(&claim_key, &claim);
+            env.storage().persistent().set(&policy_claim_key, &cid);
+            Self::extend_claim_ttl(&env, &claim_key);
+            Self::extend_claim_ttl(&env, &policy_claim_key);
 
             // Make the new claim visible to batch processors and monitoring.
             let mut pending: Vec<u128> = env.storage().instance()
@@ -424,7 +443,9 @@ impl ClaimsProcessor {
         }
         claim.status = ClaimStatus::Disputed;
         claim.dispute_reason = Some(reason.clone());
-        env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
+        let claim_key = StorageKey::Claim(claim_id);
+        env.storage().persistent().set(&claim_key, &claim);
+        Self::extend_claim_ttl(&env, &claim_key);
 
         // A disputed claim is no longer pending — drop it from the queue so it is
         // not re-evaluated and does not grow the queue unboundedly.
@@ -596,7 +617,9 @@ impl ClaimsProcessor {
             ClaimResult::Rejected
         };
 
-        env.storage().persistent().set(&StorageKey::Claim(claim.id), claim);
+        let claim_key = StorageKey::Claim(claim.id);
+        env.storage().persistent().set(&claim_key, claim);
+        Self::extend_claim_ttl(env, &claim_key);
 
         // The claim is now settled (Paid/Rejected) — drop it from the pending
         // queue so it is neither re-evaluated nor allowed to grow the queue
@@ -692,14 +715,12 @@ impl ClaimsProcessor {
         }
     }
 
-    fn require_admin(env: &Env, caller: &Address) {
-        let admin: Address = env.storage().instance()
-            .get(&StorageKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
-        if *caller != admin {
-            panic_with_error!(env, Error::Unauthorized);
-        }
-        caller.require_auth();
+    /// Extend the TTL of a Claim/PolicyClaim entry to cover
+    /// `CLAIM_RETENTION_SECONDS` (clamped to the network's max TTL).
+    fn extend_claim_ttl(env: &Env, key: &StorageKey) {
+        let desired_ledgers = (CLAIM_RETENTION_SECONDS / LEDGER_SECONDS) as u32;
+        let extend_to = desired_ledgers.min(env.storage().max_ttl());
+        env.storage().persistent().extend_ttl(key, extend_to, extend_to);
     }
 }
 

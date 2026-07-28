@@ -182,9 +182,9 @@ impl GovernanceDao {
             total_supply: config.total_supply,
         };
 
-        env.storage()
-            .persistent()
-            .set(&StorageKey::Proposal(proposal_id), &proposal);
+        let proposal_key = StorageKey::Proposal(proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+        Self::extend_proposal_ttl(&env, &proposal_key, &config);
         env.storage()
             .instance()
             .set(&StorageKey::NextProposalId, &(proposal_id.checked_add(1).unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))));
@@ -261,9 +261,16 @@ impl GovernanceDao {
                 weight,
             },
         );
-        env.storage()
-            .persistent()
-            .set(&StorageKey::Proposal(proposal_id), &proposal);
+        let proposal_key = StorageKey::Proposal(proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+
+        // Proposal, vote, and locked-balance entries must all outlive the
+        // remaining voting period + timelock + buffer, or a legitimate voter
+        // could lose their vote record / locked tokens to TTL expiry before
+        // the proposal is finalized/executed (issue #185).
+        Self::extend_proposal_ttl(&env, &proposal_key, &config);
+        Self::extend_proposal_ttl(&env, &vote_key, &config);
+        Self::extend_proposal_ttl(&env, &lock_key, &config);
 
         env.events().publish(
             (Symbol::new(&env, "vote_cast"),),
@@ -377,9 +384,9 @@ impl GovernanceDao {
             &proposal.deposit,
         );
 
-        env.storage()
-            .persistent()
-            .set(&StorageKey::Proposal(proposal_id), &proposal);
+        let proposal_key = StorageKey::Proposal(proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+        Self::extend_proposal_ttl(&env, &proposal_key, &config);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_finalized"),),
@@ -588,6 +595,21 @@ impl GovernanceDao {
             panic_with_error!(env, Error::Unauthorized);
         }
         caller.require_auth();
+    }
+
+    /// Extend a proposal/vote/locked-balance entry's TTL to cover the
+    /// remaining voting period + finalize delay + timelock + buffer
+    /// (clamped to the network's max TTL), so it survives until the
+    /// proposal is finalized and executed (issue #185).
+    fn extend_proposal_ttl(env: &Env, key: &StorageKey, config: &DaoConfig) {
+        let seconds_needed = config
+            .voting_period
+            .saturating_add(FINALIZE_DELAY)
+            .saturating_add(config.proposal_timelock)
+            .saturating_add(GOVERNANCE_TTL_BUFFER_SECONDS);
+        let desired_ledgers = (seconds_needed / LEDGER_SECONDS) as u32;
+        let extend_to = desired_ledgers.min(env.storage().max_ttl());
+        env.storage().persistent().extend_ttl(key, extend_to, extend_to);
     }
 }
 

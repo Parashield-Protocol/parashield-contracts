@@ -878,3 +878,28 @@ fn test_create_product_single_char_oracle_key_panics() {
         max_duration_days:  365,
     });
 }
+
+// ── Storage TTL (issue #186) ─────────────────────────────────────────────────
+
+/// Product and Policy entries must survive ledger time advancing past the
+/// default `min_persistent_entry_ttl` (4096 ledgers) that a persistent entry
+/// gets when no `extend_ttl` is ever called. Without the fix, reading these
+/// entries after this advancement would panic on an expired entry.
+#[test]
+fn test_product_and_policy_ttl_survive_ledger_advancement() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+    let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+
+    // Advance well past the default 4096-ledger min persistent TTL.
+    env.ledger().with_mut(|l| l.sequence_number += 10_000);
+
+    let product = client.get_product(&pid);
+    assert_eq!(product.id, pid);
+    let policy = client.get_policy(&policy_id);
+    assert_eq!(policy.id, policy_id);
+}
