@@ -338,3 +338,22 @@ fn test_proposal_timelock_execution() {
     let p_final = dao.get_proposal(&pid);
     assert_eq!(p_final.status, ProposalStatus::Executed);
 }
+
+#[test]
+fn test_proposal_expires_after_voting_period() {
+    let (env, dao, _, voter1, _, target) = setup();
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Expire proposal"),
+        &target,
+        &Symbol::new(&env, "update"),
+    );
+    // Move time past the voting period
+    env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
+    
+    // Finalize it without votes, it should fail
+    dao.finalize(&pid);
+    
+    let p = dao.get_proposal(&pid);
+    assert_eq!(p.status, crate::ProposalStatus::Failed);
+}
