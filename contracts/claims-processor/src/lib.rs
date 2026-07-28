@@ -560,6 +560,10 @@ impl ClaimsProcessor {
     /// After successful claim payment, atomically releases the coverage lock on Risk Pool
     /// to prevent coverage from remaining locked indefinitely.
     fn evaluate_and_settle(env: &Env, claim: &mut Claim, policy: &parashield_policy_engine::Policy) -> ClaimResult {
+        // Validate claim is in Pending state before transitioning (atomic state guard)  
+        if claim.status != ClaimStatus::Pending {
+            panic_with_error!(env, Error::AlreadyProcessed);
+        }
         let oracle_verifier: Address = env.storage().instance()
             .get(&StorageKey::OracleVerifier)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));

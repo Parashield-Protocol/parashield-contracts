@@ -572,7 +572,7 @@ impl OracleVerifier {
         }
 
         let median = Self::get_median_value(&env, &data_type, &key);
-        match condition.comparison {
+        let result = match condition.comparison {
             TriggerComparison::LessThan => median < condition.threshold,
             TriggerComparison::GreaterThan => median > condition.threshold,
             TriggerComparison::Equal => median == condition.threshold,
@@ -580,7 +580,15 @@ impl OracleVerifier {
                 let diff = median.saturating_sub(condition.threshold);
                 diff.abs() <= condition.tolerance
             }
-        }
+        };
+        
+        // Emit event for verification result to enable monitoring and auditing
+        env.events().publish(
+            (Symbol::new(&env, "verification_result"),),
+            (data_type, key, result, median, condition.threshold),
+        );
+        
+        result
     }
 
     /// Submit data for multiple keys in one call.

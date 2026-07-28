@@ -307,7 +307,7 @@ impl RiskPool {
         position.shares   -= shares;
         position.yield_debt = (env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0) * position.shares) / 1_000_000_000_000;
         env.storage().persistent().set(&lp_key, &position);
-        env.storage().instance().set(&StorageKey::TotalDeposited, &(total_deposited - amount));
+        env.storage().instance().set(&StorageKey::TotalDeposited, &total_deposited.checked_sub(amount).unwrap_or_else(|| panic_with_error!(&env, Error::Overflow)));
         env.storage().instance().set(&StorageKey::TotalShares,    &(total_shares - shares));
 
         env.events().publish(
