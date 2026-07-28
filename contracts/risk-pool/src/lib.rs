@@ -219,7 +219,9 @@ impl RiskPool {
         let new_shares = if total_deposited == 0 {
             amount * 1_000_000_000  // 1 share = 1 USDC * 1e9 precision
         } else {
-            amount * total_shares / total_deposited
+            amount.checked_mul(total_shares)
+                .and_then(|v| v.checked_div(total_deposited))
+                .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow))
         };
 
         if new_shares == 0 {
@@ -294,7 +296,9 @@ impl RiskPool {
 
         let available_liquidity = total_deposited.saturating_sub(total_locked);
         if available_liquidity <= 0 { panic_with_error!(&env, Error::Undercollateralized); }
-        let amount = shares * total_deposited / total_shares;
+        let amount = shares.checked_mul(total_deposited)
+            .and_then(|v| v.checked_div(total_shares))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
         if amount == 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if amount > available_liquidity { panic_with_error!(&env, Error::Undercollateralized); }
 
