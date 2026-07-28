@@ -587,3 +587,27 @@ fn sequential_create_product_ids_are_unique_and_monotone() {
     assert!(id2 > id1);
     assert!(id3 > id2);
 }
+
+#[test]
+fn test_policy_expires_at_exact_boundary() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+    
+    let now = 1_748_736_000;
+    env.ledger().with_mut(|l| l.timestamp = now);
+    let duration = 30u32;
+    let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &duration, &symbol_short!("kis2606"));
+    
+    let claims_processor = Address::generate(&env);
+    client.set_claims_processor(&admin, &claims_processor);
+    
+    // Set timestamp to exactly expiration boundary
+    env.ledger().with_mut(|l| l.timestamp = now + duration as u64 * 86_400);
+    
+    client.expire_policy(&claims_processor, &policy_id);
+    let policy = client.get_policy(&policy_id);
+    assert_eq!(policy.status, PolicyStatus::Expired);
+}
