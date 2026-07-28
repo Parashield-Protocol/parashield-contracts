@@ -379,6 +379,10 @@ impl PolicyEngine {
         // Premium calculation: premium = coverage * rate * duration_days / 365 / 10_000
         // where coverage and premium are in USDC stroops (7 decimal places),
         // premium_rate_bps is in basis points (e.g., 500 = 5%).
+        // Use checked operations to prevent overflow on large coverage amounts
+        if coverage_amount > 1_000_000_000_000 {
+            panic_with_error!(&env, Error::CoverageOutOfRange);
+        }
         let premium = coverage_amount
             .checked_mul(product.premium_rate_bps as i128)
             .and_then(|v| v.checked_mul(duration_days as i128))
