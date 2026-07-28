@@ -1,26 +1,42 @@
-# Close test-coverage and doc gaps: #164, #165, #166, #167
+# Fix missing storage TTL extension on claim, lock, and policy entries: #181, #182, #183
 
 ## Summary
 
-- **#164 (policy-engine)**: Added `cancel_policy_refund_matches_hand_calculated_value_at_known_elapsed`, which cancels a policy at a known elapsed duration (10 of 30 days) and asserts the exact `premium_paid` and refund amounts against hand-calculated values, catching off-by-one/integer-division bugs the existing approximate midpoint test would miss.
-- **#165 (governance-dao)**: Added `finalize_with_exactly_tied_votes_fails`, which drives `votes_for == votes_against` via two equal-weight voters on opposite sides and asserts `finalize()` marks the proposal `Failed` (50% for-share is below the 51% majority threshold).
-- **#166 (risk-pool)**: Added `lock_for_policy_on_empty_pool_fails_undercollateralized`, which calls `lock_for_policy` on a pool with zero deposits and asserts it rejects with `Undercollateralized` (#11).
-- **#167 (governance-dao)**: Added rustdoc to all 14 previously-undocumented public functions (`initialize`, `create_proposal`, `vote`, `withdraw_tokens`, `finalize`, `execute`, `cancel`, `get_proposal`, `get_vote`, `get_config`, `get_admin`, `proposal_count`, `get_version`, `update_config`), explaining the token-locking mechanism during voting, the quorum/majority math in `finalize()`, and the timelock behavior of `execute()`.
+Fixes three storage-TTL bugs where persistent Soroban entries could expire from
+storage (default ~20 days of inactivity) well before the business object they
+represent (a pending claim, a locked capital position, or a policy) reaches
+its natural end of life:
 
-## Incidental fix
+- **claims-processor (#183)**: `submit_claim`, `auto_process`, and
+  `evaluate_and_settle` (the write path shared by `process_claim`,
+  `auto_process`, and `batch_auto_process`) now call `extend_ttl` on the
+  `Claim` and `PolicyClaim` persistent entries whenever they are written, so a
+  pending claim can no longer be evicted from storage before a keeper
+  processes it.
+- **risk-pool (#182)**: `lock_for_policy` (a.k.a. `lock_capital`) and
+  `release_for_claim` now call `extend_ttl` on the `Lock` entry. Also applied
+  the same fix to `release_for_expiry`, which writes the identical `Lock`
+  entry and was subject to the same eviction risk. A capital lock backing a
+  long-dated policy will no longer silently expire from storage before the
+  policy matures.
+- **policy-engine (#181)**: `create_product` and `buy_policy` now call
+  `extend_ttl` on the `Product`/`ProductKey` and `Policy`/`UserPolicies`
+  persistent entries respectively, so a policy purchased for up to the
+  product's `max_duration_days` no longer risks losing its storage entry
+  (and any associated claims data) to rent expiry.
 
-While compiling to verify the new tests, found that `risk-pool`'s `Error` enum assigned discriminant `17` to both `InsufficientShares` and `DepositTooSmall`, which fails to compile under `#[repr(u32)]`. This silently blocked the entire `risk-pool` crate (including its full existing test suite) from ever building. Fixed by giving `InsufficientShares` its own discriminant (`18`); `DepositTooSmall` keeps `17` to match existing tests asserting `Error(Contract, #17)`.
+Each contract extends entries out to ~1 year (`6_312_000` ledgers at ~5s/ledger)
+once they drop below a ~30-day (`518_400` ledger) threshold.
 
-## Note on pre-existing failures (not in scope, left as-is)
+## Not changed
 
-Once `risk-pool` could compile, two pre-existing failures surfaced that are unrelated to the four issues above and were not introduced by this change (verified against unmodified `main`):
-- `risk-pool::test::withdraw_uses_available_liquidity_after_locks` and its duplicate `_2`
-- `governance-dao::test::test_finalize_refunds_deposit_locked_at_creation_not_live_config`
-
-These look like real bugs (e.g. `vote()` locks a voter's entire token balance, but `finalize()` only refunds the `create_proposal` deposit, not the voting lock) but are out of scope for this PR and are flagged here for a separate fix.
+- **oracle-verifier (#180)**: investigated and found already fixed —
+  `add_oracle` and `update_oracle_weight` both reject `weight == 0` via
+  `Error::InvalidWeight`, and this is covered by
+  `test_cannot_update_oracle_to_invalid_weight` in
+  `contracts/oracle-verifier/src/test.rs`. No code change needed.
 
 ## Test plan
 
-- [x] `cargo test -p parashield-policy-engine` — all pass
-- [x] `cargo test -p parashield-governance-dao` — all pass except the pre-existing, unrelated `test_finalize_refunds_deposit_locked_at_creation_not_live_config`
-- [x] `cargo test -p parashield-risk-pool` — all pass except the pre-existing, unrelated `withdraw_uses_available_liquidity_after_locks[_2]`
+- [x] `cargo build --workspace` succeeds
+- [ ] `cargo test --workspace` passes
