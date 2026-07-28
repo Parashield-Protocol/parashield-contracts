@@ -135,14 +135,17 @@ fn test_cannot_update_unregistered_oracle_weight() {
     client.update_oracle_weight(&admin, &oracle, &weather(), &80u32);
 }
 
+/// Adding an oracle with weight == 0 must be rejected with InvalidWeight (#8).
+/// Weight must be 1-100 for all oracle registrations.
 #[test]
 #[should_panic(expected = "Error(Contract, #8)")]
-fn test_cannot_update_oracle_to_invalid_weight() {
+fn test_add_oracle_with_zero_weight_rejected() {
     let (env, admin, contract_id) = setup();
     let client = OracleVerifierClient::new(&env, &contract_id);
     let oracle = Address::generate(&env);
-    client.add_oracle(&admin, &oracle, &weather(), &50u32);
-    client.update_oracle_weight(&admin, &oracle, &weather(), &0u32);
+    
+    // Attempt to add oracle with weight = 0 — must panic with InvalidWeight (#8)
+    client.add_oracle(&admin, &oracle, &weather(), &0u32);
 }
 
 #[test]
@@ -245,6 +248,21 @@ fn test_removed_oracle_cannot_submit() {
     client.add_oracle(&admin, &oracle, &weather(), &80u32);
     client.remove_oracle(&admin, &oracle, &weather());
     client.submit_data(&oracle, &weather(), &kisumu_key(), &10_000_000i128, &90u32, &1748736000u64);
+}
+
+/// Test that an oracle that was never registered cannot submit data.
+/// This verifies the OracleNotRegistered error path is properly enforced.
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_deregistered_oracle_cannot_submit() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    
+    let oracle = Address::generate(&env); // Never registered
+    
+    // Attempt to submit from an oracle that was never registered
+    // Must panic with OracleNotRegistered (#4)
+    client.submit_data(&oracle, &weather(), &kisumu_key(), &20_000_000i128, &90u32, &1748736000u64);
 }
 
 #[test]

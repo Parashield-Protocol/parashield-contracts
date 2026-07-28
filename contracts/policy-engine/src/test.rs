@@ -344,10 +344,11 @@ fn test_cancel_policy_refunds_premium() {
     assert_eq!(client.get_policy(&policy_id).status, PolicyStatus::Cancelled);
 }
 
-/// Cancelling after the full coverage window has elapsed refunds nothing —
-/// the entire premium has been earned.
+/// Cancelling a policy after its end_time has passed (expired policy) refunds 0.
+/// This tests the elapsed.min(total_duration) capping logic to ensure refund is 0
+/// when elapsed >= total_duration.
 #[test]
-fn test_cancel_after_full_duration_refunds_nothing() {
+fn test_cancel_expired_policy_after_end_time() {
     let (env, admin, _oracle, usdc, contract_id) = setup();
     let client = PolicyEngineClient::new(&env, &contract_id);
     let pid    = create_crop_product(&env, &client, &admin);
@@ -355,15 +356,31 @@ fn test_cancel_after_full_duration_refunds_nothing() {
     let buyer = Address::generate(&env);
     StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
 
-    env.ledger().with_mut(|l| l.timestamp = 0);
+    // Set timestamp and create a 30-day policy
+    env.ledger().with_mut(|l| l.timestamp = 1_000_000);
     let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
 
-    // Jump to the policy end time — the full premium is now earned.
     let policy = client.get_policy(&policy_id);
-    env.ledger().with_mut(|l| l.timestamp = policy.end_time);
+    let end_time = policy.end_time;
+    
+    // Advance time well past the policy end_time (simulate an expired policy)
+    let days_past_expiry = 10u64;
+    let new_timestamp = end_time + (days_past_expiry * 86_400);
+    env.ledger().with_mut(|l| l.timestamp = new_timestamp);
 
+    let buyer_before = TokenClient::new(&env, &usdc).balance(&buyer);
+    
+    // Cancel the expired policy
     let refund = client.cancel_policy(&buyer, &policy_id);
-    assert_eq!(refund, 0, "fully-elapsed policy must refund nothing");
+
+    // Refund must be 0 because elapsed >= total_duration
+    assert_eq!(refund, 0, "refund for expired policy (time past end) must be 0");
+    
+    // Verify no USDC was transferred back to buyer
+    let buyer_after = TokenClient::new(&env, &usdc).balance(&buyer);
+    assert_eq!(buyer_after, buyer_before, "buyer balance should not change (0 refund)");
+    
+    // Verify policy status is Cancelled
     assert_eq!(client.get_policy(&policy_id).status, PolicyStatus::Cancelled);
 }
 
