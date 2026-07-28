@@ -57,6 +57,7 @@ pub enum Error {
     TimelockNotExpired = 13,
     FinalizeDelayNotMet = 14,
     VersionNotNewer = 15,
+    LimitReached = 16,
 }
 
 #[contract]
@@ -176,7 +177,7 @@ impl GovernanceDao {
             votes_against: 0,
             votes_abstain: 0,
             created_at: now,
-            vote_end: now + config.voting_period,
+            vote_end: now.saturating_add(config.voting_period),
             execution_time: 0,
             total_supply: config.total_supply,
         };
@@ -186,7 +187,7 @@ impl GovernanceDao {
             .set(&StorageKey::Proposal(proposal_id), &proposal);
         env.storage()
             .instance()
-            .set(&StorageKey::NextProposalId, &(proposal_id + 1));
+            .set(&StorageKey::NextProposalId, &(proposal_id.checked_add(1).unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))));
 
         // Note: You can append `args` to your event payload if necessary
         env.events().publish(
@@ -354,7 +355,7 @@ impl GovernanceDao {
             proposal.status = ProposalStatus::Failed;
         } else {
             let for_bps = if total_votes > 0 {
-                proposal.votes_for * 10_000 / total_votes
+                proposal.votes_for.checked_mul(10_000).map(|v| v / total_votes).unwrap_or(0)
             } else {
                 0
             };
