@@ -806,7 +806,7 @@ fn test_upgrade_increments_version() {
 fn test_multiple_upgrades_track_version_correctly() {
     let (env, admin, _oracle, _usdc, contract_id) = setup();
     let client = PolicyEngineClient::new(&env, &contract_id);
-    
+
     assert_eq!(client.get_version(), 1);
     client.upgrade(&admin, &BytesN::from_array(&env, &[1u8; 32]), &2);
     assert_eq!(client.get_version(), 2);

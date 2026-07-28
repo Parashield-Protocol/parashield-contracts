@@ -592,6 +592,14 @@ impl ClaimsProcessor {
         // without bound.
         Self::remove_from_pending(env, claim.id);
 
+        // Emit specific event for rejected claims to enable off-chain monitoring
+        if !trigger_met {
+            env.events().publish(
+                (Symbol::new(env, "claim_rejected"),),
+                (claim.id, claim.policy_id, Symbol::new(env, "trigger_not_met")),
+            );
+        }
+
         env.events().publish(
             (Symbol::new(env, "claim_settled"), claim.id),
             (claim.trigger_met, claim.coverage_amount),
