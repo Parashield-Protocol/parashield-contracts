@@ -52,6 +52,15 @@ trait IOracleVerifier {
     ) -> bool;
 }
 
+// ─── Storage TTL ──────────────────────────────────────────────────────────────
+
+/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
+/// (at ~5s/ledger).
+const TTL_THRESHOLD: u32 = 518_400;
+/// Extend persistent entries out to ~1 year (at ~5s/ledger) so pending claims
+/// survive long enough to be processed.
+const TTL_EXTEND_TO: u32 = 6_312_000;
+
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -250,7 +259,9 @@ impl ClaimsProcessor {
             dispute_reason: None,
         };
         env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
+        env.storage().persistent().extend_ttl(&StorageKey::Claim(claim_id), TTL_THRESHOLD, TTL_EXTEND_TO);
         env.storage().persistent().set(&StorageKey::PolicyClaim(policy_id), &claim_id);
+        env.storage().persistent().extend_ttl(&StorageKey::PolicyClaim(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
 
         let mut pending: Vec<u128> = env.storage().instance()
             .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(&env));
@@ -352,7 +363,9 @@ impl ClaimsProcessor {
                 dispute_reason: None,
             };
             env.storage().persistent().set(&StorageKey::Claim(cid), &claim);
+            env.storage().persistent().extend_ttl(&StorageKey::Claim(cid), TTL_THRESHOLD, TTL_EXTEND_TO);
             env.storage().persistent().set(&StorageKey::PolicyClaim(policy_id), &cid);
+            env.storage().persistent().extend_ttl(&StorageKey::PolicyClaim(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
 
             // Make the new claim visible to batch processors and monitoring.
             let mut pending: Vec<u128> = env.storage().instance()
@@ -597,6 +610,7 @@ impl ClaimsProcessor {
         };
 
         env.storage().persistent().set(&StorageKey::Claim(claim.id), claim);
+        env.storage().persistent().extend_ttl(&StorageKey::Claim(claim.id), TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // The claim is now settled (Paid/Rejected) — drop it from the pending
         // queue so it is neither re-evaluated nor allowed to grow the queue
@@ -690,16 +704,6 @@ impl ClaimsProcessor {
         if buf[0] != b'G' && buf[0] != b'C' {
             panic_with_error!(env, Error::InvalidAddress);
         }
-    }
-
-    fn require_admin(env: &Env, caller: &Address) {
-        let admin: Address = env.storage().instance()
-            .get(&StorageKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
-        if *caller != admin {
-            panic_with_error!(env, Error::Unauthorized);
-        }
-        caller.require_auth();
     }
 }
 

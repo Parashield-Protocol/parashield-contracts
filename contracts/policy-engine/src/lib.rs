@@ -28,6 +28,17 @@ use soroban_sdk::{
 pub mod types;
 pub use types::*;
 
+// ─── Storage TTL ──────────────────────────────────────────────────────────────
+
+/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
+/// (at ~5s/ledger).
+#[cfg(any(test, feature = "testutils", not(feature = "library")))]
+const TTL_THRESHOLD: u32 = 518_400;
+/// Extend persistent entries out to ~1 year (at ~5s/ledger) so long-lived
+/// products and policies don't get evicted from storage before they mature.
+#[cfg(any(test, feature = "testutils", not(feature = "library")))]
+const TTL_EXTEND_TO: u32 = 6_312_000;
+
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -253,9 +264,11 @@ impl PolicyEngine {
             created_at:         env.ledger().timestamp(),
         };
         env.storage().persistent().set(&StorageKey::Product(id), &product);
+        env.storage().persistent().extend_ttl(&StorageKey::Product(id), TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // Store the (category, oracle_key) -> product_id mapping for uniqueness
-        env.storage().persistent().set(&StorageKey::ProductKey(key), &id);
+        env.storage().persistent().set(&StorageKey::ProductKey(key.clone()), &id);
+        env.storage().persistent().extend_ttl(&StorageKey::ProductKey(key), TTL_THRESHOLD, TTL_EXTEND_TO);
 
         let mut products: Vec<u128> = env.storage().instance()
             .get(&StorageKey::ActiveProducts).unwrap_or_else(|| Vec::new(&env));
@@ -403,6 +416,7 @@ impl PolicyEngine {
             created_at: now,
         };
         env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
+        env.storage().persistent().extend_ttl(&StorageKey::Policy(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // Append to user's policy list
         let user_key = StorageKey::UserPolicies(buyer.clone());
@@ -410,6 +424,7 @@ impl PolicyEngine {
             .get(&user_key).unwrap_or_else(|| Vec::new(&env));
         user_policies.push_back(policy_id);
         env.storage().persistent().set(&user_key, &user_policies);
+        env.storage().persistent().extend_ttl(&user_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         env.events().publish(
             (Symbol::new(&env, "buy_policy"), buyer),

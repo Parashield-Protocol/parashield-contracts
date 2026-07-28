@@ -38,6 +38,13 @@ const MIN_DEPOSIT: i128 = 1_000_000;
 /// Timelock duration for admin withdrawals: 7 days in seconds.
 const TIMELOCK_SECONDS: u64 = 7 * 24 * 60 * 60;
 
+/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
+/// (at ~5s/ledger).
+const TTL_THRESHOLD: u32 = 518_400;
+/// Extend persistent entries out to ~1 year (at ~5s/ledger) so capital locks
+/// backing long-dated policies don't expire from storage before maturity.
+const TTL_EXTEND_TO: u32 = 6_312_000;
+
 #[contracttype]
 enum StorageKey {
     Initialized,
@@ -444,6 +451,7 @@ impl RiskPool {
             locked_at: env.ledger().timestamp(),
             released:  false,
         });
+        env.storage().persistent().extend_ttl(&StorageKey::Lock(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
         env.storage().instance().set(&StorageKey::TotalLocked, &(total_locked + amount));
 
         env.events().publish(
@@ -469,6 +477,7 @@ impl RiskPool {
         
         lock.released = true;
         env.storage().persistent().set(&StorageKey::Lock(policy_id), &lock);
+        env.storage().persistent().extend_ttl(&StorageKey::Lock(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
         let total_locked: i128 = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
         env.storage().instance().set(&StorageKey::TotalLocked, &(total_locked.saturating_sub(lock.amount)));
 
@@ -491,6 +500,7 @@ impl RiskPool {
         if lock.released { panic_with_error!(&env, Error::AlreadyReleased); }
         lock.released = true;
         env.storage().persistent().set(&StorageKey::Lock(policy_id), &lock);
+        env.storage().persistent().extend_ttl(&StorageKey::Lock(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
         let total_locked: i128 = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
         env.storage().instance().set(&StorageKey::TotalLocked, &(total_locked.saturating_sub(lock.amount)));
     }
