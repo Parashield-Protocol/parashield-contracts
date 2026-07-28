@@ -10,6 +10,7 @@ use parashield_policy_engine::{
     PolicyEngine, PolicyEngineClient,
     TriggerType, TriggerComparison, CreateProductParams,
 };
+use parashield_risk_pool::{RiskPool, RiskPoolClient};
 
 const COVERAGE: i128 = 1_000_000_000; // 100 USDC
 
@@ -17,11 +18,12 @@ struct World {
     env:       Env,
     admin:     Address,
     keeper:    Address,
-    oracle_w:  Address, // oracle wallet (submits data)
+    oracle_w:  Address,
     usdc:      Address,
-    oracle_id: Address, // oracle-verifier contract
-    policy_id: Address, // policy-engine contract
-    claims_id: Address, // claims-processor contract
+    oracle_id: Address,
+    policy_id: Address,
+    claims_id: Address,
+    pool_id:   Address,
 }
 
 fn deploy() -> World {
@@ -41,32 +43,44 @@ fn deploy() -> World {
     OracleVerifierClient::new(&env, &oracle_id)
         .add_oracle(&admin, &oracle_wallet, &symbol_short!("weather"), &90u32);
 
-    // 2. Deploy policy engine
+    // 2. Deploy risk pool (category: crop)
+    let backstop = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    let treasury = Address::generate(&env);
+    let pool_id = env.register(RiskPool, ());
+
+    // 3. Deploy policy engine (placeholder for risk pool init)
     let policy_id = env.register(PolicyEngine, ());
+    
+    // 4. Deploy claims processor (placeholder for risk pool init)
+    let claims_id = env.register(ClaimsProcessor, ());
+
+    // Initialize risk pool with correct addresses
+    RiskPoolClient::new(&env, &pool_id).initialize(
+        &admin,
+        &usdc,
+        &treasury,
+        &backstop,
+        &symbol_short!("crop"),
+        &policy_id,
+        &claims_id,
+    );
+
+    // Initialize other contracts
     PolicyEngineClient::new(&env, &policy_id)
         .initialize(&admin, &usdc, &oracle_id);
-
-    // 3. Deploy claims processor
-    let claims_id = env.register(ClaimsProcessor, ());
+    
     ClaimsProcessorClient::new(&env, &claims_id)
-        .initialize(&admin, &policy_id, &oracle_id, &604_800u64);
+        .initialize(&admin, &policy_id, &pool_id, &oracle_id, &604_800u64);
+    
     // Authorize keeper on the claims processor
     ClaimsProcessorClient::new(&env, &claims_id)
         .add_keeper(&admin, &keeper);
 
-    // 4. Wire claims processor as authorized caller on policy engine
+    // Wire claims processor as authorized caller on policy engine
     PolicyEngineClient::new(&env, &policy_id)
         .set_claims_processor(&admin, &claims_id);
 
-    // 4b. Register the keeper so it may settle claims
-    ClaimsProcessorClient::new(&env, &claims_id)
-        .add_keeper(&admin, &keeper);
-
-    // 5. Pre-fund the policy engine with coverage capital (simulates risk pool in v1)
-    //    In production the Risk Pool contract provides this capital.
-    StellarAssetClient::new(&env, &usdc).mint(&policy_id, &100_000_000_000i128);
-
-    World { env, admin, keeper, oracle_w: oracle_wallet, usdc, oracle_id, policy_id, claims_id }
+    World { env, admin, keeper, oracle_w: oracle_wallet, usdc, oracle_id, policy_id, claims_id, pool_id }
 }
 
 fn create_crop_product(w: &World) -> u128 {
@@ -90,8 +104,18 @@ fn create_crop_product(w: &World) -> u128 {
 
 fn buy_crop_policy(w: &World, buyer: &Address, product_id: u128) -> u128 {
     StellarAssetClient::new(&w.env, &w.usdc).mint(buyer, &5_000_000_000i128);
-    PolicyEngineClient::new(&w.env, &w.policy_id)
-        .buy_policy(buyer, &product_id, &COVERAGE, &30u32, &symbol_short!("kis2606"))
+    // Fund the pool with coverage capital
+    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.pool_id, &10_000_000_000i128);
+    // Deposit to pool and lock coverage for the policy
+    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&buyer, &1_000_000_000i128, &0i128);
+    
+    let policy_id = PolicyEngineClient::new(&w.env, &w.policy_id)
+        .buy_policy(buyer, &product_id, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+    
+    // Lock coverage in the pool for this policy
+    RiskPoolClient::new(&w.env, &w.pool_id).lock_for_policy(&w.admin, &policy_id, &COVERAGE);
+    
+    policy_id
 }
 
 fn submit_rainfall(w: &World, mm_7dec: i128) {
@@ -124,7 +148,7 @@ fn test_drought_trigger_pays_out() {
     assert_eq!(result, ClaimResult::Paid);
     // Buyer: minted 5_000_000_000, paid 50_000_000 premium, received 1_000_000_000 coverage
     let balance = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
-    assert_eq!(balance, 5_000_000_000 - 50_000_000 + 1_000_000_000);
+    assert_eq!(balance, 5_000_000_000 - 4_109_589 + 1_000_000_000);
 }
 
 /// Buy policy → oracle submits above threshold → auto_process rejects.
@@ -144,7 +168,7 @@ fn test_good_rainfall_no_payout() {
     assert_eq!(result, ClaimResult::Rejected);
     // Buyer: minted 5_000_000_000, paid 50_000_000 premium, no payout received
     let buyer_bal = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
-    assert_eq!(buyer_bal, 5_000_000_000 - 50_000_000, "no payout when trigger not met");
+    assert_eq!(buyer_bal, 5_000_000_000 - 4_109_589, "no payout when trigger not met");
 }
 
 /// Policy past end_time with no trigger → auto_process marks Expired.
@@ -185,7 +209,7 @@ fn test_double_process_idempotent() {
 
     // Buyer should NOT receive double coverage — exactly one payout
     let balance = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
-    assert_eq!(balance, 5_000_000_000 - 50_000_000 + 1_000_000_000);
+    assert_eq!(balance, 5_000_000_000 - 4_109_589 + 1_000_000_000);
 }
 
 #[test]
@@ -440,11 +464,12 @@ fn test_initialize_with_valid_addresses_succeeds() {
     
     let admin           = Address::generate(&env);
     let policy_engine   = Address::generate(&env);
+    let risk_pool       = Address::generate(&env);
     let oracle_verifier = Address::generate(&env);
     
     let claims_id = env.register(ClaimsProcessor, ());
     ClaimsProcessorClient::new(&env, &claims_id)
-        .initialize(&admin, &policy_engine, &oracle_verifier, &604_800u64);
+        .initialize(&admin, &policy_engine, &risk_pool, &oracle_verifier, &604_800u64);
     
     // Should succeed without panic
     let stored_admin = ClaimsProcessorClient::new(&env, &claims_id).get_admin();
@@ -505,4 +530,57 @@ fn test_non_keeper_cannot_process_claim() {
 
     let stranger = Address::generate(&w.env);
     cp.process_claim(&stranger, &claim_id);
+}
+
+// ── Issue #160: double-processing the same claim via process_claim ──────────────
+
+/// Calling `process_claim` twice on the same claim_id in quick succession must
+/// return `AlreadyProcessed` on the second call rather than re-invoking the
+/// oracle and paying out again. This tests the idempotency guard at the
+/// process_claim level (PolicyClaim check at line 292 of lib.rs).
+#[test]
+fn test_process_claim_double_processing_returns_already_processed() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+
+    // Submit low rainfall so the trigger is met
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+
+    // First call settles the claim (Paid)
+    let first = cp.process_claim(&w.keeper, &claim_id);
+    assert_eq!(first, ClaimResult::Paid);
+
+    // Second call on same claim returns AlreadyProcessed
+    let second = cp.process_claim(&w.keeper, &claim_id);
+    assert_eq!(second, ClaimResult::AlreadyProcessed);
+
+    // Balance confirms exactly one payout — no double-spend
+    let balance = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
+    assert_eq!(balance, 5_000_000_000 - 4_109_589 + 1_000_000_000);
+}
+
+/// Test that batch_auto_process with an empty pending list returns an empty vector.
+/// This verifies the function gracefully handles the zero-claims case without panicking.
+#[test]
+fn test_batch_auto_process_empty_pending_list() {
+    let w = deploy();
+    
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    
+    // Verify no pending claims exist initially
+    assert_eq!(cp.get_pending_claims().len(), 0);
+    
+    // Call batch_auto_process with limit=10 on an empty list
+    let results = cp.batch_auto_process(&w.keeper, &10u32);
+    
+    // Must return an empty vector
+    assert_eq!(results.len(), 0, "batch_auto_process must return empty vec when pending list is empty");
+    
+    // Pending list should still be empty
+    assert_eq!(cp.get_pending_claims().len(), 0);
 }

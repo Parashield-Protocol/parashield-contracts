@@ -97,12 +97,14 @@ fn deprecate_product_removes_from_active_list() {
 }
 
 #[test]
-fn pause_product_changes_status_but_stays_in_active_list() {
+fn pause_product_removes_from_active_list() {
     let (_, pe, admin, _, _) = setup();
     let prod_id = pe.create_product(&admin, &basic_params());
+    assert_eq!(pe.get_active_products().len(), 1);
     pe.pause_product(&admin, &prod_id);
     let prod = pe.get_product(&prod_id);
     assert_eq!(prod.status, ProductStatus::Paused);
+    assert_eq!(pe.get_active_products().len(), 0);
 }
 
 // ── policy cancellation ────────────────────────────────────────────────────────
@@ -139,6 +141,84 @@ fn get_user_policies_tracks_multiple_policies() {
     // Verify offset out of bounds
     let p3 = pe.get_user_policies(&user, &2u32, &1u32);
     assert_eq!(p3.len(), 0);
+}
+
+// ── pro-rated cancellation refund ──────────────────────────────────────────────
+
+/// Cancelling halfway through the coverage period must refund only the *unearned*
+/// portion of the premium — never 100%. Guards against free-coverage exploit.
+#[test]
+fn cancel_policy_prorates_refund_by_elapsed_time() {
+    use soroban_sdk::testutils::Ledger as _;
+
+    let (env, pe, admin, _, user) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params());
+
+    // Buy at t=0 with a 30-day policy.
+    env.ledger().with_mut(|l| l.timestamp = 0);
+    let policy_id = pe.buy_policy(
+        &user, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+    );
+
+    let policy = pe.get_policy(&policy_id);
+    let premium = policy.premium_paid;
+    assert!(premium > 0);
+
+    // Advance to the exact midpoint of the coverage window.
+    let midpoint = policy.start_time + (policy.end_time - policy.start_time) / 2;
+    env.ledger().with_mut(|l| l.timestamp = midpoint);
+
+    let refund = pe.cancel_policy(&user, &policy_id);
+
+    // Refund must be strictly partial: roughly half the premium (allow ±1 stroop
+    // rounding), and never the full amount.
+    assert!(refund > 0, "half-elapsed refund should be positive");
+    assert!(refund < premium, "half-elapsed refund must not be 100%");
+    let expected_half = premium / 2;
+    assert!((refund - expected_half).abs() <= 1, "refund should be ~half the premium");
+}
+
+/// Cancel at a known elapsed duration (10 of 30 days) and assert the exact
+/// refund amount against a hand-calculated expected value. This catches an
+/// off-by-one or integer-division bug in the pro-rating formula that a mere
+/// "cancellation succeeds" test would miss.
+#[test]
+fn cancel_policy_refund_matches_hand_calculated_value_at_known_elapsed() {
+    use soroban_sdk::testutils::Ledger as _;
+
+    let (env, pe, admin, _, user) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params());
+
+    env.ledger().with_mut(|l| l.timestamp = 0);
+    let policy_id = pe.buy_policy(
+        &user, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+    );
+
+    let policy = pe.get_policy(&policy_id);
+    // Hand-calculated: premium = coverage * rate_bps * duration_days / 365 / 10_000
+    //   = 10_000_000_000 * 300 * 30 / 365 / 10_000 = 24_657_534
+    assert_eq!(policy.premium_paid, 24_657_534i128);
+
+    // Advance 10 of the 30 days (864_000 of 2_592_000 seconds elapsed).
+    env.ledger().with_mut(|l| l.timestamp = 864_000);
+
+    let refund = pe.cancel_policy(&user, &policy_id);
+
+    // earned = premium_paid * elapsed_capped / total_duration
+    //        = 24_657_534 * 864_000 / 2_592_000 = 8_219_178
+    // refund = premium_paid - earned = 16_438_356
+    assert_eq!(refund, 16_438_356i128);
+}
+
+/// buy_policy must be rejected while the contract is under emergency pause.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn buy_policy_blocked_while_paused() {
+    let (_env, pe, admin, _, user) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params());
+    pe.emergency_pause(&admin);
+    // Purchasing while paused must panic with Unauthorized (#3).
+    pe.buy_policy(&user, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"));
 }
 
 #[test]

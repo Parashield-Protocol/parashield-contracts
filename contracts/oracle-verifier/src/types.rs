@@ -10,6 +10,8 @@ pub enum TriggerComparison {
     GreaterThan,
     /// Trigger fires when observed == threshold (binary events)
     Equal,
+    /// Matches if |median - threshold| <= tolerance
+    EqualWithTolerance,
 }
 
 /// A trigger condition evaluated by the Claims Processor.
@@ -23,6 +25,9 @@ pub struct TriggerCondition {
     /// Threshold in 7-decimal fixed point
     pub threshold: i128,
     pub comparison: TriggerComparison,
+    /// The maximum acceptable absolute variance.
+    /// Set to 0 if utilizing standard LessThan/GreaterThan/Equal.
+    pub tolerance: i128,
 }
 
 /// Input struct for a single reading inside a bulk `submit_data_batch` call.
@@ -57,7 +62,17 @@ pub struct OracleDataPoint {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregatedData {
     pub median_value: i128,
+    /// Number of data submissions currently stored for this (data_type, key) —
+    /// NOT the number of currently-registered active oracles for the
+    /// data_type (see `active_oracle_count`). Kept for backward
+    /// compatibility with existing callers of this field.
     pub oracle_count: u32,
+    /// Number of oracles currently registered and active for this
+    /// data_type, independent of whether they have submitted data for
+    /// this specific key. Use this (not `oracle_count`) as a proxy for
+    /// oracle diversity/registration health — `oracle_count` conflates
+    /// submission count with registration count (issue #136).
+    pub active_oracle_count: u32,
     /// Aggregated confidence is the weighted average of valid oracle confidences,
     /// weighted by each oracle's configured registration weight and rounded down.
     pub confidence: u32,
@@ -142,10 +157,14 @@ pub struct OracleDataSubmitted {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaxDataAgeUpdated {
-    pub max_age: u64,
-}
 pub struct AdminUpdated {
     pub new_admin: Address,
 }
 
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUpgraded {
+    pub old_version: u32,
+    pub new_version: u32,
+}

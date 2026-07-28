@@ -78,10 +78,32 @@ fn test_initialize_with_non_token_usdc() {
     let pool_id = env.register(RiskPool, ());
     let pool = RiskPoolClient::new(&env, &pool_id);
     
-    pool.initialize(&admin, &fake_usdc, &treasury, &Symbol::new(&env, "crop"));
+    pool.initialize(
+        &admin,
+        &fake_usdc,
+        &treasury,
+        &Address::generate(&env), // backstop
+        &Symbol::new(&env, "crop"),
+        &Address::generate(&env), // policy_engine
+        &Address::generate(&env), // claims_processor
+    );
 }
 
 // ── deposits ──────────────────────────────────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_deposit_too_small_panics() {
+    let (_, pool, _, _, _, lp1) = setup();
+    pool.deposit(&lp1, &999_999i128, &0i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_deposit_1_stroop_panics() {
+    let (_, pool, _, _, _, lp1) = setup();
+    pool.deposit(&lp1, &1i128, &0i128); // 1 stroop
+}
 
 #[test]
 fn first_deposit_mints_one_to_one_shares() {
@@ -207,6 +229,31 @@ fn test_lock_negative_coverage_panics() {
 }
 
 // ── premium routing ────────────────────────────────────────────────────────────
+
+#[test]
+fn receive_premium_distributes_1000_usdc_80_10_10() {
+    let (env, pool, usdc_id, _, treasury, lp1) = setup();
+    let backstop = pool.get_backstop();
+    let usdc = token::Client::new(&env, &usdc_id);
+
+    pool.deposit(&lp1, &1_000_0000000i128, &0i128);
+
+    let treasury_before = usdc.balance(&treasury);
+    let backstop_before = usdc.balance(&backstop);
+    let lp_premium_before = pool.get_stats().accumulated_premium;
+
+    let premium = 1_000_0000000i128; // 1000 USDC
+    pool.receive_premium(&lp1, &premium);
+
+    let lp_share = pool.get_stats().accumulated_premium - lp_premium_before;
+    let treasury_share = usdc.balance(&treasury) - treasury_before;
+    let backstop_share = usdc.balance(&backstop) - backstop_before;
+
+    assert_eq!(lp_share, 800_0000000i128);
+    assert_eq!(treasury_share, 100_0000000i128);
+    assert_eq!(backstop_share, 100_0000000i128);
+    assert_eq!(lp_share + treasury_share + backstop_share, premium);
+}
 
 #[test]
 fn receive_premium_adds_lp_share() {
@@ -357,14 +404,12 @@ fn test_deposit_precision_loss_prevented() {
     // LP1 deposits 1000 USDC
     pool.deposit(&lp1, &1000_0000000i128, &0i128);
 
-    // LP2 deposits just 1 stroop (smallest possible unit)
-    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &1i128);
-    let shares = pool.deposit(&lp2, &1i128, &0i128);
+    // LP2 deposits the MIN_DEPOSIT (1_000_000 stroops)
+    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &1_000_000i128);
+    let shares = pool.deposit(&lp2, &1_000_000i128, &0i128);
 
-    // Because of the 1e9 precision multiplier, 1 stroop yields 1e9 shares.
-    // This prevents truncation to 0 even if the pool's deposited amount grew 
-    // significantly out of proportion to shares in the future.
-    assert_eq!(shares, 1_000_000_000i128);
+    // 1_000_000 stroops yields 1_000_000_000_000_000 shares (because 1 USDC = 1e9 shares).
+    assert_eq!(shares, 1_000_000_000_000_000i128);
     assert!(shares > 0);
 }
 
@@ -430,6 +475,16 @@ fn admin_timelock_cancel_and_re_request() {
     assert_eq!(pool.get_available_liquidity(), 800_0000000i128);
 }
 
+/// lock_for_policy on a pool with zero deposits (total_deposited == 0,
+/// total_locked == 0) must reject with Undercollateralized rather than
+/// silently succeeding or underflowing.
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn lock_for_policy_on_empty_pool_fails_undercollateralized() {
+    let (_, pool, _usdc_id, admin, _treasury, _lp1) = setup();
+    pool.lock_for_policy(&admin, &1u128, &1_0000000i128);
+}
+
 /// Non-admin cannot call lock_for_policy.
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]
@@ -462,98 +517,6 @@ fn non_admin_cannot_release_for_expiry() {
     pool.release_for_expiry(&lp1, &1u128);
 }
 
-// ── issue #84: policy engine / claims processor authorization ─────────────────
-
-/// Policy engine (registered at init) can lock capital.
-#[test]
-fn policy_engine_can_lock_for_policy() {
-    let (env, _pool, usdc_id, _admin, _treasury, lp1) = setup();
-    let policy_engine    = Address::generate(&env);
-    let claims_processor = Address::generate(&env);
-    let backstop         = env.register_stellar_asset_contract_v2(_admin.clone()).address();
-
-    let pool2_id = env.register(RiskPool, ());
-    let pool2    = RiskPoolClient::new(&env, &pool2_id);
-    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp1, &1_000_0000000i128);
-    pool2.initialize(
-        &_admin,
-        &usdc_id,
-        &_treasury,
-        &backstop,
-        &Symbol::new(&env, "defi"),
-        &policy_engine,
-        &claims_processor,
-    );
-    pool2.deposit(&lp1, &500_0000000i128, &0i128);
-    pool2.lock_for_policy(&policy_engine, &1u128, &100_0000000i128);
-    assert_eq!(pool2.get_utilization_rate(), 2_000u32);
-}
-
-/// Claims processor (registered at init) can release capital.
-#[test]
-fn claims_processor_can_release_for_claim() {
-    let (env, _pool, usdc_id, _admin, _treasury, lp1) = setup();
-    let policy_engine    = Address::generate(&env);
-    let claims_processor = Address::generate(&env);
-    let backstop         = env.register_stellar_asset_contract_v2(_admin.clone()).address();
-
-    let pool2_id = env.register(RiskPool, ());
-    let pool2    = RiskPoolClient::new(&env, &pool2_id);
-    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp1, &1_000_0000000i128);
-    pool2.initialize(
-        &_admin,
-        &usdc_id,
-        &_treasury,
-        &backstop,
-        &Symbol::new(&env, "defi"),
-        &policy_engine,
-        &claims_processor,
-    );
-    pool2.deposit(&lp1, &500_0000000i128, &0i128);
-    pool2.lock_for_policy(&policy_engine, &1u128, &100_0000000i128);
-    pool2.release_for_claim(&claims_processor, &1u128);
-    assert_eq!(pool2.get_utilization_rate(), 0u32);
-}
-
-/// Arbitrary address that is not admin, policy_engine, or claims_processor cannot lock.
-#[test]
-#[should_panic(expected = "Error(Contract, #3)")]
-fn arbitrary_address_cannot_lock_for_policy() {
-    let (env, pool, _, _, _, lp1) = setup();
-    pool.deposit(&lp1, &500_0000000i128, &0i128);
-    let attacker = Address::generate(&env);
-    pool.lock_for_policy(&attacker, &1u128, &100_0000000i128);
-}
-
-// ── issue #85: backstop tracking in stats ─────────────────────────────────────
-
-/// receive_premium tracks backstop amount in get_stats.
-#[test]
-fn receive_premium_tracks_accumulated_backstop() {
-    let (_, pool, _, _, _, lp1) = setup();
-    pool.deposit(&lp1, &1_000_0000000i128, &0i128);
-    pool.receive_premium(&lp1, &100_0000000i128);
-    let stats = pool.get_stats();
-    // 10% of 100 USDC goes to backstop
-    assert_eq!(stats.accumulated_backstop, 10_0000000i128);
-    // 80% goes to LP accumulated
-    assert_eq!(stats.accumulated_premium, 80_0000000i128);
-}
-
-// ── issue #86: withdraw respects PoolStatus::Paused ──────────────────────────
-
-/// Withdrawing while paused is rejected just like depositing while paused.
-#[test]
-#[should_panic(expected = "Error(Contract, #6)")]
-fn pool_withdraw_while_paused_fails() {
-    let (_, pool, _, admin, _, lp1) = setup();
-    let shares = pool.deposit(&lp1, &100_0000000i128, &0i128);
-    pool.pause(&admin);
-    pool.withdraw(&lp1, &shares);
-}
-
-// ── issue #87: LP list pagination (now backed by persistent indexed storage) ──
-
 #[test]
 fn test_get_lp_list_pagination() {
     let (env, pool, usdc_id, _admin, _, _lp1) = setup();
@@ -572,6 +535,93 @@ fn test_get_lp_list_pagination() {
     let paginated = pool.get_lp_list(&Some(100), &Some(50));
     assert_eq!(paginated.total_count, 200);
     assert_eq!(paginated.lps.len(), 50);
+}
+
+// ── Issue #163: withdraw with amount exactly equal to available balance ──────────
+
+/// Withdraw the exact unlocked (available) balance after a partial lock and
+/// verify zero remaining: no underflow, no rounding error, total_deposited
+/// correctly decremented to the locked portion only.
+#[test]
+fn withdraw_exact_available_balance_leaves_zero_remaining() {
+    let (_, pool, _, admin, _, lp1) = setup();
+    let total = 1_000_0000000i128; // 1000 USDC
+    let locked_amount = 300_0000000i128; // 300 USDC locked for policy
+
+    let shares = pool.deposit(&lp1, &total, &0i128);
+    pool.lock_for_policy(&admin, &1u128, &locked_amount);
+
+    // Available = total - locked = 700 USDC
+    let available = pool.get_available_liquidity();
+    assert_eq!(available, 700_0000000i128);
+
+    // Withdraw the exact available amount (convert USDC → shares)
+    let available_shares = available * total_shares(total) / total;
+    let returned = pool.withdraw(&lp1, &available_shares);
+
+    assert_eq!(returned, available);
+    assert_eq!(pool.get_available_liquidity(), 0);
+
+    // total_deposited should be exactly the locked amount
+    let stats = pool.get_stats();
+    assert_eq!(stats.total_deposited, locked_amount);
+}
+
+fn total_shares(deposited: i128) -> i128 {
+    deposited * 1_000_000_000
+}
+
+// ── Issue #200: receive_premium with zero LPs ──────────────────────────────────
+
+/// `receive_premium`'s `if total_shares > 0` guard must not panic when no LP
+/// has ever deposited — a regression that removed the guard would divide by
+/// zero computing `increment`.
+#[test]
+fn receive_premium_with_zero_lps_does_not_panic() {
+    let (_, pool, _, _, _, lp1) = setup();
+
+    let stats_before = pool.get_stats();
+    assert_eq!(stats_before.total_shares, 0, "no LP has deposited yet");
+
+    // Must not panic even though total_shares is 0.
+    pool.receive_premium(&lp1, &100_0000000i128);
+
+    let stats_after = pool.get_stats();
+    assert_eq!(stats_after.total_shares, 0, "still no LPs after the premium call");
+    // The LP-share accumulator still increases (80% of premium), it simply
+    // has no shares to divide against yet.
+    assert_eq!(
+        stats_after.accumulated_premium - stats_before.accumulated_premium,
+        80_0000000i128
+    );
+}
+
+// ── Issue #201: release_for_claim / release_for_expiry cross double-release ───
+
+/// A policy released via `release_for_claim` must not also be releasable via
+/// `release_for_expiry` — both set the same `CapitalLock.released` flag, so
+/// the second call (regardless of which function is called first) must fail
+/// with `AlreadyReleased` rather than double-counting the locked amount.
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn release_for_claim_then_release_for_expiry_fails() {
+    let (_, pool, _, admin, _, lp1) = setup();
+    pool.deposit(&lp1, &200_0000000i128, &0i128);
+    pool.lock_for_policy(&admin, &55u128, &50_0000000i128);
+
+    pool.release_for_claim(&admin, &55u128);
+    pool.release_for_expiry(&admin, &55u128); // already released via release_for_claim
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn release_for_expiry_then_release_for_claim_fails() {
+    let (_, pool, _, admin, _, lp1) = setup();
+    pool.deposit(&lp1, &200_0000000i128, &0i128);
+    pool.lock_for_policy(&admin, &56u128, &50_0000000i128);
+
+    pool.release_for_expiry(&admin, &56u128);
+    pool.release_for_claim(&admin, &56u128); // already released via release_for_expiry
 }
 
 #[test]

@@ -6,15 +6,17 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _}, // <-- Imported the Ledger trait for .with_mut() tracking
+    testutils::{Address as _, Ledger as _},
     token, Address, Env,
 };
 
 use parashield_oracle_verifier::{OracleVerifier, OracleVerifierClient};
 use parashield_policy_engine::{
-    CreateProductParams, PolicyEngine, PolicyEngineClient,
+    PolicyEngine, PolicyEngineClient,
+    CreateProductParams,
     TriggerComparison, TriggerType,
 };
+use parashield_risk_pool::{RiskPool, RiskPoolClient};
 use crate::{ClaimsProcessor, ClaimsProcessorClient, ClaimResult};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -31,6 +33,7 @@ struct TestEnv {
     admin:     Address,
     usdc:      Address,
     oracle_node: Address,
+    pool:      Address,
 }
 
 fn full_setup() -> TestEnv {
@@ -44,12 +47,20 @@ fn full_setup() -> TestEnv {
     let oracle_id = env.register(OracleVerifier, ());
     let policy_id = env.register(PolicyEngine, ());
     let claims_id = env.register(ClaimsProcessor, ());
+    let backstop = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let treasury = Address::generate(&env);
+    let pool_id = env.register(RiskPool, ());
 
     OracleVerifierClient::new(&env, &oracle_id).initialize(&admin);
     PolicyEngineClient::new(&env, &policy_id)
         .initialize(&admin, &usdc_id, &oracle_id);
+    
+    // Initialize risk pool (will be reinitialized with correct addresses later)
+    RiskPoolClient::new(&env, &pool_id)
+        .initialize(&admin, &usdc_id, &treasury, &backstop, &Symbol::new(&env, "crop"), &policy_id, &claims_id);
+    
     ClaimsProcessorClient::new(&env, &claims_id)
-        .initialize(&admin, &policy_id, &oracle_id, &604_800u64);
+        .initialize(&admin, &policy_id, &pool_id, &oracle_id, &604_800u64);
     // Authorize admin as a keeper for tests
     ClaimsProcessorClient::new(&env, &claims_id)
         .add_keeper(&admin, &admin);
@@ -59,7 +70,7 @@ fn full_setup() -> TestEnv {
     ClaimsProcessorClient::new(&env, &claims_id)
         .add_keeper(&admin, &admin);
 
-    TestEnv { env, oracle: oracle_id, policy: policy_id, claims: claims_id, admin, usdc: usdc_id, oracle_node }
+    TestEnv { env, oracle: oracle_id, policy: policy_id, claims: claims_id, admin, usdc: usdc_id, oracle_node, pool: pool_id }
 }
 
 fn create_drought_product(te: &TestEnv) -> u128 {
@@ -276,4 +287,35 @@ fn test_equal_comparison() {
 
     let result = claims_client.auto_process(&te.admin, &pol_id);
     assert_eq!(result, ClaimResult::Paid);
+}
+
+/// Disputing a pending claim must drop it from the PendingClaims queue so the
+/// queue cannot grow without bound with stuck entries.
+#[test]
+fn dispute_removes_claim_from_pending_queue() {
+    let te = full_setup();
+    let claims_client = ClaimsProcessorClient::new(&te.env, &te.claims);
+    let policy_client = PolicyEngineClient::new(&te.env, &te.policy);
+
+    let prod_id = create_drought_product(&te);
+
+    let farmer = Address::generate(&te.env);
+    token::StellarAssetClient::new(&te.env, &te.usdc).mint(&farmer, &10_000_0000000i128);
+    token::StellarAssetClient::new(&te.env, &te.usdc).mint(&te.policy, &1_000_000_0000000i128);
+
+    let pol_id = policy_client.buy_policy(
+        &farmer, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+    );
+
+    // Submit enqueues the claim.
+    let claim_id = claims_client.submit_claim(&farmer, &pol_id);
+    assert_eq!(claims_client.get_pending_claims().len(), 1);
+
+    // Disputing it must remove it from the pending queue.
+    claims_client.dispute_claim(&farmer, &claim_id, &symbol_short!("baddata"));
+    assert_eq!(
+        claims_client.get_pending_claims().len(),
+        0,
+        "disputed claim must leave the pending queue",
+    );
 }

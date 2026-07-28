@@ -50,6 +50,7 @@ pub struct Claim {
 pub struct Initialized {
     pub admin: Address,
     pub policy_engine: Address,
+    pub risk_pool: Address,
     pub oracle_verifier: Address,
     pub staleness_threshold: u64,
 }
@@ -78,5 +79,12 @@ pub struct ClaimDisputed {
     pub claim_id: u128,
     pub claimant: Address,
     pub reason: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUpgraded {
+    pub old_version: u32,
+    pub new_version: u32,
 }
 
