@@ -209,3 +209,42 @@ fn utilization_rate_large_locked_no_truncation() {
     assert_eq!(stats.total_deposited, deposit_amount);
     assert_eq!(stats.total_locked, lock_amount);
 }
+
+#[test]
+#[should_panic(expected = "PoolCapExceeded")]
+fn deposit_exceeds_max_total_deposited() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin            = Address::generate(&env);
+    let treasury         = Address::generate(&env);
+    let lp1              = Address::generate(&env);
+    let policy_engine    = Address::generate(&env);
+    let claims_processor = Address::generate(&env);
+
+    let usdc_id     = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let backstop_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let pool_id     = env.register(RiskPool, ());
+    let pool        = RiskPoolClient::new(&env, &pool_id);
+
+    // MAX_TOTAL_DEPOSITED = 1_000_000_000_000_000 (100,000,000 USDC)
+    // Mint MAX_TOTAL_DEPOSITED + 1 to test boundary
+    let max_deposit = 1_000_000_000_000_000i128;
+    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp1, &(max_deposit + 1));
+
+    pool.initialize(
+        &admin,
+        &usdc_id,
+        &treasury,
+        &backstop_id,
+        &Symbol::new(&env, "crop"),
+        &policy_engine,
+        &claims_processor,
+    );
+
+    // First deposit exactly at MAX_TOTAL_DEPOSITED should succeed
+    pool.deposit(&lp1, &max_deposit, &0i128);
+
+    // Second deposit of even 1 more stroops should panic with PoolCapExceeded
+    pool.deposit(&lp1, &1i128, &0i128);
+}
