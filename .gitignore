@@ -1,5 +1,4 @@
 target/
-Cargo.lock
 *.wasm
 scripts/.deploy-state
 test_snapshots/
