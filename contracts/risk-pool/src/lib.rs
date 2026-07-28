@@ -82,7 +82,6 @@ pub enum Error {
     Undercollateralized = 11,
     PoolCapExceeded     = 12,
     InvalidToken        = 13,
-    InsufficientShares  = 18,
     TimelockPending     = 14,
     TimelockNotReady    = 15,
     NoPendingWithdrawal = 16,
@@ -205,7 +204,7 @@ impl RiskPool {
             panic_with_error!(&env, Error::PoolCapExceeded);
         }
 
-        let new_shares = if total_deposited == 0 || total_shares == 0 {
+        let new_shares = if total_deposited == 0 {
             amount * 1_000_000_000  // 1 share = 1 USDC * 1e9 precision
         } else {
             amount * total_shares / total_deposited
