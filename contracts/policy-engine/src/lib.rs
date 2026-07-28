@@ -427,8 +427,14 @@ impl PolicyEngine {
         env.storage().persistent().extend_ttl(&user_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         env.events().publish(
-            (Symbol::new(&env, "buy_policy"), buyer),
-            (policy_id, product_id, coverage_amount, premium),
+            (Symbol::new(&env, "policy_created"),),
+            PolicyCreated {
+                policy_id,
+                product_id,
+                policyholder: buyer.clone(),
+                coverage_amount,
+                premium_paid: premium,
+            },
         );
 
         policy_id
@@ -508,8 +514,12 @@ impl PolicyEngine {
         Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
 
         env.events().publish(
-            (Symbol::new(&env, "claim_paid"), policy_id),
-            (policy.policyholder.clone(), policy.coverage_amount),
+            (Symbol::new(&env, "claim_paid"),),
+            PolicyClaimed {
+                policy_id,
+                policyholder: policy.policyholder.clone(),
+                coverage_amount: policy.coverage_amount,
+            },
         );
     }
 
