@@ -160,3 +160,52 @@ fn per_share_yield_distribution() {
     let lp1_yield_2 = pool.claim_yield(&lp1);
     assert_eq!(lp1_yield_2, 20_0000000i128); // Alice gets her 50% of the new premium (20 USDC)
 }
+
+#[test]
+fn utilization_rate_large_locked_no_truncation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin            = Address::generate(&env);
+    let treasury         = Address::generate(&env);
+    let lp1              = Address::generate(&env);
+    let policy_engine    = Address::generate(&env);
+    let claims_processor = Address::generate(&env);
+
+    let usdc_id     = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let backstop_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let pool_id     = env.register(RiskPool, ());
+    let pool        = RiskPoolClient::new(&env, &pool_id);
+
+    // Deposit 500,000 USDC (500,000,000,000,000 stroops)
+    // This exceeds the threshold where locked * 10_000 would overflow u32::MAX
+    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp1, &500_000_0000000i128);
+
+    pool.initialize(
+        &admin,
+        &usdc_id,
+        &treasury,
+        &backstop_id,
+        &Symbol::new(&env, "crop"),
+        &policy_engine,
+        &claims_processor,
+    );
+
+    let deposit_amount = 500_000_0000000i128; // 500,000 USDC
+    pool.deposit(&lp1, &deposit_amount, &0i128);
+
+    // Lock 429,497 USDC (429,497,000,000,000 stroops)
+    // This is > 429,496.7295 USDC, so locked * 10_000 > u32::MAX (4,294,967,295)
+    let lock_amount = 429_497_0000000i128;
+    pool.lock_for_policy(&admin, &1u128, &lock_amount);
+
+    // The utilization rate should saturate to u32::MAX instead of silently truncating
+    let util_rate = pool.get_utilization_rate();
+    assert_eq!(util_rate, u32::MAX, "Utilization rate should saturate to u32::MAX for large locked amounts");
+
+    // Verify the calculation: (429,497 * 10,000) / 500,000 = 8,589,940 bps
+    // This exceeds u32::MAX (4,294,967,295), so it should saturate
+    let stats = pool.get_stats();
+    assert_eq!(stats.total_deposited, deposit_amount);
+    assert_eq!(stats.total_locked, lock_amount);
+}
