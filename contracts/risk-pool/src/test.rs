@@ -570,3 +570,28 @@ fn withdraw_exact_available_balance_leaves_zero_remaining() {
 fn total_shares(deposited: i128) -> i128 {
     deposited * 1_000_000_000
 }
+
+// ── Issue #200: receive_premium with zero LPs ──────────────────────────────────
+
+/// `receive_premium`'s `if total_shares > 0` guard must not panic when no LP
+/// has ever deposited — a regression that removed the guard would divide by
+/// zero computing `increment`.
+#[test]
+fn receive_premium_with_zero_lps_does_not_panic() {
+    let (_, pool, _, _, _, lp1) = setup();
+
+    let stats_before = pool.get_stats();
+    assert_eq!(stats_before.total_shares, 0, "no LP has deposited yet");
+
+    // Must not panic even though total_shares is 0.
+    pool.receive_premium(&lp1, &100_0000000i128);
+
+    let stats_after = pool.get_stats();
+    assert_eq!(stats_after.total_shares, 0, "still no LPs after the premium call");
+    // The LP-share accumulator still increases (80% of premium), it simply
+    // has no shares to divide against yet.
+    assert_eq!(
+        stats_after.accumulated_premium - stats_before.accumulated_premium,
+        80_0000000i128
+    );
+}
