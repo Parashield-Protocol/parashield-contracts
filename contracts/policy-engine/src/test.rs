@@ -916,3 +916,41 @@ fn test_buy_policy_minimum_duration_one_day() {
     let buyer_after = TokenClient::new(&env, &usdc).balance(&buyer);
     assert_eq!(buyer_before - buyer_after, expected_premium);
 }
+
+// ── Issue #203: cancel_policy zero-elapsed and zero-total-duration paths ──────
+
+#[test]
+fn test_cancel_policy_zero_total_duration_refunds_full_premium() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid    = create_crop_product(&env, &client, &admin);
+
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    let policy_id  = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+    let premium_paid = client.get_policy(&policy_id).premium_paid;
+
+    // buy_policy can never itself produce a policy with end_time == start_time
+    // (duration_days == 0 is rejected before end_time is computed), so the
+    // `total_duration == 0` branch in cancel_policy (lines 467-469) is only
+    // reachable by forcing that state directly — locking in coverage for a
+    // structurally-unreachable-but-defended-against edge case.
+    env.as_contract(&contract_id, || {
+        let mut policy: Policy = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Policy(policy_id))
+            .unwrap();
+        policy.end_time = policy.start_time;
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Policy(policy_id), &policy);
+    });
+
+    let refund = client.cancel_policy(&buyer, &policy_id);
+    assert_eq!(
+        refund, premium_paid,
+        "total_duration == 0 must refund the full premium via the explicit branch"
+    );
+}
