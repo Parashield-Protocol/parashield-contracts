@@ -573,3 +573,15 @@ fn test_get_lp_list_pagination() {
     assert_eq!(paginated.total_count, 200);
     assert_eq!(paginated.lps.len(), 50);
 }
+
+#[test]
+fn test_pool_depletion_scenarios() {
+    let (_, pool, _, _, _, lp1) = setup();
+    let amount = 100_0000000i128;
+    let shares = pool.deposit(&lp1, &amount, &0i128);
+    let returned = pool.withdraw(&lp1, &shares);
+    assert_eq!(returned, amount);
+    let stats = pool.get_stats();
+    assert_eq!(stats.total_deposited, 0);
+    assert_eq!(pool.get_available_liquidity(), 0);
+}
