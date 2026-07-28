@@ -13,6 +13,7 @@
 //! v2 — full implementation; Risk Pool is now deployable and testable.
 #![no_std]
 extern crate alloc;
+use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
@@ -95,6 +96,7 @@ pub enum Error {
     InsufficientShares  = 17,
     DepositTooSmall     = 18,
     Overflow            = 19,
+    InvalidAddress      = 20,
 }
 
 #[contract]
@@ -782,6 +784,7 @@ impl RiskPool {
     /// Propose a new admin. Only the current admin can call this.
     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
+        Self::validate_stellar_address(&env, &new_admin);
         // Store the proposed admin (zero address means no proposal)
         env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
     }
@@ -829,6 +832,19 @@ impl RiskPool {
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         if *caller != admin { panic_with_error!(env, Error::Unauthorized); }
         caller.require_auth();
+    }
+
+    /// Validate that an address has a valid Stellar format (56-char, starts with G or C).
+    fn validate_stellar_address(env: &Env, address: &Address) {
+        let addr_str = address.to_string();
+        if addr_str.len() != 56 {
+            panic_with_error!(env, Error::InvalidAddress);
+        }
+        let mut buf = [0u8; 56];
+        addr_str.copy_into_slice(&mut buf);
+        if buf[0] != b'G' && buf[0] != b'C' {
+            panic_with_error!(env, Error::InvalidAddress);
+        }
     }
 
     fn assert_active(env: &Env) {

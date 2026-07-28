@@ -67,6 +67,7 @@ pub enum Error {
     StaleData = 9,
     TooManyOracles = 10,
     InvalidTimestamp = 11,
+    InvalidAddress = 12,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -86,8 +87,7 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
 
-        // require_auth() validates the address at the protocol level, so we do
-        // not need manual address format string validation here.
+        Self::validate_stellar_address(&env, &admin);
         admin.require_auth();
 
         env.storage()
@@ -119,6 +119,7 @@ impl OracleVerifier {
     /// `weight` is 1-100; higher-weight oracles contribute more to the median.
     pub fn add_oracle(env: Env, admin: Address, oracle: Address, data_type: Symbol, weight: u32) {
         Self::require_admin(&env, &admin);
+        Self::validate_stellar_address(&env, &oracle);
         if weight == 0 || weight > 100 {
             panic_with_error!(&env, Error::InvalidWeight);
         }
@@ -261,6 +262,7 @@ impl OracleVerifier {
     /// Propose a new admin. Only the current admin can call this.
     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
+        Self::validate_stellar_address(&env, &new_admin);
         // Store the proposed admin (zero address means no proposal)
         env.storage()
             .instance()
@@ -763,6 +765,22 @@ impl OracleVerifier {
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
+
+    /// Validate that an address has a valid Stellar format (56-char, starts with G or C).
+    fn validate_stellar_address(env: &Env, address: &Address) {
+        let addr_str = address.to_string();
+
+        if addr_str.len() != 56 {
+            panic_with_error!(env, Error::InvalidAddress);
+        }
+
+        let mut buf = [0u8; 56];
+        addr_str.copy_into_slice(&mut buf);
+
+        if buf[0] != b'G' && buf[0] != b'C' {
+            panic_with_error!(env, Error::InvalidAddress);
+        }
+    }
 
     fn require_admin(env: &Env, caller: &Address) {
         let admin: Address = env
