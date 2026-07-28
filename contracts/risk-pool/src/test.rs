@@ -595,3 +595,31 @@ fn receive_premium_with_zero_lps_does_not_panic() {
         80_0000000i128
     );
 }
+
+// ── Issue #201: release_for_claim / release_for_expiry cross double-release ───
+
+/// A policy released via `release_for_claim` must not also be releasable via
+/// `release_for_expiry` — both set the same `CapitalLock.released` flag, so
+/// the second call (regardless of which function is called first) must fail
+/// with `AlreadyReleased` rather than double-counting the locked amount.
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn release_for_claim_then_release_for_expiry_fails() {
+    let (_, pool, _, admin, _, lp1) = setup();
+    pool.deposit(&lp1, &200_0000000i128, &0i128);
+    pool.lock_for_policy(&admin, &55u128, &50_0000000i128);
+
+    pool.release_for_claim(&admin, &55u128);
+    pool.release_for_expiry(&admin, &55u128); // already released via release_for_claim
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn release_for_expiry_then_release_for_claim_fails() {
+    let (_, pool, _, admin, _, lp1) = setup();
+    pool.deposit(&lp1, &200_0000000i128, &0i128);
+    pool.lock_for_policy(&admin, &56u128, &50_0000000i128);
+
+    pool.release_for_expiry(&admin, &56u128);
+    pool.release_for_claim(&admin, &56u128); // already released via release_for_expiry
+}
