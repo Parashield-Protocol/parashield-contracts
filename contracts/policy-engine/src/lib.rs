@@ -19,6 +19,8 @@
 #![no_std]
 extern crate alloc;
 
+use alloc::string::ToString;
+
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
