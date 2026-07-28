@@ -878,3 +878,41 @@ fn test_create_product_single_char_oracle_key_panics() {
         max_duration_days:  365,
     });
 }
+
+// ── Issue #202: buy_policy minimum duration boundary (duration_days == 1) ─────
+
+#[test]
+fn test_buy_policy_minimum_duration_one_day() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid    = create_crop_product(&env, &client, &admin);
+
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+    let buyer_before = TokenClient::new(&env, &usdc).balance(&buyer);
+
+    let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &1u32, &symbol_short!("kis2606"));
+
+    let policy = client.get_policy(&policy_id);
+    assert_eq!(
+        policy.end_time - policy.start_time,
+        86_400,
+        "a 1-day policy must span exactly 86,400 seconds"
+    );
+    assert_eq!(policy.status, PolicyStatus::Active);
+
+    // premium = coverage * rate_bps * duration_days / 365 / 10_000
+    let expected_premium = COVERAGE
+        .checked_mul(500i128)
+        .unwrap()
+        .checked_mul(1i128)
+        .unwrap()
+        .checked_div(365)
+        .unwrap()
+        .checked_div(10_000)
+        .unwrap();
+    assert_eq!(policy.premium_paid, expected_premium);
+
+    let buyer_after = TokenClient::new(&env, &usdc).balance(&buyer);
+    assert_eq!(buyer_before - buyer_after, expected_premium);
+}
