@@ -483,28 +483,26 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::NoDataAvailable);
         }
         let median_value = Self::get_median_value(&env, &data_type, &key);
-        let oracle_count = points.len();
+        let mut oracle_count = 0u32;
         let mut min_confidence = 100u32;
         let mut weighted_confidence_sum: u128 = 0;
         let mut total_weight: u128 = 0;
         let mut last_updated = 0u64;
-        for i in 0..oracle_count {
+        for i in 0..points.len() {
             let p = points.get_unchecked(i);
-            if p.confidence < min_confidence {
-                min_confidence = p.confidence;
-            }
-            if p.timestamp > last_updated {
-                last_updated = p.timestamp;
-            }
-
             let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
             if let Some(entry) = env
                 .storage()
                 .persistent()
                 .get::<_, OracleEntry>(&oracle_key)
             {
-                weighted_confidence_sum += (p.confidence as u128) * (entry.weight as u128);
-                total_weight += entry.weight as u128;
+                if entry.active {
+                    oracle_count += 1;
+                    min_confidence = min_confidence.min(p.confidence);
+                    last_updated = last_updated.max(p.timestamp);
+                    weighted_confidence_sum += (p.confidence as u128) * (entry.weight as u128);
+                    total_weight += entry.weight as u128;
+                }
             }
         }
         let confidence = match weighted_confidence_sum.checked_div(total_weight) {
@@ -770,7 +768,7 @@ impl OracleVerifier {
         caller.require_auth();
     }
 
-    /// Compute the simple median of all submitted values for (data_type, key).
+    /// Compute the weighted median of active, sufficiently fresh submissions.
     fn get_median_value(env: &Env, data_type: &Symbol, key: &Symbol) -> i128 {
         let points: Vec<OracleDataPoint> = env
             .storage()
@@ -807,7 +805,7 @@ impl OracleVerifier {
                     .persistent()
                     .get::<_, OracleEntry>(&oracle_key)
                 {
-                    if n < 100 {
+                    if entry.active && n < 100 {
                         values[n] = (p.value, entry.weight);
                         n += 1;
                         total_weight += entry.weight;
