@@ -563,3 +563,24 @@ fn test_process_claim_double_processing_returns_already_processed() {
     let balance = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
     assert_eq!(balance, 5_000_000_000 - 4_109_589 + 1_000_000_000);
 }
+
+/// Test that batch_auto_process with an empty pending list returns an empty vector.
+/// This verifies the function gracefully handles the zero-claims case without panicking.
+#[test]
+fn test_batch_auto_process_empty_pending_list() {
+    let w = deploy();
+    
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    
+    // Verify no pending claims exist initially
+    assert_eq!(cp.get_pending_claims().len(), 0);
+    
+    // Call batch_auto_process with limit=10 on an empty list
+    let results = cp.batch_auto_process(&w.keeper, &10u32);
+    
+    // Must return an empty vector
+    assert_eq!(results.len(), 0, "batch_auto_process must return empty vec when pending list is empty");
+    
+    // Pending list should still be empty
+    assert_eq!(cp.get_pending_claims().len(), 0);
+}
