@@ -814,45 +814,67 @@ fn test_multiple_upgrades_track_version_correctly() {
     assert_eq!(client.get_version(), 3);
 }
 
-// ── Emergency pause/resume tests (Issue #177) ────────────────────────────────
+// ── oracle_key validation tests (#173) ───────────────────────────────────────
 
+/// oracle_key shorter than 3 chars must be rejected with InvalidOracleKey (#20).
 #[test]
-#[should_panic(expected = "Error(Contract, #3)")]
-fn test_emergency_pause_blocks_buy_policy() {
-    let (env, admin, _oracle, usdc, contract_id) = setup();
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_create_product_short_oracle_key_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
     let client = PolicyEngineClient::new(&env, &contract_id);
-
-    // Create a product
-    let product_id = create_crop_product(&env, &client, &admin);
-
-    // Setup buyer with USDC
-    let buyer = Address::generate(&env);
-    StellarAssetClient::new(&env, &usdc).mint(&buyer, &10_000_000_000i128);
-
-    // Pause the contract
-    client.emergency_pause(&admin);
-
-    // Attempt to buy policy should fail with Unauthorized error (#3)
-    client.buy_policy(&buyer, &product_id, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+    client.create_product(&admin, &CreateProductParams {
+        name:               symbol_short!("bad"),
+        category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("ab"), // ← 2 chars, below minimum
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       100_000_000,
+        coverage_max:       10_000_000_000,
+        premium_rate_bps:   500,
+        max_duration_days:  365,
+    });
 }
 
+/// oracle_key of exactly 3 chars must be accepted.
 #[test]
-fn test_emergency_resume_enables_buy_policy() {
-    let (env, admin, _oracle, usdc, contract_id) = setup();
+fn test_create_product_minimum_oracle_key_succeeds() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
     let client = PolicyEngineClient::new(&env, &contract_id);
+    let id = client.create_product(&admin, &CreateProductParams {
+        name:               symbol_short!("ok"),
+        category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("abc"), // ← exactly 3 chars
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       100_000_000,
+        coverage_max:       10_000_000_000,
+        premium_rate_bps:   500,
+        max_duration_days:  365,
+    });
+    assert!(id > 0);
+}
 
-    // Create a product
-    let product_id = create_crop_product(&env, &client, &admin);
-
-    // Setup buyer with USDC
-    let buyer = Address::generate(&env);
-    StellarAssetClient::new(&env, &usdc).mint(&buyer, &10_000_000_000i128);
-
-    // Pause, then resume
-    client.emergency_pause(&admin);
-    client.emergency_resume(&admin);
-
-    // buy_policy should now succeed
-    let policy_id = client.buy_policy(&buyer, &product_id, &COVERAGE, &30u32, &symbol_short!("kis2606"));
-    assert!(policy_id > 0);
+/// Single-char oracle_key must be rejected with InvalidOracleKey (#20).
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_create_product_single_char_oracle_key_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.create_product(&admin, &CreateProductParams {
+        name:               symbol_short!("bad"),
+        category:           symbol_short!("crop"),
+        oracle_key:         symbol_short!("x"), // ← 1 char
+        trigger_type:       TriggerType::Threshold,
+        oracle_data_type:   symbol_short!("weather"),
+        trigger_threshold:  50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min:       100_000_000,
+        coverage_max:       10_000_000_000,
+        premium_rate_bps:   500,
+        max_duration_days:  365,
+    });
 }

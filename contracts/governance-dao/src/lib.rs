@@ -64,6 +64,10 @@ pub struct GovernanceDao;
 
 #[contractimpl]
 impl GovernanceDao {
+    /// Initialize the DAO. Can only be called once.
+    ///
+    /// Stores `admin` and `config` (gov token, quorum/majority thresholds,
+    /// voting period, timelock) and sets the proposal counter to 0.
     pub fn initialize(env: Env, admin: Address, config: DaoConfig) {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
@@ -116,6 +120,12 @@ impl GovernanceDao {
 
     // ── Proposals ─────────────────────────────────────────────────────────────
 
+    /// Create a new governance proposal targeting `target::function(args)`.
+    ///
+    /// The proposer must hold at least `config.proposal_threshold` gov
+    /// tokens; that exact amount is locked (transferred into the DAO) as a
+    /// deposit and is refunded verbatim by `finalize()`, regardless of any
+    /// later change to `config.proposal_threshold`.
     pub fn create_proposal(
         env: Env,
         proposer: Address,
@@ -192,6 +202,14 @@ impl GovernanceDao {
         proposal_id
     }
 
+    /// Cast a vote (For/Against/Abstain) on an Active proposal.
+    ///
+    /// The voter's entire current gov-token balance is used as their vote
+    /// weight and is transferred into (locked in) the DAO contract for the
+    /// duration of the vote — this prevents transferring the same tokens to
+    /// another address to vote again ("token cycling"). The locked amount
+    /// is released later via `withdraw_tokens`, once the proposal is no
+    /// longer Active. Each address may vote at most once per proposal.
     pub fn vote(env: Env, voter: Address, proposal_id: u64, choice: VoteChoice) {
         voter.require_auth();
 
@@ -257,6 +275,11 @@ impl GovernanceDao {
         );
     }
 
+    /// Withdraw gov tokens that were locked by `vote()` on `proposal_id`.
+    ///
+    /// Only available once the proposal is no longer Active (i.e. after
+    /// `finalize()` or `cancel()`). Returns the voter's full locked balance
+    /// and clears the lock record so it cannot be withdrawn twice.
     pub fn withdraw_tokens(env: Env, voter: Address, proposal_id: u64) {
         voter.require_auth();
 
@@ -292,6 +315,17 @@ impl GovernanceDao {
         );
     }
 
+    /// Close voting on an Active proposal and settle it to Passed or Failed.
+    ///
+    /// Callable by anyone once `vote_end + FINALIZE_DELAY` has passed (the
+    /// delay buffer prevents finalize being raced at the exact close of
+    /// voting). Quorum is `total_votes >= total_supply * quorum_bps /
+    /// 10_000`, using the `total_supply` snapshotted at proposal creation.
+    /// If quorum is met, the proposal Passes only when `votes_for * 10_000 /
+    /// total_votes >= majority_bps`; otherwise (including the exact-tie
+    /// case, which lands at 50%) it Fails. Passing also starts the
+    /// execution timelock (`execution_time = now + proposal_timelock`).
+    /// The proposer's original deposit is refunded in both outcomes.
     pub fn finalize(env: Env, proposal_id: u64) {
         let mut proposal: Proposal = env
             .storage()
@@ -355,6 +389,13 @@ impl GovernanceDao {
         );
     }
 
+    /// Mark a Passed proposal as Executed once its timelock has expired.
+    ///
+    /// Requires `status == Passed` and `now >= execution_time`. This
+    /// contract only flips the status flag — it does not itself perform the
+    /// cross-contract call to `target::function(args)`; the caller is
+    /// responsible for building the actual invocation and its auth tree, so
+    /// this contract never needs admin rights on the proposal's target.
     pub fn execute(env: Env, proposal_id: u64) {
         let mut proposal: Proposal = env
             .storage()
@@ -388,6 +429,12 @@ impl GovernanceDao {
         );
     }
 
+    /// Admin-only: cancel an Active proposal before voting closes.
+    ///
+    /// Refunds the proposer's deposit (at the current `config`
+    /// `proposal_threshold`, since no vote has happened yet) and marks the
+    /// proposal Cancelled. Voters who already locked tokens can reclaim
+    /// them via `withdraw_tokens` once cancelled.
     pub fn cancel(env: Env, admin: Address, proposal_id: u64) {
         Self::require_admin(&env, &admin);
 
@@ -422,6 +469,7 @@ impl GovernanceDao {
 
     // ── Queries ───────────────────────────────────────────────────────────────
 
+    /// Fetch a proposal by id. Panics with `ProposalNotFound` if it doesn't exist.
     pub fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
         env.storage()
             .persistent()
@@ -429,12 +477,15 @@ impl GovernanceDao {
             .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound))
     }
 
+    /// Look up a voter's vote record (choice + weight) for a proposal, if
+    /// they voted. Returns `None` if the address has not voted.
     pub fn get_vote(env: Env, proposal_id: u64, voter: Address) -> Option<VoteRecord> {
         env.storage()
             .persistent()
             .get(&StorageKey::VoteRecord(proposal_id, voter))
     }
 
+    /// Return the current DAO configuration (gov token, thresholds, periods).
     pub fn get_config(env: Env) -> DaoConfig {
         env.storage()
             .instance()
@@ -442,6 +493,7 @@ impl GovernanceDao {
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
     }
 
+    /// Return the current admin address.
     pub fn get_admin(env: Env) -> Address {
         env.storage()
             .instance()
@@ -449,6 +501,7 @@ impl GovernanceDao {
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
     }
 
+    /// Return the total number of proposals ever created (next proposal id).
     pub fn proposal_count(env: Env) -> u64 {
         env.storage()
             .instance()
@@ -456,12 +509,19 @@ impl GovernanceDao {
             .unwrap_or(0)
     }
 
+    /// Return the contract's current storage/version number (defaults to 1).
     pub fn get_version(env: Env) -> u32 {
         env.storage().instance().get(&StorageKey::Version).unwrap_or(1)
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
 
+    /// Admin-only: replace the DAO configuration wholesale.
+    ///
+    /// Only affects proposals created after this call — `finalize()` always
+    /// uses the `deposit` and `total_supply` snapshotted on each `Proposal`
+    /// at creation time, so changing `proposal_threshold` or `total_supply`
+    /// here cannot retroactively affect proposals already in flight.
     pub fn update_config(env: Env, admin: Address, config: DaoConfig) {
         Self::require_admin(&env, &admin);
         env.storage().instance().set(&StorageKey::Config, &config);

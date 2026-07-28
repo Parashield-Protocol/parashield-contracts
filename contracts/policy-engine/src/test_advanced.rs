@@ -178,6 +178,38 @@ fn cancel_policy_prorates_refund_by_elapsed_time() {
     assert!((refund - expected_half).abs() <= 1, "refund should be ~half the premium");
 }
 
+/// Cancel at a known elapsed duration (10 of 30 days) and assert the exact
+/// refund amount against a hand-calculated expected value. This catches an
+/// off-by-one or integer-division bug in the pro-rating formula that a mere
+/// "cancellation succeeds" test would miss.
+#[test]
+fn cancel_policy_refund_matches_hand_calculated_value_at_known_elapsed() {
+    use soroban_sdk::testutils::Ledger as _;
+
+    let (env, pe, admin, _, user) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params());
+
+    env.ledger().with_mut(|l| l.timestamp = 0);
+    let policy_id = pe.buy_policy(
+        &user, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+    );
+
+    let policy = pe.get_policy(&policy_id);
+    // Hand-calculated: premium = coverage * rate_bps * duration_days / 365 / 10_000
+    //   = 10_000_000_000 * 300 * 30 / 365 / 10_000 = 24_657_534
+    assert_eq!(policy.premium_paid, 24_657_534i128);
+
+    // Advance 10 of the 30 days (864_000 of 2_592_000 seconds elapsed).
+    env.ledger().with_mut(|l| l.timestamp = 864_000);
+
+    let refund = pe.cancel_policy(&user, &policy_id);
+
+    // earned = premium_paid * elapsed_capped / total_duration
+    //        = 24_657_534 * 864_000 / 2_592_000 = 8_219_178
+    // refund = premium_paid - earned = 16_438_356
+    assert_eq!(refund, 16_438_356i128);
+}
+
 /// buy_policy must be rejected while the contract is under emergency pause.
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]

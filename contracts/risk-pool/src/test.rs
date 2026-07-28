@@ -475,6 +475,16 @@ fn admin_timelock_cancel_and_re_request() {
     assert_eq!(pool.get_available_liquidity(), 800_0000000i128);
 }
 
+/// lock_for_policy on a pool with zero deposits (total_deposited == 0,
+/// total_locked == 0) must reject with Undercollateralized rather than
+/// silently succeeding or underflowing.
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn lock_for_policy_on_empty_pool_fails_undercollateralized() {
+    let (_, pool, _usdc_id, admin, _treasury, _lp1) = setup();
+    pool.lock_for_policy(&admin, &1u128, &1_0000000i128);
+}
+
 /// Non-admin cannot call lock_for_policy.
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]
