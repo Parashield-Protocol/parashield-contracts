@@ -95,6 +95,9 @@ impl PolicyEngine {
 
     // ── Lifecycle ────────────────────────────────────────────────────────────
 
+    /// One-time initialisation. Wires up the USDC token and oracle contracts.
+    /// Panics with `AlreadyInitialized` on a second call, or `InvalidToken` if
+    /// `usdc_token` does not expose a `balance` entry-point.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -190,6 +193,8 @@ impl PolicyEngine {
 
     // ── Product Management (admin only) ──────────────────────────────────────
 
+    /// Admin-only: create a new insurance product and return its ID.
+    /// `params.premium_rate_bps` must be 1-10000; `params.coverage_amount` must be positive.
     pub fn create_product(env: Env, admin: Address, params: CreateProductParams) -> u128 {
         Self::require_admin(&env, &admin);
         if params.premium_rate_bps == 0 || params.premium_rate_bps > 10_000 {
@@ -269,6 +274,8 @@ impl PolicyEngine {
         id
     }
 
+    /// Admin-only: suspend sales for a product without deleting it.
+    /// The product is removed from the active-products list; existing policies are unaffected.
     pub fn pause_product(env: Env, admin: Address, product_id: u128) {
         Self::require_admin(&env, &admin);
         let mut product: InsuranceProduct = Self::load_product(&env, product_id);
@@ -295,6 +302,8 @@ impl PolicyEngine {
         );
     }
 
+    /// Admin-only: permanently retire a product. It is removed from the active list and its
+    /// `(category, oracle_key)` slot is freed so another product may reuse it.
     pub fn deprecate_product(env: Env, admin: Address, product_id: u128) {
         Self::require_admin(&env, &admin);
         let mut product: InsuranceProduct = Self::load_product(&env, product_id);
@@ -511,14 +520,18 @@ impl PolicyEngine {
 
     // ── Queries ───────────────────────────────────────────────────────────────
 
+    /// Return the `InsuranceProduct` for the given ID. Panics if the product does not exist.
     pub fn get_product(env: Env, product_id: u128) -> InsuranceProduct {
         Self::load_product(&env, product_id)
     }
 
+    /// Return the `Policy` for the given ID. Panics if the policy does not exist.
     pub fn get_policy(env: Env, policy_id: u128) -> Policy {
         Self::load_policy(&env, policy_id)
     }
 
+    /// Return a paginated slice of policy IDs owned by `user`. `offset` is the zero-based
+    /// start index; `limit` caps the number of IDs returned.
     pub fn get_user_policies(env: Env, user: Address, offset: u32, limit: u32) -> Vec<u128> {
         let all: Vec<u128> = env.storage().persistent()
             .get(&StorageKey::UserPolicies(user))
@@ -536,32 +549,38 @@ impl PolicyEngine {
         paginated
     }
 
+    /// Return the IDs of all products whose status is `Active`.
     pub fn get_active_products(env: Env) -> Vec<u128> {
         env.storage().instance()
             .get(&StorageKey::ActiveProducts)
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Return the USDC balance held by this contract (7-decimal stroops).
     pub fn get_contract_balance(env: Env) -> i128 {
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         token::Client::new(&env, &usdc).balance(&env.current_contract_address())
     }
 
+    /// Return the current admin address. Panics with `NotInitialized` if not set up.
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
     }
 
+    /// Return the configured oracle verifier contract address.
     pub fn get_oracle(env: Env) -> Address {
         env.storage().instance().get(&StorageKey::OracleAddress)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
     }
 
+    /// Return `true` if the contract is currently in emergency-pause mode.
     pub fn is_paused(env: Env) -> bool {
         env.storage().instance().get(&StorageKey::Paused).unwrap_or(false)
     }
 
+    /// Return the current storage schema version (defaults to 1 before any migration).
     pub fn get_version(env: Env) -> u32 {
         env.storage().instance().get(&StorageKey::Version).unwrap_or(1)
     }

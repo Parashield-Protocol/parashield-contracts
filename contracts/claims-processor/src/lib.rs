@@ -99,6 +99,9 @@ impl ClaimsProcessor {
 
     // ── Lifecycle ────────────────────────────────────────────────────────────
 
+    /// One-time initialisation. Links the contract to `policy_engine`, `risk_pool`, and
+    /// `oracle_verifier`. `staleness_threshold` is the maximum age in seconds for oracle
+    /// data to be considered fresh. Panics with `AlreadyInitialized` on a second call.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -404,6 +407,9 @@ impl ClaimsProcessor {
 
     // ── Dispute ───────────────────────────────────────────────────────────────
 
+    /// Escalate a Pending or Rejected claim to Disputed status.
+    /// Only the original claimant may dispute. Removes the claim from the pending queue
+    /// so it is not auto-processed again until an admin resolves the dispute.
     pub fn dispute_claim(env: Env, claimant: Address, claim_id: u128, reason: soroban_sdk::Symbol) {
         claimant.require_auth();
         let mut claim: Claim = env.storage().persistent()
@@ -436,28 +442,33 @@ impl ClaimsProcessor {
 
     // ── Queries ───────────────────────────────────────────────────────────────
 
+    /// Return the `Claim` record for the given `claim_id`. Panics with `ClaimNotFound` if it does not exist.
     pub fn get_claim(env: Env, claim_id: u128) -> Claim {
         env.storage().persistent()
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound))
     }
 
+    /// Return the claim ID associated with `policy_id`, or `None` if no claim has been filed.
     pub fn get_claim_id_for_policy(env: Env, policy_id: u128) -> Option<u128> {
         env.storage().persistent()
             .get(&StorageKey::PolicyClaim(policy_id))
     }
 
+    /// Return the list of claim IDs that are currently in `Pending` status.
     pub fn get_pending_claims(env: Env) -> Vec<u128> {
         env.storage().instance()
             .get(&StorageKey::PendingClaims)
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Return the current admin address. Panics with `NotInitialized` if the contract has not been set up.
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
     }
 
+    /// Return the current storage schema version (defaults to 1 before any migration).
     pub fn get_version(env: Env) -> u32 {
         env.storage().instance().get(&StorageKey::Version).unwrap_or(1)
     }

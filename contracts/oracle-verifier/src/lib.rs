@@ -313,6 +313,8 @@ impl OracleVerifier {
             .unwrap_or(604_800)
     }
 
+    /// Set the minimum number of oracle submissions required to form a consensus value.
+    /// `min_count` must be at least 1; the default is 1.
     pub fn set_min_oracle_count(env: Env, admin: Address, min_count: u32) {
         Self::require_admin(&env, &admin);
         env.storage()
@@ -324,6 +326,7 @@ impl OracleVerifier {
         );
     }
 
+    /// Return the minimum number of oracle submissions required for consensus (defaults to 1).
     pub fn get_min_oracle_count(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -745,6 +748,7 @@ impl OracleVerifier {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Return the current admin address. Panics with `NotInitialized` if the contract has not been set up.
     pub fn get_admin(env: Env) -> Address {
         env.storage()
             .instance()

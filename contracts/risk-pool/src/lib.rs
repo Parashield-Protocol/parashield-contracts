@@ -96,6 +96,9 @@ pub struct RiskPool;
 #[contractimpl]
 impl RiskPool {
 
+    /// One-time initialisation. Sets up the USDC token, treasury, backstop, and linked
+    /// protocol contracts. `category` is the coverage category this pool serves (e.g.
+    /// `"weather"`). Panics with `AlreadyInitialized` on a second call.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -188,6 +191,8 @@ impl RiskPool {
 
     // ── Deposits ──────────────────────────────────────────────────────────────
 
+    /// Deposit USDC into the pool and receive LP shares. Returns the number of shares minted.
+    /// `min_shares` is a slippage guard — the transaction reverts if fewer shares would be issued.
     pub fn deposit(env: Env, provider: Address, amount: i128, min_shares: i128) -> i128 {
         provider.require_auth();
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
@@ -261,6 +266,9 @@ impl RiskPool {
         new_shares
     }
 
+    /// Burn `shares` and return the proportional USDC to `provider`. Returns the USDC amount
+    /// transferred. Panics with `Undercollateralized` if the available (unlocked) liquidity
+    /// is insufficient to cover the redemption.
     pub fn withdraw(env: Env, provider: Address, shares: i128) -> i128 {
         provider.require_auth();
         // Guard: check for zero or negative shares input
@@ -305,6 +313,8 @@ impl RiskPool {
 
     // ── Premium and yield ─────────────────────────────────────────────────────
 
+    /// Pull `amount` USDC from `caller` and split it among LPs, treasury, and backstop
+    /// according to the protocol fee schedule. No-op if `amount` is zero or negative.
     pub fn receive_premium(env: Env, caller: Address, amount: i128) {
         caller.require_auth();
         if amount <= 0 { return; }
@@ -391,6 +401,8 @@ impl RiskPool {
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized))
     }
 
+    /// Collect accumulated premium yield for `provider` and transfer it in USDC.
+    /// Returns the amount claimed. No-op (returns 0) if no yield has accrued.
     pub fn claim_yield(env: Env, provider: Address) -> i128 {
         provider.require_auth();
         let lp_key = StorageKey::LpPosition(provider.clone());
@@ -411,6 +423,9 @@ impl RiskPool {
 
     // ── Capital locks ─────────────────────────────────────────────────────────
 
+    /// Earmark `amount` USDC as collateral for `policy_id`. Only the policy engine or
+    /// claims processor may call this. Panics if the pool is under-collateralised or if
+    /// a lock for this policy already exists.
     pub fn lock_for_policy(env: Env, caller: Address, policy_id: u128, amount: i128) {
         Self::require_protocol_caller(&env, &caller);
         Self::assert_active(&env);
@@ -440,6 +455,8 @@ impl RiskPool {
         );
     }
 
+    /// Release the capital lock for `policy_id` after a successful claim payout.
+    /// Reduces `total_locked` so the freed liquidity becomes available again.
     pub fn release_for_claim(env: Env, caller: Address, policy_id: u128) {
         Self::require_protocol_caller(&env, &caller);
         let mut lock: CapitalLock = env.storage().persistent()
@@ -464,6 +481,8 @@ impl RiskPool {
         );
     }
 
+    /// Release the capital lock for `policy_id` when the policy expires without a payout.
+    /// The locked amount returns to available liquidity and premiums remain earned.
     pub fn release_for_expiry(env: Env, caller: Address, policy_id: u128) {
         Self::require_protocol_caller(&env, &caller);
         let mut lock: CapitalLock = env.storage().persistent()
@@ -478,6 +497,7 @@ impl RiskPool {
 
     // ── Queries ───────────────────────────────────────────────────────────────
 
+    /// Return aggregate pool statistics: total deposited, locked, shares, and premium accumulators.
     pub fn get_stats(env: Env) -> PoolStats {
         PoolStats {
             category:             env.storage().instance().get(&StorageKey::Category).unwrap(),
@@ -490,10 +510,13 @@ impl RiskPool {
         }
     }
 
+    /// Return the LP position for `provider`, or `None` if they have never deposited.
     pub fn get_position(env: Env, provider: Address) -> Option<LpPosition> {
         env.storage().persistent().get(&StorageKey::LpPosition(provider))
     }
 
+    /// Return the pool utilisation rate in basis points (locked / deposited × 10,000).
+    /// Returns 0 if no USDC has been deposited.
     pub fn get_utilization_rate(env: Env) -> u32 {
         let deposited: i128 = env.storage().instance().get(&StorageKey::TotalDeposited).unwrap_or(0);
         let locked: i128    = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
@@ -509,19 +532,24 @@ impl RiskPool {
         }
     }
 
+    /// Return the current admin address. Panics with `NotInitialized` if not set up.
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized))
     }
 
+    /// Return the total number of unique LP addresses that have ever deposited.
     pub fn get_lp_count(env: Env) -> u32 {
         env.storage().instance().get(&StorageKey::LpCount).unwrap_or(0)
     }
 
+    /// Return the current storage schema version (defaults to 1 before any migration).
     pub fn get_version(env: Env) -> u32 {
         env.storage().instance().get(&StorageKey::Version).unwrap_or(1)
     }
 
+    /// Return a paginated list of LP addresses that currently hold shares.
+    /// `offset` defaults to 0 and `limit` defaults to 100 (capped at 500).
     pub fn get_lp_list(env: Env, offset: Option<u32>, limit: Option<u32>) -> PaginatedLps {
         let total_count: u32 = env.storage().instance()
             .get(&StorageKey::LpCount).unwrap_or(0);
@@ -581,6 +609,7 @@ impl RiskPool {
     //   Any withdrawal of pool funds by the admin requires a 7-day waiting
     //   period so LPs have time to exit if they disagree with the decision.
 
+    /// Admin-only: halt new deposits. Existing LPs may still withdraw and claim yield.
     pub fn pause(env: Env, admin: Address) {
         Self::require_admin(&env, &admin);
         env.storage().instance().set(&StorageKey::Status, &PoolStatus::Paused);
@@ -590,6 +619,7 @@ impl RiskPool {
         );
     }
 
+    /// Admin-only: re-enable deposits after a pause.
     pub fn resume(env: Env, admin: Address) {
         Self::require_admin(&env, &admin);
         env.storage().instance().set(&StorageKey::Status, &PoolStatus::Active);
