@@ -477,3 +477,142 @@ fn test_initial_version_tracking() {
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     assert_eq!(cp.get_version(), 1);
 }
+
+// ── Issue #263: concurrent claim submissions on the same policy ──────────────
+
+/// Two policyholders each own a policy; both submit claims and both are
+/// processed within the same block. Verifies that the claim counter, pending
+/// queue, and per-policy settlement work correctly under concurrent submissions.
+#[test]
+fn test_concurrent_claims_on_different_policies_same_block() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+
+    let buyer_a = Address::generate(&w.env);
+    let buyer_b = Address::generate(&w.env);
+    let pol_a = buy_crop_policy(&w, &buyer_a, pid);
+    let pol_b = buy_crop_policy(&w, &buyer_b, pid);
+
+    // Both submit claims at the same ledger timestamp.
+    submit_rainfall(&w, 20_000_000); // below threshold → trigger met
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_a = cp.submit_claim(&buyer_a, &pol_a);
+    let claim_b = cp.submit_claim(&buyer_b, &pol_b);
+
+    // Claim IDs must be unique.
+    assert_ne!(claim_a, claim_b);
+
+    // Pending queue holds both claims.
+    assert_eq!(cp.get_pending_claims().len(), 2);
+
+    // Process both — each must settle independently.
+    let res_a = cp.process_claim(&w.keeper, &claim_a);
+    let res_b = cp.process_claim(&w.keeper, &claim_b);
+    assert_eq!(res_a, ClaimResult::Paid);
+    assert_eq!(res_b, ClaimResult::Paid);
+
+    // Pending queue is drained.
+    assert_eq!(cp.get_pending_claims().len(), 0);
+
+    // Each buyer received exactly one payout — no cross-contamination.
+    let bal_a = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer_a);
+    let bal_b = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer_b);
+    assert_eq!(bal_a, 5_000_000_000 - 4_109_589 + COVERAGE);
+    assert_eq!(bal_b, 5_000_000_000 - 4_109_589 + COVERAGE);
+}
+
+/// Attempting to submit a second claim on the same policy must fail with
+/// AlreadyClaimed (#6), even if the first claim has not been processed yet.
+/// This is the core guard against concurrent duplicate submissions.
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_concurrent_duplicate_submission_same_policy_panics() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    // First submission succeeds.
+    cp.submit_claim(&buyer, &pol_id);
+
+    // Second submission on the SAME policy must panic before the first is processed.
+    cp.submit_claim(&buyer, &pol_id);
+}
+
+/// After a claim on a policy is fully processed (Paid), a new manual
+/// submission must be rejected with AlreadyClaimed (#6).
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_resubmit_after_paid_claim_panics() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    let res = cp.process_claim(&w.keeper, &claim_id);
+    assert_eq!(res, ClaimResult::Paid);
+
+    // Attempting to submit again on the already-settled policy → AlreadyClaimed.
+    cp.submit_claim(&buyer, &pol_id);
+}
+
+/// auto_process on the same policy twice in the same block must be idempotent:
+/// the first call settles (Paid), the second returns AlreadyProcessed without
+/// paying out twice.
+#[test]
+fn test_concurrent_auto_process_same_policy_idempotent() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let first  = cp.auto_process(&w.keeper, &pol_id);
+    let second = cp.auto_process(&w.keeper, &pol_id);
+
+    assert_eq!(first,  ClaimResult::Paid);
+    assert_eq!(second, ClaimResult::AlreadyProcessed);
+
+    // Single payout — balance must reflect exactly one coverage amount.
+    let bal = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
+    assert_eq!(bal, 5_000_000_000 - 4_109_589 + COVERAGE);
+}
+
+/// Mixed concurrent flow: submit_claim by policyholder and auto_process by
+/// keeper target the same policy simultaneously. The first to settle wins;
+/// the second must return AlreadyProcessed.
+#[test]
+fn test_mixed_submit_and_auto_process_same_policy() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    // Policyholder submits claim, then keeper auto_processes the same policy.
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    let res_manual = cp.process_claim(&w.keeper, &claim_id);
+    assert_eq!(res_manual, ClaimResult::Paid);
+
+    // auto_process on the same (now Claimed) policy returns idempotently.
+    let res_auto = cp.auto_process(&w.keeper, &pol_id);
+    assert_eq!(res_auto, ClaimResult::AlreadyProcessed);
+
+    // Balance confirms exactly one payout.
+    let bal = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
+    assert_eq!(bal, 5_000_000_000 - 4_109_589 + COVERAGE);
+}

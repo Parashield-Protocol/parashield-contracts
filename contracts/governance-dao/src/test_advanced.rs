@@ -283,3 +283,32 @@ fn admin_cannot_manipulate_total_supply_during_active_vote() {
     // but the fix prevents this by using proposal.total_supply.
     assert_eq!(p.status, ProposalStatus::Passed);
 }
+
+// ── Issue #260: proposal_id u64 overflow guard ──────────────────────────────
+
+/// When NextProposalId is at u64::MAX, the next create_proposal must panic
+/// with LimitReached (#16) instead of wrapping around to 0.
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_proposal_id_overflow_panics_with_limit_reached() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (dao, _, voter, target) = make_dao(&env);
+
+    // Force the counter to u64::MAX so the next increment overflows.
+    env.as_contract(&dao.address, || {
+        env.storage()
+            .instance()
+            .set(&crate::StorageKey::NextProposalId, &u64::MAX);
+    });
+
+    let args: Vec<Val> = Vec::new(&env);
+    // This must panic with LimitReached — not silently wrap to 0.
+    dao.create_proposal(
+        &voter,
+        &Bytes::from_slice(&env, b"Overflow test"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+}

@@ -151,6 +151,7 @@ impl GovernanceDao {
         args: Vec<Val>, // <--- ADD THIS ARGUMENT
     ) -> u64 {
         proposer.require_auth();
+        Self::validate_stellar_address(&env, &target);
         let config: DaoConfig = env
             .storage()
             .instance()
@@ -610,6 +611,19 @@ impl GovernanceDao {
             panic_with_error!(env, Error::Unauthorized);
         }
         caller.require_auth();
+    }
+
+    /// Validate that an address has a valid Stellar format (56-char, starts with G or C).
+    fn validate_stellar_address(env: &Env, address: &Address) {
+        let addr_str = address.to_string();
+        if addr_str.len() != 56 {
+            panic!("invalid address: must be an account or contract address");
+        }
+        let mut buf = [0u8; 56];
+        addr_str.copy_into_slice(&mut buf);
+        if buf[0] != b'G' && buf[0] != b'C' {
+            panic!("invalid address: must be an account or contract address");
+        }
     }
 }
 

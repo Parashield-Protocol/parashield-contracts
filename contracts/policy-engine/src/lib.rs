@@ -197,6 +197,7 @@ impl PolicyEngine {
     /// Set the Claims Processor address. Called once after deploying claims contract.
     pub fn set_claims_processor(env: Env, admin: Address, claims_processor: Address) {
         Self::require_admin(&env, &admin);
+        Self::validate_stellar_address(&env, &claims_processor);
         env.storage().instance().set(&StorageKey::ClaimsProcessor, &claims_processor);
         env.events().publish(
             (Symbol::new(&env, "claims_processor_updated"),),
@@ -636,6 +637,7 @@ pub fn emergency_resume(env: Env, admin: Address) {
      /// Propose a new admin. Only the current admin can call this.
      pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
          Self::require_admin(&env, &admin);
+         Self::validate_stellar_address(&env, &new_admin);
          // Store the proposed admin
          env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
      }
@@ -680,6 +682,19 @@ pub fn emergency_resume(env: Env, admin: Address) {
             .unwrap_or_else(|| panic_with_error!(env, Error::ClaimsProcessorNotSet));
         if *caller != cp { panic_with_error!(env, Error::Unauthorized); }
         caller.require_auth();
+    }
+
+    /// Validate that an address has a valid Stellar format (56-char, starts with G or C).
+    fn validate_stellar_address(env: &Env, address: &Address) {
+        let addr_str = address.to_string();
+        if addr_str.len() != 56 {
+            panic!("invalid address: must be a valid Stellar address");
+        }
+        let mut buf = [0u8; 56];
+        addr_str.copy_into_slice(&mut buf);
+        if buf[0] != b'G' && buf[0] != b'C' {
+            panic!("invalid address: must be a valid Stellar address");
+        }
     }
 
     fn remove_policy_from_user(env: &Env, user: &Address, policy_id: u128) {
