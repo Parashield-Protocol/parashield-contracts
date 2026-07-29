@@ -292,6 +292,22 @@ fn test_non_policyholder_cannot_submit_claim() {
         .submit_claim(&stranger, &pol_id);
 }
 
+/// submit_claim on an expired policy must panic with PolicyExpired error.
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_submit_claim_on_expired_policy_fails() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    
+    // Advance time past the 30-day policy duration
+    w.env.ledger().with_mut(|l| l.timestamp += 31 * 86_400);
+    
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    cp.submit_claim(&buyer, &pol_id);
+}
+
 /// Manual submit_claim + process_claim flow works end-to-end.
 #[test]
 fn test_manual_claim_flow() {
