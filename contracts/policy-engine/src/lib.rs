@@ -19,8 +19,6 @@
 #![no_std]
 extern crate alloc;
 
-use alloc::string::ToString;
-
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use crate::alloc::string::ToString;
 use soroban_sdk::{

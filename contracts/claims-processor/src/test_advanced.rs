@@ -163,7 +163,7 @@ fn test_batch_auto_process_boundary_conditions() {
     
     // All should be paid
     for (_, result) in results.iter() {
-        assert_eq!(*result, ClaimResult::Paid);
+        assert_eq!(result, ClaimResult::Paid);
     }
     
     // Verify all policies are now Claimed
@@ -208,6 +208,46 @@ fn test_batch_auto_process_with_limit() {
     
     let results3 = cp.batch_auto_process(&w.keeper, &2u32);
     assert_eq!(results3.len(), 1); // Only 1 remaining
+}
+
+/// A `limit` above `MAX_BATCH_SIZE` must be clamped rather than honoured.
+///
+/// Each claim costs an oracle read plus a policy-engine cross-contract call, so
+/// an unbounded batch would exhaust Soroban's per-transaction instruction
+/// budget and fail the whole call with an opaque gas error.
+///
+/// Claims are submitted explicitly here rather than relying on the shared
+/// fixture, which never calls `submit_claim` and so leaves the pending queue
+/// empty.
+#[test]
+fn test_batch_auto_process_clamps_limit_to_max_batch_size() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    // Queue one more claim than a single batch is allowed to settle.
+    let total = MAX_BATCH_SIZE + 1;
+    for _ in 0..total {
+        let buyer = Address::generate(&w.env);
+        let policy_id = buy_crop_policy(&w, &buyer, pid);
+        cp.submit_claim(&buyer, &policy_id);
+    }
+
+    // Rainfall above the 50_000_000 threshold: every claim is Rejected, so the
+    // batch exercises the ceiling without depending on pool solvency.
+    submit_rainfall(&w, 72_000_000);
+
+    // u32::MAX must not drain the queue in one transaction.
+    let first = cp.batch_auto_process(&w.keeper, &u32::MAX);
+    assert_eq!(first.len(), MAX_BATCH_SIZE);
+
+    // The clamp only defers work — a follow-up call settles the remainder.
+    let second = cp.batch_auto_process(&w.keeper, &u32::MAX);
+    assert_eq!(second.len(), total - MAX_BATCH_SIZE);
+
+    for (_, result) in second.iter() {
+        assert_eq!(result, ClaimResult::Rejected);
+    }
 }
 
 /// Test staleness threshold boundary conditions.
@@ -439,9 +479,9 @@ fn test_concurrent_claim_submissions() {
     assert_ne!(claim_id1, claim_id3);
     
     // Process all claims
-    let res1 = cp.process_claim(&w.keeper, claim_id1);
-    let res2 = cp.process_claim(&w.keeper, claim_id2);
-    let res3 = cp.process_claim(&w.keeper, claim_id3);
+    let res1 = cp.process_claim(&w.keeper, &claim_id1);
+    let res2 = cp.process_claim(&w.keeper, &claim_id2);
+    let res3 = cp.process_claim(&w.keeper, &claim_id3);
     
     assert_eq!(res1, ClaimResult::Paid);
     assert_eq!(res2, ClaimResult::Paid);
@@ -465,7 +505,7 @@ fn test_pending_queue_drained_after_settlement() {
 
     // Settling it (trigger met → Paid) must drain it from the queue.
     submit_rainfall(&w, 20_000_000);
-    let result = cp.process_claim(&w.keeper, claim_id);
+    let result = cp.process_claim(&w.keeper, &claim_id);
     assert_eq!(result, ClaimResult::Paid);
     assert_eq!(cp.get_pending_claims().len(), 0, "settled claim must leave the pending queue");
 }

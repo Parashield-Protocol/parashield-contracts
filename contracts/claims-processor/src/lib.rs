@@ -61,6 +61,18 @@ const TTL_THRESHOLD: u32 = 518_400;
 /// survive long enough to be processed.
 const TTL_EXTEND_TO: u32 = 6_312_000;
 
+// ─── Batch processing ─────────────────────────────────────────────────────────
+
+/// Hard ceiling on how many claims a single `batch_auto_process` call may
+/// settle.
+///
+/// Each claim in the batch costs an oracle read plus a cross-contract call into
+/// the policy-engine, so an unbounded batch would exhaust Soroban's per
+/// transaction instruction budget and fail with an opaque gas error — taking
+/// the whole batch down with it. Capping keeps every call within budget;
+/// callers with a longer queue simply invoke the function again.
+pub const MAX_BATCH_SIZE: u32 = 50;
+
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -386,6 +398,11 @@ impl ClaimsProcessor {
     /// Process up to `limit` pending claims parametrically in one call.
     /// Returns a Vec of (claim_id, result) pairs for the processed claims.
     /// Skips any claim that is not in Pending status (idempotent).
+    ///
+    /// `limit` is clamped to [`MAX_BATCH_SIZE`]. Passing a larger value (or
+    /// `u32::MAX`) is not an error — it simply settles the first
+    /// `MAX_BATCH_SIZE` pending claims, keeping the transaction inside
+    /// Soroban's instruction budget. Call again to drain the rest of the queue.
     pub fn batch_auto_process(env: Env, caller: Address, limit: u32) -> Vec<(u128, ClaimResult)> {
         Self::require_keeper(&env, &caller);
         Self::require_not_paused(&env);
@@ -394,7 +411,12 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| Vec::new(&env));
 
         let mut results: Vec<(u128, ClaimResult)> = Vec::new(&env);
-        let process_count = if pending.len() < limit { pending.len() } else { limit };
+        let effective_limit = if limit > MAX_BATCH_SIZE { MAX_BATCH_SIZE } else { limit };
+        let process_count = if pending.len() < effective_limit {
+            pending.len()
+        } else {
+            effective_limit
+        };
 
         let policy_engine: Address = env.storage().instance()
             .get(&StorageKey::PolicyEngine)
