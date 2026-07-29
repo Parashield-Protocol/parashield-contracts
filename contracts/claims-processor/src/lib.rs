@@ -32,6 +32,7 @@ pub use types::*;
 #[soroban_sdk::contractclient(name = "RiskPoolClient")]
 trait IRiskPool {
     fn release_for_claim(env: Env, caller: Address, policy_id: u128);
+    fn release_for_expiry(env: Env, caller: Address, policy_id: u128);
 }
 
 #[soroban_sdk::contractclient(name = "PolicyEngineClient")]
@@ -351,8 +352,17 @@ impl ClaimsProcessor {
         // Check if policy has expired with no trigger
         let now = env.ledger().timestamp();
         if now > policy.end_time {
+            let risk_pool: Address = env.storage().instance()
+                .get(&StorageKey::RiskPool)
+                .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
             PolicyEngineClient::new(&env, &policy_engine)
                 .expire_policy(&env.current_contract_address(), &policy_id);
+            // Atomic lock release, mirroring the payout path: expiring a policy
+            // and freeing its earmarked capital happen in one transaction, so a
+            // crash between the two cannot strand liquidity in the pool. If the
+            // release fails the whole call reverts and the policy stays Active.
+            RiskPoolClient::new(&env, &risk_pool)
+                .release_for_expiry(&env.current_contract_address(), &policy_id);
             return ClaimResult::Expired;
         }
 

@@ -190,6 +190,38 @@ fn test_expired_policy_no_payout() {
     assert_eq!(policy.status, parashield_policy_engine::PolicyStatus::Expired);
 }
 
+/// Expiring a policy must free its earmarked capital in the same transaction.
+///
+/// Previously `expire_policy` only flipped the policy status; the pool's
+/// `release_for_expiry` was left to a separate backend call, so a crash between
+/// the two left the policy Expired while its coverage stayed locked — quietly
+/// shrinking the liquidity available to underwrite new policies.
+#[test]
+fn test_expired_policy_releases_pool_capital() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+
+    let pool = RiskPoolClient::new(&w.env, &w.pool_id);
+    let locked_while_active = pool.get_stats().total_locked;
+    assert_eq!(locked_while_active, COVERAGE, "coverage should be locked while active");
+
+    // Advance past the 30-day policy duration.
+    w.env.ledger().with_mut(|l| l.timestamp += 31 * 86_400);
+
+    let result = ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .auto_process(&w.keeper, &pol_id);
+    assert_eq!(result, ClaimResult::Expired);
+
+    // The lock is gone without any separate backend call.
+    assert_eq!(
+        pool.get_stats().total_locked,
+        0,
+        "expiry must release the capital lock atomically",
+    );
+}
+
 /// auto_process on already-paid policy returns AlreadyProcessed (idempotent).
 #[test]
 fn test_double_process_idempotent() {
