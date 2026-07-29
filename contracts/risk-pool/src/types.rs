@@ -145,12 +145,21 @@ pub struct PoolResumed {
 }
 
 /// A timelocked admin withdrawal request.
-/// Once created, the admin must wait TIMELOCK_SECONDS before executing.
+/// Once created, the admin must wait until `execute_after` before executing.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminWithdrawalRequest {
     pub amount: i128,
     pub requested_at: u64,
+    /// Absolute timestamp the request becomes executable, fixed when the
+    /// request is made.
+    ///
+    /// The deadline is stored rather than recomputed from `requested_at +
+    /// TIMELOCK_SECONDS` at execution time, so that upgrading the contract
+    /// with a shorter `TIMELOCK_SECONDS` cannot retroactively shorten the
+    /// wait on a request that is already in flight — the guarantee LPs relied
+    /// on when the request was published.
+    pub execute_after: u64,
     pub executed: bool,
 }
 
