@@ -591,6 +591,7 @@ fn test_proposal_expires_after_voting_period() {
         &Bytes::from_slice(&env, b"Expire proposal"),
         &target,
         &Symbol::new(&env, "update"),
+        &Vec::new(&env),
     );
     // Move time past the voting period
     env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
@@ -600,4 +601,12 @@ fn test_proposal_expires_after_voting_period() {
     
     let p = dao.get_proposal(&pid);
     assert_eq!(p.status, crate::ProposalStatus::Failed);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_upgrade_rejects_same_version() {
+    let (env, dao, admin, _, _, _) = setup();
+    let dummy_hash = soroban_sdk::BytesN::from_array(&env, &[0; 32]);
+    dao.upgrade(&admin, &dummy_hash, &1);
 }
