@@ -543,7 +543,8 @@ impl OracleVerifier {
             }
         }
         let confidence = match weighted_confidence_sum.checked_div(total_weight) {
-            Some(c) => c as u32,
+            // #242 — saturate to u32::MAX instead of silently truncating
+            Some(c) => u32::try_from(c).unwrap_or(u32::MAX),
             None => 0u32,
         };
 
