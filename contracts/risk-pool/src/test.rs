@@ -475,6 +475,45 @@ fn admin_timelock_cancel_and_re_request() {
     assert_eq!(pool.get_available_liquidity(), 800_0000000i128);
 }
 
+/// The timelock deadline is frozen when the request is made, not recomputed
+/// from the current `TIMELOCK_SECONDS` at execution time.
+///
+/// Without this, upgrading the contract with a shorter constant between
+/// `request_admin_withdrawal` and `execute_admin_withdrawal` would retroactively
+/// shorten the wait on a request LPs had already seen published — exactly the
+/// window they rely on to exit.
+///
+/// Simulated by storing a request whose deadline is longer than the current
+/// constant, then executing past the constant but before the stored deadline.
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn admin_timelock_honours_stored_deadline_not_current_constant() {
+    let (env, pool, _usdc_id, admin, _treasury, lp1) = setup();
+    pool.deposit(&lp1, &1_000_0000000i128, &0i128);
+
+    pool.request_admin_withdrawal(&admin, &100_0000000i128);
+
+    // Stand in for a request created under a longer timelock.
+    env.as_contract(&pool.address, || {
+        let mut req: crate::AdminWithdrawalRequest = env
+            .storage()
+            .persistent()
+            .get(&crate::StorageKey::AdminWithdrawalRequest)
+            .unwrap();
+        req.execute_after = req.requested_at + 30 * 24 * 60 * 60;
+        env.storage()
+            .persistent()
+            .set(&crate::StorageKey::AdminWithdrawalRequest, &req);
+    });
+
+    // Past the current 7-day constant, but short of the stored 30-day deadline.
+    let jump = (7 * 24 * 60 * 60 + 1) as u64;
+    env.ledger().set_timestamp(env.ledger().timestamp() + jump);
+
+    // Recomputing from TIMELOCK_SECONDS would let this through.
+    pool.execute_admin_withdrawal(&admin);
+}
+
 /// lock_for_policy on a pool with zero deposits (total_deposited == 0,
 /// total_locked == 0) must reject with Undercollateralized rather than
 /// silently succeeding or underflowing.

@@ -671,11 +671,16 @@ impl RiskPool {
         }
 
         let now = env.ledger().timestamp();
+        // Freeze the deadline now. Recomputing it at execution time would let a
+        // contract upgrade that shortens TIMELOCK_SECONDS cut the wait on a
+        // request LPs have already seen published.
+        let execute_after = now + TIMELOCK_SECONDS;
         env.storage().persistent().set(
             &StorageKey::AdminWithdrawalRequest,
             &AdminWithdrawalRequest {
                 amount,
                 requested_at: now,
+                execute_after,
                 executed: false,
             },
         );
@@ -685,7 +690,7 @@ impl RiskPool {
             AdminWithdrawalScheduled {
                 admin: admin.clone(),
                 amount,
-                execute_after: now + TIMELOCK_SECONDS,
+                execute_after,
             },
         );
     }
@@ -701,7 +706,7 @@ impl RiskPool {
         if req.executed { panic_with_error!(&env, Error::AlreadyReleased); }
 
         let now = env.ledger().timestamp();
-        if now < req.requested_at + TIMELOCK_SECONDS {
+        if now < req.execute_after {
             panic_with_error!(&env, Error::TimelockNotReady);
         }
 

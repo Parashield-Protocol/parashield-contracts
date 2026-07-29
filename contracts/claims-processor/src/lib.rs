@@ -32,6 +32,7 @@ pub use types::*;
 #[soroban_sdk::contractclient(name = "RiskPoolClient")]
 trait IRiskPool {
     fn release_for_claim(env: Env, caller: Address, policy_id: u128);
+    fn release_for_expiry(env: Env, caller: Address, policy_id: u128);
 }
 
 #[soroban_sdk::contractclient(name = "PolicyEngineClient")]
@@ -60,6 +61,18 @@ const TTL_THRESHOLD: u32 = 518_400;
 /// Extend persistent entries out to ~1 year (at ~5s/ledger) so pending claims
 /// survive long enough to be processed.
 const TTL_EXTEND_TO: u32 = 6_312_000;
+
+// ─── Batch processing ─────────────────────────────────────────────────────────
+
+/// Hard ceiling on how many claims a single `batch_auto_process` call may
+/// settle.
+///
+/// Each claim in the batch costs an oracle read plus a cross-contract call into
+/// the policy-engine, so an unbounded batch would exhaust Soroban's per
+/// transaction instruction budget and fail with an opaque gas error — taking
+/// the whole batch down with it. Capping keeps every call within budget;
+/// callers with a longer queue simply invoke the function again.
+pub const MAX_BATCH_SIZE: u32 = 50;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -347,8 +360,17 @@ impl ClaimsProcessor {
         // Check if policy has expired with no trigger
         let now = env.ledger().timestamp();
         if now > policy.end_time {
+            let risk_pool: Address = env.storage().instance()
+                .get(&StorageKey::RiskPool)
+                .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
             PolicyEngineClient::new(&env, &policy_engine)
                 .expire_policy(&env.current_contract_address(), &policy_id);
+            // Atomic lock release, mirroring the payout path: expiring a policy
+            // and freeing its earmarked capital happen in one transaction, so a
+            // crash between the two cannot strand liquidity in the pool. If the
+            // release fails the whole call reverts and the policy stays Active.
+            RiskPoolClient::new(&env, &risk_pool)
+                .release_for_expiry(&env.current_contract_address(), &policy_id);
             return ClaimResult::Expired;
         }
 
@@ -394,6 +416,11 @@ impl ClaimsProcessor {
     /// Process up to `limit` pending claims parametrically in one call.
     /// Returns a Vec of (claim_id, result) pairs for the processed claims.
     /// Skips any claim that is not in Pending status (idempotent).
+    ///
+    /// `limit` is clamped to [`MAX_BATCH_SIZE`]. Passing a larger value (or
+    /// `u32::MAX`) is not an error — it simply settles the first
+    /// `MAX_BATCH_SIZE` pending claims, keeping the transaction inside
+    /// Soroban's instruction budget. Call again to drain the rest of the queue.
     pub fn batch_auto_process(env: Env, caller: Address, limit: u32) -> Vec<(u128, ClaimResult)> {
         Self::require_keeper(&env, &caller);
         Self::require_not_paused(&env);
@@ -402,7 +429,12 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| Vec::new(&env));
 
         let mut results: Vec<(u128, ClaimResult)> = Vec::new(&env);
-        let process_count = if pending.len() < limit { pending.len() } else { limit };
+        let effective_limit = if limit > MAX_BATCH_SIZE { MAX_BATCH_SIZE } else { limit };
+        let process_count = if pending.len() < effective_limit {
+            pending.len()
+        } else {
+            effective_limit
+        };
 
         let policy_engine: Address = env.storage().instance()
             .get(&StorageKey::PolicyEngine)
