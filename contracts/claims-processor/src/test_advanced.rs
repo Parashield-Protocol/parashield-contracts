@@ -163,7 +163,7 @@ fn test_batch_auto_process_boundary_conditions() {
     
     // All should be paid
     for (_, result) in results.iter() {
-        assert_eq!(*result, ClaimResult::Paid);
+        assert_eq!(result, ClaimResult::Paid);
     }
     
     // Verify all policies are now Claimed
@@ -439,9 +439,9 @@ fn test_concurrent_claim_submissions() {
     assert_ne!(claim_id1, claim_id3);
     
     // Process all claims
-    let res1 = cp.process_claim(&w.keeper, claim_id1);
-    let res2 = cp.process_claim(&w.keeper, claim_id2);
-    let res3 = cp.process_claim(&w.keeper, claim_id3);
+    let res1 = cp.process_claim(&w.keeper, &claim_id1);
+    let res2 = cp.process_claim(&w.keeper, &claim_id2);
+    let res3 = cp.process_claim(&w.keeper, &claim_id3);
     
     assert_eq!(res1, ClaimResult::Paid);
     assert_eq!(res2, ClaimResult::Paid);
@@ -465,7 +465,7 @@ fn test_pending_queue_drained_after_settlement() {
 
     // Settling it (trigger met → Paid) must drain it from the queue.
     submit_rainfall(&w, 20_000_000);
-    let result = cp.process_claim(&w.keeper, claim_id);
+    let result = cp.process_claim(&w.keeper, &claim_id);
     assert_eq!(result, ClaimResult::Paid);
     assert_eq!(cp.get_pending_claims().len(), 0, "settled claim must leave the pending queue");
 }
