@@ -582,3 +582,22 @@ fn test_finalize_does_not_pull_raised_live_threshold() {
     assert_eq!(p.deposit, deposit_before);
     assert_eq!(p.status, ProposalStatus::Passed);
 }
+
+#[test]
+fn test_proposal_expires_after_voting_period() {
+    let (env, dao, _, voter1, _, target) = setup();
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Expire proposal"),
+        &target,
+        &Symbol::new(&env, "update"),
+    );
+    // Move time past the voting period
+    env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
+    
+    // Finalize it without votes, it should fail
+    dao.finalize(&pid);
+    
+    let p = dao.get_proposal(&pid);
+    assert_eq!(p.status, crate::ProposalStatus::Failed);
+}

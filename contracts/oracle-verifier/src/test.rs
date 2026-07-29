@@ -860,6 +860,17 @@ fn test_min_oracle_count_enforcement() {
     assert!(res.is_err());
 }
 
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_stale_data_rejection() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &100u32);
+
+    let t0 = 1_000_000u64;
+    env.ledger().with_mut(|l| l.timestamp = t0);
+    client.submit_data(&oracle, &weather(), &kisumu_key(), &30_000_000i128, &90u32, &t0);
 // ── Issue #162: reject readings when fewer than min_oracle_count submit ──────────
 
 /// Submit from 2 out of 3 required oracles and verify aggregation correctly
@@ -901,6 +912,18 @@ fn test_reject_when_fewer_than_min_oracle_count_submit() {
     let condition = TriggerCondition {
         data_type: weather(),
         key: kisumu_key(),
+        threshold: 50_000_000i128,
+        comparison: TriggerComparison::LessThan,
+    };
+    
+    // Default max_data_age is 7 days (604,800). 
+    // Advance time beyond max_data_age to make it stale.
+    env.ledger().with_mut(|l| l.timestamp = t0 + 604_801);
+    
+    // This should panic with NoDataAvailable (#6)
+    client.verify_trigger(&weather(), &kisumu_key(), &condition);
+}
+
         threshold: 50_000_000,
         comparison: TriggerComparison::LessThan,
         tolerance: 0i128,
