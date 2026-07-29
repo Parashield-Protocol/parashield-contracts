@@ -96,6 +96,7 @@ pub enum Error {
     AlreadyProcessed   = 7,
     InvalidAddress     = 8,
     Paused             = 9,
+    PolicyExpired      = 10,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -244,8 +245,15 @@ impl ClaimsProcessor {
             panic_with_error!(&env, Error::PolicyNotActive);
         }
 
+        // Guard: reject expired policies even if status hasn't been updated yet.
+        // A direct contract caller could bypass the backend's status check, so
+        // we verify end_time at the contract level.
+        let now = env.ledger().timestamp();
+        if policy.end_time > 0 && now > policy.end_time {
+            panic_with_error!(&env, Error::PolicyExpired);
+        }
+
         let claim_id   = Self::next_claim_id(&env);
-        let now        = env.ledger().timestamp();
         let claim = Claim {
             id: claim_id,
             policy_id,

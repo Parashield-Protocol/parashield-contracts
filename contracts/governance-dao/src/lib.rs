@@ -24,6 +24,13 @@ use soroban_sdk::{
 pub mod types;
 pub use types::*;
 
+/// Minimum voting period: 1 hour in seconds.
+const MIN_VOTING_PERIOD: u64 = 3_600;
+/// Maximum voting period: 30 days in seconds. Prevents an admin from setting
+/// an unreachably large period that would cause vote_end + FINALIZE_DELAY to
+/// overflow or make proposals permanently unresolvable.
+const MAX_VOTING_PERIOD: u64 = 30 * 24 * 3_600;
+
 #[contracttype]
 enum StorageKey {
     Initialized,
@@ -58,6 +65,8 @@ pub enum Error {
     FinalizeDelayNotMet = 14,
     VersionNotNewer = 15,
     LimitReached = 16,
+    VotingPeriodTooShort = 17,
+    VotingPeriodTooLong = 18,
 }
 
 #[contract]
@@ -104,6 +113,12 @@ impl GovernanceDao {
         env.storage()
             .instance()
             .set(&StorageKey::Initialized, &true);
+        if config.voting_period < MIN_VOTING_PERIOD {
+            panic_with_error!(&env, Error::VotingPeriodTooShort);
+        }
+        if config.voting_period > MAX_VOTING_PERIOD {
+            panic_with_error!(&env, Error::VotingPeriodTooLong);
+        }
         env.storage().instance().set(&StorageKey::Admin, &admin);
         env.storage().instance().set(&StorageKey::Config, &config);
         env.storage()
@@ -526,6 +541,12 @@ impl GovernanceDao {
     /// here cannot retroactively affect proposals already in flight.
     pub fn update_config(env: Env, admin: Address, config: DaoConfig) {
         Self::require_admin(&env, &admin);
+        if config.voting_period < MIN_VOTING_PERIOD {
+            panic_with_error!(&env, Error::VotingPeriodTooShort);
+        }
+        if config.voting_period > MAX_VOTING_PERIOD {
+            panic_with_error!(&env, Error::VotingPeriodTooLong);
+        }
         env.storage().instance().set(&StorageKey::Config, &config);
 
         env.events().publish(
