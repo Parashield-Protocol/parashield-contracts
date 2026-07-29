@@ -429,10 +429,12 @@ impl ClaimsProcessor {
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
         if claim.claimant != claimant { panic_with_error!(&env, Error::Unauthorized); }
-        // Only open (Pending) or rejected claims are disputable. A Paid claim is
-        // already settled (USDC transferred) and a Disputed claim is already open,
-        // so neither may be overwritten.
-        if claim.status != ClaimStatus::Pending && claim.status != ClaimStatus::Rejected {
+        // Only open (Pending) or rejected claims are disputable. Paid claims are
+        // already settled (USDC transferred), Disputed claims are already open,
+        // and Expired claims should not be reopened through a dispute flow.
+        if claim.status != ClaimStatus::Pending
+            && claim.status != ClaimStatus::Rejected
+        {
             panic_with_error!(&env, Error::AlreadyProcessed);
         }
         claim.status = ClaimStatus::Disputed;
@@ -556,9 +558,21 @@ impl ClaimsProcessor {
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
-    /// Core evaluation: check oracle, update claim record, instruct Policy Engine.
-    /// After successful claim payment, atomically releases the coverage lock on Risk Pool
-    /// to prevent coverage from remaining locked indefinitely.
+    /// Evaluate a pending claim and settle it against the configured oracle trigger.
+    ///
+    /// This internal helper is the core claim lifecycle step. It first validates
+    /// that the claim is still pending, then resolves the oracle verifier,
+    /// policy engine, and risk pool contract addresses from storage. It builds a
+    /// trigger condition from the policy's oracle data type, key, threshold, and
+    /// comparison mode, and asks the oracle verifier whether the trigger is
+    /// currently met using a fresh-data check.
+    ///
+    /// If the trigger is met, the claim is marked as paid, the policy engine is
+    /// instructed to pay the claim, and the risk-pool coverage lock is released
+    /// in the same transaction. If the trigger is not met, the claim is marked
+    /// as rejected and no payout is issued. In either case, the claim record is
+    /// persisted, its pending-queue entry is removed, and a settlement event is
+    /// emitted so the outcome is observable off-chain.
     fn evaluate_and_settle(env: &Env, claim: &mut Claim, policy: &parashield_policy_engine::Policy) -> ClaimResult {
         // Validate claim is in Pending state before transitioning (atomic state guard)  
         if claim.status != ClaimStatus::Pending {

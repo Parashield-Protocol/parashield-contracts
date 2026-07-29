@@ -338,6 +338,26 @@ impl OracleVerifier {
 
     /// Submit a data point for a (data_type, key) pair.
     ///
+    /// This function stores one reading from a registered oracle for a specific
+    /// observation key. Multiple oracles may submit values for the same key;
+    /// later aggregation does not discard or "average out" conflicting values
+    /// by default. Instead, the contract computes a weighted median over all
+    /// eligible submissions for that key, so a small number of contradictory
+    /// readings do not dominate the result unless their assigned oracle weights
+    /// do.
+    ///
+    /// For a reading to be considered during aggregation, the submission must
+    /// be fresh enough for the configured max-data-age window, from an active
+    /// oracle, and at or above the configured minimum confidence threshold. The
+    /// aggregation logic also requires at least `min_oracle_count` eligible
+    /// submissions before it will return a consensus value; if fewer are
+    /// available, the call fails with `NoDataAvailable`.
+    ///
+    /// The final value is the weighted median of the eligible submissions, where
+    /// each oracle's registered weight influences its position in the ordered
+    /// set. If the total weight is even, the midpoint between the two middle
+    /// values is returned.
+    ///
     /// - `data_type`: category — "weather", "flight", "onchain", "disaster"
     /// - `key`: specific measurement — "rainfall:kisumu:2026-06", "flight:KQ100:2026-06-15"
     /// - `value`: 7-decimal fixed point (same precision as Stellar assets)
@@ -421,8 +441,23 @@ impl OracleVerifier {
 
     // ── Verification ─────────────────────────────────────────────────────────
 
-    /// Returns true if the aggregated oracle value satisfies `condition`.
-    /// This is the single function the Claims Processor calls to decide payout.
+    /// Evaluate whether the aggregated oracle value satisfies a trigger condition.
+    ///
+    /// This is the single entry point the Claims Processor uses to decide
+    /// whether a policy should payout. The function reads the aggregated value
+    /// for the requested `(data_type, key)` pair and compares it to the
+    /// configured threshold using the requested comparison operator.
+    ///
+    /// The comparison is performed on the same fixed-point numeric units used
+    /// for oracle submissions, so the threshold and observed value should be
+    /// expressed in the same precision. `LessThan`, `GreaterThan`, and `Equal`
+    /// apply the standard relational comparison directly, while
+    /// `EqualWithTolerance` treats the condition as satisfied when the
+    /// absolute difference between the aggregated value and the threshold is
+    /// less than or equal to the supplied tolerance.
+    ///
+    /// The return value is `true` when the condition is met and `false`
+    /// otherwise.
     pub fn verify_trigger(
         env: Env,
         data_type: Symbol,
