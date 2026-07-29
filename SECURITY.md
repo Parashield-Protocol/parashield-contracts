@@ -1,13 +1,5 @@
 # Security Policy
 
-## Supported Versions
-
-| Version | Supported          |
-|---------|--------------------|
-| v2.x    | :white_check_mark: |
-| v1.x    | :x:                |
-
-## Reporting a Vulnerability
 
 **Do not open a public GitHub issue for security vulnerabilities.**
 
@@ -35,3 +27,13 @@ We aim to respond within 48 hours and will coordinate a disclosure timeline with
 
 Critical vulnerabilities may be eligible for a bounty.
 Details announced at launch.
+
+
+## Supported Versions
+
+| Version | Supported          |
+|---------|--------------------|
+| v2.x    | :white_check_mark: |
+| v1.x    | :x:                |
+
+## Reporting a Vulnerability

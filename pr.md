@@ -28,6 +28,14 @@ its natural end of life:
 Each contract extends entries out to ~1 year (`6_312_000` ledgers at ~5s/ledger)
 once they drop below a ~30-day (`518_400` ledger) threshold.
 
+
+
+## Test plan
+
+- [x] `cargo build --workspace` succeeds
+- [ ] `cargo test --workspace` passes
+
+
 ## Not changed
 
 - **oracle-verifier (#180)**: investigated and found already fixed —
@@ -35,8 +43,3 @@ once they drop below a ~30-day (`518_400` ledger) threshold.
   `Error::InvalidWeight`, and this is covered by
   `test_cannot_update_oracle_to_invalid_weight` in
   `contracts/oracle-verifier/src/test.rs`. No code change needed.
-
-## Test plan
-
-- [x] `cargo build --workspace` succeeds
-- [ ] `cargo test --workspace` passes

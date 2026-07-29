@@ -6,17 +6,6 @@ Parametric insurance replaces claims adjusters with oracle data. If the measured
 
 ---
 
-## Contracts
-
-```
-contracts/
-├── oracle-verifier     authorized oracles submit readings; median aggregation; verify_trigger
-├── policy-engine       products, policies, USDC escrow, payout execution
-├── claims-processor    reads oracle data, evaluates trigger, calls pay_claim / expire_policy
-├── risk-pool           LP capital provisioning — v2, not yet implemented
-└── governance-dao      on-chain parameter governance — v2, not yet implemented
-```
-
 ### Dependency order
 
 ```
@@ -46,6 +35,19 @@ claims-processor ← (policy-engine + oracle-verifier addresses passed at init)
 ```
 
 ---
+
+
+## Contracts
+
+```
+contracts/
+├── oracle-verifier     authorized oracles submit readings; median aggregation; verify_trigger
+├── policy-engine       products, policies, USDC escrow, payout execution
+├── claims-processor    reads oracle data, evaluates trigger, calls pay_claim / expire_policy
+├── risk-pool           LP capital provisioning — v2, not yet implemented
+└── governance-dao      on-chain parameter governance — v2, not yet implemented
+```
+
 
 ## A note on Claimable Balances
 
