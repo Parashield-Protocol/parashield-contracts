@@ -25,6 +25,10 @@ use soroban_sdk::{
 pub mod types;
 pub use types::*;
 
+// ─── Storage TTL ──────────────────────────────────────────────────────────────
+const TTL_THRESHOLD: u32 = 518_400; // ~30 days
+const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year
+
 /// Maximum number of registered oracles. Bounds the median aggregation loop and
 /// the worst-case weighted sum (MAX_ORACLES * max_weight * max_value) so it
 /// cannot overflow i128.
@@ -133,6 +137,7 @@ impl OracleVerifier {
             active: true,
         };
         env.storage().persistent().set(&key, &entry);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         let mut list: Vec<Address> = env
             .storage()
@@ -188,6 +193,7 @@ impl OracleVerifier {
             .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
         entry.weight = weight;
         env.storage().persistent().set(&key, &entry);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
     /// Deactivate an oracle (soft delete — historical data is retained).
@@ -201,6 +207,7 @@ impl OracleVerifier {
             .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
         entry.active = false;
         env.storage().persistent().set(&key, &entry);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // Prune the address from the flat OracleList so get_oracles() and
         // instance storage don't accumulate deactivated addresses forever
@@ -405,6 +412,7 @@ impl OracleVerifier {
         }
 
         env.storage().persistent().set(&dp_key, &points);
+        env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         env.events().publish(
             (Symbol::new(&env, "oracle_data_submitted"),),
@@ -652,7 +660,8 @@ impl OracleVerifier {
             if !found {
                 points.push_back(new_point);
             }
-            env.storage().persistent().set(&dp_key, &points);
+                env.storage().persistent().set(&dp_key, &points);
+            env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
             env.events().publish(
                 (Symbol::new(&env, "oracle_data_submitted"),),
@@ -723,7 +732,8 @@ impl OracleVerifier {
             if !found {
                 points.push_back(new_point);
             }
-            env.storage().persistent().set(&dp_key, &points);
+                env.storage().persistent().set(&dp_key, &points);
+            env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
             env.events().publish(
                 (Symbol::new(&env, "oracle_data_submitted"),),
