@@ -13,6 +13,7 @@
 //! v2 — full implementation; Risk Pool is now deployable and testable.
 #![no_std]
 extern crate alloc;
+use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
@@ -38,18 +39,12 @@ const MIN_DEPOSIT: i128 = 1_000_000;
 /// Timelock duration for admin withdrawals: 7 days in seconds.
 const TIMELOCK_SECONDS: u64 = 7 * 24 * 60 * 60;
 
-/// Approximate Stellar ledger close time in seconds, used to convert
-/// wall-clock TTL windows into ledger counts for `extend_ttl`.
-const LEDGER_SECONDS: u64 = 5;
-
-/// Capital locks must outlive the underlying policy until `release_for_claim`
-/// / `release_for_expiry` runs; 365 days comfortably covers policy-engine's
-/// longest policy durations plus a settlement buffer.
-const LOCK_RETENTION_SECONDS: u64 = 365 * 24 * 60 * 60;
-
-/// Admin withdrawal requests must survive the timelock plus a buffer for
-/// `execute_admin_withdrawal` to actually run.
-const WITHDRAWAL_RETENTION_SECONDS: u64 = TIMELOCK_SECONDS + 30 * 24 * 60 * 60;
+/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
+/// (at ~5s/ledger).
+const TTL_THRESHOLD: u32 = 518_400;
+/// Extend persistent entries out to ~1 year (at ~5s/ledger) so capital locks
+/// backing long-dated policies don't expire from storage before maturity.
+const TTL_EXTEND_TO: u32 = 6_312_000;
 
 #[contracttype]
 enum StorageKey {
@@ -101,6 +96,7 @@ pub enum Error {
     InsufficientShares  = 17,
     DepositTooSmall     = 18,
     Overflow            = 19,
+    InvalidAddress      = 20,
 }
 
 #[contract]
@@ -225,7 +221,9 @@ impl RiskPool {
         let new_shares = if total_deposited == 0 {
             amount * 1_000_000_000  // 1 share = 1 USDC * 1e9 precision
         } else {
-            amount * total_shares / total_deposited
+            amount.checked_mul(total_shares)
+                .and_then(|v| v.checked_div(total_deposited))
+                .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow))
         };
 
         if new_shares == 0 {
@@ -275,8 +273,12 @@ impl RiskPool {
         env.storage().instance().set(&StorageKey::TotalShares,    &(total_shares + new_shares));
 
         env.events().publish(
-            (Symbol::new(&env, "deposit"), provider.clone()),
-            (amount, new_shares),
+            (Symbol::new(&env, "liquidity_deposited"),),
+            LiquidityDeposited {
+                provider: provider.clone(),
+                amount,
+                shares_minted: new_shares,
+            },
         );
 
         new_shares
@@ -301,9 +303,14 @@ impl RiskPool {
         let total_shares: i128    = env.storage().instance().get(&StorageKey::TotalShares).unwrap_or(0);
         let total_locked: i128    = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
 
+        // Guard: prevent division by zero if total_shares == 0
+        if total_shares == 0 { panic_with_error!(&env, Error::NoShares); }
+
         let available_liquidity = total_deposited.saturating_sub(total_locked);
         if available_liquidity <= 0 { panic_with_error!(&env, Error::Undercollateralized); }
-        let amount = shares * total_deposited / total_shares;
+        let amount = shares.checked_mul(total_deposited)
+            .and_then(|v| v.checked_div(total_shares))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
         if amount == 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if amount > available_liquidity { panic_with_error!(&env, Error::Undercollateralized); }
 
@@ -316,13 +323,16 @@ impl RiskPool {
         position.shares   -= shares;
         position.yield_debt = (env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0) * position.shares) / 1_000_000_000_000;
         env.storage().persistent().set(&lp_key, &position);
-        Self::extend_to_max(&env, &lp_key);
-        env.storage().instance().set(&StorageKey::TotalDeposited, &(total_deposited - amount));
+        env.storage().instance().set(&StorageKey::TotalDeposited, &total_deposited.checked_sub(amount).unwrap_or_else(|| panic_with_error!(&env, Error::Overflow)));
         env.storage().instance().set(&StorageKey::TotalShares,    &(total_shares - shares));
 
         env.events().publish(
-            (Symbol::new(&env, "withdraw"), provider.clone()),
-            (amount, shares),
+            (Symbol::new(&env, "liquidity_withdrawn"),),
+            LiquidityWithdrawn {
+                provider: provider.clone(),
+                shares_burned: shares,
+                amount_returned: amount,
+            },
         );
 
         amount
@@ -463,7 +473,7 @@ impl RiskPool {
             locked_at: env.ledger().timestamp(),
             released:  false,
         });
-        Self::extend_lock_ttl(&env, &lock_key);
+        env.storage().persistent().extend_ttl(&StorageKey::Lock(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
         env.storage().instance().set(&StorageKey::TotalLocked, &(total_locked + amount));
 
         env.events().publish(
@@ -476,7 +486,24 @@ impl RiskPool {
     }
 
     /// Release the capital lock for `policy_id` after a successful claim payout.
-    /// Reduces `total_locked` so the freed liquidity becomes available again.
+    ///
+    /// ### Flow & Caller
+    /// This function is called by the `claims-processor` contract immediately after the policy
+    /// engine successfully transfers the coverage payout to the policyholder.
+    ///
+    /// ### Capital Effect
+    /// This reduces `total_locked` in the pool, reflecting that the coverage lock is now removed.
+    /// Since the claim was paid, the underwriting capital has been disbursed to the policyholder.
+    ///
+    /// ### Design Rationale
+    /// Having separate functions (`release_for_claim` and `release_for_expiry`) instead of a single
+    /// `release(policy_id, reason)` endpoint serves several key purposes:
+    /// 1. **Access Control & Security**: Allows fine-grained tracking of capital outflows due to claims
+    ///    vs. standard policy expirations.
+    /// 2. **Auditability & Logging**: Distinct event paths make off-chain monitoring, analytics,
+    ///    and accounting of paid claims vs. expired policies trivial.
+    /// 3. **Gas Optimization**: Avoids the instruction overhead of parsing and branching on an enum/string
+    ///    reason within the contract.
     pub fn release_for_claim(env: Env, caller: Address, policy_id: u128) {
         Self::require_protocol_caller(&env, &caller);
         let mut lock: CapitalLock = env.storage().persistent()
@@ -489,6 +516,7 @@ impl RiskPool {
         
         lock.released = true;
         env.storage().persistent().set(&StorageKey::Lock(policy_id), &lock);
+        env.storage().persistent().extend_ttl(&StorageKey::Lock(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
         let total_locked: i128 = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
         env.storage().instance().set(&StorageKey::TotalLocked, &(total_locked.saturating_sub(lock.amount)));
 
@@ -502,7 +530,26 @@ impl RiskPool {
     }
 
     /// Release the capital lock for `policy_id` when the policy expires without a payout.
-    /// The locked amount returns to available liquidity and premiums remain earned.
+    ///
+    /// ### Flow & Caller
+    /// This function is called by the `claims-processor` contract when a policy reaches its
+    /// expiration timestamp without triggering a payout.
+    ///
+    /// ### Capital Effect
+    /// This reduces `total_locked` in the pool, releasing the locked capital back into the
+    /// pool's available liquidity. Unlike `release_for_claim`, the capital remains in the pool
+    /// and is available to underwrite new policies, while the premium paid by the policyholder
+    /// is fully earned by the pool.
+    ///
+    /// ### Design Rationale
+    /// Having separate functions (`release_for_claim` and `release_for_expiry`) instead of a single
+    /// `release(policy_id, reason)` endpoint serves several key purposes:
+    /// 1. **Access Control & Security**: Allows fine-grained tracking of capital outflows due to claims
+    ///    vs. standard policy expirations.
+    /// 2. **Auditability & Logging**: Distinct event paths make off-chain monitoring, analytics,
+    ///    and accounting of paid claims vs. expired policies trivial.
+    /// 3. **Gas Optimization**: Avoids the instruction overhead of parsing and branching on an enum/string
+    ///    reason within the contract.
     pub fn release_for_expiry(env: Env, caller: Address, policy_id: u128) {
         Self::require_protocol_caller(&env, &caller);
         let mut lock: CapitalLock = env.storage().persistent()
@@ -511,6 +558,7 @@ impl RiskPool {
         if lock.released { panic_with_error!(&env, Error::AlreadyReleased); }
         lock.released = true;
         env.storage().persistent().set(&StorageKey::Lock(policy_id), &lock);
+        env.storage().persistent().extend_ttl(&StorageKey::Lock(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
         let total_locked: i128 = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
         env.storage().instance().set(&StorageKey::TotalLocked, &(total_locked.saturating_sub(lock.amount)));
     }
@@ -664,11 +712,16 @@ impl RiskPool {
         }
 
         let now = env.ledger().timestamp();
+        // Freeze the deadline now. Recomputing it at execution time would let a
+        // contract upgrade that shortens TIMELOCK_SECONDS cut the wait on a
+        // request LPs have already seen published.
+        let execute_after = now + TIMELOCK_SECONDS;
         env.storage().persistent().set(
             &StorageKey::AdminWithdrawalRequest,
             &AdminWithdrawalRequest {
                 amount,
                 requested_at: now,
+                execute_after,
                 executed: false,
             },
         );
@@ -679,7 +732,7 @@ impl RiskPool {
             AdminWithdrawalScheduled {
                 admin: admin.clone(),
                 amount,
-                execute_after: now + TIMELOCK_SECONDS,
+                execute_after,
             },
         );
     }
@@ -695,9 +748,16 @@ impl RiskPool {
         if req.executed { panic_with_error!(&env, Error::AlreadyReleased); }
 
         let now = env.ledger().timestamp();
-        if now < req.requested_at + TIMELOCK_SECONDS {
+        if now < req.execute_after {
             panic_with_error!(&env, Error::TimelockNotReady);
         }
+
+        // Re-check unlocked liquidity with fresh totals. `request_admin_withdrawal`
+        // validated the amount at request time, but new capital locks created during
+        // the timelock can shrink the available balance — executing blindly would
+        // drain funds earmarked as policy collateral.
+        let available = Self::get_available_liquidity(env.clone());
+        if req.amount > available { panic_with_error!(&env, Error::Undercollateralized); }
 
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
         let treasury: Address = env.storage().instance().get(&StorageKey::Treasury).unwrap();
@@ -778,6 +838,7 @@ impl RiskPool {
     /// Propose a new admin. Only the current admin can call this.
     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
+        Self::validate_stellar_address(&env, &new_admin);
         // Store the proposed admin (zero address means no proposal)
         env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
     }
@@ -827,28 +888,17 @@ impl RiskPool {
         caller.require_auth();
     }
 
-    /// Extend a persistent entry's TTL to the network maximum. Used for
-    /// LP position/address records, which must survive for as long as an LP
-    /// holds shares — an indefinite, not policy-bound, duration.
-    fn extend_to_max(env: &Env, key: &StorageKey) {
-        let max_ttl = env.storage().max_ttl();
-        env.storage().persistent().extend_ttl(key, max_ttl, max_ttl);
-    }
-
-    /// Extend a `Lock` entry's TTL to cover `LOCK_RETENTION_SECONDS`
-    /// (clamped to the network's max TTL).
-    fn extend_lock_ttl(env: &Env, key: &StorageKey) {
-        let desired_ledgers = (LOCK_RETENTION_SECONDS / LEDGER_SECONDS) as u32;
-        let extend_to = desired_ledgers.min(env.storage().max_ttl());
-        env.storage().persistent().extend_ttl(key, extend_to, extend_to);
-    }
-
-    /// Extend the `AdminWithdrawalRequest` entry's TTL to cover
-    /// `WITHDRAWAL_RETENTION_SECONDS` (clamped to the network's max TTL).
-    fn extend_withdrawal_ttl(env: &Env, key: &StorageKey) {
-        let desired_ledgers = (WITHDRAWAL_RETENTION_SECONDS / LEDGER_SECONDS) as u32;
-        let extend_to = desired_ledgers.min(env.storage().max_ttl());
-        env.storage().persistent().extend_ttl(key, extend_to, extend_to);
+    /// Validate that an address has a valid Stellar format (56-char, starts with G or C).
+    fn validate_stellar_address(env: &Env, address: &Address) {
+        let addr_str = address.to_string();
+        if addr_str.len() != 56 {
+            panic_with_error!(env, Error::InvalidAddress);
+        }
+        let mut buf = [0u8; 56];
+        addr_str.copy_into_slice(&mut buf);
+        if buf[0] != b'G' && buf[0] != b'C' {
+            panic_with_error!(env, Error::InvalidAddress);
+        }
     }
 
     fn assert_active(env: &Env) {

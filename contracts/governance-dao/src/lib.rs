@@ -24,6 +24,13 @@ use soroban_sdk::{
 pub mod types;
 pub use types::*;
 
+/// Minimum voting period: 1 hour in seconds.
+const MIN_VOTING_PERIOD: u64 = 3_600;
+/// Maximum voting period: 30 days in seconds. Prevents an admin from setting
+/// an unreachably large period that would cause vote_end + FINALIZE_DELAY to
+/// overflow or make proposals permanently unresolvable.
+const MAX_VOTING_PERIOD: u64 = 30 * 24 * 3_600;
+
 #[contracttype]
 enum StorageKey {
     Initialized,
@@ -58,6 +65,8 @@ pub enum Error {
     FinalizeDelayNotMet = 14,
     VersionNotNewer = 15,
     LimitReached = 16,
+    VotingPeriodTooShort = 17,
+    VotingPeriodTooLong = 18,
 }
 
 #[contract]
@@ -104,6 +113,12 @@ impl GovernanceDao {
         env.storage()
             .instance()
             .set(&StorageKey::Initialized, &true);
+        if config.voting_period < MIN_VOTING_PERIOD {
+            panic_with_error!(&env, Error::VotingPeriodTooShort);
+        }
+        if config.voting_period > MAX_VOTING_PERIOD {
+            panic_with_error!(&env, Error::VotingPeriodTooLong);
+        }
         env.storage().instance().set(&StorageKey::Admin, &admin);
         env.storage().instance().set(&StorageKey::Config, &config);
         env.storage()
@@ -136,6 +151,7 @@ impl GovernanceDao {
         args: Vec<Val>, // <--- ADD THIS ARGUMENT
     ) -> u64 {
         proposer.require_auth();
+        Self::validate_stellar_address(&env, &target);
         let config: DaoConfig = env
             .storage()
             .instance()
@@ -361,6 +377,7 @@ impl GovernanceDao {
         if total_votes < quorum_needed {
             proposal.status = ProposalStatus::Failed;
         } else {
+            // Guard: prevent division by zero if total_votes == 0
             let for_bps = if total_votes > 0 {
                 proposal.votes_for.checked_mul(10_000).map(|v| v / total_votes).unwrap_or(0)
             } else {
@@ -532,6 +549,12 @@ impl GovernanceDao {
     /// here cannot retroactively affect proposals already in flight.
     pub fn update_config(env: Env, admin: Address, config: DaoConfig) {
         Self::require_admin(&env, &admin);
+        if config.voting_period < MIN_VOTING_PERIOD {
+            panic_with_error!(&env, Error::VotingPeriodTooShort);
+        }
+        if config.voting_period > MAX_VOTING_PERIOD {
+            panic_with_error!(&env, Error::VotingPeriodTooLong);
+        }
         env.storage().instance().set(&StorageKey::Config, &config);
 
         env.events().publish(
@@ -597,19 +620,17 @@ impl GovernanceDao {
         caller.require_auth();
     }
 
-    /// Extend a proposal/vote/locked-balance entry's TTL to cover the
-    /// remaining voting period + finalize delay + timelock + buffer
-    /// (clamped to the network's max TTL), so it survives until the
-    /// proposal is finalized and executed (issue #185).
-    fn extend_proposal_ttl(env: &Env, key: &StorageKey, config: &DaoConfig) {
-        let seconds_needed = config
-            .voting_period
-            .saturating_add(FINALIZE_DELAY)
-            .saturating_add(config.proposal_timelock)
-            .saturating_add(GOVERNANCE_TTL_BUFFER_SECONDS);
-        let desired_ledgers = (seconds_needed / LEDGER_SECONDS) as u32;
-        let extend_to = desired_ledgers.min(env.storage().max_ttl());
-        env.storage().persistent().extend_ttl(key, extend_to, extend_to);
+    /// Validate that an address has a valid Stellar format (56-char, starts with G or C).
+    fn validate_stellar_address(env: &Env, address: &Address) {
+        let addr_str = address.to_string();
+        if addr_str.len() != 56 {
+            panic!("invalid address: must be an account or contract address");
+        }
+        let mut buf = [0u8; 56];
+        addr_str.copy_into_slice(&mut buf);
+        if buf[0] != b'G' && buf[0] != b'C' {
+            panic!("invalid address: must be an account or contract address");
+        }
     }
 }
 

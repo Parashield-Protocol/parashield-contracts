@@ -7,6 +7,8 @@ pub enum ClaimStatus {
     Paid,
     Rejected,
     Disputed,
+    /// Claim was resolved as expired before it could be processed.
+    Expired,
 }
 
 /// Result returned by `process_claim` and `auto_process`.

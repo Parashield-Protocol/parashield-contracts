@@ -200,3 +200,70 @@ fn verify_trigger_equal_with_tolerance_failure_outside_range() {
 
     assert!(!c.verify_trigger(&wt(), &kk(), &condition));
 }
+
+// ── Issue #261: zero-division guard when total_votes / total_weight == 0 ────
+
+/// When no oracles have submitted data, calling verify_trigger must panic with
+/// NoDataAvailable (#6) instead of dividing by zero in the median calculation.
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_verify_trigger_panics_when_no_submissions() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let oracle = Address::generate(&env);
+    c.add_oracle(&admin, &oracle, &wt(), &90u32);
+
+    // Oracle is registered but has NOT submitted any data.
+    // total_weight == 0, n == 0 → must not divide by zero.
+    let condition = TriggerCondition {
+        data_type: wt(),
+        key: kk(),
+        threshold: 50_000_000i128,
+        comparison: TriggerComparison::LessThan,
+        tolerance: 0i128,
+    };
+    c.verify_trigger(&wt(), &kk(), &condition);
+}
+
+/// get_aggregated must also panic with NoDataAvailable when there are zero
+/// submissions, rather than producing a division-by-zero in the weighted
+/// confidence calculation.
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_get_aggregated_panics_when_no_submissions() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let oracle = Address::generate(&env);
+    c.add_oracle(&admin, &oracle, &wt(), &80u32);
+
+    // No data submitted → total_weight == 0.
+    c.get_aggregated(&wt(), &kk());
+}
+
+/// When all registered oracles are deactivated after submitting data, the
+/// median calculation must reject with NoDataAvailable rather than dividing
+/// by total_weight == 0.
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_verify_trigger_panics_when_all_oracles_deactivated() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let oracle = Address::generate(&env);
+    c.add_oracle(&admin, &oracle, &wt(), &90u32);
+
+    env.ledger().set_timestamp(1);
+    c.submit_data(&oracle, &wt(), &kk(), &30_000_000i128, &90u32, &1u64);
+
+    // Deactivate the only oracle — its submission remains, but total_weight
+    // drops to 0 because the oracle is no longer active.
+    c.remove_oracle(&admin, &oracle, &wt());
+
+    let condition = TriggerCondition {
+        data_type: wt(),
+        key: kk(),
+        threshold: 50_000_000i128,
+        comparison: TriggerComparison::LessThan,
+        tolerance: 0i128,
+    };
+    c.verify_trigger(&wt(), &kk(), &condition);
+}

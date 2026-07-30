@@ -32,6 +32,7 @@ pub use types::*;
 #[soroban_sdk::contractclient(name = "RiskPoolClient")]
 trait IRiskPool {
     fn release_for_claim(env: Env, caller: Address, policy_id: u128);
+    fn release_for_expiry(env: Env, caller: Address, policy_id: u128);
 }
 
 #[soroban_sdk::contractclient(name = "PolicyEngineClient")]
@@ -51,6 +52,27 @@ trait IOracleVerifier {
         max_age_seconds: u64,
     ) -> bool;
 }
+
+// ─── Storage TTL ──────────────────────────────────────────────────────────────
+
+/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
+/// (at ~5s/ledger).
+const TTL_THRESHOLD: u32 = 518_400;
+/// Extend persistent entries out to ~1 year (at ~5s/ledger) so pending claims
+/// survive long enough to be processed.
+const TTL_EXTEND_TO: u32 = 6_312_000;
+
+// ─── Batch processing ─────────────────────────────────────────────────────────
+
+/// Hard ceiling on how many claims a single `batch_auto_process` call may
+/// settle.
+///
+/// Each claim in the batch costs an oracle read plus a cross-contract call into
+/// the policy-engine, so an unbounded batch would exhaust Soroban's per
+/// transaction instruction budget and fail with an opaque gas error — taking
+/// the whole batch down with it. Capping keeps every call within budget;
+/// callers with a longer queue simply invoke the function again.
+pub const MAX_BATCH_SIZE: u32 = 50;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -87,6 +109,7 @@ pub enum Error {
     AlreadyProcessed   = 7,
     InvalidAddress     = 8,
     Paused             = 9,
+    PolicyExpired      = 10,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -246,8 +269,15 @@ impl ClaimsProcessor {
             panic_with_error!(&env, Error::PolicyNotActive);
         }
 
+        // Guard: reject expired policies even if status hasn't been updated yet.
+        // A direct contract caller could bypass the backend's status check, so
+        // we verify end_time at the contract level.
+        let now = env.ledger().timestamp();
+        if policy.end_time > 0 && now > policy.end_time {
+            panic_with_error!(&env, Error::PolicyExpired);
+        }
+
         let claim_id   = Self::next_claim_id(&env);
-        let now        = env.ledger().timestamp();
         let claim = Claim {
             id: claim_id,
             policy_id,
@@ -260,12 +290,10 @@ impl ClaimsProcessor {
             processed_at: None,
             dispute_reason: None,
         };
-        let claim_key = StorageKey::Claim(claim_id);
-        let policy_claim_key = StorageKey::PolicyClaim(policy_id);
-        env.storage().persistent().set(&claim_key, &claim);
-        env.storage().persistent().set(&policy_claim_key, &claim_id);
-        Self::extend_claim_ttl(&env, &claim_key);
-        Self::extend_claim_ttl(&env, &policy_claim_key);
+        env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
+        env.storage().persistent().extend_ttl(&StorageKey::Claim(claim_id), TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage().persistent().set(&StorageKey::PolicyClaim(policy_id), &claim_id);
+        env.storage().persistent().extend_ttl(&StorageKey::PolicyClaim(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
 
         let mut pending: Vec<u128> = env.storage().instance()
             .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(&env));
@@ -343,8 +371,17 @@ impl ClaimsProcessor {
         // Check if policy has expired with no trigger
         let now = env.ledger().timestamp();
         if now > policy.end_time {
+            let risk_pool: Address = env.storage().instance()
+                .get(&StorageKey::RiskPool)
+                .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
             PolicyEngineClient::new(&env, &policy_engine)
                 .expire_policy(&env.current_contract_address(), &policy_id);
+            // Atomic lock release, mirroring the payout path: expiring a policy
+            // and freeing its earmarked capital happen in one transaction, so a
+            // crash between the two cannot strand liquidity in the pool. If the
+            // release fails the whole call reverts and the policy stays Active.
+            RiskPoolClient::new(&env, &risk_pool)
+                .release_for_expiry(&env.current_contract_address(), &policy_id);
             return ClaimResult::Expired;
         }
 
@@ -366,18 +403,28 @@ impl ClaimsProcessor {
                 processed_at: None,
                 dispute_reason: None,
             };
-            let claim_key = StorageKey::Claim(cid);
-            let policy_claim_key = StorageKey::PolicyClaim(policy_id);
-            env.storage().persistent().set(&claim_key, &claim);
-            env.storage().persistent().set(&policy_claim_key, &cid);
-            Self::extend_claim_ttl(&env, &claim_key);
-            Self::extend_claim_ttl(&env, &policy_claim_key);
+            env.storage().persistent().set(&StorageKey::Claim(cid), &claim);
+            env.storage().persistent().extend_ttl(&StorageKey::Claim(cid), TTL_THRESHOLD, TTL_EXTEND_TO);
+            env.storage().persistent().set(&StorageKey::PolicyClaim(policy_id), &cid);
+            env.storage().persistent().extend_ttl(&StorageKey::PolicyClaim(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
 
             // Make the new claim visible to batch processors and monitoring.
             let mut pending: Vec<u128> = env.storage().instance()
                 .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(&env));
             pending.push_back(cid);
             env.storage().instance().set(&StorageKey::PendingClaims, &pending);
+
+            // Emit claim_submitted event for off-chain indexing
+            env.events().publish(
+                (Symbol::new(&env, "claim_submitted"),),
+                ClaimSubmitted {
+                    claim_id: cid,
+                    policy_id,
+                    claimant: policy.policyholder.clone(),
+                    coverage_amount: policy.coverage_amount,
+                },
+            );
+
             cid
         };
 
@@ -392,6 +439,11 @@ impl ClaimsProcessor {
     /// Process up to `limit` pending claims parametrically in one call.
     /// Returns a Vec of (claim_id, result) pairs for the processed claims.
     /// Skips any claim that is not in Pending status (idempotent).
+    ///
+    /// `limit` is clamped to [`MAX_BATCH_SIZE`]. Passing a larger value (or
+    /// `u32::MAX`) is not an error — it simply settles the first
+    /// `MAX_BATCH_SIZE` pending claims, keeping the transaction inside
+    /// Soroban's instruction budget. Call again to drain the rest of the queue.
     pub fn batch_auto_process(env: Env, caller: Address, limit: u32) -> Vec<(u128, ClaimResult)> {
         Self::require_keeper(&env, &caller);
         Self::require_not_paused(&env);
@@ -400,7 +452,12 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| Vec::new(&env));
 
         let mut results: Vec<(u128, ClaimResult)> = Vec::new(&env);
-        let process_count = if pending.len() < limit { pending.len() } else { limit };
+        let effective_limit = if limit > MAX_BATCH_SIZE { MAX_BATCH_SIZE } else { limit };
+        let process_count = if pending.len() < effective_limit {
+            pending.len()
+        } else {
+            effective_limit
+        };
 
         let policy_engine: Address = env.storage().instance()
             .get(&StorageKey::PolicyEngine)
@@ -435,10 +492,12 @@ impl ClaimsProcessor {
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
         if claim.claimant != claimant { panic_with_error!(&env, Error::Unauthorized); }
-        // Only open (Pending) or rejected claims are disputable. A Paid claim is
-        // already settled (USDC transferred) and a Disputed claim is already open,
-        // so neither may be overwritten.
-        if claim.status != ClaimStatus::Pending && claim.status != ClaimStatus::Rejected {
+        // Only open (Pending) or rejected claims are disputable. Paid claims are
+        // already settled (USDC transferred), Disputed claims are already open,
+        // and Expired claims should not be reopened through a dispute flow.
+        if claim.status != ClaimStatus::Pending
+            && claim.status != ClaimStatus::Rejected
+        {
             panic_with_error!(&env, Error::AlreadyProcessed);
         }
         claim.status = ClaimStatus::Disputed;
@@ -564,10 +623,26 @@ impl ClaimsProcessor {
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
-    /// Core evaluation: check oracle, update claim record, instruct Policy Engine.
-    /// After successful claim payment, atomically releases the coverage lock on Risk Pool
-    /// to prevent coverage from remaining locked indefinitely.
+    /// Evaluate a pending claim and settle it against the configured oracle trigger.
+    ///
+    /// This internal helper is the core claim lifecycle step. It first validates
+    /// that the claim is still pending, then resolves the oracle verifier,
+    /// policy engine, and risk pool contract addresses from storage. It builds a
+    /// trigger condition from the policy's oracle data type, key, threshold, and
+    /// comparison mode, and asks the oracle verifier whether the trigger is
+    /// currently met using a fresh-data check.
+    ///
+    /// If the trigger is met, the claim is marked as paid, the policy engine is
+    /// instructed to pay the claim, and the risk-pool coverage lock is released
+    /// in the same transaction. If the trigger is not met, the claim is marked
+    /// as rejected and no payout is issued. In either case, the claim record is
+    /// persisted, its pending-queue entry is removed, and a settlement event is
+    /// emitted so the outcome is observable off-chain.
     fn evaluate_and_settle(env: &Env, claim: &mut Claim, policy: &parashield_policy_engine::Policy) -> ClaimResult {
+        // Validate claim is in Pending state before transitioning (atomic state guard)  
+        if claim.status != ClaimStatus::Pending {
+            panic_with_error!(env, Error::AlreadyProcessed);
+        }
         let oracle_verifier: Address = env.storage().instance()
             .get(&StorageKey::OracleVerifier)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
@@ -617,17 +692,21 @@ impl ClaimsProcessor {
             ClaimResult::Rejected
         };
 
-        let claim_key = StorageKey::Claim(claim.id);
-        env.storage().persistent().set(&claim_key, claim);
-        Self::extend_claim_ttl(env, &claim_key);
+        env.storage().persistent().set(&StorageKey::Claim(claim.id), claim);
+        env.storage().persistent().extend_ttl(&StorageKey::Claim(claim.id), TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // The claim is now settled (Paid/Rejected) — drop it from the pending
         // queue so it is neither re-evaluated nor allowed to grow the queue
         // without bound.
         Self::remove_from_pending(env, claim.id);
 
-        // Emit specific event for rejected claims to enable off-chain monitoring
-        if !trigger_met {
+        // Emit specific event for rejected/paid claims to enable off-chain monitoring
+        if trigger_met {
+            env.events().publish(
+                (Symbol::new(env, "claim_paid"),),
+                (claim.id, claim.policy_id, claim.coverage_amount),
+            );
+        } else {
             env.events().publish(
                 (Symbol::new(env, "claim_rejected"),),
                 (claim.id, claim.policy_id, Symbol::new(env, "trigger_not_met")),
@@ -713,14 +792,6 @@ impl ClaimsProcessor {
         if buf[0] != b'G' && buf[0] != b'C' {
             panic_with_error!(env, Error::InvalidAddress);
         }
-    }
-
-    /// Extend the TTL of a Claim/PolicyClaim entry to cover
-    /// `CLAIM_RETENTION_SECONDS` (clamped to the network's max TTL).
-    fn extend_claim_ttl(env: &Env, key: &StorageKey) {
-        let desired_ledgers = (CLAIM_RETENTION_SECONDS / LEDGER_SECONDS) as u32;
-        let extend_to = desired_ledgers.min(env.storage().max_ttl());
-        env.storage().persistent().extend_ttl(key, extend_to, extend_to);
     }
 }
 

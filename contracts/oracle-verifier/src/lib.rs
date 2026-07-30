@@ -25,25 +25,27 @@ use soroban_sdk::{
 pub mod types;
 pub use types::*;
 
+// ─── Storage TTL ──────────────────────────────────────────────────────────────
+const TTL_THRESHOLD: u32 = 518_400; // ~30 days
+const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year
+
 /// Maximum number of registered oracles. Bounds the median aggregation loop and
 /// the worst-case weighted sum (MAX_ORACLES * max_weight * max_value) so it
 /// cannot overflow i128.
 #[allow(dead_code)]
 const MAX_ORACLES: u32 = 100;
 
-/// Approximate Stellar ledger close time in seconds, used to convert
-/// wall-clock TTL windows into ledger counts for `extend_ttl`.
-#[allow(dead_code)]
-const LEDGER_SECONDS: u64 = 5;
+// ─── Storage TTL ──────────────────────────────────────────────────────────────
 
-/// Oracle readings must outlive the longest active policy period so that
-/// `verify_trigger` can still find them when a claim is finally evaluated —
-/// even if the (data_type, key) never receives another submission after its
-/// observation window closes (issue #184). 120 days covers typical
-/// parametric policy coverage windows plus a claims-processing buffer; it is
-/// capped to the network's max TTL at call time so `extend_ttl` never panics.
+/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
+/// (at ~5s/ledger).
 #[allow(dead_code)]
-const DATA_RETENTION_SECONDS: u64 = 120 * 24 * 60 * 60;
+const TTL_THRESHOLD: u32 = 518_400;
+/// Extend persistent entries out to ~1 year (at ~5s/ledger) so an oracle
+/// registration doesn't silently expire from storage during a quiet period
+/// with no submissions.
+#[allow(dead_code)]
+const TTL_EXTEND_TO: u32 = 6_312_000;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -81,6 +83,7 @@ pub enum Error {
     StaleData = 9,
     TooManyOracles = 10,
     InvalidTimestamp = 11,
+    InvalidAddress = 12,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -100,8 +103,7 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
 
-        // require_auth() validates the address at the protocol level, so we do
-        // not need manual address format string validation here.
+        Self::validate_stellar_address(&env, &admin);
         admin.require_auth();
 
         env.storage()
@@ -133,6 +135,7 @@ impl OracleVerifier {
     /// `weight` is 1-100; higher-weight oracles contribute more to the median.
     pub fn add_oracle(env: Env, admin: Address, oracle: Address, data_type: Symbol, weight: u32) {
         Self::require_admin(&env, &admin);
+        Self::validate_stellar_address(&env, &oracle);
         if weight == 0 || weight > 100 {
             panic_with_error!(&env, Error::InvalidWeight);
         }
@@ -147,6 +150,7 @@ impl OracleVerifier {
             active: true,
         };
         env.storage().persistent().set(&key, &entry);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         let mut list: Vec<Address> = env
             .storage()
@@ -202,6 +206,7 @@ impl OracleVerifier {
             .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
         entry.weight = weight;
         env.storage().persistent().set(&key, &entry);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
     /// Deactivate an oracle (soft delete — historical data is retained).
@@ -215,6 +220,7 @@ impl OracleVerifier {
             .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
         entry.active = false;
         env.storage().persistent().set(&key, &entry);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // Prune the address from the flat OracleList so get_oracles() and
         // instance storage don't accumulate deactivated addresses forever
@@ -275,6 +281,7 @@ impl OracleVerifier {
     /// Propose a new admin. Only the current admin can call this.
     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
+        Self::validate_stellar_address(&env, &new_admin);
         // Store the proposed admin (zero address means no proposal)
         env.storage()
             .instance()
@@ -352,6 +359,26 @@ impl OracleVerifier {
 
     /// Submit a data point for a (data_type, key) pair.
     ///
+    /// This function stores one reading from a registered oracle for a specific
+    /// observation key. Multiple oracles may submit values for the same key;
+    /// later aggregation does not discard or "average out" conflicting values
+    /// by default. Instead, the contract computes a weighted median over all
+    /// eligible submissions for that key, so a small number of contradictory
+    /// readings do not dominate the result unless their assigned oracle weights
+    /// do.
+    ///
+    /// For a reading to be considered during aggregation, the submission must
+    /// be fresh enough for the configured max-data-age window, from an active
+    /// oracle, and at or above the configured minimum confidence threshold. The
+    /// aggregation logic also requires at least `min_oracle_count` eligible
+    /// submissions before it will return a consensus value; if fewer are
+    /// available, the call fails with `NoDataAvailable`.
+    ///
+    /// The final value is the weighted median of the eligible submissions, where
+    /// each oracle's registered weight influences its position in the ordered
+    /// set. If the total weight is even, the midpoint between the two middle
+    /// values is returned.
+    ///
     /// - `data_type`: category — "weather", "flight", "onchain", "disaster"
     /// - `key`: specific measurement — "rainfall:kisumu:2026-06", "flight:KQ100:2026-06-15"
     /// - `value`: 7-decimal fixed point (same precision as Stellar assets)
@@ -390,6 +417,10 @@ impl OracleVerifier {
         if !entry.active {
             panic_with_error!(&env, Error::Unauthorized);
         }
+        // Keep the registration alive alongside the reading it authorized.
+        env.storage()
+            .persistent()
+            .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // Load existing submissions for this (data_type, key)
         let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
@@ -419,7 +450,7 @@ impl OracleVerifier {
         }
 
         env.storage().persistent().set(&dp_key, &points);
-        Self::extend_data_points_ttl(&env, &dp_key);
+        env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         env.events().publish(
             (Symbol::new(&env, "oracle_data_submitted"),),
@@ -436,8 +467,23 @@ impl OracleVerifier {
 
     // ── Verification ─────────────────────────────────────────────────────────
 
-    /// Returns true if the aggregated oracle value satisfies `condition`.
-    /// This is the single function the Claims Processor calls to decide payout.
+    /// Evaluate whether the aggregated oracle value satisfies a trigger condition.
+    ///
+    /// This is the single entry point the Claims Processor uses to decide
+    /// whether a policy should payout. The function reads the aggregated value
+    /// for the requested `(data_type, key)` pair and compares it to the
+    /// configured threshold using the requested comparison operator.
+    ///
+    /// The comparison is performed on the same fixed-point numeric units used
+    /// for oracle submissions, so the threshold and observed value should be
+    /// expressed in the same precision. `LessThan`, `GreaterThan`, and `Equal`
+    /// apply the standard relational comparison directly, while
+    /// `EqualWithTolerance` treats the condition as satisfied when the
+    /// absolute difference between the aggregated value and the threshold is
+    /// less than or equal to the supplied tolerance.
+    ///
+    /// The return value is `true` when the condition is met and `false`
+    /// otherwise.
     pub fn verify_trigger(
         env: Env,
         data_type: Symbol,
@@ -498,32 +544,31 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::NoDataAvailable);
         }
         let median_value = Self::get_median_value(&env, &data_type, &key);
-        let oracle_count = points.len();
+        let mut oracle_count = 0u32;
         let mut min_confidence = 100u32;
         let mut weighted_confidence_sum: u128 = 0;
         let mut total_weight: u128 = 0;
         let mut last_updated = 0u64;
-        for i in 0..oracle_count {
+        for i in 0..points.len() {
             let p = points.get_unchecked(i);
-            if p.confidence < min_confidence {
-                min_confidence = p.confidence;
-            }
-            if p.timestamp > last_updated {
-                last_updated = p.timestamp;
-            }
-
             let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
             if let Some(entry) = env
                 .storage()
                 .persistent()
                 .get::<_, OracleEntry>(&oracle_key)
             {
-                weighted_confidence_sum += (p.confidence as u128) * (entry.weight as u128);
-                total_weight += entry.weight as u128;
+                if entry.active {
+                    oracle_count += 1;
+                    min_confidence = min_confidence.min(p.confidence);
+                    last_updated = last_updated.max(p.timestamp);
+                    weighted_confidence_sum += (p.confidence as u128) * (entry.weight as u128);
+                    total_weight += entry.weight as u128;
+                }
             }
         }
         let confidence = match weighted_confidence_sum.checked_div(total_weight) {
-            Some(c) => c as u32,
+            // #242 — saturate to u32::MAX instead of silently truncating
+            Some(c) => u32::try_from(c).unwrap_or(u32::MAX),
             None => 0u32,
         };
 
@@ -589,7 +634,7 @@ impl OracleVerifier {
         }
 
         let median = Self::get_median_value(&env, &data_type, &key);
-        match condition.comparison {
+        let result = match condition.comparison {
             TriggerComparison::LessThan => median < condition.threshold,
             TriggerComparison::GreaterThan => median > condition.threshold,
             TriggerComparison::Equal => median == condition.threshold,
@@ -597,7 +642,15 @@ impl OracleVerifier {
                 let diff = median.saturating_sub(condition.threshold);
                 diff.abs() <= condition.tolerance
             }
-        }
+        };
+        
+        // Emit event for verification result to enable monitoring and auditing
+        env.events().publish(
+            (Symbol::new(&env, "verification_result"),),
+            (data_type, key, result, median, condition.threshold),
+        );
+        
+        result
     }
 
     /// Submit data for multiple keys in one call.
@@ -618,6 +671,10 @@ impl OracleVerifier {
         if !entry.active {
             panic_with_error!(&env, Error::Unauthorized);
         }
+        // Keep the registration alive alongside the readings it authorized.
+        env.storage()
+            .persistent()
+            .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         for i in 0..submissions.len() {
             let (key, value, confidence, timestamp) = submissions.get_unchecked(i);
@@ -661,8 +718,8 @@ impl OracleVerifier {
             if !found {
                 points.push_back(new_point);
             }
-            env.storage().persistent().set(&dp_key, &points);
-            Self::extend_data_points_ttl(&env, &dp_key);
+                env.storage().persistent().set(&dp_key, &points);
+            env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
             env.events().publish(
                 (Symbol::new(&env, "oracle_data_submitted"),),
@@ -700,6 +757,10 @@ impl OracleVerifier {
         if !entry.active {
             panic_with_error!(&env, Error::Unauthorized);
         }
+        // Keep the registration alive alongside the readings it authorized.
+        env.storage()
+            .persistent()
+            .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         for i in 0..submissions.len() {
             let sub = submissions.get_unchecked(i);
@@ -733,8 +794,8 @@ impl OracleVerifier {
             if !found {
                 points.push_back(new_point);
             }
-            env.storage().persistent().set(&dp_key, &points);
-            Self::extend_data_points_ttl(&env, &dp_key);
+                env.storage().persistent().set(&dp_key, &points);
+            env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
             env.events().publish(
                 (Symbol::new(&env, "oracle_data_submitted"),),
@@ -775,6 +836,22 @@ impl OracleVerifier {
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
+    /// Validate that an address has a valid Stellar format (56-char, starts with G or C).
+    fn validate_stellar_address(env: &Env, address: &Address) {
+        let addr_str = address.to_string();
+
+        if addr_str.len() != 56 {
+            panic_with_error!(env, Error::InvalidAddress);
+        }
+
+        let mut buf = [0u8; 56];
+        addr_str.copy_into_slice(&mut buf);
+
+        if buf[0] != b'G' && buf[0] != b'C' {
+            panic_with_error!(env, Error::InvalidAddress);
+        }
+    }
+
     fn require_admin(env: &Env, caller: &Address) {
         let admin: Address = env
             .storage()
@@ -787,17 +864,7 @@ impl OracleVerifier {
         caller.require_auth();
     }
 
-    /// Extend the TTL of a `DataPoints` entry to cover `DATA_RETENTION_SECONDS`
-    /// (clamped to the network's max TTL), so a reading submitted once for a
-    /// (data_type, key) that never receives another submission still survives
-    /// long enough for `verify_trigger`/`get_data` to find it (issue #184).
-    fn extend_data_points_ttl(env: &Env, key: &StorageKey) {
-        let desired_ledgers = (DATA_RETENTION_SECONDS / LEDGER_SECONDS) as u32;
-        let extend_to = desired_ledgers.min(env.storage().max_ttl());
-        env.storage().persistent().extend_ttl(key, extend_to, extend_to);
-    }
-
-    /// Compute the simple median of all submitted values for (data_type, key).
+    /// Compute the weighted median of active, sufficiently fresh submissions.
     fn get_median_value(env: &Env, data_type: &Symbol, key: &Symbol) -> i128 {
         let points: Vec<OracleDataPoint> = env
             .storage()
@@ -834,7 +901,7 @@ impl OracleVerifier {
                     .persistent()
                     .get::<_, OracleEntry>(&oracle_key)
                 {
-                    if n < 100 {
+                    if entry.active && n < 100 {
                         values[n] = (p.value, entry.weight);
                         n += 1;
                         total_weight += entry.weight;

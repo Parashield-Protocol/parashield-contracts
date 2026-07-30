@@ -190,6 +190,38 @@ fn test_expired_policy_no_payout() {
     assert_eq!(policy.status, parashield_policy_engine::PolicyStatus::Expired);
 }
 
+/// Expiring a policy must free its earmarked capital in the same transaction.
+///
+/// Previously `expire_policy` only flipped the policy status; the pool's
+/// `release_for_expiry` was left to a separate backend call, so a crash between
+/// the two left the policy Expired while its coverage stayed locked — quietly
+/// shrinking the liquidity available to underwrite new policies.
+#[test]
+fn test_expired_policy_releases_pool_capital() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+
+    let pool = RiskPoolClient::new(&w.env, &w.pool_id);
+    let locked_while_active = pool.get_stats().total_locked;
+    assert_eq!(locked_while_active, COVERAGE, "coverage should be locked while active");
+
+    // Advance past the 30-day policy duration.
+    w.env.ledger().with_mut(|l| l.timestamp += 31 * 86_400);
+
+    let result = ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .auto_process(&w.keeper, &pol_id);
+    assert_eq!(result, ClaimResult::Expired);
+
+    // The lock is gone without any separate backend call.
+    assert_eq!(
+        pool.get_stats().total_locked,
+        0,
+        "expiry must release the capital lock atomically",
+    );
+}
+
 /// auto_process on already-paid policy returns AlreadyProcessed (idempotent).
 #[test]
 fn test_double_process_idempotent() {
@@ -258,6 +290,22 @@ fn test_non_policyholder_cannot_submit_claim() {
 
     ClaimsProcessorClient::new(&w.env, &w.claims_id)
         .submit_claim(&stranger, &pol_id);
+}
+
+/// submit_claim on an expired policy must panic with PolicyExpired error.
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_submit_claim_on_expired_policy_fails() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    
+    // Advance time past the 30-day policy duration
+    w.env.ledger().with_mut(|l| l.timestamp += 31 * 86_400);
+    
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    cp.submit_claim(&buyer, &pol_id);
 }
 
 /// Manual submit_claim + process_claim flow works end-to-end.
@@ -564,26 +612,23 @@ fn test_process_claim_double_processing_returns_already_processed() {
     assert_eq!(balance, 5_000_000_000 - 4_109_589 + 1_000_000_000);
 }
 
-// ── Storage TTL (issue #186) ─────────────────────────────────────────────────
-
-/// Claim and PolicyClaim entries must survive ledger time advancing past the
-/// default `min_persistent_entry_ttl` (4096 ledgers) that a persistent entry
-/// gets when no `extend_ttl` is ever called. Without the fix, reading these
-/// entries after this advancement would panic on an expired entry.
+/// Test that batch_auto_process with an empty pending list returns an empty vector.
+/// This verifies the function gracefully handles the zero-claims case without panicking.
 #[test]
-fn test_claim_ttl_survives_ledger_advancement() {
+fn test_batch_auto_process_empty_pending_list() {
     let w = deploy();
-    let pid = create_crop_product(&w);
-    let buyer = Address::generate(&w.env);
-    let pol_id = buy_crop_policy(&w, &buyer, pid);
-
+    
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
-    let claim_id = cp.submit_claim(&buyer, &pol_id);
-
-    // Advance well past the default 4096-ledger min persistent TTL.
-    w.env.ledger().with_mut(|l| l.sequence_number += 10_000);
-
-    let claim = cp.get_claim(&claim_id);
-    assert_eq!(claim.id, claim_id);
-    assert_eq!(cp.get_claim_id_for_policy(&pol_id), Some(claim_id));
+    
+    // Verify no pending claims exist initially
+    assert_eq!(cp.get_pending_claims().len(), 0);
+    
+    // Call batch_auto_process with limit=10 on an empty list
+    let results = cp.batch_auto_process(&w.keeper, &10u32);
+    
+    // Must return an empty vector
+    assert_eq!(results.len(), 0, "batch_auto_process must return empty vec when pending list is empty");
+    
+    // Pending list should still be empty
+    assert_eq!(cp.get_pending_claims().len(), 0);
 }

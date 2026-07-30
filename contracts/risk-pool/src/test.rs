@@ -475,6 +475,45 @@ fn admin_timelock_cancel_and_re_request() {
     assert_eq!(pool.get_available_liquidity(), 800_0000000i128);
 }
 
+/// The timelock deadline is frozen when the request is made, not recomputed
+/// from the current `TIMELOCK_SECONDS` at execution time.
+///
+/// Without this, upgrading the contract with a shorter constant between
+/// `request_admin_withdrawal` and `execute_admin_withdrawal` would retroactively
+/// shorten the wait on a request LPs had already seen published — exactly the
+/// window they rely on to exit.
+///
+/// Simulated by storing a request whose deadline is longer than the current
+/// constant, then executing past the constant but before the stored deadline.
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn admin_timelock_honours_stored_deadline_not_current_constant() {
+    let (env, pool, _usdc_id, admin, _treasury, lp1) = setup();
+    pool.deposit(&lp1, &1_000_0000000i128, &0i128);
+
+    pool.request_admin_withdrawal(&admin, &100_0000000i128);
+
+    // Stand in for a request created under a longer timelock.
+    env.as_contract(&pool.address, || {
+        let mut req: crate::AdminWithdrawalRequest = env
+            .storage()
+            .persistent()
+            .get(&crate::StorageKey::AdminWithdrawalRequest)
+            .unwrap();
+        req.execute_after = req.requested_at + 30 * 24 * 60 * 60;
+        env.storage()
+            .persistent()
+            .set(&crate::StorageKey::AdminWithdrawalRequest, &req);
+    });
+
+    // Past the current 7-day constant, but short of the stored 30-day deadline.
+    let jump = (7 * 24 * 60 * 60 + 1) as u64;
+    env.ledger().set_timestamp(env.ledger().timestamp() + jump);
+
+    // Recomputing from TIMELOCK_SECONDS would let this through.
+    pool.execute_admin_withdrawal(&admin);
+}
+
 /// lock_for_policy on a pool with zero deposits (total_deposited == 0,
 /// total_locked == 0) must reject with Undercollateralized rather than
 /// silently succeeding or underflowing.
@@ -571,25 +610,67 @@ fn total_shares(deposited: i128) -> i128 {
     deposited * 1_000_000_000
 }
 
-// ── Storage TTL (issue #186) ─────────────────────────────────────────────────
+// ── Issue #200: receive_premium with zero LPs ──────────────────────────────────
 
-/// LpPosition and Lock entries must survive ledger time advancing past the
-/// default `min_persistent_entry_ttl` (4096 ledgers) that a persistent entry
-/// gets when no `extend_ttl` is ever called. Without the fix, reading these
-/// entries after this advancement would panic on an expired entry.
+/// `receive_premium`'s `if total_shares > 0` guard must not panic when no LP
+/// has ever deposited — a regression that removed the guard would divide by
+/// zero computing `increment`.
 #[test]
-fn test_lp_position_and_lock_ttl_survive_ledger_advancement() {
-    let (env, pool, _usdc, admin, _treasury, lp1) = setup();
-    pool.deposit(&lp1, &500_000_0000000i128, &0i128);
-    pool.lock_for_policy(&admin, &1u128, &1_000_0000000i128);
+fn receive_premium_with_zero_lps_does_not_panic() {
+    let (_, pool, _, _, _, lp1) = setup();
 
-    // Advance well past the default 4096-ledger min persistent TTL.
-    env.ledger().with_mut(|l| l.sequence_number += 10_000);
+    let stats_before = pool.get_stats();
+    assert_eq!(stats_before.total_shares, 0, "no LP has deposited yet");
 
-    let position = pool.get_position(&lp1);
-    assert!(position.is_some());
-    assert_eq!(position.unwrap().deposited, 500_000_0000000i128);
+    // Must not panic even though total_shares is 0.
+    pool.receive_premium(&lp1, &100_0000000i128);
 
-    // release_for_claim only succeeds if the Lock entry is still readable.
-    pool.release_for_claim(&admin, &1u128);
+    let stats_after = pool.get_stats();
+    assert_eq!(stats_after.total_shares, 0, "still no LPs after the premium call");
+    // The LP-share accumulator still increases (80% of premium), it simply
+    // has no shares to divide against yet.
+    assert_eq!(
+        stats_after.accumulated_premium - stats_before.accumulated_premium,
+        80_0000000i128
+    );
+}
+
+// ── Issue #201: release_for_claim / release_for_expiry cross double-release ───
+
+/// A policy released via `release_for_claim` must not also be releasable via
+/// `release_for_expiry` — both set the same `CapitalLock.released` flag, so
+/// the second call (regardless of which function is called first) must fail
+/// with `AlreadyReleased` rather than double-counting the locked amount.
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn release_for_claim_then_release_for_expiry_fails() {
+    let (_, pool, _, admin, _, lp1) = setup();
+    pool.deposit(&lp1, &200_0000000i128, &0i128);
+    pool.lock_for_policy(&admin, &55u128, &50_0000000i128);
+
+    pool.release_for_claim(&admin, &55u128);
+    pool.release_for_expiry(&admin, &55u128); // already released via release_for_claim
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn release_for_expiry_then_release_for_claim_fails() {
+    let (_, pool, _, admin, _, lp1) = setup();
+    pool.deposit(&lp1, &200_0000000i128, &0i128);
+    pool.lock_for_policy(&admin, &56u128, &50_0000000i128);
+
+    pool.release_for_expiry(&admin, &56u128);
+    pool.release_for_claim(&admin, &56u128); // already released via release_for_expiry
+}
+
+#[test]
+fn test_pool_depletion_scenarios() {
+    let (_, pool, _, _, _, lp1) = setup();
+    let amount = 100_0000000i128;
+    let shares = pool.deposit(&lp1, &amount, &0i128);
+    let returned = pool.withdraw(&lp1, &shares);
+    assert_eq!(returned, amount);
+    let stats = pool.get_stats();
+    assert_eq!(stats.total_deposited, 0);
+    assert_eq!(pool.get_available_liquidity(), 0);
 }

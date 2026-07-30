@@ -21,6 +21,7 @@ extern crate alloc;
 use alloc::string::ToString;
 
 #[cfg_attr(feature = "library", allow(unused_imports))]
+use crate::alloc::string::ToString;
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
     token, Address, BytesN, Env, Symbol, Vec,
@@ -28,6 +29,25 @@ use soroban_sdk::{
 
 pub mod types;
 pub use types::*;
+
+// ─── Storage TTL ──────────────────────────────────────────────────────────────
+
+/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
+/// (at ~5s/ledger).
+#[cfg(any(test, feature = "testutils", not(feature = "library")))]
+const TTL_THRESHOLD: u32 = 518_400;
+/// Extend persistent entries out to ~1 year (at ~5s/ledger) so long-lived
+/// products and policies don't get evicted from storage before they mature.
+#[cfg(any(test, feature = "testutils", not(feature = "library")))]
+const TTL_EXTEND_TO: u32 = 6_312_000;
+
+// ─── Pagination ───────────────────────────────────────────────────────────────
+
+/// Upper bound on the number of entries a paginated query will return in one
+/// call. Without a cap, a caller could pass `limit = u32::MAX` and force the
+/// contract to build one huge `Vec`, blowing Soroban's instruction budget.
+#[cfg(any(test, feature = "testutils", not(feature = "library")))]
+const MAX_PAGE_SIZE: u32 = 100;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -93,6 +113,7 @@ pub enum Error {
     ClaimsProcessorNotSet   = 18,
     InvalidDurationRange    = 19,
     InvalidOracleKey        = 20,
+    Overflow               = 21,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -194,6 +215,7 @@ impl PolicyEngine {
     /// Set the Claims Processor address. Called once after deploying claims contract.
     pub fn set_claims_processor(env: Env, admin: Address, claims_processor: Address) {
         Self::require_admin(&env, &admin);
+        Self::validate_stellar_address(&env, &claims_processor);
         env.storage().instance().set(&StorageKey::ClaimsProcessor, &claims_processor);
         env.events().publish(
             (Symbol::new(&env, "claims_processor_updated"),),
@@ -264,14 +286,12 @@ impl PolicyEngine {
             status:             ProductStatus::Active,
             created_at:         env.ledger().timestamp(),
         };
-        let product_key = StorageKey::Product(id);
-        env.storage().persistent().set(&product_key, &product);
-        Self::extend_to_max(&env, &product_key);
+        env.storage().persistent().set(&StorageKey::Product(id), &product);
+        env.storage().persistent().extend_ttl(&StorageKey::Product(id), TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // Store the (category, oracle_key) -> product_id mapping for uniqueness
-        let product_lookup_key = StorageKey::ProductKey(key);
-        env.storage().persistent().set(&product_lookup_key, &id);
-        Self::extend_to_max(&env, &product_lookup_key);
+        env.storage().persistent().set(&StorageKey::ProductKey(key.clone()), &id);
+        env.storage().persistent().extend_ttl(&StorageKey::ProductKey(key), TTL_THRESHOLD, TTL_EXTEND_TO);
 
         let mut products: Vec<u128> = env.storage().instance()
             .get(&StorageKey::ActiveProducts).unwrap_or_else(|| Vec::new(&env));
@@ -382,6 +402,10 @@ impl PolicyEngine {
         // Premium calculation: premium = coverage * rate * duration_days / 365 / 10_000
         // where coverage and premium are in USDC stroops (7 decimal places),
         // premium_rate_bps is in basis points (e.g., 500 = 5%).
+        // Use checked operations to prevent overflow on large coverage amounts
+        if coverage_amount > 1_000_000_000_000 {
+            panic_with_error!(&env, Error::CoverageOutOfRange);
+        }
         let premium = coverage_amount
             .checked_mul(product.premium_rate_bps as i128)
             .and_then(|v| v.checked_mul(duration_days as i128))
@@ -418,9 +442,8 @@ impl PolicyEngine {
             status: PolicyStatus::Active,
             created_at: now,
         };
-        let policy_key = StorageKey::Policy(policy_id);
-        env.storage().persistent().set(&policy_key, &policy);
-        Self::extend_policy_ttl(&env, &policy_key, duration_secs);
+        env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
+        env.storage().persistent().extend_ttl(&StorageKey::Policy(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // Append to user's policy list
         let user_key = StorageKey::UserPolicies(buyer.clone());
@@ -428,11 +451,17 @@ impl PolicyEngine {
             .get(&user_key).unwrap_or_else(|| Vec::new(&env));
         user_policies.push_back(policy_id);
         env.storage().persistent().set(&user_key, &user_policies);
-        Self::extend_to_max(&env, &user_key);
+        env.storage().persistent().extend_ttl(&user_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         env.events().publish(
-            (Symbol::new(&env, "buy_policy"), buyer),
-            (policy_id, product_id, coverage_amount, premium),
+            (Symbol::new(&env, "policy_created"),),
+            PolicyCreated {
+                policy_id,
+                product_id,
+                policyholder: buyer.clone(),
+                coverage_amount,
+                premium_paid: premium,
+            },
         );
 
         policy_id
@@ -462,7 +491,9 @@ impl PolicyEngine {
             policy.premium_paid
         } else {
             let elapsed_capped = elapsed.min(total_duration);
-            let earned = policy.premium_paid * elapsed_capped as i128 / total_duration as i128;
+            let earned = policy.premium_paid.checked_mul(elapsed_capped as i128)
+                .and_then(|v| v.checked_div(total_duration as i128))
+                .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
             policy.premium_paid.saturating_sub(earned)
         };
 
@@ -512,8 +543,12 @@ impl PolicyEngine {
         Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
 
         env.events().publish(
-            (Symbol::new(&env, "claim_paid"), policy_id),
-            (policy.policyholder.clone(), policy.coverage_amount),
+            (Symbol::new(&env, "claim_paid"),),
+            PolicyClaimed {
+                policy_id,
+                policyholder: policy.policyholder.clone(),
+                coverage_amount: policy.coverage_amount,
+            },
         );
     }
 
@@ -550,18 +585,20 @@ impl PolicyEngine {
     }
 
     /// Return a paginated slice of policy IDs owned by `user`. `offset` is the zero-based
-    /// start index; `limit` caps the number of IDs returned.
+    /// start index; `limit` caps the number of IDs returned and is itself clamped to
+    /// `MAX_PAGE_SIZE`.
     pub fn get_user_policies(env: Env, user: Address, offset: u32, limit: u32) -> Vec<u128> {
         let all: Vec<u128> = env.storage().persistent()
             .get(&StorageKey::UserPolicies(user))
             .unwrap_or_else(|| Vec::new(&env));
-        
+
+        let limit = limit.min(MAX_PAGE_SIZE);
         let mut paginated = Vec::new(&env);
         let len = all.len();
         if offset >= len {
             return paginated;
         }
-        let end = (offset + limit).min(len);
+        let end = offset.saturating_add(limit).min(len);
         for i in offset..end {
             paginated.push_back(all.get_unchecked(i));
         }
@@ -620,6 +657,7 @@ pub fn emergency_resume(env: Env, admin: Address) {
      /// Propose a new admin. Only the current admin can call this.
      pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
          Self::require_admin(&env, &admin);
+         Self::validate_stellar_address(&env, &new_admin);
          // Store the proposed admin
          env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
      }
@@ -664,6 +702,19 @@ pub fn emergency_resume(env: Env, admin: Address) {
             .unwrap_or_else(|| panic_with_error!(env, Error::ClaimsProcessorNotSet));
         if *caller != cp { panic_with_error!(env, Error::Unauthorized); }
         caller.require_auth();
+    }
+
+    /// Validate that an address has a valid Stellar format (56-char, starts with G or C).
+    fn validate_stellar_address(env: &Env, address: &Address) {
+        let addr_str = address.to_string();
+        if addr_str.len() != 56 {
+            panic!("invalid address: must be a valid Stellar address");
+        }
+        let mut buf = [0u8; 56];
+        addr_str.copy_into_slice(&mut buf);
+        if buf[0] != b'G' && buf[0] != b'C' {
+            panic!("invalid address: must be a valid Stellar address");
+        }
     }
 
     fn remove_policy_from_user(env: &Env, user: &Address, policy_id: u128) {

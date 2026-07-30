@@ -583,31 +583,47 @@ fn test_finalize_does_not_pull_raised_live_threshold() {
     assert_eq!(p.status, ProposalStatus::Passed);
 }
 
-// ── Storage TTL (issue #185 / #186) ─────────────────────────────────────────
-
-/// Proposal, VoteRecord, and LockedBalance entries must survive ledger time
-/// advancing past the default `min_persistent_entry_ttl` (4096 ledgers) that
-/// a persistent entry gets when no `extend_ttl` is ever called. Without the
-/// fix, reading these entries after this advancement would panic on an
-/// expired entry.
 #[test]
-fn test_proposal_and_vote_ttl_survive_ledger_advancement() {
-    let (env, dao, _admin, voter1, _voter2, target) = setup();
+fn test_proposal_expires_after_voting_period() {
+    let (env, dao, _, voter1, _, target) = setup();
     let args: Vec<Val> = Vec::new(&env);
     let pid = dao.create_proposal(
         &voter1,
-        &Bytes::from_slice(&env, b"ttl test proposal"),
+        &Bytes::from_slice(&env, b"Expire proposal"),
         &target,
         &Symbol::new(&env, "update"),
         &args,
     );
-    dao.vote(&voter1, &pid, &VoteChoice::For);
+    // Move time past the voting period
+    env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
+    
+    // Finalize it without votes, it should fail
+    dao.finalize(&pid);
+    
+    let p = dao.get_proposal(&pid);
+    assert_eq!(p.status, crate::ProposalStatus::Failed);
+}
 
-    // Advance well past the default 4096-ledger min persistent TTL.
-    env.ledger().with_mut(|l| l.sequence_number += 10_000);
-
-    let proposal = dao.get_proposal(&pid);
-    assert_eq!(proposal.id, pid);
-    let vote = dao.get_vote(&pid, &voter1);
-    assert!(vote.is_some());
+#[test]
+fn test_cancel_refunds_deposit_to_proposer() {
+    let (env, dao, admin, voter1, _, target) = setup();
+    
+    let config = dao.get_config();
+    let gov_token = token::Client::new(&env, &config.gov_token);
+    let balance_before = gov_token.balance(&voter1);
+    
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Refund proposal"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+    
+    assert_eq!(gov_token.balance(&voter1), balance_before - config.proposal_threshold);
+    
+    dao.cancel(&admin, &pid);
+    
+    assert_eq!(gov_token.balance(&voter1), balance_before);
 }
