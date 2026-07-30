@@ -40,6 +40,14 @@ const TTL_THRESHOLD: u32 = 518_400;
 #[cfg(any(test, feature = "testutils", not(feature = "library")))]
 const TTL_EXTEND_TO: u32 = 6_312_000;
 
+// ─── Pagination ───────────────────────────────────────────────────────────────
+
+/// Upper bound on the number of entries a paginated query will return in one
+/// call. Without a cap, a caller could pass `limit = u32::MAX` and force the
+/// contract to build one huge `Vec`, blowing Soroban's instruction budget.
+#[cfg(any(test, feature = "testutils", not(feature = "library")))]
+const MAX_PAGE_SIZE: u32 = 100;
+
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -565,18 +573,20 @@ impl PolicyEngine {
     }
 
     /// Return a paginated slice of policy IDs owned by `user`. `offset` is the zero-based
-    /// start index; `limit` caps the number of IDs returned.
+    /// start index; `limit` caps the number of IDs returned and is itself clamped to
+    /// `MAX_PAGE_SIZE`.
     pub fn get_user_policies(env: Env, user: Address, offset: u32, limit: u32) -> Vec<u128> {
         let all: Vec<u128> = env.storage().persistent()
             .get(&StorageKey::UserPolicies(user))
             .unwrap_or_else(|| Vec::new(&env));
-        
+
+        let limit = limit.min(MAX_PAGE_SIZE);
         let mut paginated = Vec::new(&env);
         let len = all.len();
         if offset >= len {
             return paginated;
         }
-        let end = (offset + limit).min(len);
+        let end = offset.saturating_add(limit).min(len);
         for i in offset..end {
             paginated.push_back(all.get_unchecked(i));
         }
