@@ -402,6 +402,18 @@ impl ClaimsProcessor {
                 .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(&env));
             pending.push_back(cid);
             env.storage().instance().set(&StorageKey::PendingClaims, &pending);
+
+            // Emit claim_submitted event for off-chain indexing
+            env.events().publish(
+                (Symbol::new(&env, "claim_submitted"),),
+                ClaimSubmitted {
+                    claim_id: cid,
+                    policy_id,
+                    claimant: policy.policyholder.clone(),
+                    coverage_amount: policy.coverage_amount,
+                },
+            );
+
             cid
         };
 
@@ -675,8 +687,13 @@ impl ClaimsProcessor {
         // without bound.
         Self::remove_from_pending(env, claim.id);
 
-        // Emit specific event for rejected claims to enable off-chain monitoring
-        if !trigger_met {
+        // Emit specific event for rejected/paid claims to enable off-chain monitoring
+        if trigger_met {
+            env.events().publish(
+                (Symbol::new(env, "claim_paid"),),
+                (claim.id, claim.policy_id, claim.coverage_amount),
+            );
+        } else {
             env.events().publish(
                 (Symbol::new(env, "claim_rejected"),),
                 (claim.id, claim.policy_id, Symbol::new(env, "trigger_not_met")),
