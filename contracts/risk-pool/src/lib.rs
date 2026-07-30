@@ -481,7 +481,24 @@ impl RiskPool {
     }
 
     /// Release the capital lock for `policy_id` after a successful claim payout.
-    /// Reduces `total_locked` so the freed liquidity becomes available again.
+    ///
+    /// ### Flow & Caller
+    /// This function is called by the `claims-processor` contract immediately after the policy
+    /// engine successfully transfers the coverage payout to the policyholder.
+    ///
+    /// ### Capital Effect
+    /// This reduces `total_locked` in the pool, reflecting that the coverage lock is now removed.
+    /// Since the claim was paid, the underwriting capital has been disbursed to the policyholder.
+    ///
+    /// ### Design Rationale
+    /// Having separate functions (`release_for_claim` and `release_for_expiry`) instead of a single
+    /// `release(policy_id, reason)` endpoint serves several key purposes:
+    /// 1. **Access Control & Security**: Allows fine-grained tracking of capital outflows due to claims
+    ///    vs. standard policy expirations.
+    /// 2. **Auditability & Logging**: Distinct event paths make off-chain monitoring, analytics,
+    ///    and accounting of paid claims vs. expired policies trivial.
+    /// 3. **Gas Optimization**: Avoids the instruction overhead of parsing and branching on an enum/string
+    ///    reason within the contract.
     pub fn release_for_claim(env: Env, caller: Address, policy_id: u128) {
         Self::require_protocol_caller(&env, &caller);
         let mut lock: CapitalLock = env.storage().persistent()
@@ -508,7 +525,26 @@ impl RiskPool {
     }
 
     /// Release the capital lock for `policy_id` when the policy expires without a payout.
-    /// The locked amount returns to available liquidity and premiums remain earned.
+    ///
+    /// ### Flow & Caller
+    /// This function is called by the `claims-processor` contract when a policy reaches its
+    /// expiration timestamp without triggering a payout.
+    ///
+    /// ### Capital Effect
+    /// This reduces `total_locked` in the pool, releasing the locked capital back into the
+    /// pool's available liquidity. Unlike `release_for_claim`, the capital remains in the pool
+    /// and is available to underwrite new policies, while the premium paid by the policyholder
+    /// is fully earned by the pool.
+    ///
+    /// ### Design Rationale
+    /// Having separate functions (`release_for_claim` and `release_for_expiry`) instead of a single
+    /// `release(policy_id, reason)` endpoint serves several key purposes:
+    /// 1. **Access Control & Security**: Allows fine-grained tracking of capital outflows due to claims
+    ///    vs. standard policy expirations.
+    /// 2. **Auditability & Logging**: Distinct event paths make off-chain monitoring, analytics,
+    ///    and accounting of paid claims vs. expired policies trivial.
+    /// 3. **Gas Optimization**: Avoids the instruction overhead of parsing and branching on an enum/string
+    ///    reason within the contract.
     pub fn release_for_expiry(env: Env, caller: Address, policy_id: u128) {
         Self::require_protocol_caller(&env, &caller);
         let mut lock: CapitalLock = env.storage().persistent()
