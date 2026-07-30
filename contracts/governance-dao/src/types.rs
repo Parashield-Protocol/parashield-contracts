@@ -2,6 +2,15 @@ use soroban_sdk::{contracttype, Address, Bytes, Symbol, Val, Vec};
 
 pub const FINALIZE_DELAY: u64 = 24 * 3600;
 
+/// Approximate Stellar ledger close time in seconds, used to convert
+/// wall-clock TTL windows into ledger counts for `extend_ttl`.
+pub const LEDGER_SECONDS: u64 = 5;
+
+/// Extra buffer (beyond voting period + finalize delay + timelock) added to
+/// proposal/vote/locked-balance TTLs so `withdraw_tokens`/`execute` still
+/// have time to run after the timelock expires (issue #185).
+pub const GOVERNANCE_TTL_BUFFER_SECONDS: u64 = 30 * 24 * 3600;
+
 /// Current lifecycle state of a governance proposal.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -112,6 +112,17 @@ pub enum Error {
     PolicyExpired      = 10,
 }
 
+/// Approximate Stellar ledger close time in seconds, used to convert
+/// wall-clock TTL windows into ledger counts for `extend_ttl`.
+const LEDGER_SECONDS: u64 = 5;
+
+/// Claim and PolicyClaim entries must survive from submission until the
+/// claim is finally settled (Paid/Rejected) — including disputes, which have
+/// no automatic timeout. 365 days comfortably covers policy-engine's longest
+/// policy durations plus dispute-resolution time; capped to the network's
+/// max TTL at call time so `extend_ttl` never panics.
+const CLAIM_RETENTION_SECONDS: u64 = 365 * 24 * 60 * 60;
+
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -491,7 +502,9 @@ impl ClaimsProcessor {
         }
         claim.status = ClaimStatus::Disputed;
         claim.dispute_reason = Some(reason.clone());
-        env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
+        let claim_key = StorageKey::Claim(claim_id);
+        env.storage().persistent().set(&claim_key, &claim);
+        Self::extend_claim_ttl(&env, &claim_key);
 
         // A disputed claim is no longer pending — drop it from the queue so it is
         // not re-evaluated and does not grow the queue unboundedly.

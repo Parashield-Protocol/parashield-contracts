@@ -198,9 +198,9 @@ impl GovernanceDao {
             total_supply: config.total_supply,
         };
 
-        env.storage()
-            .persistent()
-            .set(&StorageKey::Proposal(proposal_id), &proposal);
+        let proposal_key = StorageKey::Proposal(proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+        Self::extend_proposal_ttl(&env, &proposal_key, &config);
         env.storage()
             .instance()
             .set(&StorageKey::NextProposalId, &(proposal_id.checked_add(1).unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))));
@@ -277,9 +277,16 @@ impl GovernanceDao {
                 weight,
             },
         );
-        env.storage()
-            .persistent()
-            .set(&StorageKey::Proposal(proposal_id), &proposal);
+        let proposal_key = StorageKey::Proposal(proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+
+        // Proposal, vote, and locked-balance entries must all outlive the
+        // remaining voting period + timelock + buffer, or a legitimate voter
+        // could lose their vote record / locked tokens to TTL expiry before
+        // the proposal is finalized/executed (issue #185).
+        Self::extend_proposal_ttl(&env, &proposal_key, &config);
+        Self::extend_proposal_ttl(&env, &vote_key, &config);
+        Self::extend_proposal_ttl(&env, &lock_key, &config);
 
         env.events().publish(
             (Symbol::new(&env, "vote_cast"),),
@@ -394,9 +401,9 @@ impl GovernanceDao {
             &proposal.deposit,
         );
 
-        env.storage()
-            .persistent()
-            .set(&StorageKey::Proposal(proposal_id), &proposal);
+        let proposal_key = StorageKey::Proposal(proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+        Self::extend_proposal_ttl(&env, &proposal_key, &config);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_finalized"),),

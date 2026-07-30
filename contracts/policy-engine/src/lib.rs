@@ -18,6 +18,7 @@
 //! to pay the policyholder when the oracle confirms a trigger.
 #![no_std]
 extern crate alloc;
+use alloc::string::ToString;
 
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use crate::alloc::string::ToString;
@@ -74,6 +75,17 @@ enum StorageKey {
     /// Contract version (u32) for storage migration tracking
     Version,
 }
+
+/// Approximate Stellar ledger close time in seconds, used to convert
+/// wall-clock TTL windows into ledger counts for `extend_ttl`.
+#[allow(dead_code)]
+const LEDGER_SECONDS: u64 = 5;
+
+/// Extra time added on top of a policy's own duration when extending the TTL
+/// of its `Policy` entry, so the Claims Processor still has time to evaluate
+/// and settle a claim after the policy's `end_time` (issue #186).
+#[allow(dead_code)]
+const POLICY_CLAIMS_BUFFER_SECONDS: u64 = 90 * 24 * 60 * 60;
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
@@ -720,7 +732,27 @@ pub fn emergency_resume(env: Env, admin: Address) {
         if let Some(i) = pos {
             user_policies.remove(i);
             env.storage().persistent().set(&key, &user_policies);
+            Self::extend_to_max(env, &key);
         }
+    }
+
+    /// Extend a persistent entry's TTL to the network maximum. Used for
+    /// Product/ProductKey/UserPolicies records, which are admin- or
+    /// user-index data with no natural expiry.
+    fn extend_to_max(env: &Env, key: &StorageKey) {
+        let max_ttl = env.storage().max_ttl();
+        env.storage().persistent().extend_ttl(key, max_ttl, max_ttl);
+    }
+
+    /// Extend a `Policy` entry's TTL to cover its own coverage duration plus
+    /// `POLICY_CLAIMS_BUFFER_SECONDS` (clamped to the network's max TTL), so
+    /// `get_policy`/`pay_claim`/`expire_policy` can still find it even if it
+    /// is only ever written once, at purchase time (issue #186).
+    fn extend_policy_ttl(env: &Env, key: &StorageKey, duration_secs: u64) {
+        let ttl_seconds = duration_secs.saturating_add(POLICY_CLAIMS_BUFFER_SECONDS);
+        let desired_ledgers = (ttl_seconds / LEDGER_SECONDS) as u32;
+        let extend_to = desired_ledgers.min(env.storage().max_ttl());
+        env.storage().persistent().extend_ttl(key, extend_to, extend_to);
     }
 
     fn load_product(env: &Env, id: u128) -> InsuranceProduct {

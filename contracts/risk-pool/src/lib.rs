@@ -251,7 +251,9 @@ impl RiskPool {
             None => {
                 let count: u32 = env.storage().instance()
                     .get(&StorageKey::LpCount).unwrap_or(0);
-                env.storage().persistent().set(&StorageKey::LpAddress(count), &provider);
+                let lp_address_key = StorageKey::LpAddress(count);
+                env.storage().persistent().set(&lp_address_key, &provider);
+                Self::extend_to_max(&env, &lp_address_key);
                 env.storage().instance().set(&StorageKey::LpCount, &(count + 1));
                 let acc_per_share: i128 = env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0);
                 LpPosition {
@@ -266,6 +268,7 @@ impl RiskPool {
             }
         };
         env.storage().persistent().set(&lp_key, &position);
+        Self::extend_to_max(&env, &lp_key);
         env.storage().instance().set(&StorageKey::TotalDeposited, &(total_deposited + amount));
         env.storage().instance().set(&StorageKey::TotalShares,    &(total_shares + new_shares));
 
@@ -440,6 +443,7 @@ impl RiskPool {
 
         if claimed > 0 {
             env.storage().persistent().set(&lp_key, &position);
+            Self::extend_to_max(&env, &lp_key);
         }
 
         claimed
@@ -462,7 +466,8 @@ impl RiskPool {
         if available < amount { panic_with_error!(&env, Error::Undercollateralized); }
         if env.storage().persistent().has(&StorageKey::Lock(policy_id)) { panic_with_error!(&env, Error::AlreadyLocked); }
 
-        env.storage().persistent().set(&StorageKey::Lock(policy_id), &CapitalLock {
+        let lock_key = StorageKey::Lock(policy_id);
+        env.storage().persistent().set(&lock_key, &CapitalLock {
             policy_id,
             amount,
             locked_at: env.ledger().timestamp(),
@@ -720,6 +725,7 @@ impl RiskPool {
                 executed: false,
             },
         );
+        Self::extend_withdrawal_ttl(&env, &StorageKey::AdminWithdrawalRequest);
 
         env.events().publish(
             (Symbol::new(&env, "admin_withdrawal_scheduled"),),
