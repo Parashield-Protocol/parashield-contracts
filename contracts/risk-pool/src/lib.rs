@@ -710,6 +710,13 @@ impl RiskPool {
             panic_with_error!(&env, Error::TimelockNotReady);
         }
 
+        // Re-check unlocked liquidity with fresh totals. `request_admin_withdrawal`
+        // validated the amount at request time, but new capital locks created during
+        // the timelock can shrink the available balance — executing blindly would
+        // drain funds earmarked as policy collateral.
+        let available = Self::get_available_liquidity(env.clone());
+        if req.amount > available { panic_with_error!(&env, Error::Undercollateralized); }
+
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
         let treasury: Address = env.storage().instance().get(&StorageKey::Treasury).unwrap();
         token::Client::new(&env, &usdc)

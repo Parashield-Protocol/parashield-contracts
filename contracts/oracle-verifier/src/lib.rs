@@ -35,6 +35,18 @@ const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year
 #[allow(dead_code)]
 const MAX_ORACLES: u32 = 100;
 
+// ─── Storage TTL ──────────────────────────────────────────────────────────────
+
+/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
+/// (at ~5s/ledger).
+#[allow(dead_code)]
+const TTL_THRESHOLD: u32 = 518_400;
+/// Extend persistent entries out to ~1 year (at ~5s/ledger) so an oracle
+/// registration doesn't silently expire from storage during a quiet period
+/// with no submissions.
+#[allow(dead_code)]
+const TTL_EXTEND_TO: u32 = 6_312_000;
+
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -405,6 +417,10 @@ impl OracleVerifier {
         if !entry.active {
             panic_with_error!(&env, Error::Unauthorized);
         }
+        // Keep the registration alive alongside the reading it authorized.
+        env.storage()
+            .persistent()
+            .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // Load existing submissions for this (data_type, key)
         let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
@@ -655,6 +671,10 @@ impl OracleVerifier {
         if !entry.active {
             panic_with_error!(&env, Error::Unauthorized);
         }
+        // Keep the registration alive alongside the readings it authorized.
+        env.storage()
+            .persistent()
+            .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         for i in 0..submissions.len() {
             let (key, value, confidence, timestamp) = submissions.get_unchecked(i);
@@ -737,6 +757,10 @@ impl OracleVerifier {
         if !entry.active {
             panic_with_error!(&env, Error::Unauthorized);
         }
+        // Keep the registration alive alongside the readings it authorized.
+        env.storage()
+            .persistent()
+            .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         for i in 0..submissions.len() {
             let sub = submissions.get_unchecked(i);
