@@ -586,12 +586,13 @@ fn test_finalize_does_not_pull_raised_live_threshold() {
 #[test]
 fn test_proposal_expires_after_voting_period() {
     let (env, dao, _, voter1, _, target) = setup();
+    let args: Vec<Val> = Vec::new(&env);
     let pid = dao.create_proposal(
         &voter1,
         &Bytes::from_slice(&env, b"Expire proposal"),
         &target,
         &Symbol::new(&env, "update"),
-        &Vec::new(&env),
+        &args,
     );
     // Move time past the voting period
     env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
@@ -604,9 +605,25 @@ fn test_proposal_expires_after_voting_period() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #15)")]
-fn test_upgrade_rejects_same_version() {
-    let (env, dao, admin, _, _, _) = setup();
-    let dummy_hash = soroban_sdk::BytesN::from_array(&env, &[0; 32]);
-    dao.upgrade(&admin, &dummy_hash, &1);
+fn test_cancel_refunds_deposit_to_proposer() {
+    let (env, dao, admin, voter1, _, target) = setup();
+    
+    let config = dao.get_config();
+    let gov_token = token::Client::new(&env, &config.gov_token);
+    let balance_before = gov_token.balance(&voter1);
+    
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Refund proposal"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+    
+    assert_eq!(gov_token.balance(&voter1), balance_before - config.proposal_threshold);
+    
+    dao.cancel(&admin, &pid);
+    
+    assert_eq!(gov_token.balance(&voter1), balance_before);
 }

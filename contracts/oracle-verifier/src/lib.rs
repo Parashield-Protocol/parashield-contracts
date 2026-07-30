@@ -25,11 +25,27 @@ use soroban_sdk::{
 pub mod types;
 pub use types::*;
 
+// ─── Storage TTL ──────────────────────────────────────────────────────────────
+const TTL_THRESHOLD: u32 = 518_400; // ~30 days
+const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year
+
 /// Maximum number of registered oracles. Bounds the median aggregation loop and
 /// the worst-case weighted sum (MAX_ORACLES * max_weight * max_value) so it
 /// cannot overflow i128.
 #[allow(dead_code)]
 const MAX_ORACLES: u32 = 100;
+
+// ─── Storage TTL ──────────────────────────────────────────────────────────────
+
+/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
+/// (at ~5s/ledger).
+#[allow(dead_code)]
+const TTL_THRESHOLD: u32 = 518_400;
+/// Extend persistent entries out to ~1 year (at ~5s/ledger) so an oracle
+/// registration doesn't silently expire from storage during a quiet period
+/// with no submissions.
+#[allow(dead_code)]
+const TTL_EXTEND_TO: u32 = 6_312_000;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -134,6 +150,7 @@ impl OracleVerifier {
             active: true,
         };
         env.storage().persistent().set(&key, &entry);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         let mut list: Vec<Address> = env
             .storage()
@@ -189,6 +206,7 @@ impl OracleVerifier {
             .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
         entry.weight = weight;
         env.storage().persistent().set(&key, &entry);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
     /// Deactivate an oracle (soft delete — historical data is retained).
@@ -202,6 +220,7 @@ impl OracleVerifier {
             .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
         entry.active = false;
         env.storage().persistent().set(&key, &entry);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // Prune the address from the flat OracleList so get_oracles() and
         // instance storage don't accumulate deactivated addresses forever
@@ -398,6 +417,10 @@ impl OracleVerifier {
         if !entry.active {
             panic_with_error!(&env, Error::Unauthorized);
         }
+        // Keep the registration alive alongside the reading it authorized.
+        env.storage()
+            .persistent()
+            .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // Load existing submissions for this (data_type, key)
         let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
@@ -427,6 +450,7 @@ impl OracleVerifier {
         }
 
         env.storage().persistent().set(&dp_key, &points);
+        env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         env.events().publish(
             (Symbol::new(&env, "oracle_data_submitted"),),
@@ -543,7 +567,8 @@ impl OracleVerifier {
             }
         }
         let confidence = match weighted_confidence_sum.checked_div(total_weight) {
-            Some(c) => c as u32,
+            // #242 — saturate to u32::MAX instead of silently truncating
+            Some(c) => u32::try_from(c).unwrap_or(u32::MAX),
             None => 0u32,
         };
 
@@ -646,6 +671,10 @@ impl OracleVerifier {
         if !entry.active {
             panic_with_error!(&env, Error::Unauthorized);
         }
+        // Keep the registration alive alongside the readings it authorized.
+        env.storage()
+            .persistent()
+            .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         for i in 0..submissions.len() {
             let (key, value, confidence, timestamp) = submissions.get_unchecked(i);
@@ -689,7 +718,8 @@ impl OracleVerifier {
             if !found {
                 points.push_back(new_point);
             }
-            env.storage().persistent().set(&dp_key, &points);
+                env.storage().persistent().set(&dp_key, &points);
+            env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
             env.events().publish(
                 (Symbol::new(&env, "oracle_data_submitted"),),
@@ -727,6 +757,10 @@ impl OracleVerifier {
         if !entry.active {
             panic_with_error!(&env, Error::Unauthorized);
         }
+        // Keep the registration alive alongside the readings it authorized.
+        env.storage()
+            .persistent()
+            .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         for i in 0..submissions.len() {
             let sub = submissions.get_unchecked(i);
@@ -760,7 +794,8 @@ impl OracleVerifier {
             if !found {
                 points.push_back(new_point);
             }
-            env.storage().persistent().set(&dp_key, &points);
+                env.storage().persistent().set(&dp_key, &points);
+            env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
             env.events().publish(
                 (Symbol::new(&env, "oracle_data_submitted"),),
