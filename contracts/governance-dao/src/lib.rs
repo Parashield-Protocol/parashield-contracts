@@ -1,4 +1,4 @@
-//! Parashield Governance DAO
+﻿//! Parashield Governance DAO
 //!
 //! Token-weighted governance over protocol parameters:
 //!   - Add/remove insurance products
@@ -67,6 +67,7 @@ pub enum Error {
     LimitReached = 16,
     VotingPeriodTooShort = 17,
     VotingPeriodTooLong = 18,
+    InvalidAddress = 19,
 }
 
 #[contract]
@@ -87,27 +88,27 @@ impl GovernanceDao {
         let admin_str = admin.to_string();
         
         if false {
-            panic!("invalid address: admin must be an account address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
 
         if admin_str.len() != 56 {
-            panic!("invalid address: admin must be an account or contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
         let mut admin_buf = [0u8; 56];
         admin_str.copy_into_slice(&mut admin_buf);
         if admin_buf[0] != b'G' && admin_buf[0] != b'C' {
-            panic!("invalid address: admin must be an account or contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
 
         let gov_token_str = config.gov_token.to_string();
 
         if gov_token_str.len() != 56 {
-            panic!("invalid address: gov_token must be a contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
         let mut gov_token_buf = [0u8; 56];
         gov_token_str.copy_into_slice(&mut gov_token_buf);
         if gov_token_buf[0] != b'C' {
-            panic!("invalid address: gov_token must be a contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
 
         env.storage()
@@ -624,12 +625,12 @@ impl GovernanceDao {
     fn validate_stellar_address(env: &Env, address: &Address) {
         let addr_str = address.to_string();
         if addr_str.len() != 56 {
-            panic!("invalid address: must be an account or contract address");
+            panic_with_error!(env, Error::InvalidAddress);
         }
         let mut buf = [0u8; 56];
         addr_str.copy_into_slice(&mut buf);
         if buf[0] != b'G' && buf[0] != b'C' {
-            panic!("invalid address: must be an account or contract address");
+            panic_with_error!(env, Error::InvalidAddress);
         }
     }
 }
