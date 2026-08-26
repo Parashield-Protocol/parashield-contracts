@@ -80,6 +80,9 @@ enum StorageKey {
     /// Amount of stake token (i128) currently deposited by an oracle for a
     /// given data_type — (data_type, oracle) → amount.
     OracleStakeAmt(Symbol, Address),
+    /// Address slashed stake is transferred to. Unset = slashed stake is
+    /// retained by the contract (effectively burned).
+    SlashTreasury,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -436,6 +439,13 @@ impl OracleVerifier {
         env.storage().instance().get(&StorageKey::MinStake).unwrap_or(0)
     }
 
+    /// Set the address slashed stake is transferred to. Admin-only. If never
+    /// set, slashed stake stays locked in the contract.
+    pub fn set_slash_treasury(env: Env, admin: Address, treasury: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&StorageKey::SlashTreasury, &treasury);
+    }
+
     /// Deposit `amount` of the configured stake token toward `oracle`'s stake
     /// for `data_type`. Callable by anyone but requires the oracle's own
     /// authorization, so only the oracle (or someone it has delegated to)
@@ -523,6 +533,87 @@ impl OracleVerifier {
                 oracle,
                 data_type,
                 amount,
+            },
+        );
+    }
+
+    /// Slash `amount` from `oracle`'s stake for `data_type` as a penalty for
+    /// provably incorrect data (verified off-chain / via governance and
+    /// submitted by the admin). Caps at the oracle's current stake. If the
+    /// slash brings the oracle below the configured `min_stake`, the oracle
+    /// is deactivated so it can no longer submit until it re-stakes and is
+    /// re-registered. Slashed funds move to the configured slash treasury,
+    /// if any, otherwise remain locked in the contract.
+    pub fn slash_oracle(
+        env: Env,
+        admin: Address,
+        oracle: Address,
+        data_type: Symbol,
+        amount: i128,
+        reason: Symbol,
+    ) {
+        Self::require_admin(&env, &admin);
+        if amount <= 0 {
+            panic_with_error!(&env, Error::InvalidStakeAmount);
+        }
+
+        let stake_key = StorageKey::OracleStakeAmt(data_type.clone(), oracle.clone());
+        let current: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0);
+        if current <= 0 {
+            panic_with_error!(&env, Error::NoStake);
+        }
+        let slashed = amount.min(current);
+        let remaining = current - slashed;
+        env.storage().persistent().set(&stake_key, &remaining);
+
+        if let Some(token_addr) = env.storage().instance().get::<_, Address>(&StorageKey::StakeToken) {
+            if let Some(treasury) = env.storage().instance().get::<_, Address>(&StorageKey::SlashTreasury) {
+                token::Client::new(&env, &token_addr).transfer(
+                    &env.current_contract_address(),
+                    &treasury,
+                    &slashed,
+                );
+            }
+        }
+
+        let min_stake: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinStake)
+            .unwrap_or(0);
+        if min_stake > 0 && remaining < min_stake {
+            let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
+            if let Some(mut entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+                if entry.active {
+                    entry.active = false;
+                    env.storage().persistent().set(&oracle_key, &entry);
+
+                    let list: Vec<Address> = env
+                        .storage()
+                        .instance()
+                        .get(&StorageKey::OracleList(data_type.clone()))
+                        .unwrap_or_else(|| Vec::new(&env));
+                    let mut pruned: Vec<Address> = Vec::new(&env);
+                    for addr in list.iter() {
+                        if addr != oracle {
+                            pruned.push_back(addr);
+                        }
+                    }
+                    env.storage()
+                        .instance()
+                        .set(&StorageKey::OracleList(data_type.clone()), &pruned);
+                }
+            }
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle_slashed"),),
+            OracleSlashed {
+                oracle,
+                data_type,
+                amount: slashed,
+                remaining_stake: remaining,
+                reason,
             },
         );
     }
