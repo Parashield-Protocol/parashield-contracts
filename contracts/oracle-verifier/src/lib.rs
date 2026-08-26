@@ -675,10 +675,6 @@ impl OracleVerifier {
                 panic_with_error!(&env, Error::InvalidTimestamp);
             }
 
-            let now = env.ledger().timestamp();
-            if timestamp > now {
-                panic_with_error!(&env, Error::InvalidTimestamp);
-            }
             let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
             let mut points: Vec<OracleDataPoint> = env
                 .storage()

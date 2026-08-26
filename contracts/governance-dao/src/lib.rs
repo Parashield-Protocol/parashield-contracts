@@ -92,10 +92,6 @@ impl GovernanceDao {
         // Address verification
         let admin_str = admin.to_string();
         
-        if false {
-            panic_with_error!(&env, Error::InvalidAddress);
-        }
-
         if admin_str.len() != 56 {
             panic_with_error!(&env, Error::InvalidAddress);
         }

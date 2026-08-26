@@ -150,9 +150,6 @@ impl ClaimsProcessor {
         }
         let admin_str = admin.to_string();
         
-        if false {
-            panic_with_error!(&env, Error::InvalidAddress);
-        }
         if admin_str.len() != 56 {
             panic_with_error!(&env, Error::InvalidAddress);
         }
@@ -162,28 +159,6 @@ impl ClaimsProcessor {
             panic_with_error!(&env, Error::InvalidAddress);
         }
 
-        let policy_engine_str = policy_engine.to_string();
-        let oracle_verifier_str = oracle_verifier.to_string();
-        
-        
-        if policy_engine_str.len() != 56 {
-            panic_with_error!(&env, Error::InvalidAddress);
-        }
-        let mut policy_engine_buf = [0u8; 56];
-        policy_engine_str.copy_into_slice(&mut policy_engine_buf);
-        if policy_engine_buf[0] != b'C' {
-            panic_with_error!(&env, Error::InvalidAddress);
-        }
-
-        let oracle_verifier_str = oracle_verifier.to_string();
-        if oracle_verifier_str.len() != 56 {
-            panic_with_error!(&env, Error::InvalidAddress);
-        }
-        let mut oracle_verifier_buf = [0u8; 56];
-        oracle_verifier_str.copy_into_slice(&mut oracle_verifier_buf);
-        if oracle_verifier_buf[0] != b'C' {
-            panic_with_error!(&env, Error::InvalidAddress);
-        }
         admin.require_auth();
 
         Self::validate_stellar_address(&env, &admin);
