@@ -83,6 +83,15 @@ enum StorageKey {
     /// Address slashed stake is transferred to. Unset = slashed stake is
     /// retained by the contract (effectively burned).
     SlashTreasury,
+    /// Guardian addresses authorized to approve critical actions (Vec<Address>).
+    Guardians,
+    /// Number of guardian approvals required to execute a critical action
+    /// (u32). 0 means guardian multisig is disabled (admin acts alone).
+    GuardianThreshold,
+    /// A pending, not-yet-executed contract upgrade awaiting guardian approvals.
+    PendingUpgrade,
+    /// A pending admin-transfer proposal awaiting guardian approvals.
+    PendingAdminChange,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -109,6 +118,10 @@ pub enum Error {
     NoStake = 16,
     InvalidStakeAmount = 17,
     OracleStillActive = 18,
+    NotGuardian = 19,
+    AlreadyApprovedAction = 20,
+    NoPendingUpgrade = 21,
+    InvalidThreshold = 22,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -303,13 +316,90 @@ impl OracleVerifier {
     }
 
     /// Propose a new admin. Only the current admin can call this.
+    ///
+    /// If a guardian threshold > 0 is configured (`set_guardians`), this does
+    /// not activate the proposal immediately — it requires `threshold`
+    /// guardians to call `approve_admin_change` first, guarding this
+    /// takeover-capable operation against a single compromised admin key.
+    /// With no guardians configured (default), behavior is unchanged.
     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
         Self::validate_stellar_address(&env, &new_admin);
-        // Store the proposed admin (zero address means no proposal)
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0);
+        if threshold == 0 {
+            env.storage()
+                .instance()
+                .set(&StorageKey::PendingAdmin, &new_admin);
+            return;
+        }
+
+        let pending = PendingAdminChange {
+            new_admin,
+            approvals: Vec::new(&env),
+        };
         env.storage()
             .instance()
-            .set(&StorageKey::PendingAdmin, &new_admin);
+            .set(&StorageKey::PendingAdminChange, &pending);
+    }
+
+    /// Guardian approval for a pending admin-change proposal. Once enough
+    /// guardians have approved (>= threshold), the change is activated —
+    /// `new_admin` must then still call `accept_admin` to take effect.
+    pub fn approve_admin_change(env: Env, guardian: Address, new_admin: Address) {
+        guardian.require_auth();
+
+        let guardians: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut is_guardian = false;
+        for g in guardians.iter() {
+            if g == guardian {
+                is_guardian = true;
+                break;
+            }
+        }
+        if !is_guardian {
+            panic_with_error!(&env, Error::NotGuardian);
+        }
+
+        let mut pending: PendingAdminChange = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PendingAdminChange)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingUpgrade));
+        if pending.new_admin != new_admin {
+            panic_with_error!(&env, Error::NoPendingUpgrade);
+        }
+        for a in pending.approvals.iter() {
+            if a == guardian {
+                panic_with_error!(&env, Error::AlreadyApprovedAction);
+            }
+        }
+        pending.approvals.push_back(guardian);
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0);
+
+        if pending.approvals.len() >= threshold {
+            env.storage().instance().remove(&StorageKey::PendingAdminChange);
+            env.storage()
+                .instance()
+                .set(&StorageKey::PendingAdmin, &new_admin);
+        } else {
+            env.storage()
+                .instance()
+                .set(&StorageKey::PendingAdminChange, &pending);
+        }
     }
 
     /// Accept the proposed admin. Only the proposed admin can call this.
@@ -616,6 +706,120 @@ impl OracleVerifier {
                 reason,
             },
         );
+    }
+
+    // ── Guardian Multisig (critical actions) ─────────────────────────────────
+
+    /// Configure the guardian set and approval threshold required for
+    /// critical actions (currently: contract upgrades). Admin-only.
+    /// `threshold == 0` disables the guardian requirement (default), so the
+    /// admin alone can act — preserves existing single-admin behavior until
+    /// guardians are explicitly configured.
+    pub fn set_guardians(env: Env, admin: Address, guardians: Vec<Address>, threshold: u32) {
+        Self::require_admin(&env, &admin);
+        if threshold as u32 > guardians.len() {
+            panic_with_error!(&env, Error::InvalidThreshold);
+        }
+        env.storage().instance().set(&StorageKey::Guardians, &guardians);
+        env.storage()
+            .instance()
+            .set(&StorageKey::GuardianThreshold, &threshold);
+        env.events().publish(
+            (Symbol::new(&env, "guardians_updated"),),
+            GuardiansUpdated { guardians, threshold },
+        );
+    }
+
+    /// Return the current guardian set.
+    pub fn get_guardians(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Return the current guardian approval threshold (0 = disabled).
+    pub fn get_guardian_threshold(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0)
+    }
+
+    /// Return the pending upgrade awaiting guardian approvals, if any.
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        env.storage().instance().get(&StorageKey::PendingUpgrade)
+    }
+
+    /// Guardian approval for the pending upgrade. Once enough guardians have
+    /// approved (>= threshold), the upgrade executes immediately.
+    pub fn approve_upgrade(env: Env, guardian: Address, new_wasm_hash: BytesN<32>) {
+        guardian.require_auth();
+
+        let guardians: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut is_guardian = false;
+        for g in guardians.iter() {
+            if g == guardian {
+                is_guardian = true;
+                break;
+            }
+        }
+        if !is_guardian {
+            panic_with_error!(&env, Error::NotGuardian);
+        }
+
+        let mut pending: PendingUpgrade = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PendingUpgrade)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingUpgrade));
+        if pending.new_wasm_hash != new_wasm_hash {
+            panic_with_error!(&env, Error::NoPendingUpgrade);
+        }
+
+        for a in pending.approvals.iter() {
+            if a == guardian {
+                panic_with_error!(&env, Error::AlreadyApprovedAction);
+            }
+        }
+        pending.approvals.push_back(guardian.clone());
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0);
+
+        env.events().publish(
+            (Symbol::new(&env, "upgrade_approved"),),
+            UpgradeApproved {
+                new_wasm_hash: new_wasm_hash.clone(),
+                approver: guardian,
+                approvals: pending.approvals.len(),
+                threshold,
+            },
+        );
+
+        if pending.approvals.len() >= threshold {
+            env.storage().instance().remove(&StorageKey::PendingUpgrade);
+            env.deployer().update_current_contract_wasm(new_wasm_hash);
+        } else {
+            env.storage().instance().set(&StorageKey::PendingUpgrade, &pending);
+        }
+    }
+
+    /// Admin-only: cancel a pending upgrade before it collects enough
+    /// guardian approvals.
+    pub fn cancel_pending_upgrade(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        if !env.storage().instance().has(&StorageKey::PendingUpgrade) {
+            panic_with_error!(&env, Error::NoPendingUpgrade);
+        }
+        env.storage().instance().remove(&StorageKey::PendingUpgrade);
     }
 
     // ── Data Submission ───────────────────────────────────────────────────────
@@ -1141,9 +1345,30 @@ impl OracleVerifier {
 
     /// Upgrade the contract WASM in-place. Only the admin may call this.
     /// Storage is preserved across upgrades; only the execution code changes.
+    ///
+    /// If a guardian threshold > 0 is configured (`set_guardians`), this call
+    /// does not upgrade immediately — it registers the upgrade as pending and
+    /// requires `threshold` guardians to call `approve_upgrade` before the
+    /// WASM is actually replaced, guarding this irreversible operation
+    /// against a single compromised admin key.
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
         Self::require_admin(&env, &admin);
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0);
+        if threshold == 0 {
+            env.deployer().update_current_contract_wasm(new_wasm_hash);
+            return;
+        }
+
+        let pending = PendingUpgrade {
+            new_wasm_hash,
+            approvals: Vec::new(&env),
+        };
+        env.storage().instance().set(&StorageKey::PendingUpgrade, &pending);
     }
 
     /// List all registered oracle addresses for a specific data_type.
