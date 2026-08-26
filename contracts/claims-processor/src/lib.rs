@@ -148,16 +148,6 @@ impl ClaimsProcessor {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
-        let admin_str = admin.to_string();
-        
-        if admin_str.len() != 56 {
-            panic_with_error!(&env, Error::InvalidAddress);
-        }
-        let mut admin_buf = [0u8; 56];
-        admin_str.copy_into_slice(&mut admin_buf);
-        if admin_buf[0] != b'G' && admin_buf[0] != b'C' {
-            panic_with_error!(&env, Error::InvalidAddress);
-        }
 
         admin.require_auth();
 
