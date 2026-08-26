@@ -1,5 +1,9 @@
 ﻿#![allow(dead_code)]
 #![allow(unused_imports)]
+// Address/state validation must fail with a typed contract error so callers
+// can match on it programmatically, never with a raw panic! and a string
+// message.
+#![deny(clippy::panic)]
 //! Parashield Claims Processor
 //!
 //! Evaluates whether a policy's trigger condition has been met by querying the
