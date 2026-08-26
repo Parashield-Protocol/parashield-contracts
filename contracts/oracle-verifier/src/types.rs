@@ -146,6 +146,12 @@ pub struct MinOracleCountUpdated {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MinSubmitIntervalUpdated {
+    pub seconds: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OracleDataSubmitted {
     pub oracle: Address,
     pub data_type: Symbol,

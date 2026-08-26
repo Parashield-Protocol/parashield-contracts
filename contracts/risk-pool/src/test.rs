@@ -377,6 +377,47 @@ fn resume_allows_deposit() {
     assert!(shares > 0);
 }
 
+// ── winding down ──────────────────────────────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn winding_down_blocks_new_deposits() {
+    let (_, pool, _, admin, _, lp1) = setup();
+    pool.deposit(&lp1, &100_0000000i128, &0i128);
+    pool.start_winding_down(&admin);
+    pool.deposit(&lp1, &100_0000000i128, &0i128);
+}
+
+#[test]
+fn winding_down_allows_existing_lp_to_withdraw() {
+    let (_, pool, _, admin, _, lp1) = setup();
+    let shares = pool.deposit(&lp1, &100_0000000i128, &0i128);
+    pool.start_winding_down(&admin);
+    let amount = pool.withdraw(&lp1, &shares);
+    assert!(amount > 0);
+    let stats = pool.get_stats();
+    assert_eq!(stats.status, crate::PoolStatus::WindingDown);
+}
+
+// ── premium split ─────────────────────────────────────────────────────────────
+
+#[test]
+fn admin_can_update_premium_split() {
+    let (_, pool, _, admin, _, _) = setup();
+    pool.update_premium_split(&admin, &7_000i128, &2_000i128, &1_000i128);
+    let split = pool.get_premium_split();
+    assert_eq!(split.lp_bps, 7_000);
+    assert_eq!(split.treas_bps, 2_000);
+    assert_eq!(split.backstop_bps, 1_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")]
+fn premium_split_must_sum_to_10000() {
+    let (_, pool, _, admin, _, _) = setup();
+    pool.update_premium_split(&admin, &7_000i128, &2_000i128, &2_000i128);
+}
+
 // ── position queries ──────────────────────────────────────────────────────────
 
 #[test]

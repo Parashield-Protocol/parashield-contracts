@@ -23,10 +23,11 @@ use soroban_sdk::{
 pub mod types;
 pub use types::*;
 
-const PREMIUM_LP_BPS:       i128 = 8_000;  // 80% of premium to LP pool
-const PREMIUM_TREAS_BPS:    i128 = 1_000;  // 10% to treasury
-const PREMIUM_BACKSTOP_BPS: i128 = 1_000;  // 10% to backstop fund
-const _: () = assert!(PREMIUM_LP_BPS + PREMIUM_TREAS_BPS + PREMIUM_BACKSTOP_BPS == 10_000);
+/// Default premium split, in effect until the admin calls `update_premium_split`.
+const DEFAULT_PREMIUM_LP_BPS:       i128 = 8_000;  // 80% of premium to LP pool
+const DEFAULT_PREMIUM_TREAS_BPS:    i128 = 1_000;  // 10% to treasury
+const DEFAULT_PREMIUM_BACKSTOP_BPS: i128 = 1_000;  // 10% to backstop fund
+const _: () = assert!(DEFAULT_PREMIUM_LP_BPS + DEFAULT_PREMIUM_TREAS_BPS + DEFAULT_PREMIUM_BACKSTOP_BPS == 10_000);
 
 /// Upper bound on cumulative deposits (7-decimal USDC stroops).
 /// 10^15 stroops == 100,000,000 USDC. Caps total pool size so share value
@@ -71,6 +72,8 @@ enum StorageKey {
     ClaimsProcessor,
     /// Contract version (u32) for storage migration tracking
     Version,
+    /// Premium split ratios (lp_bps, treas_bps, backstop_bps), admin-adjustable
+    PremiumSplit,
 }
 
 #[contracterror]
@@ -98,6 +101,7 @@ pub enum Error {
     Overflow            = 19,
     InvalidAddress      = 20,
     InvalidVersion      = 21,
+    InvalidSplit        = 22,
 }
 
 #[contract]
@@ -241,9 +245,10 @@ impl RiskPool {
 
         let now = env.ledger().timestamp();
         let lp_key = StorageKey::LpPosition(provider.clone());
+        let mut pending_yield: i128 = 0;
         let mut position: LpPosition = match env.storage().persistent().get::<_, LpPosition>(&lp_key) {
             Some(mut pos) => {
-                Self::internal_claim_yield(&env, &mut pos);
+                pending_yield = Self::settle_yield(&env, &mut pos);
                 pos.deposited += amount;
                 pos.shares    += new_shares;
                 pos.yield_debt = (env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0) * pos.shares) / 1_000_000_000_000;
@@ -282,6 +287,10 @@ impl RiskPool {
             },
         );
 
+        // All deposit state is now persisted; safe to move the yield owed to
+        // the provider, if any, as the last step (checks-effects-interactions).
+        Self::pay_out_yield(&env, &provider, pending_yield);
+
         new_shares
     }
 
@@ -292,7 +301,7 @@ impl RiskPool {
         provider.require_auth();
         // Guard: check for zero or negative shares input
         if shares <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
-        Self::assert_active(&env);
+        Self::assert_withdrawable(&env);
 
         let lp_key = StorageKey::LpPosition(provider.clone());
         let mut position: LpPosition = env.storage().persistent()
@@ -315,11 +324,7 @@ impl RiskPool {
         if amount == 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if amount > available_liquidity { panic_with_error!(&env, Error::Undercollateralized); }
 
-        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
-        token::Client::new(&env, &usdc)
-            .transfer(&env.current_contract_address(), &provider, &amount);
-
-        Self::internal_claim_yield(&env, &mut position);
+        let pending_yield = Self::settle_yield(&env, &mut position);
         position.deposited = position.deposited.saturating_sub(amount);
         position.shares   -= shares;
         position.yield_debt = (env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0) * position.shares) / 1_000_000_000_000;
@@ -337,6 +342,13 @@ impl RiskPool {
             },
         );
 
+        // All withdrawal state is persisted before either external transfer
+        // runs: the principal amount, then any yield owed (checks-effects-interactions).
+        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+        token::Client::new(&env, &usdc)
+            .transfer(&env.current_contract_address(), &provider, &amount);
+        Self::pay_out_yield(&env, &provider, pending_yield);
+
         amount
     }
 
@@ -351,9 +363,10 @@ impl RiskPool {
         token::Client::new(&env, &usdc)
             .transfer(&caller, &env.current_contract_address(), &amount);
 
-        let lp_share       = amount * PREMIUM_LP_BPS       / 10_000;
-        let treas_share    = amount * PREMIUM_TREAS_BPS    / 10_000;
-        let backstop_share = amount * PREMIUM_BACKSTOP_BPS / 10_000;
+        let (lp_bps, treas_bps, backstop_bps) = Self::get_premium_split_bps(&env);
+        let lp_share       = amount * lp_bps       / 10_000;
+        let treas_share    = amount * treas_bps    / 10_000;
+        let backstop_share = amount * backstop_bps / 10_000;
 
         let treasury: Address = env.storage().instance().get(&StorageKey::Treasury).unwrap();
         token::Client::new(&env, &usdc)
@@ -439,14 +452,14 @@ impl RiskPool {
             .get(&lp_key)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
 
-        let old_claimed = position.yield_claimed;
-        Self::internal_claim_yield(&env, &mut position);
-        let claimed = position.yield_claimed - old_claimed;
+        let claimed = Self::settle_yield(&env, &mut position);
 
         if claimed > 0 {
             env.storage().persistent().set(&lp_key, &position);
             Self::extend_to_max(&env, &lp_key);
         }
+
+        Self::pay_out_yield(&env, &provider, claimed);
 
         claimed
     }
@@ -618,6 +631,12 @@ impl RiskPool {
         env.storage().instance().get(&StorageKey::Version).unwrap_or(1)
     }
 
+    /// Return the current premium split ratios in basis points: (lp, treasury, backstop).
+    pub fn get_premium_split(env: Env) -> PremiumSplit {
+        let (lp_bps, treas_bps, backstop_bps) = Self::get_premium_split_bps(&env);
+        PremiumSplit { lp_bps, treas_bps, backstop_bps }
+    }
+
     /// Return a paginated list of LP addresses that currently hold shares.
     /// `offset` defaults to 0 and `limit` defaults to 100 (capped at 500).
     pub fn get_lp_list(env: Env, offset: Option<u32>, limit: Option<u32>) -> PaginatedLps {
@@ -696,6 +715,37 @@ impl RiskPool {
         env.events().publish(
             (Symbol::new(&env, "pool_resumed"),),
             PoolResumed { admin: admin.clone() },
+        );
+    }
+
+    /// Admin-only: begin graceful wind-down of the pool. Blocks new deposits while
+    /// letting existing LPs continue to withdraw and claim yield. Only callable
+    /// while the pool is `Active`.
+    pub fn start_winding_down(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        Self::assert_active(&env);
+        env.storage().instance().set(&StorageKey::Status, &PoolStatus::WindingDown);
+        env.events().publish(
+            (Symbol::new(&env, "pool_winding_down"),),
+            PoolWindingDown { admin: admin.clone() },
+        );
+    }
+
+    /// Admin-only: update the premium split ratios (in basis points). The three
+    /// values must sum to 10,000 (100%). Applies to premiums received after this call.
+    pub fn update_premium_split(env: Env, admin: Address, lp_bps: i128, treas_bps: i128, backstop_bps: i128) {
+        Self::require_admin(&env, &admin);
+        if lp_bps < 0 || treas_bps < 0 || backstop_bps < 0 {
+            panic_with_error!(&env, Error::InvalidSplit);
+        }
+        if lp_bps + treas_bps + backstop_bps != 10_000 {
+            panic_with_error!(&env, Error::InvalidSplit);
+        }
+        let split = PremiumSplit { lp_bps, treas_bps, backstop_bps };
+        env.storage().instance().set(&StorageKey::PremiumSplit, &split);
+        env.events().publish(
+            (Symbol::new(&env, "premium_split_updated"),),
+            PremiumSplitUpdated { lp_bps, treas_bps, backstop_bps },
         );
     }
 
@@ -904,10 +954,27 @@ impl RiskPool {
         }
     }
 
+    /// Return the current premium split ratios in basis points, falling back to the
+    /// compiled-in defaults if the admin has never called `update_premium_split`.
+    fn get_premium_split_bps(env: &Env) -> (i128, i128, i128) {
+        match env.storage().instance().get::<_, PremiumSplit>(&StorageKey::PremiumSplit) {
+            Some(split) => (split.lp_bps, split.treas_bps, split.backstop_bps),
+            None => (DEFAULT_PREMIUM_LP_BPS, DEFAULT_PREMIUM_TREAS_BPS, DEFAULT_PREMIUM_BACKSTOP_BPS),
+        }
+    }
+
     fn assert_active(env: &Env) {
         let status: PoolStatus = env.storage().instance()
             .get(&StorageKey::Status).unwrap_or(PoolStatus::Active);
         if status != PoolStatus::Active { panic_with_error!(env, Error::PoolNotActive); }
+    }
+
+    /// Withdrawals are allowed while the pool is `Active` or `WindingDown`, but not
+    /// while `Paused`.
+    fn assert_withdrawable(env: &Env) {
+        let status: PoolStatus = env.storage().instance()
+            .get(&StorageKey::Status).unwrap_or(PoolStatus::Active);
+        if status == PoolStatus::Paused { panic_with_error!(env, Error::PoolNotActive); }
     }
 
     /// Extend a persistent entry's TTL to the network maximum. Used for
@@ -924,32 +991,48 @@ impl RiskPool {
         env.storage().persistent().extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
-    fn internal_claim_yield(env: &Env, position: &mut LpPosition) {
+    /// Settle `position`'s accrued yield in memory (updates `yield_claimed`,
+    /// `last_yield_claim`, and `yield_debt`) and return the amount owed to the
+    /// provider, if any. Does **not** transfer tokens or emit events — callers
+    /// must finish persisting all state first, then call
+    /// [`Self::pay_out_yield`] last, so the external token transfer happens
+    /// only after every state mutation for the operation has landed
+    /// (checks-effects-interactions; avoids reentering mid-deposit/withdraw).
+    fn settle_yield(env: &Env, position: &mut LpPosition) -> i128 {
         let total_shares: i128 = env.storage().instance().get(&StorageKey::TotalShares).unwrap_or(0);
         let acc_per_share: i128 = env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0);
         if total_shares == 0 {
-            return;
+            return 0;
         }
 
         let entitled = (acc_per_share * position.shares) / 1_000_000_000_000;
         let claimable = entitled.saturating_sub(position.yield_debt);
         if claimable > 0 {
-            let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
-            token::Client::new(env, &usdc)
-                .transfer(&env.current_contract_address(), &position.provider, &claimable);
-
             position.yield_claimed += claimable;
             position.last_yield_claim = env.ledger().timestamp();
             position.yield_debt = entitled;
-
-            env.events().publish(
-                (Symbol::new(env, "yield_claimed"),),
-                YieldClaimed {
-                    provider: position.provider.clone(),
-                    amount: claimable,
-                },
-            );
         }
+        claimable
+    }
+
+    /// Transfer a previously-settled yield `amount` to `provider` and emit
+    /// `yield_claimed`. Must be called only after all other state for the
+    /// current operation has been persisted — see [`Self::settle_yield`].
+    fn pay_out_yield(env: &Env, provider: &Address, amount: i128) {
+        if amount <= 0 {
+            return;
+        }
+        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+        token::Client::new(env, &usdc)
+            .transfer(&env.current_contract_address(), provider, &amount);
+
+        env.events().publish(
+            (Symbol::new(env, "yield_claimed"),),
+            YieldClaimed {
+                provider: provider.clone(),
+                amount,
+            },
+        );
     }
 }
 
