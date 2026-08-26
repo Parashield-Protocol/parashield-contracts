@@ -345,6 +345,30 @@ impl OracleVerifier {
             .unwrap_or(1)
     }
 
+    /// Set the minimum number of seconds a single oracle must wait between
+    /// submissions for the same data_type. Guards against a malicious or
+    /// malfunctioning oracle flooding the contract with submissions to
+    /// consume storage/instruction budget (griefing).
+    pub fn set_min_submit_interval(env: Env, admin: Address, seconds: u64) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::MinSubmitInterval, &seconds);
+        env.events().publish(
+            (Symbol::new(&env, "min_submit_interval_updated"),),
+            MinSubmitIntervalUpdated { seconds },
+        );
+    }
+
+    /// Return the minimum number of seconds required between submissions
+    /// from the same oracle for a data_type (defaults to 30).
+    pub fn get_min_submit_interval(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::MinSubmitInterval)
+            .unwrap_or(DEFAULT_MIN_SUBMIT_INTERVAL)
+    }
+
     // ── Data Submission ───────────────────────────────────────────────────────
 
     /// Submit a data point for a (data_type, key) pair.
