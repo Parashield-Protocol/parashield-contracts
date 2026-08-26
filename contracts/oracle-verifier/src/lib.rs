@@ -17,8 +17,8 @@ extern crate alloc;
 
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, BytesN, Env,
-    Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address,
+    BytesN, Env, Symbol, Vec,
 };
 
 pub mod types;
@@ -72,6 +72,14 @@ enum StorageKey {
     /// Timestamp (u64) of an oracle's last accepted submission for a
     /// data_type — (data_type, oracle) → last submission time
     LastSubmission(Symbol, Address),
+    /// Token used for oracle stake deposits (Address). Unset = staking disabled.
+    StakeToken,
+    /// Minimum stake (i128) an oracle must hold for a data_type before
+    /// `add_oracle` will register it. Defaults to 0 (disabled).
+    MinStake,
+    /// Amount of stake token (i128) currently deposited by an oracle for a
+    /// given data_type — (data_type, oracle) → amount.
+    OracleStakeAmt(Symbol, Address),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -93,6 +101,11 @@ pub enum Error {
     InvalidTimestamp = 11,
     InvalidAddress = 12,
     RateLimited = 13,
+    InsufficientStake = 14,
+    StakeTokenNotSet = 15,
+    NoStake = 16,
+    InvalidStakeAmount = 17,
+    OracleStillActive = 18,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -142,6 +155,24 @@ impl OracleVerifier {
         let key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         if env.storage().persistent().has(&key) {
             panic_with_error!(&env, Error::OracleAlreadyExists);
+        }
+        // Enforce a minimum economic stake so oracles have skin in the game.
+        // Disabled by default (min_stake == 0) for backward compatibility with
+        // deployments/tests that don't use the staking feature.
+        let min_stake: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinStake)
+            .unwrap_or(0);
+        if min_stake > 0 {
+            let staked: i128 = env
+                .storage()
+                .persistent()
+                .get(&StorageKey::OracleStakeAmt(data_type.clone(), oracle.clone()))
+                .unwrap_or(0);
+            if staked < min_stake {
+                panic_with_error!(&env, Error::InsufficientStake);
+            }
         }
         let entry = OracleEntry {
             oracle: oracle.clone(),
@@ -367,6 +398,133 @@ impl OracleVerifier {
             .instance()
             .get(&StorageKey::MinSubmitInterval)
             .unwrap_or(DEFAULT_MIN_SUBMIT_INTERVAL)
+    }
+
+    // ── Oracle Staking (economic security) ───────────────────────────────────
+
+    /// Set the token used for oracle stake deposits. Admin-only.
+    pub fn set_stake_token(env: Env, admin: Address, token: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&StorageKey::StakeToken, &token);
+        env.events().publish(
+            (Symbol::new(&env, "stake_token_updated"),),
+            StakeTokenUpdated { token },
+        );
+    }
+
+    /// Return the configured stake token, if any.
+    pub fn get_stake_token(env: Env) -> Option<Address> {
+        env.storage().instance().get(&StorageKey::StakeToken)
+    }
+
+    /// Set the minimum stake an oracle must hold for a data_type before
+    /// `add_oracle` will register it. 0 disables the requirement (default).
+    pub fn set_min_stake(env: Env, admin: Address, min_stake: i128) {
+        Self::require_admin(&env, &admin);
+        if min_stake < 0 {
+            panic_with_error!(&env, Error::InvalidStakeAmount);
+        }
+        env.storage().instance().set(&StorageKey::MinStake, &min_stake);
+        env.events().publish(
+            (Symbol::new(&env, "min_stake_updated"),),
+            MinStakeUpdated { min_stake },
+        );
+    }
+
+    /// Return the currently configured minimum oracle stake (defaults to 0).
+    pub fn get_min_stake(env: Env) -> i128 {
+        env.storage().instance().get(&StorageKey::MinStake).unwrap_or(0)
+    }
+
+    /// Deposit `amount` of the configured stake token toward `oracle`'s stake
+    /// for `data_type`. Callable by anyone but requires the oracle's own
+    /// authorization, so only the oracle (or someone it has delegated to)
+    /// can grow its own stake.
+    pub fn stake(env: Env, oracle: Address, data_type: Symbol, amount: i128) {
+        oracle.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, Error::InvalidStakeAmount);
+        }
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StakeToken)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::StakeTokenNotSet));
+
+        token::Client::new(&env, &token_addr).transfer(
+            &oracle,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        let stake_key = StorageKey::OracleStakeAmt(data_type.clone(), oracle.clone());
+        let current: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0);
+        let total_stake = current + amount;
+        env.storage().persistent().set(&stake_key, &total_stake);
+        env.storage()
+            .persistent()
+            .extend_ttl(&stake_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.events().publish(
+            (Symbol::new(&env, "stake_deposited"),),
+            StakeDeposited {
+                oracle,
+                data_type,
+                amount,
+                total_stake,
+            },
+        );
+    }
+
+    /// Return the amount currently staked by `oracle` for `data_type`.
+    pub fn get_oracle_stake(env: Env, data_type: Symbol, oracle: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::OracleStakeAmt(data_type, oracle))
+            .unwrap_or(0)
+    }
+
+    /// Withdraw the caller's full stake for `data_type`. Only permitted once
+    /// the oracle is not an active registration for that data_type (never
+    /// registered, or previously removed via `remove_oracle`) — an active
+    /// oracle cannot pull its economic backing out from under a live
+    /// registration.
+    pub fn withdraw_stake(env: Env, oracle: Address, data_type: Symbol) {
+        oracle.require_auth();
+
+        let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
+        if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+            if entry.active {
+                panic_with_error!(&env, Error::OracleStillActive);
+            }
+        }
+
+        let stake_key = StorageKey::OracleStakeAmt(data_type.clone(), oracle.clone());
+        let amount: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0);
+        if amount <= 0 {
+            panic_with_error!(&env, Error::NoStake);
+        }
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StakeToken)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::StakeTokenNotSet));
+
+        env.storage().persistent().remove(&stake_key);
+        token::Client::new(&env, &token_addr).transfer(
+            &env.current_contract_address(),
+            &oracle,
+            &amount,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "stake_withdrawn"),),
+            StakeWithdrawn {
+                oracle,
+                data_type,
+                amount,
+            },
+        );
     }
 
     // ── Data Submission ───────────────────────────────────────────────────────
