@@ -1,5 +1,33 @@
 use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec};
 
+/// Reputation score for an oracle, tracking accuracy over time.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleReputation {
+    pub oracle: Address,
+    pub data_type: Symbol,
+    /// Total number of submissions made by this oracle
+    pub total_submissions: u64,
+    /// Number of submissions that were accurate (within tolerance of median)
+    pub accurate_submissions: u64,
+    /// Reputation score 0-1000 (basis points of accuracy)
+    pub score: u32,
+    /// Timestamp of last reputation update
+    pub last_updated: u64,
+}
+
+// ─── Events ──────────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReputationUpdated {
+    pub oracle: Address,
+    pub data_type: Symbol,
+    pub score: u32,
+    pub accurate: u64,
+    pub total: u64,
+}
+
 /// How the trigger threshold is compared against the observed value.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

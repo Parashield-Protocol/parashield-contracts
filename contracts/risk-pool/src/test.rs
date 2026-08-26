@@ -555,6 +555,69 @@ fn admin_timelock_honours_stored_deadline_not_current_constant() {
     pool.execute_admin_withdrawal(&admin);
 }
 
+/// Cancelling when there is no pending withdrawal request must fail with
+/// NoPendingWithdrawal rather than silently succeeding (Issue #336).
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn admin_cancel_withdrawal_with_no_pending_request_fails() {
+    let (_env, pool, _usdc_id, admin, _treasury, _lp1) = setup();
+    pool.cancel_admin_withdrawal(&admin);
+}
+
+/// Executing when there is no pending withdrawal request must fail with
+/// NoPendingWithdrawal rather than panicking on a missing-value unwrap
+/// with an unrelated error (Issue #336).
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn admin_execute_withdrawal_with_no_pending_request_fails() {
+    let (_env, pool, _usdc_id, admin, _treasury, _lp1) = setup();
+    pool.execute_admin_withdrawal(&admin);
+}
+
+/// Executing the same withdrawal request twice must fail the second time
+/// with AlreadyReleased — funds must not be transferred out twice for one
+/// request (Issue #336).
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn admin_execute_withdrawal_twice_fails() {
+    let (env, pool, _usdc_id, admin, _treasury, lp1) = setup();
+    pool.deposit(&lp1, &1_000_0000000i128, &0i128);
+    pool.request_admin_withdrawal(&admin, &100_0000000i128);
+
+    let jump = (7 * 24 * 60 * 60 + 1) as u64;
+    env.ledger().set_timestamp(env.ledger().timestamp() + jump);
+
+    pool.execute_admin_withdrawal(&admin);
+    // Second execute on the same already-executed request must be rejected.
+    pool.execute_admin_withdrawal(&admin);
+}
+
+/// Sweep of deposit/withdraw amounts checking a core financial invariant:
+/// withdrawing all of a provider's shares immediately after depositing must
+/// never return more than was deposited, and available liquidity must never
+/// go negative. A minimal stand-in for property-based testing (Issue #337)
+/// that needs no new test dependency — a fuller proptest/quickcheck harness
+/// covering more of the arithmetic surface remains follow-up work.
+#[test]
+fn deposit_withdraw_round_trip_never_creates_value() {
+    let amounts: [i128; 5] = [
+        1_0000000,           // smallest typical unit
+        1_000_0000000,       // 1,000 USDC
+        999_999_0000000,     // near-large
+        3_333_3330000,       // non-round amount
+        50_000_0000000,      // large
+    ];
+
+    for amount in amounts {
+        let (_env, pool, _usdc_id, _admin, _treasury, lp1) = setup();
+        let shares = pool.deposit(&lp1, &amount, &0i128);
+        let redeemed = pool.withdraw(&lp1, &shares);
+
+        assert!(redeemed <= amount, "withdrew {} more than deposited {}", redeemed, amount);
+        assert!(pool.get_available_liquidity() >= 0, "available liquidity went negative for amount {}", amount);
+    }
+}
+
 /// lock_for_policy on a pool with zero deposits (total_deposited == 0,
 /// total_locked == 0) must reject with Undercollateralized rather than
 /// silently succeeding or underflowing.

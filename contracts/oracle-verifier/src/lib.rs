@@ -27,6 +27,10 @@ pub use types::*;
 // ─── Storage TTL ──────────────────────────────────────────────────────────────
 /// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
 /// (at ~5s/ledger).
+// Issue #342: kept in sync by hand across all 5 contracts (governance-dao,
+// risk-pool, policy-engine, oracle-verifier, claims-processor) — extracting
+// to a shared crate is a real follow-up, not done here to avoid touching
+// every contract's Cargo.toml in one pass.
 const TTL_THRESHOLD: u32 = 518_400; // ~30 days
 /// Extend persistent entries out to ~1 year (at ~5s/ledger) so an oracle
 /// registration doesn't silently expire from storage during a quiet period
@@ -974,7 +978,7 @@ impl OracleVerifier {
         condition: TriggerCondition,
     ) -> bool {
         let median = Self::get_median_value(&env, &data_type, &key);
-        match condition.comparison {
+        let result = match condition.comparison {
             TriggerComparison::LessThan => median < condition.threshold,
             TriggerComparison::GreaterThan => median > condition.threshold,
             TriggerComparison::Equal => median == condition.threshold,
@@ -982,7 +986,44 @@ impl OracleVerifier {
                 let diff = median.saturating_sub(condition.threshold);
                 diff.abs() <= condition.tolerance
             }
+        };
+
+        // Update reputation for all contributing oracles
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let max_data_age: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MaxDataAge)
+            .unwrap_or(604_800);
+        let now = env.ledger().timestamp();
+        let min_confidence: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
+
+        let tolerance = condition.tolerance;
+        for i in 0..points.len() {
+            let p = points.get_unchecked(i);
+            if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence {
+                let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+                if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+                    if entry.active {
+                        // Oracle is accurate if its value is within tolerance of the median
+                        let diff = (p.value - median).abs();
+                        let accurate = diff <= tolerance;
+                        Self::update_reputation(&env, &p.oracle, &data_type, accurate);
+                    }
+                }
+            }
         }
+
+        result
     }
 
     /// Return the most recent submission from any oracle for (data_type, key).
@@ -1179,8 +1220,35 @@ impl OracleVerifier {
         // Emit event for verification result to enable monitoring and auditing
         env.events().publish(
             (Symbol::new(&env, "verification_result"),),
-            (data_type, key, result, median, condition.threshold),
+            (data_type.clone(), key, result, median, condition.threshold),
         );
+
+        // Update reputation for all contributing oracles
+        let max_data_age: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MaxDataAge)
+            .unwrap_or(604_800);
+        let min_confidence: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
+
+        let tolerance = condition.tolerance;
+        for i in 0..points.len() {
+            let p = points.get_unchecked(i);
+            if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence {
+                let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+                if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+                    if entry.active {
+                        let diff = (p.value - median).abs();
+                        let accurate = diff <= tolerance;
+                        Self::update_reputation(&env, &p.oracle, &data_type, accurate);
+                    }
+                }
+            }
+        }
         
         result
     }
@@ -1385,6 +1453,75 @@ impl OracleVerifier {
             .instance()
             .get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
+    }
+
+    // ── Oracle Reputation ────────────────────────────────────────────────────
+
+    /// Get the reputation score for an oracle.
+    pub fn get_reputation(env: Env, oracle: Address, data_type: Symbol) -> OracleReputation {
+        let key = StorageKey::Reputation(data_type.clone(), oracle.clone());
+        env.storage().persistent().get(&key).unwrap_or(OracleReputation {
+            oracle,
+            data_type,
+            total_submissions: 0,
+            accurate_submissions: 0,
+            score: 500, // Default 50% score for new oracles
+            last_updated: 0,
+        })
+    }
+
+    /// Update oracle reputation based on whether submission was accurate.
+    /// Called internally after aggregation to track oracle performance.
+    fn update_reputation(env: &Env, oracle: &Address, data_type: &Symbol, accurate: bool) {
+        let key = StorageKey::Reputation(data_type.clone(), oracle.clone());
+        let mut rep: OracleReputation = env.storage().persistent().get(&key).unwrap_or(OracleReputation {
+            oracle: oracle.clone(),
+            data_type: data_type.clone(),
+            total_submissions: 0,
+            accurate_submissions: 0,
+            score: 500,
+            last_updated: 0,
+        });
+
+        rep.total_submissions += 1;
+        if accurate {
+            rep.accurate_submissions += 1;
+        }
+        // Calculate score as basis points (0-1000)
+        if rep.total_submissions > 0 {
+            rep.score = ((rep.accurate_submissions * 1000) / rep.total_submissions) as u32;
+        }
+        rep.last_updated = env.ledger().timestamp();
+
+        env.storage().persistent().set(&key, &rep);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.events().publish(
+            (Symbol::new(env, "reputation_updated"),),
+            ReputationUpdated {
+                oracle: oracle.clone(),
+                data_type: data_type.clone(),
+                score: rep.score,
+                accurate: rep.accurate_submissions,
+                total: rep.total_submissions,
+            },
+        );
+    }
+
+    /// Get the effective weight of an oracle, adjusted by reputation.
+    /// Oracles with higher reputation get higher effective weights.
+    pub fn get_effective_weight(env: Env, oracle: Address, data_type: Symbol) -> u32 {
+        let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
+        let entry: OracleEntry = env
+            .storage()
+            .persistent()
+            .get(&oracle_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
+
+        let rep = Self::get_reputation(env.clone(), oracle.clone(), data_type);
+        // Effective weight = base weight * (score / 1000), minimum 1
+        let effective = (entry.weight as u64 * rep.score as u64) / 1000;
+        core::cmp::max(effective as u32, 1)
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────

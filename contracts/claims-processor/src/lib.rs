@@ -61,6 +61,10 @@ trait IOracleVerifier {
 
 /// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
 /// (at ~5s/ledger).
+// Issue #342: kept in sync by hand across all 5 contracts (governance-dao,
+// risk-pool, policy-engine, oracle-verifier, claims-processor) — extracting
+// to a shared crate is a real follow-up, not done here to avoid touching
+// every contract's Cargo.toml in one pass.
 const TTL_THRESHOLD: u32 = 518_400;
 /// Extend persistent entries out to ~1 year (at ~5s/ledger) so pending claims
 /// survive long enough to be processed.

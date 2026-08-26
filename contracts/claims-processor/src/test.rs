@@ -1,7 +1,7 @@
 use super::*;
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Ledger},
+    testutils::{storage::Persistent as _, Address as _, Ledger},
     token::StellarAssetClient,
     Env,
 };
@@ -631,4 +631,77 @@ fn test_batch_auto_process_empty_pending_list() {
     
     // Pending list should still be empty
     assert_eq!(cp.get_pending_claims().len(), 0);
+}
+
+// ── Dispute negative cases (Issue #338) ──────────────────────────────────────
+
+/// Disputing a claim id that was never submitted must fail with ClaimNotFound.
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_dispute_nonexistent_claim_fails() {
+    let w = deploy();
+    let claimant = Address::generate(&w.env);
+    ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .dispute_claim(&claimant, &999_999u128, &symbol_short!("reason"));
+}
+
+/// Disputing a claim that has already been paid out must fail with
+/// AlreadyProcessed — a settled claim cannot be reopened.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_dispute_paid_claim_fails() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 30_000_000); // below threshold
+
+    let cp       = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    assert_eq!(cp.process_claim(&w.keeper, &claim_id), ClaimResult::Paid);
+
+    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("reason"));
+}
+
+/// Disputing a claim that is already Disputed must fail with
+/// AlreadyProcessed — dispute cannot be filed twice on the same claim.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_dispute_already_disputed_claim_fails() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp       = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("first"));
+
+    // Second dispute on the same already-Disputed claim must be rejected.
+    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("second"));
+}
+
+// ── TTL behavior (Issue #335) ────────────────────────────────────────────────
+
+/// A submitted claim's TTL must be extended well past the default bump
+/// threshold, so it survives long enough to be processed/disputed instead
+/// of expiring prematurely and losing the underlying fund record.
+#[test]
+fn test_submitted_claim_ttl_is_extended() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 30_000_000);
+
+    let cp       = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+
+    let ttl = w.env.as_contract(&w.claims_id, || {
+        w.env.storage().persistent().get_ttl(&StorageKey::Claim(claim_id))
+    });
+    // Must be extended well beyond the default archival threshold, not left
+    // at whatever minimal TTL a fresh write happens to get.
+    assert!(ttl > TTL_THRESHOLD, "claim TTL {} was not extended past the bump threshold", ttl);
 }
