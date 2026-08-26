@@ -17,7 +17,7 @@ extern crate alloc;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
-    BytesN, Env, Symbol, Val, Vec,
+    BytesN, Env, IntoVal, Symbol, Val, Vec,
 };
 
 pub mod types;
@@ -198,6 +198,7 @@ impl GovernanceDao {
             vote_end: now.saturating_add(config.voting_period),
             execution_time: 0,
             total_supply: config.total_supply,
+            kind: ProposalKind::Standard,
         };
 
         let proposal_key = StorageKey::Proposal(proposal_id);
@@ -207,6 +208,92 @@ impl GovernanceDao {
             .set(&StorageKey::NextProposalId, &(proposal_id.checked_add(1).unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))));
 
         // Note: You can append `args` to your event payload if necessary
+        env.events().publish(
+            (Symbol::new(&env, "proposal_created"),),
+            ProposalCreated {
+                proposal_id,
+                proposer,
+                target,
+                function,
+            },
+        );
+
+        proposal_id
+    }
+
+    /// Create a proposal that, on execution, upgrades `target`'s contract
+    /// WASM to `new_wasm_hash`. `target` must have this DAO's own address
+    /// configured as its admin — `execute()` invokes
+    /// `target::upgrade(dao_address, new_wasm_hash)` on the DAO's behalf, so
+    /// contract-upgrade authorization becomes a first-class governance
+    /// action instead of living solely with a single admin key.
+    ///
+    /// Shares the same threshold/deposit/vote/finalize/timelock lifecycle as
+    /// `create_proposal`; only the proposal `kind` and pre-built
+    /// target/function/args differ.
+    pub fn propose_upgrade(
+        env: Env,
+        proposer: Address,
+        title: Bytes,
+        target: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> u64 {
+        proposer.require_auth();
+        Self::validate_stellar_address(&env, &target);
+        let config: DaoConfig = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+
+        let gov_token = token::Client::new(&env, &config.gov_token);
+        let weight = gov_token.balance(&proposer);
+        if weight < config.proposal_threshold {
+            panic_with_error!(&env, Error::InsufficientWeight);
+        }
+        let deposit = config.proposal_threshold;
+        gov_token.transfer(&proposer, &env.current_contract_address(), &deposit);
+
+        let proposal_id: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::NextProposalId)
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+
+        let mut args: Vec<Val> = Vec::new(&env);
+        args.push_back(env.current_contract_address().into_val(&env));
+        args.push_back(new_wasm_hash.into_val(&env));
+        let function = Symbol::new(&env, "upgrade");
+
+        let proposal = Proposal {
+            id: proposal_id,
+            proposer: proposer.clone(),
+            title,
+            target: target.clone(),
+            function: function.clone(),
+            args,
+            deposit,
+            status: ProposalStatus::Active,
+            votes_for: 0,
+            votes_against: 0,
+            votes_abstain: 0,
+            created_at: now,
+            vote_end: now.saturating_add(config.voting_period),
+            execution_time: 0,
+            total_supply: config.total_supply,
+            kind: ProposalKind::Upgrade,
+        };
+
+        let proposal_key = StorageKey::Proposal(proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+        env.storage().instance().set(
+            &StorageKey::NextProposalId,
+            &(proposal_id
+                .checked_add(1)
+                .unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))),
+        );
+
         env.events().publish(
             (Symbol::new(&env, "proposal_created"),),
             ProposalCreated {
