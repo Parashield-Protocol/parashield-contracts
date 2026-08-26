@@ -14,7 +14,6 @@
 //! v2 — full implementation; DAO is now deployable and testable.
 #![no_std]
 extern crate alloc;
-use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
@@ -30,6 +29,12 @@ const MIN_VOTING_PERIOD: u64 = 3_600;
 /// an unreachably large period that would cause vote_end + FINALIZE_DELAY to
 /// overflow or make proposals permanently unresolvable.
 const MAX_VOTING_PERIOD: u64 = 30 * 24 * 3_600;
+/// Storage TTL threshold for proposal-related entries
+const TTL_THRESHOLD: u32 = 518_400; // ~30 days
+/// Storage TTL extension target for proposal-related entries
+const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year
+/// Minimum delay after vote_end before finalize() can be called
+const FINALIZE_DELAY: u64 = 300; // 5 minutes
 
 #[contracttype]
 enum StorageKey {
@@ -456,10 +461,10 @@ impl GovernanceDao {
 
     /// Admin-only: cancel an Active proposal before voting closes.
     ///
-    /// Refunds the proposer's deposit (at the current `config`
-    /// `proposal_threshold`, since no vote has happened yet) and marks the
-    /// proposal Cancelled. Voters who already locked tokens can reclaim
-    /// them via `withdraw_tokens` once cancelled.
+    /// Refunds the proposer's deposit (the exact amount locked at
+    /// proposal creation) and marks the proposal Cancelled. Voters who
+    /// already locked tokens can reclaim them via `withdraw_tokens`
+    /// once cancelled.
     pub fn cancel(env: Env, admin: Address, proposal_id: u64) {
         Self::require_admin(&env, &admin);
 
@@ -483,7 +488,7 @@ impl GovernanceDao {
         gov_token.transfer(
             &env.current_contract_address(),
             &proposal.proposer,
-            &config.proposal_threshold,
+            &proposal.deposit,
         );
 
         env.events().publish(
@@ -631,6 +636,12 @@ impl GovernanceDao {
         if buf[0] != b'G' && buf[0] != b'C' {
             panic!("invalid address: must be an account or contract address");
         }
+    }
+
+    /// Extend the TTL for proposal-related storage entries to prevent expiry
+    /// during voting, timelock, and execution periods.
+    fn extend_proposal_ttl(env: &Env, key: &StorageKey, _config: &DaoConfig) {
+        env.storage().persistent().extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 }
 
