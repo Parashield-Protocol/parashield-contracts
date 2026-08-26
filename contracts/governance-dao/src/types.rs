@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Bytes, Symbol, Val, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Symbol, Val, Vec};
 
 pub const FINALIZE_DELAY: u64 = 24 * 3600;
 
@@ -36,6 +36,17 @@ pub enum VoteChoice {
     Abstain,
 }
 
+/// What kind of action a proposal performs on execution.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProposalKind {
+    /// Arbitrary `target::function(args)` call, as authored by the proposer.
+    Standard,
+    /// Upgrades `target`'s contract WASM. `target` must have this DAO
+    /// configured as its admin for execution to succeed.
+    Upgrade,
+}
+
 /// A governance proposal for a protocol parameter change.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,6 +78,8 @@ pub struct Proposal {
     /// Total supply captured at proposal creation time for quorum calculation.
     /// This prevents admin manipulation of total_supply during active votes.
     pub total_supply: i128,
+    /// Whether this is a generic call or a contract-upgrade proposal.
+    pub kind: ProposalKind,
 }
 
 /// A single vote record stored per (proposal_id, voter) key.
@@ -159,4 +172,29 @@ pub struct DaoConfigUpdated {
 pub struct ContractUpgraded {
     pub old_version: u32,
     pub new_version: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuardiansUpdated {
+    pub guardians: Vec<Address>,
+    pub threshold: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeApproved {
+    pub new_wasm_hash: BytesN<32>,
+    pub approver: Address,
+    pub approvals: u32,
+    pub threshold: u32,
+}
+
+/// A pending contract-upgrade action awaiting guardian approvals.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUpgrade {
+    pub new_wasm_hash: BytesN<32>,
+    pub new_version: u32,
+    pub approvals: Vec<Address>,
 }
