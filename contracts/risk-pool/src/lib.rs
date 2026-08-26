@@ -924,32 +924,48 @@ impl RiskPool {
         env.storage().persistent().extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
-    fn internal_claim_yield(env: &Env, position: &mut LpPosition) {
+    /// Settle `position`'s accrued yield in memory (updates `yield_claimed`,
+    /// `last_yield_claim`, and `yield_debt`) and return the amount owed to the
+    /// provider, if any. Does **not** transfer tokens or emit events — callers
+    /// must finish persisting all state first, then call
+    /// [`Self::pay_out_yield`] last, so the external token transfer happens
+    /// only after every state mutation for the operation has landed
+    /// (checks-effects-interactions; avoids reentering mid-deposit/withdraw).
+    fn settle_yield(env: &Env, position: &mut LpPosition) -> i128 {
         let total_shares: i128 = env.storage().instance().get(&StorageKey::TotalShares).unwrap_or(0);
         let acc_per_share: i128 = env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0);
         if total_shares == 0 {
-            return;
+            return 0;
         }
 
         let entitled = (acc_per_share * position.shares) / 1_000_000_000_000;
         let claimable = entitled.saturating_sub(position.yield_debt);
         if claimable > 0 {
-            let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
-            token::Client::new(env, &usdc)
-                .transfer(&env.current_contract_address(), &position.provider, &claimable);
-
             position.yield_claimed += claimable;
             position.last_yield_claim = env.ledger().timestamp();
             position.yield_debt = entitled;
-
-            env.events().publish(
-                (Symbol::new(env, "yield_claimed"),),
-                YieldClaimed {
-                    provider: position.provider.clone(),
-                    amount: claimable,
-                },
-            );
         }
+        claimable
+    }
+
+    /// Transfer a previously-settled yield `amount` to `provider` and emit
+    /// `yield_claimed`. Must be called only after all other state for the
+    /// current operation has been persisted — see [`Self::settle_yield`].
+    fn pay_out_yield(env: &Env, provider: &Address, amount: i128) {
+        if amount <= 0 {
+            return;
+        }
+        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+        token::Client::new(env, &usdc)
+            .transfer(&env.current_contract_address(), provider, &amount);
+
+        env.events().publish(
+            (Symbol::new(env, "yield_claimed"),),
+            YieldClaimed {
+                provider: provider.clone(),
+                amount,
+            },
+        );
     }
 }
 
