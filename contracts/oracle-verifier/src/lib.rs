@@ -41,11 +41,13 @@ const MAX_ORACLES: u32 = 100;
 /// Maximum number of data points stored per (data_type, key).
 const MAX_DATA_POINTS: u32 = 100;
 
-/// Maximum number of registered oracles. Bounds the median aggregation loop and
-/// the worst-case weighted sum (MAX_ORACLES * max_weight * max_value) so it
-/// cannot overflow i128.
-#[allow(dead_code)]
-const MAX_ORACLES: u32 = 100;
+/// Default minimum number of seconds a single oracle must wait between
+/// submissions for the same data_type, used when no admin override has been
+/// set via `set_min_submit_interval`. Chosen well below any realistic
+/// real-world observation cadence (rainfall, flight status, etc.) while still
+/// bounding how much storage/instruction budget a single misbehaving oracle
+/// can consume by flooding submissions.
+const DEFAULT_MIN_SUBMIT_INTERVAL: u64 = 30;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -64,6 +66,12 @@ enum StorageKey {
     MaxDataAge,
     PendingAdmin,
     MinOracleCount,
+    /// Minimum seconds between submissions from the same oracle for a given
+    /// data_type (u64)
+    MinSubmitInterval,
+    /// Timestamp (u64) of an oracle's last accepted submission for a
+    /// data_type — (data_type, oracle) → last submission time
+    LastSubmission(Symbol, Address),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -84,6 +92,7 @@ pub enum Error {
     TooManyOracles = 10,
     InvalidTimestamp = 11,
     InvalidAddress = 12,
+    RateLimited = 13,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
