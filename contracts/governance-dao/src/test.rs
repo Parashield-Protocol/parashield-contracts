@@ -15,6 +15,15 @@ use crate::{DaoConfig, GovernanceDao, GovernanceDaoClient, ProposalStatus, VoteC
 
 const VOTING_PERIOD: u64 = 7 * 24 * 3600; // 7 days in seconds
 
+#[soroban_sdk::contract]
+pub struct MockTarget;
+
+#[soroban_sdk::contractimpl]
+impl MockTarget {
+    pub fn update(_env: Env) {}
+    pub fn upgrade(_env: Env) {}
+}
+
 pub fn setup() -> (
     Env,
     GovernanceDaoClient<'static>,
@@ -29,7 +38,7 @@ pub fn setup() -> (
     let admin = Address::generate(&env);
     let voter1 = Address::generate(&env);
     let voter2 = Address::generate(&env);
-    let target = Address::generate(&env);
+    let target = env.register(MockTarget, ());
 
     let gov_token_id = env
         .register_stellar_asset_contract_v2(admin.clone())
@@ -329,7 +338,7 @@ fn test_proposal_timelock_execution() {
 
     let admin = Address::generate(&env);
     let voter1 = Address::generate(&env);
-    let target = Address::generate(&env);
+    let target = env.register(MockTarget, ());
     let gov_token_id = env
         .register_stellar_asset_contract_v2(admin.clone())
         .address();
@@ -594,8 +603,8 @@ fn test_proposal_expires_after_voting_period() {
         &Symbol::new(&env, "update"),
         &args,
     );
-    // Move time past the voting period
-    env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
+    // Move time past the voting period AND finalize delay buffer (24h)
+    env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
     
     // Finalize it without votes, it should fail
     dao.finalize(&pid);

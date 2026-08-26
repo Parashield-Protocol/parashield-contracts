@@ -26,7 +26,12 @@ pub mod types;
 pub use types::*;
 
 // ─── Storage TTL ──────────────────────────────────────────────────────────────
+/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
+/// (at ~5s/ledger).
 const TTL_THRESHOLD: u32 = 518_400; // ~30 days
+/// Extend persistent entries out to ~1 year (at ~5s/ledger) so an oracle
+/// registration doesn't silently expire from storage during a quiet period
+/// with no submissions.
 const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year
 
 /// Maximum number of registered oracles. Bounds the median aggregation loop and
@@ -34,18 +39,8 @@ const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year
 /// cannot overflow i128.
 #[allow(dead_code)]
 const MAX_ORACLES: u32 = 100;
-
-// ─── Storage TTL ──────────────────────────────────────────────────────────────
-
-/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
-/// (at ~5s/ledger).
-#[allow(dead_code)]
-const TTL_THRESHOLD: u32 = 518_400;
-/// Extend persistent entries out to ~1 year (at ~5s/ledger) so an oracle
-/// registration doesn't silently expire from storage during a quiet period
-/// with no submissions.
-#[allow(dead_code)]
-const TTL_EXTEND_TO: u32 = 6_312_000;
+/// Maximum number of data points stored per (data_type, key).
+const MAX_DATA_POINTS: u32 = 100;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -57,8 +52,8 @@ enum StorageKey {
     Oracle(Symbol, Address),
     /// Vec<OracleDataPoint> — all submissions for (data_type, key)
     DataPoints(Symbol, Symbol),
-    /// Vec<Address> — every registered oracle address
-    OracleList,
+    /// Vec<Address> — registered oracle addresses for a specific data_type
+    OracleList(Symbol),
     /// Global minimum confidence threshold (u32)
     MinConfidence,
     MaxDataAge,
@@ -110,9 +105,7 @@ impl OracleVerifier {
             .instance()
             .set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
-        env.storage()
-            .instance()
-            .set(&StorageKey::OracleList, &Vec::<Address>::new(&env));
+
 
         // No pending admin initially
         let pending_admin = env
@@ -155,13 +148,8 @@ impl OracleVerifier {
         let mut list: Vec<Address> = env
             .storage()
             .instance()
-            .get(&StorageKey::OracleList)
+            .get(&StorageKey::OracleList(data_type.clone()))
             .unwrap_or_else(|| Vec::new(&env));
-        if list.len() >= MAX_ORACLES {
-            panic_with_error!(&env, Error::TooManyOracles);
-        }
-        list.push_back(oracle.clone());
-        env.storage().instance().set(&StorageKey::OracleList, &list);
         let mut already_present = false;
         for i in 0..list.len() {
             if list.get_unchecked(i) == oracle {
@@ -170,8 +158,11 @@ impl OracleVerifier {
             }
         }
         if !already_present {
+            if list.len() >= MAX_ORACLES {
+                panic_with_error!(&env, Error::TooManyOracles);
+            }
             list.push_back(oracle.clone());
-            env.storage().instance().set(&StorageKey::OracleList, &list);
+            env.storage().instance().set(&StorageKey::OracleList(data_type.clone()), &list);
         }
 
         env.events().publish(
@@ -222,18 +213,10 @@ impl OracleVerifier {
         env.storage().persistent().set(&key, &entry);
         env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
-        // Prune the address from the flat OracleList so get_oracles() and
-        // instance storage don't accumulate deactivated addresses forever
-        // (issue #135). Note: OracleList is a single cross-data_type list —
-        // if this address is still separately registered+active for a
-        // different data_type, it is removed from this shared list anyway.
-        // That's a pre-existing limitation of the flat-list design (not
-        // introduced here); scoping OracleList per data_type would be a
-        // separate, larger change.
         let list: Vec<Address> = env
             .storage()
             .instance()
-            .get(&StorageKey::OracleList)
+            .get(&StorageKey::OracleList(data_type.clone()))
             .unwrap_or_else(|| Vec::new(&env));
         let mut pruned: Vec<Address> = Vec::new(&env);
         for addr in list.iter() {
@@ -241,7 +224,7 @@ impl OracleVerifier {
                 pruned.push_back(addr);
             }
         }
-        env.storage().instance().set(&StorageKey::OracleList, &pruned);
+        env.storage().instance().set(&StorageKey::OracleList(data_type.clone()), &pruned);
 
         env.events().publish(
             (Symbol::new(&env, "oracle_removed"),),
@@ -437,19 +420,33 @@ impl OracleVerifier {
             confidence,
             timestamp,
         };
-        let mut found = false;
+        // Prune stale or unregistered/inactive oracle entries first
+        let max_data_age: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MaxDataAge)
+            .unwrap_or(604_800);
+        let mut pruned_points: Vec<OracleDataPoint> = Vec::new(&env);
         for i in 0..points.len() {
-            if points.get_unchecked(i).oracle == oracle {
-                points.set(i, new_point.clone());
-                found = true;
-                break;
+            let p = points.get_unchecked(i);
+            if p.oracle == oracle {
+                continue; // will be replaced
+            }
+            if now.saturating_sub(p.timestamp) <= max_data_age {
+                let oracle_k = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+                if let Some(e) = env.storage().persistent().get::<_, OracleEntry>(&oracle_k) {
+                    if e.active {
+                        pruned_points.push_back(p);
+                    }
+                }
             }
         }
-        if !found {
-            points.push_back(new_point);
+        if pruned_points.len() >= MAX_DATA_POINTS {
+            pruned_points.pop_front();
         }
+        pruned_points.push_back(new_point);
 
-        env.storage().persistent().set(&dp_key, &points);
+        env.storage().persistent().set(&dp_key, &pruned_points);
         env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         env.events().publish(
@@ -579,7 +576,7 @@ impl OracleVerifier {
         let oracle_list: Vec<Address> = env
             .storage()
             .instance()
-            .get(&StorageKey::OracleList)
+            .get(&StorageKey::OracleList(data_type.clone()))
             .unwrap_or_else(|| Vec::new(&env));
         let mut active_oracle_count: u32 = 0;
         for addr in oracle_list.iter() {
@@ -818,11 +815,11 @@ impl OracleVerifier {
         env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 
-    /// List all registered oracle addresses.
-    pub fn get_oracles(env: Env) -> Vec<Address> {
+    /// List all registered oracle addresses for a specific data_type.
+    pub fn get_oracles(env: Env, data_type: Symbol) -> Vec<Address> {
         env.storage()
             .instance()
-            .get(&StorageKey::OracleList)
+            .get(&StorageKey::OracleList(data_type))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -887,12 +884,13 @@ impl OracleVerifier {
             .get(&StorageKey::MinConfidence)
             .unwrap_or(0);
 
-        // Collect values and weights on the stack
+        // Collect values and weights on the stack (capped by MAX_DATA_POINTS)
         let mut values = [(0i128, 0u32); 100];
         let mut total_weight: u32 = 0;
         let mut n = 0;
 
-        for i in 0..points.len() {
+        let points_cap = points.len().min(MAX_DATA_POINTS);
+        for i in 0..points_cap {
             let p = points.get_unchecked(i);
             if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence {
                 let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());

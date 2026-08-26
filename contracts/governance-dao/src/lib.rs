@@ -200,7 +200,6 @@ impl GovernanceDao {
 
         let proposal_key = StorageKey::Proposal(proposal_id);
         env.storage().persistent().set(&proposal_key, &proposal);
-        Self::extend_proposal_ttl(&env, &proposal_key, &config);
         env.storage()
             .instance()
             .set(&StorageKey::NextProposalId, &(proposal_id.checked_add(1).unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))));
@@ -279,14 +278,6 @@ impl GovernanceDao {
         );
         let proposal_key = StorageKey::Proposal(proposal_id);
         env.storage().persistent().set(&proposal_key, &proposal);
-
-        // Proposal, vote, and locked-balance entries must all outlive the
-        // remaining voting period + timelock + buffer, or a legitimate voter
-        // could lose their vote record / locked tokens to TTL expiry before
-        // the proposal is finalized/executed (issue #185).
-        Self::extend_proposal_ttl(&env, &proposal_key, &config);
-        Self::extend_proposal_ttl(&env, &vote_key, &config);
-        Self::extend_proposal_ttl(&env, &lock_key, &config);
 
         env.events().publish(
             (Symbol::new(&env, "vote_cast"),),
@@ -403,7 +394,6 @@ impl GovernanceDao {
 
         let proposal_key = StorageKey::Proposal(proposal_id);
         env.storage().persistent().set(&proposal_key, &proposal);
-        Self::extend_proposal_ttl(&env, &proposal_key, &config);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_finalized"),),
@@ -441,8 +431,9 @@ impl GovernanceDao {
             panic_with_error!(&env, Error::TimelockNotExpired);
         }
 
-        // Signal execution — actual cross-contract call is the caller's responsibility
-        // (they build the Auth tree) to avoid this contract needing admin on targets.
+        // Perform actual cross-contract call to target::function(args)
+        let _: Val = env.invoke_contract(&proposal.target, &proposal.function, proposal.args.clone());
+
         proposal.status = ProposalStatus::Executed;
         env.storage()
             .persistent()

@@ -20,8 +20,7 @@
 extern crate alloc;
 use alloc::string::ToString;
 
-#[cfg_attr(feature = "library", allow(unused_imports))]
-use crate::alloc::string::ToString;
+
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
     token, Address, BytesN, Env, Symbol, Vec,
@@ -34,11 +33,9 @@ pub use types::*;
 
 /// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
 /// (at ~5s/ledger).
-#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 const TTL_THRESHOLD: u32 = 518_400;
 /// Extend persistent entries out to ~1 year (at ~5s/ledger) so long-lived
 /// products and policies don't get evicted from storage before they mature.
-#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 const TTL_EXTEND_TO: u32 = 6_312_000;
 
 // ─── Pagination ───────────────────────────────────────────────────────────────
