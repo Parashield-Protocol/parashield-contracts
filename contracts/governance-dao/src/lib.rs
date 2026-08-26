@@ -30,6 +30,10 @@ const MIN_VOTING_PERIOD: u64 = 3_600;
 /// overflow or make proposals permanently unresolvable.
 const MAX_VOTING_PERIOD: u64 = 30 * 24 * 3_600;
 /// Storage TTL threshold for proposal-related entries
+// Issue #342: kept in sync by hand across all 5 contracts (governance-dao,
+// risk-pool, policy-engine, oracle-verifier, claims-processor) — extracting
+// to a shared crate is a real follow-up, not done here to avoid touching
+// every contract's Cargo.toml in one pass.
 const TTL_THRESHOLD: u32 = 518_400; // ~30 days
 /// Storage TTL extension target for proposal-related entries
 const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year
