@@ -104,10 +104,10 @@ fn create_crop_product(w: &World) -> u128 {
 
 fn buy_crop_policy(w: &World, buyer: &Address, product_id: u128) -> u128 {
     StellarAssetClient::new(&w.env, &w.usdc).mint(buyer, &5_000_000_000i128);
-    // Fund the pool with coverage capital
-    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.pool_id, &10_000_000_000i128);
-    // Deposit to pool and lock coverage for the policy
-    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&buyer, &1_000_000_000i128, &0i128);
+    // Fund the pool and policy contract with coverage capital
+    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.admin, &1_000_000_000i128);
+    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&w.admin, &1_000_000_000i128, &0i128);
+    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.policy_id, &10_000_000_000i128);
     
     let policy_id = PolicyEngineClient::new(&w.env, &w.policy_id)
         .buy_policy(buyer, &product_id, &COVERAGE, &30u32, &symbol_short!("kis2606"));

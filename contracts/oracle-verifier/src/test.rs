@@ -97,7 +97,7 @@ fn test_update_oracle_weight_changes_aggregation() {
     let (env, admin, contract_id) = setup();
 
     // Wind back the clock for this specific test case's mock data
-    env.ledger().set_timestamp(1);
+    env.ledger().set_timestamp(1748736000);
 
     let client = OracleVerifierClient::new(&env, &contract_id);
     let oracle1 = Address::generate(&env);

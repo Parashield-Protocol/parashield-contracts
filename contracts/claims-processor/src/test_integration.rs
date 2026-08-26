@@ -70,7 +70,16 @@ fn full_setup() -> TestEnv {
     ClaimsProcessorClient::new(&env, &claims_id)
         .add_keeper(&admin, &admin);
 
+    token::StellarAssetClient::new(&env, &usdc_id).mint(&admin, &1_000_000_0000000i128);
+    RiskPoolClient::new(&env, &pool_id).deposit(&admin, &1_000_000_0000000i128, &0i128);
+
     TestEnv { env, oracle: oracle_id, policy: policy_id, claims: claims_id, admin, usdc: usdc_id, oracle_node, pool: pool_id }
+}
+
+fn buy_and_lock(te: &TestEnv, buyer: &Address, prod_id: u128, coverage: i128, days: u32, key: Symbol) -> u128 {
+    let pol_id = PolicyEngineClient::new(&te.env, &te.policy).buy_policy(buyer, &prod_id, &coverage, &days, &key);
+    RiskPoolClient::new(&te.env, &te.pool).lock_for_policy(&te.admin, &pol_id, &coverage);
+    pol_id
 }
 
 fn create_drought_product(te: &TestEnv) -> u128 {
@@ -98,7 +107,6 @@ fn create_drought_product(te: &TestEnv) -> u128 {
 fn batch_processes_multiple_pending_claims() {
     let te = full_setup();
     let claims_client = ClaimsProcessorClient::new(&te.env, &te.claims);
-    let policy_client = PolicyEngineClient::new(&te.env, &te.policy);
     let oracle_client = OracleVerifierClient::new(&te.env, &te.oracle);
 
     let prod_id = create_drought_product(&te);
@@ -117,11 +125,11 @@ fn batch_processes_multiple_pending_claims() {
         &te.policy, &1_000_000_0000000i128,
     );
 
-    let p1 = policy_client.buy_policy(
-        &farmer1, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+    let p1 = buy_and_lock(
+        &te, &farmer1, prod_id, 1_000_0000000i128, 30u32, symbol_short!("kis2606"),
     );
-    let p2 = policy_client.buy_policy(
-        &farmer2, &prod_id, &2_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+    let p2 = buy_and_lock(
+        &te, &farmer2, prod_id, 2_000_0000000i128, 30u32, symbol_short!("kis2606"),
     );
 
     claims_client.submit_claim(&farmer1, &p1);
@@ -140,7 +148,6 @@ fn batch_processes_multiple_pending_claims() {
 fn batch_skips_non_pending_claims() {
     let te = full_setup();
     let claims_client = ClaimsProcessorClient::new(&te.env, &te.claims);
-    let policy_client = PolicyEngineClient::new(&te.env, &te.policy);
     let oracle_client = OracleVerifierClient::new(&te.env, &te.oracle);
 
     let prod_id = create_drought_product(&te);
@@ -155,8 +162,8 @@ fn batch_skips_non_pending_claims() {
     token::StellarAssetClient::new(&te.env, &te.usdc).mint(&farmer, &10_000_0000000i128);
     token::StellarAssetClient::new(&te.env, &te.usdc).mint(&te.policy, &1_000_000_0000000i128);
 
-    let p1 = policy_client.buy_policy(
-        &farmer, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+    let p1 = buy_and_lock(
+        &te, &farmer, prod_id, 1_000_0000000i128, 30u32, symbol_short!("kis2606"),
     );
     let _claim_id = claims_client.submit_claim(&farmer, &p1);
     // Process it once
@@ -175,7 +182,6 @@ fn batch_skips_non_pending_claims() {
 fn test_stale_oracle_data_rejected() {
     let te = full_setup();
     let claims_client = ClaimsProcessorClient::new(&te.env, &te.claims);
-    let policy_client = PolicyEngineClient::new(&te.env, &te.policy);
     let oracle_client = OracleVerifierClient::new(&te.env, &te.oracle);
 
     let prod_id = create_drought_product(&te);
@@ -193,8 +199,8 @@ fn test_stale_oracle_data_rejected() {
     token::StellarAssetClient::new(&te.env, &te.usdc).mint(&farmer, &10_000_0000000i128);
     token::StellarAssetClient::new(&te.env, &te.usdc).mint(&te.policy, &1_000_000_0000000i128);
 
-    let pol_id = policy_client.buy_policy(
-        &farmer, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+    let pol_id = buy_and_lock(
+        &te, &farmer, prod_id, 1_000_0000000i128, 30u32, symbol_short!("kis2606"),
     );
 
     // Advance ledger to more than staleness_threshold (604_800 s) past the data timestamp
@@ -210,7 +216,6 @@ fn test_stale_oracle_data_rejected() {
 fn test_fresh_oracle_data_accepted() {
     let te = full_setup();
     let claims_client = ClaimsProcessorClient::new(&te.env, &te.claims);
-    let policy_client = PolicyEngineClient::new(&te.env, &te.policy);
     let oracle_client = OracleVerifierClient::new(&te.env, &te.oracle);
 
     let prod_id = create_drought_product(&te);
@@ -229,8 +234,8 @@ fn test_fresh_oracle_data_accepted() {
     token::StellarAssetClient::new(&te.env, &te.usdc).mint(&farmer, &10_000_0000000i128);
     token::StellarAssetClient::new(&te.env, &te.usdc).mint(&te.policy, &1_000_000_0000000i128);
 
-    let pol_id = policy_client.buy_policy(
-        &farmer, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+    let pol_id = buy_and_lock(
+        &te, &farmer, prod_id, 1_000_0000000i128, 30u32, symbol_short!("kis2606"),
     );
 
     // Set ledger to within the staleness threshold (data is fresh)
@@ -278,8 +283,8 @@ fn test_equal_comparison() {
     token::StellarAssetClient::new(&te.env, &te.usdc).mint(&farmer, &10_000_0000000i128);
     token::StellarAssetClient::new(&te.env, &te.usdc).mint(&te.policy, &1_000_000_0000000i128);
 
-    let pol_id = policy_client.buy_policy(
-        &farmer, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("flight1"),
+    let pol_id = buy_and_lock(
+        &te, &farmer, prod_id, 1_000_0000000i128, 30u32, symbol_short!("flight1"),
     );
 
     let fresh_now = data_ts + 3_600;
@@ -295,7 +300,6 @@ fn test_equal_comparison() {
 fn dispute_removes_claim_from_pending_queue() {
     let te = full_setup();
     let claims_client = ClaimsProcessorClient::new(&te.env, &te.claims);
-    let policy_client = PolicyEngineClient::new(&te.env, &te.policy);
 
     let prod_id = create_drought_product(&te);
 
@@ -303,8 +307,8 @@ fn dispute_removes_claim_from_pending_queue() {
     token::StellarAssetClient::new(&te.env, &te.usdc).mint(&farmer, &10_000_0000000i128);
     token::StellarAssetClient::new(&te.env, &te.usdc).mint(&te.policy, &1_000_000_0000000i128);
 
-    let pol_id = policy_client.buy_policy(
-        &farmer, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+    let pol_id = buy_and_lock(
+        &te, &farmer, prod_id, 1_000_0000000i128, 30u32, symbol_short!("kis2606"),
     );
 
     // Submit enqueues the claim.

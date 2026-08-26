@@ -110,10 +110,10 @@ fn create_crop_product(w: &World) -> u128 {
 
 fn buy_crop_policy(w: &World, buyer: &Address, product_id: u128) -> u128 {
     StellarAssetClient::new(&w.env, &w.usdc).mint(buyer, &5_000_000_000i128);
-    // Fund the pool with coverage capital
-    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.pool_id, &10_000_000_000i128);
-    // Deposit to pool and lock coverage for the policy
-    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&buyer, &1_000_000_000i128, &0i128);
+    // Fund the pool and policy engine contract with coverage capital
+    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.admin, &1_000_000_000i128);
+    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&w.admin, &1_000_000_000i128, &0i128);
+    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.policy_id, &10_000_000_000i128);
     
     let policy_id = PolicyEngineClient::new(&w.env, &w.policy_id)
         .buy_policy(buyer, &product_id, &COVERAGE, &30u32, &symbol_short!("kis2606"));
@@ -152,10 +152,13 @@ fn test_batch_auto_process_boundary_conditions() {
     let pol_id2 = buy_crop_policy(&w, &buyer2, pid);
     let pol_id3 = buy_crop_policy(&w, &buyer3, pid);
     
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    cp.submit_claim(&buyer1, &pol_id1);
+    cp.submit_claim(&buyer2, &pol_id2);
+    cp.submit_claim(&buyer3, &pol_id3);
+    
     // Submit rainfall data that triggers payout (below threshold)
     submit_rainfall(&w, 20_000_000);
-    
-    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     
     // Process all 3 claims in batch
     let results = cp.batch_auto_process(&w.keeper, &3u32);
@@ -186,12 +189,14 @@ fn test_batch_auto_process_boundary_conditions() {
 fn test_batch_auto_process_with_limit() {
     let w = deploy();
     let pid = create_crop_product(&w);
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     
-    // Create 5 policies
+    // Create 5 policies and submit claims
     let mut policy_ids = Vec::new(&w.env);
-    for i in 0..5 {
+    for _ in 0..5 {
         let buyer = Address::generate(&w.env);
         let pol_id = buy_crop_policy(&w, &buyer, pid);
+        cp.submit_claim(&buyer, &pol_id);
         policy_ids.push_back(pol_id);
     }
     
@@ -306,8 +311,9 @@ fn test_staleness_threshold_boundary() {
 
     let buyer = Address::generate(&env);
     StellarAssetClient::new(&env, &usdc).mint(&buyer, &5_000_000_000i128);
-    StellarAssetClient::new(&env, &usdc).mint(&pool_id, &10_000_000_000i128);
-    RiskPoolClient::new(&env, &pool_id).deposit(&buyer, &1_000_000_000i128, &0i128);
+    StellarAssetClient::new(&env, &usdc).mint(&admin, &1_000_000_000i128);
+    RiskPoolClient::new(&env, &pool_id).deposit(&admin, &1_000_000_000i128, &0i128);
+    StellarAssetClient::new(&env, &usdc).mint(&policy_id, &10_000_000_000i128);
     
     let pol_id = PolicyEngineClient::new(&env, &policy_id)
         .buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
@@ -357,9 +363,10 @@ fn test_policy_exactly_at_expiration() {
     let buyer = Address::generate(&w.env);
     let pol_id = buy_crop_policy(&w, &buyer, pid);
     
-    // Advance to exactly the policy end_time
+    // Advance past policy end_time
     let policy = PolicyEngineClient::new(&w.env, &w.policy_id).get_policy(&pol_id);
-    w.env.ledger().with_mut(|l| l.timestamp = policy.end_time);
+    w.env.ledger().with_mut(|l| l.timestamp = policy.end_time + 1);
+    submit_rainfall(&w, 20_000_000);
     
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let result = cp.auto_process(&w.keeper, &pol_id);
@@ -410,8 +417,9 @@ fn test_maximum_coverage_boundary() {
     
     let buyer = Address::generate(&w.env);
     StellarAssetClient::new(&w.env, &w.usdc).mint(&buyer, &50_000_000_000i128);
-    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.pool_id, &20_000_000_000i128);
-    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&buyer, &10_000_000_000i128, &0i128);
+    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.admin, &10_000_000_000i128);
+    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&w.admin, &10_000_000_000i128, &0i128);
+    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.policy_id, &10_000_000_000i128);
     
     // Buy policy at maximum coverage
     let pol_id = PolicyEngineClient::new(&w.env, &w.policy_id)
@@ -434,8 +442,9 @@ fn test_minimum_coverage_boundary() {
     let buyer = Address::generate(&w.env);
     
     StellarAssetClient::new(&w.env, &w.usdc).mint(&buyer, &1_000_000_000i128);
-    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.pool_id, &1_000_000_000i128);
-    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&buyer, &100_000_000i128, &0i128);
+    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.admin, &1_000_000_000i128);
+    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&w.admin, &1_000_000_000i128, &0i128);
+    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.policy_id, &10_000_000_000i128);
     
     // Buy policy at minimum coverage
     let pol_id = PolicyEngineClient::new(&w.env, &w.policy_id)
