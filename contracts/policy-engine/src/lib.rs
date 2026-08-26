@@ -1,4 +1,4 @@
-//! Parashield Policy Engine
+﻿//! Parashield Policy Engine
 //!
 //! Manages insurance products and policies.
 //!
@@ -111,6 +111,8 @@ pub enum Error {
     InvalidDurationRange    = 19,
     InvalidOracleKey        = 20,
     Overflow               = 21,
+    InvalidAddress          = 22,
+    InvalidVersion          = 23,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -141,42 +143,35 @@ impl PolicyEngine {
         // do not need manual address format validation here.
         let admin_str = admin.to_string();
         //
-        if false {
-            panic!("invalid address: admin must be an account address");
-        }
         if admin_str.len() != 56 {
-            panic!("invalid address: admin must be an account or contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
         let mut admin_buf = [0u8; 56];
         admin_str.copy_into_slice(&mut admin_buf);
         if admin_buf[0] != b'G' && admin_buf[0] != b'C' {
-            panic!("invalid address: admin must be an account or contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
 
         let usdc_str = usdc_token.to_string();
         let oracle_str = oracle_address.to_string();
         //
         //
-        if false {
-            panic!("invalid address: usdc_token must be a contract address");
-        }
         if usdc_str.len() != 56 {
-            panic!("invalid address: usdc_token must be a contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
         let mut usdc_buf = [0u8; 56];
         usdc_str.copy_into_slice(&mut usdc_buf);
         if usdc_buf[0] != b'C' {
-            panic!("invalid address: usdc_token must be a contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
 
-        let oracle_str = oracle_address.to_string();
         if oracle_str.len() != 56 {
-            panic!("invalid address: oracle_address must be a contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
         let mut oracle_buf = [0u8; 56];
         oracle_str.copy_into_slice(&mut oracle_buf);
         if oracle_buf[0] != b'C' {
-            panic!("invalid address: oracle_address must be a contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
         
         let balance_res = env.try_invoke_contract::<i128, soroban_sdk::Error>(
@@ -314,6 +309,7 @@ impl PolicyEngine {
         let mut product: InsuranceProduct = Self::load_product(&env, product_id);
         product.status = ProductStatus::Paused;
         env.storage().persistent().set(&StorageKey::Product(product_id), &product);
+        Self::extend_to_max(&env, &StorageKey::Product(product_id));
 
         let mut products: Vec<u128> = env.storage().instance()
             .get(&StorageKey::ActiveProducts).unwrap_or_else(|| Vec::new(&env));
@@ -342,6 +338,7 @@ impl PolicyEngine {
         let mut product: InsuranceProduct = Self::load_product(&env, product_id);
         product.status = ProductStatus::Deprecated;
         env.storage().persistent().set(&StorageKey::Product(product_id), &product);
+        Self::extend_to_max(&env, &StorageKey::Product(product_id));
 
         // Remove from the ActiveProducts list on deprecation
         let mut products: Vec<u128> = env.storage().instance()
@@ -477,6 +474,7 @@ impl PolicyEngine {
         }
         policy.status = PolicyStatus::Cancelled;
         env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
+        Self::extend_to_max(&env, &StorageKey::Policy(policy_id));
         Self::remove_policy_from_user(&env, &policyholder, policy_id);
 
         // Pro-rate the refund: only return the unearned portion of the premium.
@@ -537,6 +535,7 @@ impl PolicyEngine {
 
         policy.status = PolicyStatus::Claimed;
         env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
+        Self::extend_to_max(&env, &StorageKey::Policy(policy_id));
         Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
 
         env.events().publish(
@@ -562,6 +561,7 @@ impl PolicyEngine {
         }
         policy.status = PolicyStatus::Expired;
         env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
+        Self::extend_to_max(&env, &StorageKey::Policy(policy_id));
         Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
         env.events().publish(
             (Symbol::new(&env, "policy_expired"),),
@@ -705,12 +705,12 @@ pub fn emergency_resume(env: Env, admin: Address) {
     fn validate_stellar_address(env: &Env, address: &Address) {
         let addr_str = address.to_string();
         if addr_str.len() != 56 {
-            panic!("invalid address: must be a valid Stellar address");
+            panic_with_error!(env, Error::InvalidAddress);
         }
         let mut buf = [0u8; 56];
         addr_str.copy_into_slice(&mut buf);
         if buf[0] != b'G' && buf[0] != b'C' {
-            panic!("invalid address: must be a valid Stellar address");
+            panic_with_error!(env, Error::InvalidAddress);
         }
     }
 
@@ -796,7 +796,7 @@ pub fn emergency_resume(env: Env, admin: Address) {
         Self::require_admin(&env, &admin);
         let current_version: u32 = env.storage().instance().get(&StorageKey::Version).unwrap_or(1);
         if new_version <= current_version {
-            panic!("new version must be greater than current version");
+            panic_with_error!(&env, Error::InvalidVersion);
         }
         
         // Run migrations from current_version to new_version

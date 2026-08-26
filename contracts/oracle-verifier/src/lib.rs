@@ -14,7 +14,6 @@
 //! - Duplicate submissions from the same oracle overwrite the previous value.
 #![no_std]
 extern crate alloc;
-use alloc::string::ToString;
 
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
@@ -41,6 +40,12 @@ const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year
 const MAX_ORACLES: u32 = 100;
 /// Maximum number of data points stored per (data_type, key).
 const MAX_DATA_POINTS: u32 = 100;
+
+/// Maximum number of registered oracles. Bounds the median aggregation loop and
+/// the worst-case weighted sum (MAX_ORACLES * max_weight * max_value) so it
+/// cannot overflow i128.
+#[allow(dead_code)]
+const MAX_ORACLES: u32 = 100;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -106,13 +111,6 @@ impl OracleVerifier {
             .set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
 
-
-        // No pending admin initially
-        let pending_admin = env
-            .storage()
-            .instance()
-            .get::<_, Option<Address>>(&StorageKey::PendingAdmin) // Explicitly type the lookup
-            .unwrap_or(None);
 
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
@@ -688,10 +686,6 @@ impl OracleVerifier {
                 panic_with_error!(&env, Error::InvalidTimestamp);
             }
 
-            let now = env.ledger().timestamp();
-            if timestamp > now {
-                panic_with_error!(&env, Error::InvalidTimestamp);
-            }
             let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
             let mut points: Vec<OracleDataPoint> = env
                 .storage()

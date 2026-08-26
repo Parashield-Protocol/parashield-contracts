@@ -1,4 +1,4 @@
-//! Parashield Governance DAO
+﻿//! Parashield Governance DAO
 //!
 //! Token-weighted governance over protocol parameters:
 //!   - Add/remove insurance products
@@ -14,7 +14,6 @@
 //! v2 — full implementation; DAO is now deployable and testable.
 #![no_std]
 extern crate alloc;
-use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
@@ -30,6 +29,12 @@ const MIN_VOTING_PERIOD: u64 = 3_600;
 /// an unreachably large period that would cause vote_end + FINALIZE_DELAY to
 /// overflow or make proposals permanently unresolvable.
 const MAX_VOTING_PERIOD: u64 = 30 * 24 * 3_600;
+/// Storage TTL threshold for proposal-related entries
+const TTL_THRESHOLD: u32 = 518_400; // ~30 days
+/// Storage TTL extension target for proposal-related entries
+const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year
+/// Minimum delay after vote_end before finalize() can be called
+const FINALIZE_DELAY: u64 = 300; // 5 minutes
 
 #[contracttype]
 enum StorageKey {
@@ -67,6 +72,7 @@ pub enum Error {
     LimitReached = 16,
     VotingPeriodTooShort = 17,
     VotingPeriodTooLong = 18,
+    InvalidAddress = 19,
 }
 
 #[contract]
@@ -86,28 +92,24 @@ impl GovernanceDao {
         // Address verification
         let admin_str = admin.to_string();
         
-        if false {
-            panic!("invalid address: admin must be an account address");
-        }
-
         if admin_str.len() != 56 {
-            panic!("invalid address: admin must be an account or contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
         let mut admin_buf = [0u8; 56];
         admin_str.copy_into_slice(&mut admin_buf);
         if admin_buf[0] != b'G' && admin_buf[0] != b'C' {
-            panic!("invalid address: admin must be an account or contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
 
         let gov_token_str = config.gov_token.to_string();
 
         if gov_token_str.len() != 56 {
-            panic!("invalid address: gov_token must be a contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
         let mut gov_token_buf = [0u8; 56];
         gov_token_str.copy_into_slice(&mut gov_token_buf);
         if gov_token_buf[0] != b'C' {
-            panic!("invalid address: gov_token must be a contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
 
         env.storage()
@@ -447,10 +449,10 @@ impl GovernanceDao {
 
     /// Admin-only: cancel an Active proposal before voting closes.
     ///
-    /// Refunds the proposer's deposit (at the current `config`
-    /// `proposal_threshold`, since no vote has happened yet) and marks the
-    /// proposal Cancelled. Voters who already locked tokens can reclaim
-    /// them via `withdraw_tokens` once cancelled.
+    /// Refunds the proposer's deposit (the exact amount locked at
+    /// proposal creation) and marks the proposal Cancelled. Voters who
+    /// already locked tokens can reclaim them via `withdraw_tokens`
+    /// once cancelled.
     pub fn cancel(env: Env, admin: Address, proposal_id: u64) {
         Self::require_admin(&env, &admin);
 
@@ -474,7 +476,7 @@ impl GovernanceDao {
         gov_token.transfer(
             &env.current_contract_address(),
             &proposal.proposer,
-            &config.proposal_threshold,
+            &proposal.deposit,
         );
 
         env.events().publish(
@@ -615,13 +617,19 @@ impl GovernanceDao {
     fn validate_stellar_address(env: &Env, address: &Address) {
         let addr_str = address.to_string();
         if addr_str.len() != 56 {
-            panic!("invalid address: must be an account or contract address");
+            panic_with_error!(env, Error::InvalidAddress);
         }
         let mut buf = [0u8; 56];
         addr_str.copy_into_slice(&mut buf);
         if buf[0] != b'G' && buf[0] != b'C' {
-            panic!("invalid address: must be an account or contract address");
+            panic_with_error!(env, Error::InvalidAddress);
         }
+    }
+
+    /// Extend the TTL for proposal-related storage entries to prevent expiry
+    /// during voting, timelock, and execution periods.
+    fn extend_proposal_ttl(env: &Env, key: &StorageKey, _config: &DaoConfig) {
+        env.storage().persistent().extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 }
 
