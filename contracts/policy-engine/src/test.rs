@@ -802,6 +802,8 @@ fn test_policy_expires_at_exact_boundary() {
     client.expire_policy(&claims_processor, &policy_id);
     let policy = client.get_policy(&policy_id);
     assert_eq!(policy.status, PolicyStatus::Expired);
+}
+
 // ── Versioning tests ─────────────────────────────────────────────────────────
 
 #[test]

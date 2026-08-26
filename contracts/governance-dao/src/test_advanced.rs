@@ -30,7 +30,7 @@ fn base_config(gov_token: Address) -> DaoConfig {
 fn make_dao(env: &Env) -> (GovernanceDaoClient<'static>, Address, Address, Address) {
     let admin = Address::generate(env);
     let voter = Address::generate(env);
-    let target = Address::generate(env);
+    let target = env.register(crate::test::MockTarget, ());
 
     let gov_token_id = env
         .register_stellar_asset_contract_v2(admin.clone())

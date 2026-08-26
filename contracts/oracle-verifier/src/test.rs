@@ -68,7 +68,7 @@ fn test_add_oracle_and_list() {
     let client = OracleVerifierClient::new(&env, &contract_id);
     let oracle = Address::generate(&env);
     client.add_oracle(&admin, &oracle, &weather(), &50u32);
-    let list = client.get_oracles();
+    let list = client.get_oracles(&weather());
     assert_eq!(list.len(), 1);
 }
 
@@ -196,12 +196,12 @@ fn test_remove_oracle_prunes_oracle_list() {
 
     client.add_oracle(&admin, &oracle1, &weather(), &80u32);
     client.add_oracle(&admin, &oracle2, &weather(), &80u32);
-    assert_eq!(client.get_oracles().len(), 2);
+    assert_eq!(client.get_oracles(&weather()).len(), 2);
 
     client.remove_oracle(&admin, &oracle1, &weather());
 
     // get_oracles() must no longer report the deactivated address.
-    let remaining = client.get_oracles();
+    let remaining = client.get_oracles(&weather());
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining.get_unchecked(0), oracle2);
 }
@@ -751,7 +751,7 @@ fn test_max_oracles_no_overflow() {
         );
     }
 
-    assert_eq!(client.get_oracles().len(), MAX_ORACLES);
+    assert_eq!(client.get_oracles(&weather()).len(), MAX_ORACLES);
 
     // Aggregation must not overflow; median of identical values is that value.
     let agg = client.get_aggregated(&weather(), &kisumu_key());
@@ -871,6 +871,23 @@ fn test_stale_data_rejection() {
     let t0 = 1_000_000u64;
     env.ledger().with_mut(|l| l.timestamp = t0);
     client.submit_data(&oracle, &weather(), &kisumu_key(), &30_000_000i128, &90u32, &t0);
+
+    let condition = TriggerCondition {
+        data_type: weather(),
+        key: kisumu_key(),
+        threshold: 50_000_000i128,
+        comparison: TriggerComparison::LessThan,
+        tolerance: 0i128,
+    };
+
+    // Default max_data_age is 7 days (604,800).
+    // Advance time beyond max_data_age to make it stale.
+    env.ledger().with_mut(|l| l.timestamp = t0 + 604_801);
+
+    // This should panic with NoDataAvailable (#6)
+    client.verify_trigger(&weather(), &kisumu_key(), &condition);
+}
+
 // ── Issue #162: reject readings when fewer than min_oracle_count submit ──────────
 
 /// Submit from 2 out of 3 required oracles and verify aggregation correctly
@@ -913,18 +930,6 @@ fn test_reject_when_fewer_than_min_oracle_count_submit() {
         data_type: weather(),
         key: kisumu_key(),
         threshold: 50_000_000i128,
-        comparison: TriggerComparison::LessThan,
-    };
-    
-    // Default max_data_age is 7 days (604,800). 
-    // Advance time beyond max_data_age to make it stale.
-    env.ledger().with_mut(|l| l.timestamp = t0 + 604_801);
-    
-    // This should panic with NoDataAvailable (#6)
-    client.verify_trigger(&weather(), &kisumu_key(), &condition);
-}
-
-        threshold: 50_000_000,
         comparison: TriggerComparison::LessThan,
         tolerance: 0i128,
     };
@@ -980,6 +985,6 @@ fn test_add_oracle_validates_oracle_address() {
     client.add_oracle(&admin, &oracle, &weather(), &80u32);
 
     // The oracle was accepted — list length is 1.
-    assert_eq!(client.get_oracles().len(), 1);
-    assert_eq!(client.get_oracles().get_unchecked(0), oracle);
+    assert_eq!(client.get_oracles(&weather()).len(), 1);
+    assert_eq!(client.get_oracles(&weather()).get_unchecked(0), oracle);
 }
