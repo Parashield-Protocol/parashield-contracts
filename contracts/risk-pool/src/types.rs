@@ -18,6 +18,15 @@ pub enum PoolStatus {
     WindingDown,
 }
 
+/// Admin-adjustable premium split ratios, in basis points, summing to 10,000.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PremiumSplit {
+    pub lp_bps:       i128,
+    pub treas_bps:    i128,
+    pub backstop_bps: i128,
+}
+
 /// A liquidity provider's position in the pool.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,4 +204,18 @@ pub struct AdminUpdated {
 pub struct ContractUpgraded {
     pub old_version: u32,
     pub new_version: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PremiumSplitUpdated {
+    pub lp_bps:       i128,
+    pub treas_bps:    i128,
+    pub backstop_bps: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolWindingDown {
+    pub admin: Address,
 }
