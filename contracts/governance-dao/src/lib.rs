@@ -86,10 +86,6 @@ impl GovernanceDao {
         // Address verification
         let admin_str = admin.to_string();
         
-        if false {
-            panic!("invalid address: admin must be an account address");
-        }
-
         if admin_str.len() != 56 {
             panic!("invalid address: admin must be an account or contract address");
         }

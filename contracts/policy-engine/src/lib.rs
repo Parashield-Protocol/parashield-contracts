@@ -20,8 +20,6 @@
 extern crate alloc;
 use alloc::string::ToString;
 
-#[cfg_attr(feature = "library", allow(unused_imports))]
-use crate::alloc::string::ToString;
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
     token, Address, BytesN, Env, Symbol, Vec,
@@ -144,9 +142,6 @@ impl PolicyEngine {
         // do not need manual address format validation here.
         let admin_str = admin.to_string();
         //
-        if false {
-            panic!("invalid address: admin must be an account address");
-        }
         if admin_str.len() != 56 {
             panic!("invalid address: admin must be an account or contract address");
         }
@@ -160,9 +155,6 @@ impl PolicyEngine {
         let oracle_str = oracle_address.to_string();
         //
         //
-        if false {
-            panic!("invalid address: usdc_token must be a contract address");
-        }
         if usdc_str.len() != 56 {
             panic!("invalid address: usdc_token must be a contract address");
         }
@@ -172,7 +164,6 @@ impl PolicyEngine {
             panic!("invalid address: usdc_token must be a contract address");
         }
 
-        let oracle_str = oracle_address.to_string();
         if oracle_str.len() != 56 {
             panic!("invalid address: oracle_address must be a contract address");
         }

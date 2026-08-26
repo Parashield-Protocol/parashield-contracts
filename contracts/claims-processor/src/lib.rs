@@ -149,9 +149,6 @@ impl ClaimsProcessor {
         }
         let admin_str = admin.to_string();
         
-        if false {
-            panic!("invalid address: admin must be an account address");
-        }
         if admin_str.len() != 56 {
             panic!("invalid address: admin must be an account or contract address");
         }
@@ -161,28 +158,6 @@ impl ClaimsProcessor {
             panic!("invalid address: admin must be an account or contract address");
         }
 
-        let policy_engine_str = policy_engine.to_string();
-        let oracle_verifier_str = oracle_verifier.to_string();
-        
-        
-        if policy_engine_str.len() != 56 {
-            panic!("invalid address: policy_engine must be a contract address");
-        }
-        let mut policy_engine_buf = [0u8; 56];
-        policy_engine_str.copy_into_slice(&mut policy_engine_buf);
-        if policy_engine_buf[0] != b'C' {
-            panic!("invalid address: policy_engine must be a contract address");
-        }
-
-        let oracle_verifier_str = oracle_verifier.to_string();
-        if oracle_verifier_str.len() != 56 {
-            panic!("invalid address: oracle_verifier must be a contract address");
-        }
-        let mut oracle_verifier_buf = [0u8; 56];
-        oracle_verifier_str.copy_into_slice(&mut oracle_verifier_buf);
-        if oracle_verifier_buf[0] != b'C' {
-            panic!("invalid address: oracle_verifier must be a contract address");
-        }
         admin.require_auth();
 
         Self::validate_stellar_address(&env, &admin);
