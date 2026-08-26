@@ -436,6 +436,8 @@ impl OracleVerifier {
             .persistent()
             .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
+        Self::enforce_rate_limit(&env, &data_type, &oracle, now);
+
         // Load existing submissions for this (data_type, key)
         let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
         let mut points: Vec<OracleDataPoint> = env
@@ -704,6 +706,8 @@ impl OracleVerifier {
             .persistent()
             .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
+        Self::enforce_rate_limit(&env, &data_type, &oracle, env.ledger().timestamp());
+
         for i in 0..submissions.len() {
             let (key, value, confidence, timestamp) = submissions.get_unchecked(i);
             if confidence == 0 || confidence > 100 {
@@ -785,6 +789,8 @@ impl OracleVerifier {
         env.storage()
             .persistent()
             .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        Self::enforce_rate_limit(&env, &data_type, &oracle, env.ledger().timestamp());
 
         for i in 0..submissions.len() {
             let sub = submissions.get_unchecked(i);
@@ -874,6 +880,26 @@ impl OracleVerifier {
         if buf[0] != b'G' && buf[0] != b'C' {
             panic_with_error!(env, Error::InvalidAddress);
         }
+    }
+
+    /// Enforce the per-oracle submission cooldown for `data_type`: panics with
+    /// `RateLimited` if `oracle` submitted for this data_type more recently
+    /// than `get_min_submit_interval()` seconds ago, otherwise records `now`
+    /// as the new last-submission time. Call once per submission entry point
+    /// (submit_data / submit_data_batch / batch_submit_data), not per reading,
+    /// so a single call with many keys pays the check once.
+    fn enforce_rate_limit(env: &Env, data_type: &Symbol, oracle: &Address, now: u64) {
+        let min_interval = Self::get_min_submit_interval(env.clone());
+        let key = StorageKey::LastSubmission(data_type.clone(), oracle.clone());
+        if let Some(last) = env.storage().persistent().get::<_, u64>(&key) {
+            if now.saturating_sub(last) < min_interval {
+                panic_with_error!(env, Error::RateLimited);
+            }
+        }
+        env.storage().persistent().set(&key, &now);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
     fn require_admin(env: &Env, caller: &Address) {
