@@ -1,5 +1,11 @@
 use soroban_sdk::{contracttype, Address, Bytes, Symbol, Val, Vec};
 
+// Issue #339: this is a compile-time constant with no runtime override.
+// Making it configurable means adding a `finalize_delay: u64` field to
+// `DaoConfig` below, which is a required field on every construction site
+// (lib.rs `initialize`/`update_config`, plus test.rs and test_advanced.rs) —
+// left as a follow-up so that migration can be done deliberately in one
+// pass rather than partially here.
 pub const FINALIZE_DELAY: u64 = 24 * 3600;
 
 /// Approximate Stellar ledger close time in seconds, used to convert
