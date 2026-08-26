@@ -40,6 +40,10 @@ const MIN_DEPOSIT: i128 = 1_000_000;
 /// Timelock duration for admin withdrawals: 7 days in seconds.
 const TIMELOCK_SECONDS: u64 = 7 * 24 * 60 * 60;
 
+/// Timelock duration for parameter changes: 2 days in seconds.
+/// Shorter than withdrawal timelock since parameter changes are less risky.
+const PARAMETER_TIMELOCK_SECONDS: u64 = 2 * 24 * 60 * 60;
+
 /// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
 /// (at ~5s/ledger).
 // Issue #342: kept in sync by hand across all 5 contracts (governance-dao,
@@ -78,6 +82,8 @@ enum StorageKey {
     Version,
     /// Premium split ratios (lp_bps, treas_bps, backstop_bps), admin-adjustable
     PremiumSplit,
+    /// Pending premium split change with timelock
+    PendingParameterChange,
 }
 
 #[contracterror]
@@ -106,6 +112,9 @@ pub enum Error {
     InvalidAddress      = 20,
     InvalidVersion      = 21,
     InvalidSplit        = 22,
+    ParameterChangePending = 23,
+    NoPendingParameterChange = 24,
+    ParameterChangeNotReady = 25,
 }
 
 #[contract]
@@ -759,6 +768,110 @@ impl RiskPool {
             (Symbol::new(&env, "premium_split_updated"),),
             PremiumSplitUpdated { lp_bps, treas_bps, backstop_bps },
         );
+    }
+
+    /// Admin-only: propose a time-locked change to premium split ratios.
+    /// LPs have `PARAMETER_TIMELOCK_SECONDS` (2 days) to exit before the change takes effect.
+    pub fn propose_parameter_change(
+        env: Env,
+        admin: Address,
+        lp_bps: i128,
+        treas_bps: i128,
+        backstop_bps: i128,
+    ) {
+        Self::require_admin(&env, &admin);
+        if lp_bps < 0 || treas_bps < 0 || backstop_bps < 0 {
+            panic_with_error!(&env, Error::InvalidSplit);
+        }
+        if lp_bps + treas_bps + backstop_bps != 10_000 {
+            panic_with_error!(&env, Error::InvalidSplit);
+        }
+        if env.storage().persistent().has(&StorageKey::PendingParameterChange) {
+            panic_with_error!(&env, Error::ParameterChangePending);
+        }
+
+        let now = env.ledger().timestamp();
+        let executable_after = now + PARAMETER_TIMELOCK_SECONDS;
+
+        let pending = PendingParameterChange {
+            new_lp_bps: lp_bps,
+            new_treas_bps: treas_bps,
+            new_backstop_bps: backstop_bps,
+            proposed_at: now,
+            executable_after,
+            executed: false,
+        };
+        env.storage().persistent().set(&StorageKey::PendingParameterChange, &pending);
+        Self::extend_to_max(&env, &StorageKey::PendingParameterChange);
+
+        env.events().publish(
+            (Symbol::new(&env, "parameter_change_scheduled"),),
+            ParameterChangeScheduled {
+                admin: admin.clone(),
+                new_lp_bps: lp_bps,
+                new_treas_bps: treas_bps,
+                new_backstop_bps: backstop_bps,
+                executable_after,
+            },
+        );
+    }
+
+    /// Execute a previously proposed parameter change after the timelock expires.
+    pub fn execute_parameter_change(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        let mut pending: PendingParameterChange = env.storage().persistent()
+            .get(&StorageKey::PendingParameterChange)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingParameterChange));
+
+        if pending.executed {
+            panic_with_error!(&env, Error::AlreadyReleased);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < pending.executable_after {
+            panic_with_error!(&env, Error::ParameterChangeNotReady);
+        }
+
+        // Apply the parameter change
+        let split = PremiumSplit {
+            lp_bps: pending.new_lp_bps,
+            treas_bps: pending.new_treas_bps,
+            backstop_bps: pending.new_backstop_bps,
+        };
+        env.storage().instance().set(&StorageKey::PremiumSplit, &split);
+
+        // Mark as executed
+        pending.executed = true;
+        env.storage().persistent().set(&StorageKey::PendingParameterChange, &pending);
+
+        env.events().publish(
+            (Symbol::new(&env, "parameter_change_executed"),),
+            ParameterChangeExecuted {
+                admin: admin.clone(),
+                lp_bps: pending.new_lp_bps,
+                treas_bps: pending.new_treas_bps,
+                backstop_bps: pending.new_backstop_bps,
+            },
+        );
+    }
+
+    /// Cancel a pending parameter change.
+    pub fn cancel_parameter_change(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        if !env.storage().persistent().has(&StorageKey::PendingParameterChange) {
+            panic_with_error!(&env, Error::NoPendingParameterChange);
+        }
+        env.storage().persistent().remove(&StorageKey::PendingParameterChange);
+
+        env.events().publish(
+            (Symbol::new(&env, "parameter_change_cancelled"),),
+            ParameterChangeCancelled { admin: admin.clone() },
+        );
+    }
+
+    /// Get the pending parameter change, if any.
+    pub fn get_pending_parameter_change(env: Env) -> Option<PendingParameterChange> {
+        env.storage().persistent().get(&StorageKey::PendingParameterChange)
     }
 
     /// Request an emergency withdrawal of unlocked liquidity.

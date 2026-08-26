@@ -437,7 +437,13 @@ impl GovernanceDao {
             panic_with_error!(&env, Error::TimelockNotExpired);
         }
 
+        // Validate target address is a valid Stellar address before execution
+        // This is a defense-in-depth check to prevent targeting invalid contracts
+        Self::validate_stellar_address(&env, &proposal.target);
+
         // Perform actual cross-contract call to target::function(args)
+        // If the target contract doesn't exist or the function is invalid,
+        // this call will fail and the proposal won't be marked as executed
         let _: Val = env.invoke_contract(&proposal.target, &proposal.function, proposal.args.clone());
 
         proposal.status = ProposalStatus::Executed;
