@@ -219,3 +219,44 @@ pub struct PremiumSplitUpdated {
 pub struct PoolWindingDown {
     pub admin: Address,
 }
+
+/// Pending parameter change with timelock.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingParameterChange {
+    /// New premium split values
+    pub new_lp_bps: i128,
+    pub new_treas_bps: i128,
+    pub new_backstop_bps: i128,
+    /// When the change was proposed
+    pub proposed_at: u64,
+    /// When the change can be executed (proposed_at + TIMELOCK)
+    pub executable_after: u64,
+    /// Whether this change has been executed
+    pub executed: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParameterChangeScheduled {
+    pub admin: Address,
+    pub new_lp_bps: i128,
+    pub new_treas_bps: i128,
+    pub new_backstop_bps: i128,
+    pub executable_after: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParameterChangeExecuted {
+    pub admin: Address,
+    pub lp_bps: i128,
+    pub treas_bps: i128,
+    pub backstop_bps: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParameterChangeCancelled {
+    pub admin: Address,
+}
