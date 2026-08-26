@@ -23,10 +23,11 @@ use soroban_sdk::{
 pub mod types;
 pub use types::*;
 
-const PREMIUM_LP_BPS:       i128 = 8_000;  // 80% of premium to LP pool
-const PREMIUM_TREAS_BPS:    i128 = 1_000;  // 10% to treasury
-const PREMIUM_BACKSTOP_BPS: i128 = 1_000;  // 10% to backstop fund
-const _: () = assert!(PREMIUM_LP_BPS + PREMIUM_TREAS_BPS + PREMIUM_BACKSTOP_BPS == 10_000);
+/// Default premium split, in effect until the admin calls `update_premium_split`.
+const DEFAULT_PREMIUM_LP_BPS:       i128 = 8_000;  // 80% of premium to LP pool
+const DEFAULT_PREMIUM_TREAS_BPS:    i128 = 1_000;  // 10% to treasury
+const DEFAULT_PREMIUM_BACKSTOP_BPS: i128 = 1_000;  // 10% to backstop fund
+const _: () = assert!(DEFAULT_PREMIUM_LP_BPS + DEFAULT_PREMIUM_TREAS_BPS + DEFAULT_PREMIUM_BACKSTOP_BPS == 10_000);
 
 /// Upper bound on cumulative deposits (7-decimal USDC stroops).
 /// 10^15 stroops == 100,000,000 USDC. Caps total pool size so share value
@@ -71,6 +72,8 @@ enum StorageKey {
     ClaimsProcessor,
     /// Contract version (u32) for storage migration tracking
     Version,
+    /// Premium split ratios (lp_bps, treas_bps, backstop_bps), admin-adjustable
+    PremiumSplit,
 }
 
 #[contracterror]
@@ -98,6 +101,7 @@ pub enum Error {
     Overflow            = 19,
     InvalidAddress      = 20,
     InvalidVersion      = 21,
+    InvalidSplit        = 22,
 }
 
 #[contract]
@@ -297,7 +301,7 @@ impl RiskPool {
         provider.require_auth();
         // Guard: check for zero or negative shares input
         if shares <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
-        Self::assert_active(&env);
+        Self::assert_withdrawable(&env);
 
         let lp_key = StorageKey::LpPosition(provider.clone());
         let mut position: LpPosition = env.storage().persistent()
@@ -359,9 +363,10 @@ impl RiskPool {
         token::Client::new(&env, &usdc)
             .transfer(&caller, &env.current_contract_address(), &amount);
 
-        let lp_share       = amount * PREMIUM_LP_BPS       / 10_000;
-        let treas_share    = amount * PREMIUM_TREAS_BPS    / 10_000;
-        let backstop_share = amount * PREMIUM_BACKSTOP_BPS / 10_000;
+        let (lp_bps, treas_bps, backstop_bps) = Self::get_premium_split_bps(&env);
+        let lp_share       = amount * lp_bps       / 10_000;
+        let treas_share    = amount * treas_bps    / 10_000;
+        let backstop_share = amount * backstop_bps / 10_000;
 
         let treasury: Address = env.storage().instance().get(&StorageKey::Treasury).unwrap();
         token::Client::new(&env, &usdc)
@@ -626,6 +631,12 @@ impl RiskPool {
         env.storage().instance().get(&StorageKey::Version).unwrap_or(1)
     }
 
+    /// Return the current premium split ratios in basis points: (lp, treasury, backstop).
+    pub fn get_premium_split(env: Env) -> PremiumSplit {
+        let (lp_bps, treas_bps, backstop_bps) = Self::get_premium_split_bps(&env);
+        PremiumSplit { lp_bps, treas_bps, backstop_bps }
+    }
+
     /// Return a paginated list of LP addresses that currently hold shares.
     /// `offset` defaults to 0 and `limit` defaults to 100 (capped at 500).
     pub fn get_lp_list(env: Env, offset: Option<u32>, limit: Option<u32>) -> PaginatedLps {
@@ -704,6 +715,37 @@ impl RiskPool {
         env.events().publish(
             (Symbol::new(&env, "pool_resumed"),),
             PoolResumed { admin: admin.clone() },
+        );
+    }
+
+    /// Admin-only: begin graceful wind-down of the pool. Blocks new deposits while
+    /// letting existing LPs continue to withdraw and claim yield. Only callable
+    /// while the pool is `Active`.
+    pub fn start_winding_down(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        Self::assert_active(&env);
+        env.storage().instance().set(&StorageKey::Status, &PoolStatus::WindingDown);
+        env.events().publish(
+            (Symbol::new(&env, "pool_winding_down"),),
+            PoolWindingDown { admin: admin.clone() },
+        );
+    }
+
+    /// Admin-only: update the premium split ratios (in basis points). The three
+    /// values must sum to 10,000 (100%). Applies to premiums received after this call.
+    pub fn update_premium_split(env: Env, admin: Address, lp_bps: i128, treas_bps: i128, backstop_bps: i128) {
+        Self::require_admin(&env, &admin);
+        if lp_bps < 0 || treas_bps < 0 || backstop_bps < 0 {
+            panic_with_error!(&env, Error::InvalidSplit);
+        }
+        if lp_bps + treas_bps + backstop_bps != 10_000 {
+            panic_with_error!(&env, Error::InvalidSplit);
+        }
+        let split = PremiumSplit { lp_bps, treas_bps, backstop_bps };
+        env.storage().instance().set(&StorageKey::PremiumSplit, &split);
+        env.events().publish(
+            (Symbol::new(&env, "premium_split_updated"),),
+            PremiumSplitUpdated { lp_bps, treas_bps, backstop_bps },
         );
     }
 
@@ -912,10 +954,27 @@ impl RiskPool {
         }
     }
 
+    /// Return the current premium split ratios in basis points, falling back to the
+    /// compiled-in defaults if the admin has never called `update_premium_split`.
+    fn get_premium_split_bps(env: &Env) -> (i128, i128, i128) {
+        match env.storage().instance().get::<_, PremiumSplit>(&StorageKey::PremiumSplit) {
+            Some(split) => (split.lp_bps, split.treas_bps, split.backstop_bps),
+            None => (DEFAULT_PREMIUM_LP_BPS, DEFAULT_PREMIUM_TREAS_BPS, DEFAULT_PREMIUM_BACKSTOP_BPS),
+        }
+    }
+
     fn assert_active(env: &Env) {
         let status: PoolStatus = env.storage().instance()
             .get(&StorageKey::Status).unwrap_or(PoolStatus::Active);
         if status != PoolStatus::Active { panic_with_error!(env, Error::PoolNotActive); }
+    }
+
+    /// Withdrawals are allowed while the pool is `Active` or `WindingDown`, but not
+    /// while `Paused`.
+    fn assert_withdrawable(env: &Env) {
+        let status: PoolStatus = env.storage().instance()
+            .get(&StorageKey::Status).unwrap_or(PoolStatus::Active);
+        if status == PoolStatus::Paused { panic_with_error!(env, Error::PoolNotActive); }
     }
 
     /// Extend a persistent entry's TTL to the network maximum. Used for
