@@ -241,9 +241,10 @@ impl RiskPool {
 
         let now = env.ledger().timestamp();
         let lp_key = StorageKey::LpPosition(provider.clone());
+        let mut pending_yield: i128 = 0;
         let mut position: LpPosition = match env.storage().persistent().get::<_, LpPosition>(&lp_key) {
             Some(mut pos) => {
-                Self::internal_claim_yield(&env, &mut pos);
+                pending_yield = Self::settle_yield(&env, &mut pos);
                 pos.deposited += amount;
                 pos.shares    += new_shares;
                 pos.yield_debt = (env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0) * pos.shares) / 1_000_000_000_000;
@@ -282,6 +283,10 @@ impl RiskPool {
             },
         );
 
+        // All deposit state is now persisted; safe to move the yield owed to
+        // the provider, if any, as the last step (checks-effects-interactions).
+        Self::pay_out_yield(&env, &provider, pending_yield);
+
         new_shares
     }
 
@@ -315,11 +320,7 @@ impl RiskPool {
         if amount == 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if amount > available_liquidity { panic_with_error!(&env, Error::Undercollateralized); }
 
-        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
-        token::Client::new(&env, &usdc)
-            .transfer(&env.current_contract_address(), &provider, &amount);
-
-        Self::internal_claim_yield(&env, &mut position);
+        let pending_yield = Self::settle_yield(&env, &mut position);
         position.deposited = position.deposited.saturating_sub(amount);
         position.shares   -= shares;
         position.yield_debt = (env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0) * position.shares) / 1_000_000_000_000;
@@ -336,6 +337,13 @@ impl RiskPool {
                 amount_returned: amount,
             },
         );
+
+        // All withdrawal state is persisted before either external transfer
+        // runs: the principal amount, then any yield owed (checks-effects-interactions).
+        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+        token::Client::new(&env, &usdc)
+            .transfer(&env.current_contract_address(), &provider, &amount);
+        Self::pay_out_yield(&env, &provider, pending_yield);
 
         amount
     }
@@ -439,14 +447,14 @@ impl RiskPool {
             .get(&lp_key)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
 
-        let old_claimed = position.yield_claimed;
-        Self::internal_claim_yield(&env, &mut position);
-        let claimed = position.yield_claimed - old_claimed;
+        let claimed = Self::settle_yield(&env, &mut position);
 
         if claimed > 0 {
             env.storage().persistent().set(&lp_key, &position);
             Self::extend_to_max(&env, &lp_key);
         }
+
+        Self::pay_out_yield(&env, &provider, claimed);
 
         claimed
     }
