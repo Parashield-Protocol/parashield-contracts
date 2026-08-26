@@ -812,7 +812,7 @@ fn test_initial_version_is_one() {
 }
 
 #[test]
-#[should_panic(expected = "new version must be greater than current version")]
+#[should_panic(expected = "Error(Contract, #23)")]
 fn test_upgrade_to_same_version_panics() {
     let (env, admin, _oracle, _usdc, contract_id) = setup();
     let client = PolicyEngineClient::new(&env, &contract_id);
@@ -821,7 +821,7 @@ fn test_upgrade_to_same_version_panics() {
 }
 
 #[test]
-#[should_panic(expected = "new version must be greater than current version")]
+#[should_panic(expected = "Error(Contract, #23)")]
 fn test_upgrade_to_lower_version_panics() {
     let (env, admin, _oracle, _usdc, contract_id) = setup();
     let client = PolicyEngineClient::new(&env, &contract_id);

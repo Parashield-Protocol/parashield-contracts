@@ -14,7 +14,6 @@
 //! - Duplicate submissions from the same oracle overwrite the previous value.
 #![no_std]
 extern crate alloc;
-use alloc::string::ToString;
 
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
@@ -26,26 +25,20 @@ pub mod types;
 pub use types::*;
 
 // ─── Storage TTL ──────────────────────────────────────────────────────────────
-const TTL_THRESHOLD: u32 = 518_400; // ~30 days
-const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year
+
+/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
+/// (at ~5s/ledger).
+const TTL_THRESHOLD: u32 = 518_400;
+/// Extend persistent entries out to ~1 year (at ~5s/ledger) so an oracle
+/// registration doesn't silently expire from storage during a quiet period
+/// with no submissions.
+const TTL_EXTEND_TO: u32 = 6_312_000;
 
 /// Maximum number of registered oracles. Bounds the median aggregation loop and
 /// the worst-case weighted sum (MAX_ORACLES * max_weight * max_value) so it
 /// cannot overflow i128.
 #[allow(dead_code)]
 const MAX_ORACLES: u32 = 100;
-
-// ─── Storage TTL ──────────────────────────────────────────────────────────────
-
-/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
-/// (at ~5s/ledger).
-#[allow(dead_code)]
-const TTL_THRESHOLD: u32 = 518_400;
-/// Extend persistent entries out to ~1 year (at ~5s/ledger) so an oracle
-/// registration doesn't silently expire from storage during a quiet period
-/// with no submissions.
-#[allow(dead_code)]
-const TTL_EXTEND_TO: u32 = 6_312_000;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -114,13 +107,6 @@ impl OracleVerifier {
             .instance()
             .set(&StorageKey::OracleList, &Vec::<Address>::new(&env));
 
-        // No pending admin initially
-        let pending_admin = env
-            .storage()
-            .instance()
-            .get::<_, Option<Address>>(&StorageKey::PendingAdmin) // Explicitly type the lookup
-            .unwrap_or(None);
-
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
             Initialized {
@@ -160,8 +146,6 @@ impl OracleVerifier {
         if list.len() >= MAX_ORACLES {
             panic_with_error!(&env, Error::TooManyOracles);
         }
-        list.push_back(oracle.clone());
-        env.storage().instance().set(&StorageKey::OracleList, &list);
         let mut already_present = false;
         for i in 0..list.len() {
             if list.get_unchecked(i) == oracle {

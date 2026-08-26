@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+﻿#![allow(dead_code)]
 #![allow(unused_imports)]
 //! Parashield Claims Processor
 //!
@@ -110,6 +110,7 @@ pub enum Error {
     InvalidAddress     = 8,
     Paused             = 9,
     PolicyExpired      = 10,
+    InvalidVersion     = 11,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -150,12 +151,12 @@ impl ClaimsProcessor {
         let admin_str = admin.to_string();
         
         if admin_str.len() != 56 {
-            panic!("invalid address: admin must be an account or contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
         let mut admin_buf = [0u8; 56];
         admin_str.copy_into_slice(&mut admin_buf);
         if admin_buf[0] != b'G' && admin_buf[0] != b'C' {
-            panic!("invalid address: admin must be an account or contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
 
         admin.require_auth();
@@ -194,6 +195,7 @@ impl ClaimsProcessor {
     pub fn add_keeper(env: Env, admin: Address, keeper: Address) {
         Self::require_admin(&env, &admin);
         env.storage().persistent().set(&StorageKey::Keeper(keeper.clone()), &true);
+        env.storage().persistent().extend_ttl(&StorageKey::Keeper(keeper.clone()), TTL_THRESHOLD, TTL_EXTEND_TO);
         env.events().publish(
             (Symbol::new(&env, "keeper_added"),),
             keeper,
@@ -564,7 +566,7 @@ impl ClaimsProcessor {
         
         let current_version: u32 = env.storage().instance().get(&StorageKey::Version).unwrap_or(1);
         if new_version <= current_version {
-            panic!("new version must be greater than current version");
+            panic_with_error!(&env, Error::InvalidVersion);
         }
         
         // Run migrations from current_version to new_version
@@ -743,6 +745,16 @@ impl ClaimsProcessor {
         if paused {
             panic_with_error!(env, Error::Paused);
         }
+    }
+
+    /// Extend a `Claim`/`PolicyClaim` entry's TTL to cover
+    /// `CLAIM_RETENTION_SECONDS` from now (clamped to the network's max TTL),
+    /// so a claim record survives from submission through settlement or an
+    /// open-ended dispute even if it's only ever written once (issue #246).
+    fn extend_claim_ttl(env: &Env, key: &StorageKey) {
+        let desired_ledgers = (CLAIM_RETENTION_SECONDS / LEDGER_SECONDS) as u32;
+        let extend_to = desired_ledgers.min(env.storage().max_ttl());
+        env.storage().persistent().extend_ttl(key, extend_to, extend_to);
     }
 
     fn next_claim_id(env: &Env) -> u128 {
