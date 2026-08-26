@@ -1,4 +1,4 @@
-﻿#![allow(dead_code)]
+#![allow(dead_code)]
 #![allow(unused_imports)]
 //! Parashield Claims Processor
 //!
@@ -700,17 +700,12 @@ impl ClaimsProcessor {
 
     /// Remove a claim id from the pending queue, if present.
     fn remove_from_pending(env: &Env, claim_id: u128) {
-        let pending: Vec<u128> = env.storage().instance()
+        let mut pending: Vec<u128> = env.storage().instance()
             .get(&StorageKey::PendingClaims)
             .unwrap_or_else(|| Vec::new(env));
-        let mut updated: Vec<u128> = Vec::new(env);
-        for id in pending.iter() {
-            if id != claim_id {
-                updated.push_back(id);
-            }
-        }
-        if updated.len() != pending.len() {
-            env.storage().instance().set(&StorageKey::PendingClaims, &updated);
+        if let Some(idx) = pending.first_index_of(claim_id) {
+            pending.remove(idx);
+            env.storage().instance().set(&StorageKey::PendingClaims, &pending);
         }
     }
 

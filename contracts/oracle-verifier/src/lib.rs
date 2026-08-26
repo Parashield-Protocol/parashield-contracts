@@ -41,12 +41,6 @@ const MAX_ORACLES: u32 = 100;
 /// Maximum number of data points stored per (data_type, key).
 const MAX_DATA_POINTS: u32 = 100;
 
-/// Maximum number of registered oracles. Bounds the median aggregation loop and
-/// the worst-case weighted sum (MAX_ORACLES * max_weight * max_value) so it
-/// cannot overflow i128.
-#[allow(dead_code)]
-const MAX_ORACLES: u32 = 100;
-
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -405,7 +399,7 @@ impl OracleVerifier {
 
         // Load existing submissions for this (data_type, key)
         let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
-        let mut points: Vec<OracleDataPoint> = env
+        let points: Vec<OracleDataPoint> = env
             .storage()
             .persistent()
             .get(&dp_key)
@@ -538,13 +532,31 @@ impl OracleVerifier {
         if points.is_empty() {
             panic_with_error!(&env, Error::NoDataAvailable);
         }
-        let median_value = Self::get_median_value(&env, &data_type, &key);
+
+        let max_data_age: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MaxDataAge)
+            .unwrap_or(604_800);
+        let now = env.ledger().timestamp();
+        let min_confidence: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
+
+        let mut values = [(0i128, 0u32); 100];
+        let mut total_weight: u32 = 0;
+        let mut n = 0;
+
         let mut oracle_count = 0u32;
-        let mut min_confidence = 100u32;
+        let mut min_confidence_val = 100u32;
         let mut weighted_confidence_sum: u128 = 0;
-        let mut total_weight: u128 = 0;
+        let mut total_weight_sum: u128 = 0;
         let mut last_updated = 0u64;
-        for i in 0..points.len() {
+
+        let points_cap = points.len().min(MAX_DATA_POINTS);
+        for i in 0..points_cap {
             let p = points.get_unchecked(i);
             let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
             if let Some(entry) = env
@@ -554,44 +566,75 @@ impl OracleVerifier {
             {
                 if entry.active {
                     oracle_count += 1;
-                    min_confidence = min_confidence.min(p.confidence);
+                    min_confidence_val = min_confidence_val.min(p.confidence);
                     last_updated = last_updated.max(p.timestamp);
                     weighted_confidence_sum += (p.confidence as u128) * (entry.weight as u128);
-                    total_weight += entry.weight as u128;
+                    total_weight_sum += entry.weight as u128;
+
+                    if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence {
+                        if n >= 100 {
+                            panic_with_error!(&env, Error::TooManyOracles);
+                        }
+                        values[n] = (p.value, entry.weight);
+                        n += 1;
+                        total_weight += entry.weight;
+                    }
                 }
             }
         }
-        let confidence = match weighted_confidence_sum.checked_div(total_weight) {
-            // #242 — saturate to u32::MAX instead of silently truncating
+
+        let min_oracle_count: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinOracleCount)
+            .unwrap_or(1);
+        if (n as u32) < min_oracle_count || n == 0 || total_weight == 0 {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
+        let active_values = &mut values[0..n];
+        active_values.sort_unstable_by_key(|&(val, _)| val);
+
+        let half = total_weight / 2;
+        let mut cumulative = 0;
+        let mut median_value = 0i128;
+        for i in 0..n {
+            let (val, wt) = active_values[i];
+            cumulative += wt;
+            if cumulative > half {
+                median_value = val;
+                break;
+            } else if cumulative == half && total_weight.is_multiple_of(2) {
+                if i + 1 < n {
+                    median_value = (val + active_values[i + 1].0) / 2;
+                } else {
+                    median_value = val;
+                }
+                break;
+            }
+        }
+        if median_value == 0 && cumulative <= half {
+            median_value = active_values[n - 1].0;
+        }
+
+        let confidence = match weighted_confidence_sum.checked_div(total_weight_sum) {
             Some(c) => u32::try_from(c).unwrap_or(u32::MAX),
             None => 0u32,
         };
 
-        // Count oracles currently registered+active for this data_type,
-        // independent of whether they've submitted data for this specific
-        // key (issue #136) — this is what monitoring/governance tooling
-        // should use as a diversity signal, not oracle_count above.
         let oracle_list: Vec<Address> = env
             .storage()
             .instance()
-            .get(&StorageKey::OracleList(data_type.clone()))
+            .get(&StorageKey::OracleList(data_type))
             .unwrap_or_else(|| Vec::new(&env));
-        let mut active_oracle_count: u32 = 0;
-        for addr in oracle_list.iter() {
-            let oracle_key = StorageKey::Oracle(data_type.clone(), addr.clone());
-            if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
-                if entry.active {
-                    active_oracle_count += 1;
-                }
-            }
-        }
+        let active_oracle_count: u32 = oracle_list.len();
 
         AggregatedData {
             median_value,
             oracle_count,
             active_oracle_count,
             confidence,
-            min_confidence,
+            min_confidence: min_confidence_val,
             last_updated,
         }
     }
@@ -893,7 +936,10 @@ impl OracleVerifier {
                     .persistent()
                     .get::<_, OracleEntry>(&oracle_key)
                 {
-                    if entry.active && n < 100 {
+                    if entry.active {
+                        if n >= 100 {
+                            panic_with_error!(env, Error::TooManyOracles);
+                        }
                         values[n] = (p.value, entry.weight);
                         n += 1;
                         total_weight += entry.weight;
