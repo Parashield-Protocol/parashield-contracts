@@ -17,8 +17,8 @@ extern crate alloc;
 
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, BytesN, Env,
-    Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address,
+    BytesN, Env, Symbol, Vec,
 };
 
 pub mod types;
@@ -76,8 +76,26 @@ enum StorageKey {
     /// Timestamp (u64) of an oracle's last accepted submission for a
     /// data_type — (data_type, oracle) → last submission time
     LastSubmission(Symbol, Address),
-    /// Oracle reputation score for (data_type, oracle)
-    Reputation(Symbol, Address),
+    /// Token used for oracle stake deposits (Address). Unset = staking disabled.
+    StakeToken,
+    /// Minimum stake (i128) an oracle must hold for a data_type before
+    /// `add_oracle` will register it. Defaults to 0 (disabled).
+    MinStake,
+    /// Amount of stake token (i128) currently deposited by an oracle for a
+    /// given data_type — (data_type, oracle) → amount.
+    OracleStakeAmt(Symbol, Address),
+    /// Address slashed stake is transferred to. Unset = slashed stake is
+    /// retained by the contract (effectively burned).
+    SlashTreasury,
+    /// Guardian addresses authorized to approve critical actions (Vec<Address>).
+    Guardians,
+    /// Number of guardian approvals required to execute a critical action
+    /// (u32). 0 means guardian multisig is disabled (admin acts alone).
+    GuardianThreshold,
+    /// A pending, not-yet-executed contract upgrade awaiting guardian approvals.
+    PendingUpgrade,
+    /// A pending admin-transfer proposal awaiting guardian approvals.
+    PendingAdminChange,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -99,6 +117,15 @@ pub enum Error {
     InvalidTimestamp = 11,
     InvalidAddress = 12,
     RateLimited = 13,
+    InsufficientStake = 14,
+    StakeTokenNotSet = 15,
+    NoStake = 16,
+    InvalidStakeAmount = 17,
+    OracleStillActive = 18,
+    NotGuardian = 19,
+    AlreadyApprovedAction = 20,
+    NoPendingUpgrade = 21,
+    InvalidThreshold = 22,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -148,6 +175,24 @@ impl OracleVerifier {
         let key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         if env.storage().persistent().has(&key) {
             panic_with_error!(&env, Error::OracleAlreadyExists);
+        }
+        // Enforce a minimum economic stake so oracles have skin in the game.
+        // Disabled by default (min_stake == 0) for backward compatibility with
+        // deployments/tests that don't use the staking feature.
+        let min_stake: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinStake)
+            .unwrap_or(0);
+        if min_stake > 0 {
+            let staked: i128 = env
+                .storage()
+                .persistent()
+                .get(&StorageKey::OracleStakeAmt(data_type.clone(), oracle.clone()))
+                .unwrap_or(0);
+            if staked < min_stake {
+                panic_with_error!(&env, Error::InsufficientStake);
+            }
         }
         let entry = OracleEntry {
             oracle: oracle.clone(),
@@ -275,13 +320,90 @@ impl OracleVerifier {
     }
 
     /// Propose a new admin. Only the current admin can call this.
+    ///
+    /// If a guardian threshold > 0 is configured (`set_guardians`), this does
+    /// not activate the proposal immediately — it requires `threshold`
+    /// guardians to call `approve_admin_change` first, guarding this
+    /// takeover-capable operation against a single compromised admin key.
+    /// With no guardians configured (default), behavior is unchanged.
     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
         Self::validate_stellar_address(&env, &new_admin);
-        // Store the proposed admin (zero address means no proposal)
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0);
+        if threshold == 0 {
+            env.storage()
+                .instance()
+                .set(&StorageKey::PendingAdmin, &new_admin);
+            return;
+        }
+
+        let pending = PendingAdminChange {
+            new_admin,
+            approvals: Vec::new(&env),
+        };
         env.storage()
             .instance()
-            .set(&StorageKey::PendingAdmin, &new_admin);
+            .set(&StorageKey::PendingAdminChange, &pending);
+    }
+
+    /// Guardian approval for a pending admin-change proposal. Once enough
+    /// guardians have approved (>= threshold), the change is activated —
+    /// `new_admin` must then still call `accept_admin` to take effect.
+    pub fn approve_admin_change(env: Env, guardian: Address, new_admin: Address) {
+        guardian.require_auth();
+
+        let guardians: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut is_guardian = false;
+        for g in guardians.iter() {
+            if g == guardian {
+                is_guardian = true;
+                break;
+            }
+        }
+        if !is_guardian {
+            panic_with_error!(&env, Error::NotGuardian);
+        }
+
+        let mut pending: PendingAdminChange = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PendingAdminChange)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingUpgrade));
+        if pending.new_admin != new_admin {
+            panic_with_error!(&env, Error::NoPendingUpgrade);
+        }
+        for a in pending.approvals.iter() {
+            if a == guardian {
+                panic_with_error!(&env, Error::AlreadyApprovedAction);
+            }
+        }
+        pending.approvals.push_back(guardian);
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0);
+
+        if pending.approvals.len() >= threshold {
+            env.storage().instance().remove(&StorageKey::PendingAdminChange);
+            env.storage()
+                .instance()
+                .set(&StorageKey::PendingAdmin, &new_admin);
+        } else {
+            env.storage()
+                .instance()
+                .set(&StorageKey::PendingAdminChange, &pending);
+        }
     }
 
     /// Accept the proposed admin. Only the proposed admin can call this.
@@ -373,6 +495,335 @@ impl OracleVerifier {
             .instance()
             .get(&StorageKey::MinSubmitInterval)
             .unwrap_or(DEFAULT_MIN_SUBMIT_INTERVAL)
+    }
+
+    // ── Oracle Staking (economic security) ───────────────────────────────────
+
+    /// Set the token used for oracle stake deposits. Admin-only.
+    pub fn set_stake_token(env: Env, admin: Address, token: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&StorageKey::StakeToken, &token);
+        env.events().publish(
+            (Symbol::new(&env, "stake_token_updated"),),
+            StakeTokenUpdated { token },
+        );
+    }
+
+    /// Return the configured stake token, if any.
+    pub fn get_stake_token(env: Env) -> Option<Address> {
+        env.storage().instance().get(&StorageKey::StakeToken)
+    }
+
+    /// Set the minimum stake an oracle must hold for a data_type before
+    /// `add_oracle` will register it. 0 disables the requirement (default).
+    pub fn set_min_stake(env: Env, admin: Address, min_stake: i128) {
+        Self::require_admin(&env, &admin);
+        if min_stake < 0 {
+            panic_with_error!(&env, Error::InvalidStakeAmount);
+        }
+        env.storage().instance().set(&StorageKey::MinStake, &min_stake);
+        env.events().publish(
+            (Symbol::new(&env, "min_stake_updated"),),
+            MinStakeUpdated { min_stake },
+        );
+    }
+
+    /// Return the currently configured minimum oracle stake (defaults to 0).
+    pub fn get_min_stake(env: Env) -> i128 {
+        env.storage().instance().get(&StorageKey::MinStake).unwrap_or(0)
+    }
+
+    /// Set the address slashed stake is transferred to. Admin-only. If never
+    /// set, slashed stake stays locked in the contract.
+    pub fn set_slash_treasury(env: Env, admin: Address, treasury: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&StorageKey::SlashTreasury, &treasury);
+    }
+
+    /// Deposit `amount` of the configured stake token toward `oracle`'s stake
+    /// for `data_type`. Callable by anyone but requires the oracle's own
+    /// authorization, so only the oracle (or someone it has delegated to)
+    /// can grow its own stake.
+    pub fn stake(env: Env, oracle: Address, data_type: Symbol, amount: i128) {
+        oracle.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, Error::InvalidStakeAmount);
+        }
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StakeToken)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::StakeTokenNotSet));
+
+        token::Client::new(&env, &token_addr).transfer(
+            &oracle,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        let stake_key = StorageKey::OracleStakeAmt(data_type.clone(), oracle.clone());
+        let current: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0);
+        let total_stake = current + amount;
+        env.storage().persistent().set(&stake_key, &total_stake);
+        env.storage()
+            .persistent()
+            .extend_ttl(&stake_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.events().publish(
+            (Symbol::new(&env, "stake_deposited"),),
+            StakeDeposited {
+                oracle,
+                data_type,
+                amount,
+                total_stake,
+            },
+        );
+    }
+
+    /// Return the amount currently staked by `oracle` for `data_type`.
+    pub fn get_oracle_stake(env: Env, data_type: Symbol, oracle: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::OracleStakeAmt(data_type, oracle))
+            .unwrap_or(0)
+    }
+
+    /// Withdraw the caller's full stake for `data_type`. Only permitted once
+    /// the oracle is not an active registration for that data_type (never
+    /// registered, or previously removed via `remove_oracle`) — an active
+    /// oracle cannot pull its economic backing out from under a live
+    /// registration.
+    pub fn withdraw_stake(env: Env, oracle: Address, data_type: Symbol) {
+        oracle.require_auth();
+
+        let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
+        if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+            if entry.active {
+                panic_with_error!(&env, Error::OracleStillActive);
+            }
+        }
+
+        let stake_key = StorageKey::OracleStakeAmt(data_type.clone(), oracle.clone());
+        let amount: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0);
+        if amount <= 0 {
+            panic_with_error!(&env, Error::NoStake);
+        }
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StakeToken)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::StakeTokenNotSet));
+
+        env.storage().persistent().remove(&stake_key);
+        token::Client::new(&env, &token_addr).transfer(
+            &env.current_contract_address(),
+            &oracle,
+            &amount,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "stake_withdrawn"),),
+            StakeWithdrawn {
+                oracle,
+                data_type,
+                amount,
+            },
+        );
+    }
+
+    /// Slash `amount` from `oracle`'s stake for `data_type` as a penalty for
+    /// provably incorrect data (verified off-chain / via governance and
+    /// submitted by the admin). Caps at the oracle's current stake. If the
+    /// slash brings the oracle below the configured `min_stake`, the oracle
+    /// is deactivated so it can no longer submit until it re-stakes and is
+    /// re-registered. Slashed funds move to the configured slash treasury,
+    /// if any, otherwise remain locked in the contract.
+    pub fn slash_oracle(
+        env: Env,
+        admin: Address,
+        oracle: Address,
+        data_type: Symbol,
+        amount: i128,
+        reason: Symbol,
+    ) {
+        Self::require_admin(&env, &admin);
+        if amount <= 0 {
+            panic_with_error!(&env, Error::InvalidStakeAmount);
+        }
+
+        let stake_key = StorageKey::OracleStakeAmt(data_type.clone(), oracle.clone());
+        let current: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0);
+        if current <= 0 {
+            panic_with_error!(&env, Error::NoStake);
+        }
+        let slashed = amount.min(current);
+        let remaining = current - slashed;
+        env.storage().persistent().set(&stake_key, &remaining);
+
+        if let Some(token_addr) = env.storage().instance().get::<_, Address>(&StorageKey::StakeToken) {
+            if let Some(treasury) = env.storage().instance().get::<_, Address>(&StorageKey::SlashTreasury) {
+                token::Client::new(&env, &token_addr).transfer(
+                    &env.current_contract_address(),
+                    &treasury,
+                    &slashed,
+                );
+            }
+        }
+
+        let min_stake: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinStake)
+            .unwrap_or(0);
+        if min_stake > 0 && remaining < min_stake {
+            let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
+            if let Some(mut entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+                if entry.active {
+                    entry.active = false;
+                    env.storage().persistent().set(&oracle_key, &entry);
+
+                    let list: Vec<Address> = env
+                        .storage()
+                        .instance()
+                        .get(&StorageKey::OracleList(data_type.clone()))
+                        .unwrap_or_else(|| Vec::new(&env));
+                    let mut pruned: Vec<Address> = Vec::new(&env);
+                    for addr in list.iter() {
+                        if addr != oracle {
+                            pruned.push_back(addr);
+                        }
+                    }
+                    env.storage()
+                        .instance()
+                        .set(&StorageKey::OracleList(data_type.clone()), &pruned);
+                }
+            }
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle_slashed"),),
+            OracleSlashed {
+                oracle,
+                data_type,
+                amount: slashed,
+                remaining_stake: remaining,
+                reason,
+            },
+        );
+    }
+
+    // ── Guardian Multisig (critical actions) ─────────────────────────────────
+
+    /// Configure the guardian set and approval threshold required for
+    /// critical actions (currently: contract upgrades). Admin-only.
+    /// `threshold == 0` disables the guardian requirement (default), so the
+    /// admin alone can act — preserves existing single-admin behavior until
+    /// guardians are explicitly configured.
+    pub fn set_guardians(env: Env, admin: Address, guardians: Vec<Address>, threshold: u32) {
+        Self::require_admin(&env, &admin);
+        if threshold as u32 > guardians.len() {
+            panic_with_error!(&env, Error::InvalidThreshold);
+        }
+        env.storage().instance().set(&StorageKey::Guardians, &guardians);
+        env.storage()
+            .instance()
+            .set(&StorageKey::GuardianThreshold, &threshold);
+        env.events().publish(
+            (Symbol::new(&env, "guardians_updated"),),
+            GuardiansUpdated { guardians, threshold },
+        );
+    }
+
+    /// Return the current guardian set.
+    pub fn get_guardians(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Return the current guardian approval threshold (0 = disabled).
+    pub fn get_guardian_threshold(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0)
+    }
+
+    /// Return the pending upgrade awaiting guardian approvals, if any.
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        env.storage().instance().get(&StorageKey::PendingUpgrade)
+    }
+
+    /// Guardian approval for the pending upgrade. Once enough guardians have
+    /// approved (>= threshold), the upgrade executes immediately.
+    pub fn approve_upgrade(env: Env, guardian: Address, new_wasm_hash: BytesN<32>) {
+        guardian.require_auth();
+
+        let guardians: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut is_guardian = false;
+        for g in guardians.iter() {
+            if g == guardian {
+                is_guardian = true;
+                break;
+            }
+        }
+        if !is_guardian {
+            panic_with_error!(&env, Error::NotGuardian);
+        }
+
+        let mut pending: PendingUpgrade = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PendingUpgrade)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingUpgrade));
+        if pending.new_wasm_hash != new_wasm_hash {
+            panic_with_error!(&env, Error::NoPendingUpgrade);
+        }
+
+        for a in pending.approvals.iter() {
+            if a == guardian {
+                panic_with_error!(&env, Error::AlreadyApprovedAction);
+            }
+        }
+        pending.approvals.push_back(guardian.clone());
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0);
+
+        env.events().publish(
+            (Symbol::new(&env, "upgrade_approved"),),
+            UpgradeApproved {
+                new_wasm_hash: new_wasm_hash.clone(),
+                approver: guardian,
+                approvals: pending.approvals.len(),
+                threshold,
+            },
+        );
+
+        if pending.approvals.len() >= threshold {
+            env.storage().instance().remove(&StorageKey::PendingUpgrade);
+            env.deployer().update_current_contract_wasm(new_wasm_hash);
+        } else {
+            env.storage().instance().set(&StorageKey::PendingUpgrade, &pending);
+        }
+    }
+
+    /// Admin-only: cancel a pending upgrade before it collects enough
+    /// guardian approvals.
+    pub fn cancel_pending_upgrade(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        if !env.storage().instance().has(&StorageKey::PendingUpgrade) {
+            panic_with_error!(&env, Error::NoPendingUpgrade);
+        }
+        env.storage().instance().remove(&StorageKey::PendingUpgrade);
     }
 
     // ── Data Submission ───────────────────────────────────────────────────────
@@ -962,9 +1413,30 @@ impl OracleVerifier {
 
     /// Upgrade the contract WASM in-place. Only the admin may call this.
     /// Storage is preserved across upgrades; only the execution code changes.
+    ///
+    /// If a guardian threshold > 0 is configured (`set_guardians`), this call
+    /// does not upgrade immediately — it registers the upgrade as pending and
+    /// requires `threshold` guardians to call `approve_upgrade` before the
+    /// WASM is actually replaced, guarding this irreversible operation
+    /// against a single compromised admin key.
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
         Self::require_admin(&env, &admin);
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0);
+        if threshold == 0 {
+            env.deployer().update_current_contract_wasm(new_wasm_hash);
+            return;
+        }
+
+        let pending = PendingUpgrade {
+            new_wasm_hash,
+            approvals: Vec::new(&env),
+        };
+        env.storage().instance().set(&StorageKey::PendingUpgrade, &pending);
     }
 
     /// List all registered oracle addresses for a specific data_type.

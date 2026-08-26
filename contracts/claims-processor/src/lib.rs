@@ -100,6 +100,13 @@ enum StorageKey {
     Paused,              // bool — emergency pause state
     /// Contract version (u32) for storage migration tracking
     Version,
+    /// Guardian addresses authorized to approve critical actions (Vec<Address>).
+    Guardians,
+    /// Number of guardian approvals required to execute a critical action
+    /// (u32). 0 means guardian multisig is disabled (admin acts alone).
+    GuardianThreshold,
+    /// A pending, not-yet-executed contract upgrade awaiting guardian approvals.
+    PendingUpgrade,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -119,6 +126,10 @@ pub enum Error {
     Paused             = 9,
     PolicyExpired      = 10,
     InvalidVersion     = 11,
+    NotGuardian          = 12,
+    AlreadyApprovedAction = 13,
+    NoPendingUpgrade     = 14,
+    InvalidThreshold     = 15,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -556,33 +567,180 @@ impl ClaimsProcessor {
     /// Upgrade the contract WASM in-place. Only the admin may call this.
     /// Storage is preserved across upgrades; only the execution code changes.
     /// Runs storage migrations if the new version requires them.
+    ///
+    /// If a guardian threshold > 0 is configured (`set_guardians`), this call
+    /// does not upgrade immediately — it registers the upgrade as pending and
+    /// requires `threshold` guardians to call `approve_upgrade` before the
+    /// WASM is actually replaced, guarding this irreversible operation
+    /// against a single compromised admin key.
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>, new_version: u32) {
         let stored_admin: Address = env.storage().instance().get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         if admin != stored_admin { panic_with_error!(&env, Error::Unauthorized); }
         admin.require_auth();
-        
+
         let current_version: u32 = env.storage().instance().get(&StorageKey::Version).unwrap_or(1);
         if new_version <= current_version {
             panic_with_error!(&env, Error::InvalidVersion);
         }
-        
-        // Run migrations from current_version to new_version
-        Self::run_migrations(&env, current_version, new_version);
-        
-        // Update the stored version
-        env.storage().instance().set(&StorageKey::Version, &new_version);
-        
-        // Perform the actual WASM upgrade
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
-        
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0);
+        if threshold == 0 {
+            Self::run_migrations(&env, current_version, new_version);
+            env.storage().instance().set(&StorageKey::Version, &new_version);
+            env.deployer().update_current_contract_wasm(new_wasm_hash);
+
+            env.events().publish(
+                (Symbol::new(&env, "contract_upgraded"),),
+                ContractUpgraded {
+                    old_version: current_version,
+                    new_version,
+                },
+            );
+            return;
+        }
+
+        let pending = PendingUpgrade {
+            new_wasm_hash,
+            new_version,
+            approvals: Vec::new(&env),
+        };
+        env.storage().instance().set(&StorageKey::PendingUpgrade, &pending);
+    }
+
+    /// Configure the guardian set and approval threshold required for
+    /// critical actions (currently: contract upgrades). Admin-only.
+    /// `threshold == 0` disables the guardian requirement (default), so the
+    /// admin alone can act — preserves existing single-admin behavior until
+    /// guardians are explicitly configured.
+    pub fn set_guardians(env: Env, admin: Address, guardians: Vec<Address>, threshold: u32) {
+        let stored_admin: Address = env.storage().instance().get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        if admin != stored_admin { panic_with_error!(&env, Error::Unauthorized); }
+        admin.require_auth();
+        if threshold > guardians.len() {
+            panic_with_error!(&env, Error::InvalidThreshold);
+        }
+        env.storage().instance().set(&StorageKey::Guardians, &guardians);
+        env.storage()
+            .instance()
+            .set(&StorageKey::GuardianThreshold, &threshold);
         env.events().publish(
-            (Symbol::new(&env, "contract_upgraded"),),
-            ContractUpgraded {
-                old_version: current_version,
-                new_version,
+            (Symbol::new(&env, "guardians_updated"),),
+            GuardiansUpdated { guardians, threshold },
+        );
+    }
+
+    /// Return the current guardian set.
+    pub fn get_guardians(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Return the current guardian approval threshold (0 = disabled).
+    pub fn get_guardian_threshold(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0)
+    }
+
+    /// Return the pending upgrade awaiting guardian approvals, if any.
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        env.storage().instance().get(&StorageKey::PendingUpgrade)
+    }
+
+    /// Guardian approval for the pending upgrade. Once enough guardians have
+    /// approved (>= threshold), the upgrade executes immediately.
+    pub fn approve_upgrade(env: Env, guardian: Address, new_wasm_hash: BytesN<32>) {
+        guardian.require_auth();
+
+        let guardians: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut is_guardian = false;
+        for g in guardians.iter() {
+            if g == guardian {
+                is_guardian = true;
+                break;
+            }
+        }
+        if !is_guardian {
+            panic_with_error!(&env, Error::NotGuardian);
+        }
+
+        let mut pending: PendingUpgrade = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PendingUpgrade)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingUpgrade));
+        if pending.new_wasm_hash != new_wasm_hash {
+            panic_with_error!(&env, Error::NoPendingUpgrade);
+        }
+        for a in pending.approvals.iter() {
+            if a == guardian {
+                panic_with_error!(&env, Error::AlreadyApprovedAction);
+            }
+        }
+        pending.approvals.push_back(guardian.clone());
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0);
+
+        env.events().publish(
+            (Symbol::new(&env, "upgrade_approved"),),
+            UpgradeApproved {
+                new_wasm_hash: new_wasm_hash.clone(),
+                approver: guardian,
+                approvals: pending.approvals.len(),
+                threshold,
             },
         );
+
+        if pending.approvals.len() >= threshold {
+            let current_version: u32 =
+                env.storage().instance().get(&StorageKey::Version).unwrap_or(1);
+            env.storage().instance().remove(&StorageKey::PendingUpgrade);
+            Self::run_migrations(&env, current_version, pending.new_version);
+            env.storage()
+                .instance()
+                .set(&StorageKey::Version, &pending.new_version);
+            env.deployer().update_current_contract_wasm(new_wasm_hash);
+
+            env.events().publish(
+                (Symbol::new(&env, "contract_upgraded"),),
+                ContractUpgraded {
+                    old_version: current_version,
+                    new_version: pending.new_version,
+                },
+            );
+        } else {
+            env.storage().instance().set(&StorageKey::PendingUpgrade, &pending);
+        }
+    }
+
+    /// Admin-only: cancel a pending upgrade before it collects enough
+    /// guardian approvals.
+    pub fn cancel_pending_upgrade(env: Env, admin: Address) {
+        let stored_admin: Address = env.storage().instance().get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        if admin != stored_admin { panic_with_error!(&env, Error::Unauthorized); }
+        admin.require_auth();
+        if !env.storage().instance().has(&StorageKey::PendingUpgrade) {
+            panic_with_error!(&env, Error::NoPendingUpgrade);
+        }
+        env.storage().instance().remove(&StorageKey::PendingUpgrade);
     }
 
     /// Run storage migrations from old_version to new_version.

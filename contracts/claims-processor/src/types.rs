@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Symbol};
+use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,5 +88,30 @@ pub struct ClaimDisputed {
 pub struct ContractUpgraded {
     pub old_version: u32,
     pub new_version: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuardiansUpdated {
+    pub guardians: Vec<Address>,
+    pub threshold: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeApproved {
+    pub new_wasm_hash: BytesN<32>,
+    pub approver: Address,
+    pub approvals: u32,
+    pub threshold: u32,
+}
+
+/// A pending contract-upgrade action awaiting guardian approvals.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUpgrade {
+    pub new_wasm_hash: BytesN<32>,
+    pub new_version: u32,
+    pub approvals: Vec<Address>,
 }
 

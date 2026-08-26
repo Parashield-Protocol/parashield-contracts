@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Symbol};
+use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec};
 
 /// Reputation score for an oracle, tracking accuracy over time.
 #[contracttype]
@@ -201,4 +201,75 @@ pub struct AdminUpdated {
 pub struct ContractUpgraded {
     pub old_version: u32,
     pub new_version: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StakeDeposited {
+    pub oracle: Address,
+    pub data_type: Symbol,
+    pub amount: i128,
+    pub total_stake: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StakeWithdrawn {
+    pub oracle: Address,
+    pub data_type: Symbol,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleSlashed {
+    pub oracle: Address,
+    pub data_type: Symbol,
+    pub amount: i128,
+    pub remaining_stake: i128,
+    pub reason: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MinStakeUpdated {
+    pub min_stake: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StakeTokenUpdated {
+    pub token: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuardiansUpdated {
+    pub guardians: Vec<Address>,
+    pub threshold: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeApproved {
+    pub new_wasm_hash: BytesN<32>,
+    pub approver: Address,
+    pub approvals: u32,
+    pub threshold: u32,
+}
+
+/// A pending contract-upgrade action awaiting guardian approvals.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUpgrade {
+    pub new_wasm_hash: BytesN<32>,
+    pub approvals: Vec<Address>,
+}
+
+/// A pending admin-transfer proposal awaiting guardian approvals.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminChange {
+    pub new_admin: Address,
+    pub approvals: Vec<Address>,
 }
