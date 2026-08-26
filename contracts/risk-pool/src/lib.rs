@@ -1,4 +1,4 @@
-//! Parashield Risk Pool
+﻿//! Parashield Risk Pool
 //!
 //! Liquidity providers deposit USDC into category-specific risk pools.
 //! Pool-share tokens represent proportional ownership.
@@ -97,6 +97,7 @@ pub enum Error {
     DepositTooSmall     = 18,
     Overflow            = 19,
     InvalidAddress      = 20,
+    InvalidVersion      = 21,
 }
 
 #[contract]
@@ -127,12 +128,12 @@ impl RiskPool {
         let admin_str = admin.to_string();
 
         if admin_str.len() != 56 {
-            panic!("invalid address: admin must be an account or contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
         let mut admin_buf = [0u8; 56];
         admin_str.copy_into_slice(&mut admin_buf);
         if admin_buf[0] != b'G' && admin_buf[0] != b'C' {
-            panic!("invalid address: admin must be an account or contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
 
         let usdc_str = usdc_token.to_string();
@@ -147,22 +148,22 @@ impl RiskPool {
         }
 
         if usdc_str.len() != 56 {
-            panic!("invalid address: usdc_token must be a contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
         let mut usdc_buf = [0u8; 56];
         usdc_str.copy_into_slice(&mut usdc_buf);
         if usdc_buf[0] != b'C' {
-            panic!("invalid address: usdc_token must be a contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
 
         let treasury_str = treasury.to_string();
         if treasury_str.len() != 56 {
-            panic!("invalid address: treasury must be a contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
         let mut treasury_buf = [0u8; 56];
         treasury_str.copy_into_slice(&mut treasury_buf);
         if treasury_buf[0] != b'C' {
-            panic!("invalid address: treasury must be a contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
 
         admin.require_auth();
@@ -323,6 +324,7 @@ impl RiskPool {
         position.shares   -= shares;
         position.yield_debt = (env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0) * position.shares) / 1_000_000_000_000;
         env.storage().persistent().set(&lp_key, &position);
+        Self::extend_to_max(&env, &lp_key);
         env.storage().instance().set(&StorageKey::TotalDeposited, &total_deposited.checked_sub(amount).unwrap_or_else(|| panic_with_error!(&env, Error::Overflow)));
         env.storage().instance().set(&StorageKey::TotalShares,    &(total_shares - shares));
 
@@ -767,6 +769,7 @@ impl RiskPool {
         let mut req = req;
         req.executed = true;
         env.storage().persistent().set(&StorageKey::AdminWithdrawalRequest, &req);
+        Self::extend_withdrawal_ttl(&env, &StorageKey::AdminWithdrawalRequest);
 
         let total_deposited: i128 = env.storage().instance()
             .get(&StorageKey::TotalDeposited).unwrap_or(0);
@@ -803,7 +806,7 @@ impl RiskPool {
         Self::require_admin(&env, &admin);
         let current_version: u32 = env.storage().instance().get(&StorageKey::Version).unwrap_or(1);
         if new_version <= current_version {
-            panic!("new version must be greater than current version");
+            panic_with_error!(&env, Error::InvalidVersion);
         }
         
         // Run migrations from current_version to new_version
@@ -905,6 +908,20 @@ impl RiskPool {
         let status: PoolStatus = env.storage().instance()
             .get(&StorageKey::Status).unwrap_or(PoolStatus::Active);
         if status != PoolStatus::Active { panic_with_error!(env, Error::PoolNotActive); }
+    }
+
+    /// Extend a persistent entry's TTL to the network maximum. Used for
+    /// LP position/index records, which have no natural expiry (issue #244).
+    fn extend_to_max(env: &Env, key: &StorageKey) {
+        let max_ttl = env.storage().max_ttl();
+        env.storage().persistent().extend_ttl(key, max_ttl, max_ttl);
+    }
+
+    /// Extend an `AdminWithdrawalRequest` entry's TTL. `TTL_THRESHOLD`/`TTL_EXTEND_TO`
+    /// (~30 days / ~1 year) comfortably cover the `TIMELOCK_SECONDS` (7-day) wait
+    /// between requesting and executing a withdrawal (issue #244).
+    fn extend_withdrawal_ttl(env: &Env, key: &StorageKey) {
+        env.storage().persistent().extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
     fn internal_claim_yield(env: &Env, position: &mut LpPosition) {
