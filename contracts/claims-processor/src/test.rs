@@ -106,7 +106,7 @@ fn buy_crop_policy(w: &World, buyer: &Address, product_id: u128) -> u128 {
     StellarAssetClient::new(&w.env, &w.usdc).mint(buyer, &5_000_000_000i128);
     // Fund the pool and policy contract with coverage capital
     StellarAssetClient::new(&w.env, &w.usdc).mint(&w.admin, &1_000_000_000i128);
-    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&w.admin, &1_000_000_000i128, &0i128);
+    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&w.admin, &1_000_000_000i128, &0i128, &false);
     StellarAssetClient::new(&w.env, &w.usdc).mint(&w.policy_id, &10_000_000_000i128);
     
     let policy_id = PolicyEngineClient::new(&w.env, &w.policy_id)
@@ -143,7 +143,7 @@ fn test_drought_trigger_pays_out() {
     submit_rainfall(&w, 32_000_000);
 
     let result = ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .auto_process(&w.keeper, &pol_id);
+        .auto_process(&w.keeper, &pol_id, &None);
 
     assert_eq!(result, ClaimResult::Paid);
     // Buyer: minted 5_000_000_000, paid 50_000_000 premium, received 1_000_000_000 coverage
@@ -163,7 +163,7 @@ fn test_good_rainfall_no_payout() {
     submit_rainfall(&w, 72_000_000);
 
     let result = ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .auto_process(&w.keeper, &pol_id);
+        .auto_process(&w.keeper, &pol_id, &None);
 
     assert_eq!(result, ClaimResult::Rejected);
     // Buyer: minted 5_000_000_000, paid 50_000_000 premium, no payout received
@@ -183,7 +183,7 @@ fn test_expired_policy_no_payout() {
     w.env.ledger().with_mut(|l| l.timestamp += 31 * 86_400);
 
     let result = ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .auto_process(&w.keeper, &pol_id);
+        .auto_process(&w.keeper, &pol_id, &None);
 
     assert_eq!(result, ClaimResult::Expired);
     let policy = PolicyEngineClient::new(&w.env, &w.policy_id).get_policy(&pol_id);
@@ -211,7 +211,7 @@ fn test_expired_policy_releases_pool_capital() {
     w.env.ledger().with_mut(|l| l.timestamp += 31 * 86_400);
 
     let result = ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .auto_process(&w.keeper, &pol_id);
+        .auto_process(&w.keeper, &pol_id, &None);
     assert_eq!(result, ClaimResult::Expired);
 
     // The lock is gone without any separate backend call.
@@ -233,8 +233,8 @@ fn test_double_process_idempotent() {
     submit_rainfall(&w, 20_000_000); // 20mm — well below threshold
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
-    let first  = cp.auto_process(&w.keeper, &pol_id);
-    let second = cp.auto_process(&w.keeper, &pol_id);
+    let first  = cp.auto_process(&w.keeper, &pol_id, &None);
+    let second = cp.auto_process(&w.keeper, &pol_id, &None);
 
     assert_eq!(first,  ClaimResult::Paid);
     assert_eq!(second, ClaimResult::AlreadyProcessed);
@@ -254,8 +254,8 @@ fn test_process_claim_is_idempotent_after_first_settlement() {
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let claim_id = cp.submit_claim(&buyer, &pol_id);
-    let first = cp.process_claim(&w.keeper, &claim_id);
-    let second = cp.process_claim(&w.keeper, &claim_id);
+    let first = cp.process_claim(&w.keeper, &claim_id, &None);
+    let second = cp.process_claim(&w.keeper, &claim_id, &None);
 
     assert_eq!(first, ClaimResult::Paid);
     assert_eq!(second, ClaimResult::AlreadyProcessed);
@@ -319,7 +319,7 @@ fn test_manual_claim_flow() {
 
     let cp       = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let claim_id = cp.submit_claim(&buyer, &pol_id);
-    let result   = cp.process_claim(&w.keeper, &claim_id);
+    let result   = cp.process_claim(&w.keeper, &claim_id, &None);
 
     assert_eq!(result, ClaimResult::Paid);
     let claim = cp.get_claim(&claim_id);
@@ -342,7 +342,7 @@ fn test_auto_process_rejects_unregistered_keeper() {
 
     // `stranger` is not in the keeper registry → Unauthorized
     ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .auto_process(&stranger, &pol_id);
+        .auto_process(&stranger, &pol_id, &None);
 }
 
 /// process_claim from an unregistered address is rejected.
@@ -358,7 +358,7 @@ fn test_process_claim_rejects_unregistered_keeper() {
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let claim_id = cp.submit_claim(&buyer, &pol_id);
-    cp.process_claim(&stranger, &claim_id);
+    cp.process_claim(&stranger, &claim_id, &None);
 }
 
 /// A revoked keeper can no longer settle claims.
@@ -373,7 +373,7 @@ fn test_removed_keeper_cannot_process() {
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     cp.remove_keeper(&w.admin, &w.keeper);
-    cp.auto_process(&w.keeper, &pol_id);
+    cp.auto_process(&w.keeper, &pol_id, &None);
 }
 
 /// Only the admin may register a keeper.
@@ -402,7 +402,7 @@ fn test_pending_queue_cleared_after_auto_process() {
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     assert_eq!(cp.get_pending_claims().len(), 0);
 
-    let result = cp.auto_process(&w.keeper, &pol_id);
+    let result = cp.auto_process(&w.keeper, &pol_id, &None);
     assert_eq!(result, ClaimResult::Paid);
 
     // Settled claim must not linger in the pending queue.
@@ -422,7 +422,7 @@ fn test_pending_queue_cleared_after_process_claim() {
     let claim_id = cp.submit_claim(&buyer, &pol_id);
     assert_eq!(cp.get_pending_claims().len(), 1);
 
-    cp.process_claim(&w.keeper, &claim_id);
+    cp.process_claim(&w.keeper, &claim_id, &None);
     assert_eq!(cp.get_pending_claims().len(), 0, "settled claim left in queue");
 }
 
@@ -458,7 +458,7 @@ fn test_cannot_dispute_paid_claim() {
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let claim_id = cp.submit_claim(&buyer, &pol_id);
-    cp.process_claim(&w.keeper, &claim_id);
+    cp.process_claim(&w.keeper, &claim_id, &None);
     assert_eq!(cp.get_claim(&claim_id).status, ClaimStatus::Paid);
 
     // Attempting to dispute a settled/paid claim must panic.
@@ -476,7 +476,7 @@ fn test_rejected_claim_disputable_then_locked() {
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let claim_id = cp.submit_claim(&buyer, &pol_id);
-    let result = cp.process_claim(&w.keeper, &claim_id);
+    let result = cp.process_claim(&w.keeper, &claim_id, &None);
     assert_eq!(result, ClaimResult::Rejected);
 
     // First dispute on a Rejected claim succeeds.
@@ -496,7 +496,7 @@ fn test_cannot_redispute_disputed_claim() {
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let claim_id = cp.submit_claim(&buyer, &pol_id);
-    cp.process_claim(&w.keeper, &claim_id);
+    cp.process_claim(&w.keeper, &claim_id, &None);
     cp.dispute_claim(&buyer, &claim_id, &symbol_short!("disagree"));
     // Second dispute → AlreadyProcessed
     cp.dispute_claim(&buyer, &claim_id, &symbol_short!("again"));
@@ -560,7 +560,7 @@ fn test_non_keeper_cannot_auto_process() {
     // A stranger that is not an authorized keeper tries to auto_process
     let stranger = Address::generate(&w.env);
     ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .auto_process(&stranger, &pol_id);
+        .auto_process(&stranger, &pol_id, &None);
 }
 
 /// Non-keeper cannot call process_claim.
@@ -577,7 +577,7 @@ fn test_non_keeper_cannot_process_claim() {
     let claim_id = cp.submit_claim(&buyer, &pol_id);
 
     let stranger = Address::generate(&w.env);
-    cp.process_claim(&stranger, &claim_id);
+    cp.process_claim(&stranger, &claim_id, &None);
 }
 
 // ── Issue #160: double-processing the same claim via process_claim ──────────────
@@ -600,11 +600,11 @@ fn test_process_claim_double_processing_returns_already_processed() {
     let claim_id = cp.submit_claim(&buyer, &pol_id);
 
     // First call settles the claim (Paid)
-    let first = cp.process_claim(&w.keeper, &claim_id);
+    let first = cp.process_claim(&w.keeper, &claim_id, &None);
     assert_eq!(first, ClaimResult::Paid);
 
     // Second call on same claim returns AlreadyProcessed
-    let second = cp.process_claim(&w.keeper, &claim_id);
+    let second = cp.process_claim(&w.keeper, &claim_id, &None);
     assert_eq!(second, ClaimResult::AlreadyProcessed);
 
     // Balance confirms exactly one payout — no double-spend
@@ -658,7 +658,7 @@ fn test_dispute_paid_claim_fails() {
 
     let cp       = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let claim_id = cp.submit_claim(&buyer, &pol_id);
-    assert_eq!(cp.process_claim(&w.keeper, &claim_id), ClaimResult::Paid);
+    assert_eq!(cp.process_claim(&w.keeper, &claim_id, &None), ClaimResult::Paid);
 
     cp.dispute_claim(&buyer, &claim_id, &symbol_short!("reason"));
 }
