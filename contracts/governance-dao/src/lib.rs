@@ -66,6 +66,12 @@ const DEFAULT_PARTICIPATION_WINDOW: u32 = 5;
 /// Upper bound on the participation window. Bounds both the stored history and
 /// the averaging loop.
 const MAX_PARTICIPATION_WINDOW: u32 = 20;
+/// Maximum delegators a single delegate may accept.
+///
+/// Bounds the loop that sums delegated weight at vote time — an unbounded
+/// delegate list would eventually make voting cost more instructions than a
+/// transaction can carry, which would lock that delegate out entirely.
+const MAX_DELEGATORS: u32 = 50;
 
 #[contracttype]
 enum StorageKey {
@@ -89,6 +95,13 @@ enum StorageKey {
     QuorumDecay,
     /// Rolling turnout history used to compute adaptive quorum.
     Participation,
+    /// Who an address has delegated its voting power to — Address → Address.
+    DelegateOf(Address),
+    /// Addresses currently delegating to an account — Address → Vec<Address>.
+    Delegators(Address),
+    /// Marks that a delegator's weight was already counted in a proposal, so
+    /// they cannot also vote it themselves — (proposal_id, delegator).
+    DelegatedVote(u64, Address),
     /// A registered proposal template (`ProposalTemplate`) by name.
     Template(Symbol),
     /// Names of all registered templates (`Vec<Symbol>`).
@@ -126,6 +139,11 @@ pub enum Error {
     InvalidThreshold = 23,
     QuorumTooLow = 24,
     InvalidQuorumDecay = 25,
+    SelfDelegation = 26,
+    NoDelegation = 27,
+    AlreadyDelegated = 28,
+    WeightAlreadyCounted = 29,
+    TooManyDelegators = 30,
     ProposalNotExpired = 26,
     TemplateNotFound = 27,
     TemplateInactive = 28,
@@ -385,6 +403,164 @@ impl GovernanceDao {
         proposal_id
     }
 
+    // ── Delegation (issue #363) ───────────────────────────────────────────────
+
+    /// Delegate this account's voting power to `delegate`.
+    ///
+    /// Delegation moves *authority*, not tokens. The delegator keeps custody of
+    /// their balance throughout — the DAO counts it toward the delegate's vote
+    /// at the moment that vote is cast, and the delegator can revoke at any
+    /// time. That matters: a design that required transferring tokens to a
+    /// delegate would make delegation a custody decision, which is a far higher
+    /// bar than the participation problem it is meant to solve.
+    ///
+    /// Weight is read live at vote time rather than snapshotted here, so a
+    /// delegator who sells their tokens stops lending weight they no longer
+    /// have.
+    ///
+    /// One hop only. Delegating to someone who has themselves delegated is
+    /// rejected: chains make the weight behind a vote impossible to see, and a
+    /// cycle would let weight be counted more than once.
+    pub fn delegate(env: Env, delegator: Address, delegate: Address) {
+        delegator.require_auth();
+
+        if delegator == delegate {
+            panic_with_error!(&env, Error::SelfDelegation);
+        }
+
+        // Refuse to build a chain — the delegate must vote for themselves.
+        if env
+            .storage()
+            .persistent()
+            .has(&StorageKey::DelegateOf(delegate.clone()))
+        {
+            panic_with_error!(&env, Error::SelfDelegation);
+        }
+
+        // A delegator cannot be a delegate: allowing both would create the
+        // same ambiguity as a chain, one hop later.
+        let own_delegators: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Delegators(delegator.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        if !own_delegators.is_empty() {
+            panic_with_error!(&env, Error::SelfDelegation);
+        }
+
+        let existing: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DelegateOf(delegator.clone()));
+        if let Some(current) = existing {
+            if current == delegate {
+                panic_with_error!(&env, Error::AlreadyDelegated);
+            }
+            // Re-pointing an existing delegation: detach from the old delegate
+            // first so their list cannot keep a stale entry.
+            Self::remove_delegator(&env, &current, &delegator);
+        }
+
+        let mut delegators: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Delegators(delegate.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if delegators.len() >= MAX_DELEGATORS {
+            panic_with_error!(&env, Error::TooManyDelegators);
+        }
+        delegators.push_back(delegator.clone());
+
+        env.storage()
+            .persistent()
+            .set(&StorageKey::DelegateOf(delegator.clone()), &delegate);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Delegators(delegate.clone()), &delegators);
+
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let weight = token::Client::new(&env, &config.gov_token).balance(&delegator);
+
+        env.events().publish(
+            (Symbol::new(&env, "power_delegated"),),
+            VotingPowerDelegated {
+                delegator,
+                delegate,
+                weight,
+            },
+        );
+    }
+
+    /// Withdraw a delegation, returning voting authority to the delegator.
+    ///
+    /// Effective immediately for any proposal the delegate has not already
+    /// voted on. Votes already cast are not unwound — the weight was counted
+    /// when the vote was recorded, and retroactively removing it would let a
+    /// delegator silently reverse a decision after the fact.
+    pub fn revoke_delegation(env: Env, delegator: Address) {
+        delegator.require_auth();
+
+        let delegate: Address = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DelegateOf(delegator.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoDelegation));
+
+        env.storage()
+            .persistent()
+            .remove(&StorageKey::DelegateOf(delegator.clone()));
+        Self::remove_delegator(&env, &delegate, &delegator);
+
+        env.events().publish(
+            (Symbol::new(&env, "delegation_revoked"),),
+            DelegationRevoked {
+                delegator,
+                delegate,
+            },
+        );
+    }
+
+    /// Who this address has delegated to, if anyone.
+    pub fn get_delegate(env: Env, delegator: Address) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::DelegateOf(delegator))
+    }
+
+    /// A delegate's standing: who delegates to them, and what a vote cast right
+    /// now would carry.
+    ///
+    /// Weight is computed from live balances, so this is a projection rather
+    /// than a promise — a delegator who moves tokens before the vote changes
+    /// the answer.
+    pub fn get_delegate_info(env: Env, delegate: Address) -> DelegateInfo {
+        let delegators: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Delegators(delegate.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let gov_token = token::Client::new(&env, &config.gov_token);
+
+        let mut delegated_weight: i128 = 0;
+        for i in 0..delegators.len() {
+            delegated_weight =
+                delegated_weight.saturating_add(gov_token.balance(&delegators.get_unchecked(i)));
+        }
+
+        let own_weight = gov_token.balance(&delegate);
+
+        DelegateInfo {
+            delegate,
+            delegators,
+            delegated_weight,
+            own_weight,
+            total_weight: own_weight.saturating_add(delegated_weight),
+        }
+    }
+
     /// Cast a vote (For/Against/Abstain) on an Active proposal.
     ///
     /// The voter's entire current gov-token balance is used as their vote
@@ -393,6 +569,7 @@ impl GovernanceDao {
     /// another address to vote again ("token cycling"). The locked amount
     /// is released later via `withdraw_tokens`, once the proposal is no
     /// longer Active. Each address may vote at most once per proposal.
+
     pub fn vote(env: Env, voter: Address, proposal_id: u64, choice: VoteChoice) {
         voter.require_auth();
 
@@ -419,7 +596,31 @@ impl GovernanceDao {
         let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
         let gov_token = token::Client::new(&env, &config.gov_token);
 
+        // A holder who has delegated has handed their authority away. Letting
+        // them vote too would count the same tokens twice — once here, once in
+        // their delegate's tally.
+        if env
+            .storage()
+            .persistent()
+            .has(&StorageKey::DelegateOf(voter.clone()))
+        {
+            panic_with_error!(&env, Error::WeightAlreadyCounted);
+        }
+
+        // Likewise if a delegate has already voted and swept this holder's
+        // weight into their own tally.
+        if env
+            .storage()
+            .persistent()
+            .has(&StorageKey::DelegatedVote(proposal_id, voter.clone()))
+        {
+            panic_with_error!(&env, Error::WeightAlreadyCounted);
+        }
+
         // 1. Capture voting balance weight
+        let own_weight = gov_token.balance(&voter);
+        if own_weight <= 0 {
+            panic_with_error!(&env, Error::InsufficientWeight);
         let mut weight = gov_token.balance(&voter);
         if weight <= 0 {
             // Check for delegated LP shares even if wallet balance is zero
@@ -435,11 +636,23 @@ impl GovernanceDao {
         }
 
         // 2. Lock tokens in the DAO contract to prevent token cycling / double-voting
-        gov_token.transfer(&voter, &env.current_contract_address(), &weight);
+        //
+        // Only the voter's own tokens are locked. Delegated weight is counted,
+        // never custodied — the DAO has no authority to move a delegator's
+        // balance, and taking it would turn delegation into a custody decision.
+        gov_token.transfer(&voter, &env.current_contract_address(), &own_weight);
+
+        // 3. Add any weight delegated to this voter, recording each delegator
+        //    so they cannot also vote this proposal themselves.
+        let delegated_weight = Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
+        let weight = own_weight.saturating_add(delegated_weight);
 
         // Save the tracked locked balance for later retrieval
+        // Only the voter's own tokens were transferred in, so only that amount
+        // is refundable — refunding `weight` would pay out delegated balances
+        // the contract never held.
         let lock_key = StorageKey::LockedBalance(proposal_id, voter.clone());
-        env.storage().persistent().set(&lock_key, &weight);
+        env.storage().persistent().set(&lock_key, &own_weight);
 
         match choice {
             VoteChoice::For => proposal.votes_for += weight,
@@ -1424,6 +1637,70 @@ impl GovernanceDao {
         env.storage()
             .instance()
             .set(&StorageKey::Participation, &history);
+    }
+
+    /// Remove `delegator` from `delegate`'s delegator list.
+    fn remove_delegator(env: &Env, delegate: &Address, delegator: &Address) {
+        let delegators: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Delegators(delegate.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+
+        let mut remaining: Vec<Address> = Vec::new(env);
+        for i in 0..delegators.len() {
+            let entry = delegators.get_unchecked(i);
+            if entry != *delegator {
+                remaining.push_back(entry);
+            }
+        }
+
+        if remaining.is_empty() {
+            env.storage()
+                .persistent()
+                .remove(&StorageKey::Delegators(delegate.clone()));
+        } else {
+            env.storage()
+                .persistent()
+                .set(&StorageKey::Delegators(delegate.clone()), &remaining);
+        }
+    }
+
+    /// Sum the live balances delegated to `voter` and mark each delegator as
+    /// counted for this proposal.
+    ///
+    /// Balances are read now rather than at delegation time, so weight follows
+    /// the tokens: a delegator who has sold since delegating lends nothing.
+    fn collect_delegated_weight(
+        env: &Env,
+        voter: &Address,
+        proposal_id: u64,
+        gov_token: &token::Client,
+    ) -> i128 {
+        let delegators: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Delegators(voter.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+
+        let mut total: i128 = 0;
+        for i in 0..delegators.len() {
+            let delegator = delegators.get_unchecked(i);
+            let balance = gov_token.balance(&delegator);
+            if balance <= 0 {
+                continue;
+            }
+
+            let marker = StorageKey::DelegatedVote(proposal_id, delegator.clone());
+            if env.storage().persistent().has(&marker) {
+                continue;
+            }
+            env.storage().persistent().set(&marker, &true);
+
+            total = total.saturating_add(balance);
+        }
+
+        total
     }
 
     fn require_admin(env: &Env, caller: &Address) {

@@ -57,11 +57,6 @@ trait IOracleVerifier {
     ) -> bool;
 }
 
-#[soroban_sdk::contractclient(name = "IdentityVerifierClient")]
-trait IIdentityVerifier {
-    fn is_verified(env: Env, address: Address) -> bool;
-}
-
 // ─── Storage TTL ──────────────────────────────────────────────────────────────
 
 /// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
@@ -125,27 +120,8 @@ enum StorageKey {
     GuardianThreshold,
     /// A pending, not-yet-executed contract upgrade awaiting guardian approvals.
     PendingUpgrade,
-    /// Whether `attestor` is authorized to submit cross-chain attestations
-    /// for `chain_id` — (chain_id, attestor) → bool.
-    CrossChainAttestor(Symbol, Address),
-    /// Registered attestor addresses for a chain_id (`Vec<Address>`).
-    CrossChainAttestorList(Symbol),
-    /// The most recent cross-chain attestation submitted for a policy_id.
-    CrossChainAttestation(u128),
-    /// Optional identity verifier contract address (Address).
-    IdentityVerifier,
-    /// Whether identity verification is required for claimants (bool).
-    IdentityVerificationRequired,
-    /// Optional stability fund contract address for payout smoothing (Address).
-    StabilityFund,
-    /// Payout smoothing factor in basis points (0-10000). When set, the
-    /// actual payout is blended toward the historical average to reduce
-    /// volatility. 0 = no smoothing (default); 10000 = full smoothing
-    /// (payout always equals the historical average).
-    PayoutSmoothingBps,
-    /// Running historical average payout in USDC stroops (i128), updated
-    /// with exponential moving average on each settlement.
-    HistoricalAveragePayout,
+    /// Seconds a claim may sit Pending before it can be escalated (u64).
+    EscalationThreshold,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -170,11 +146,8 @@ pub enum Error {
     NoPendingUpgrade     = 14,
     InvalidThreshold     = 15,
     AdminTimelockNotExpired = 16,
-    AttestorNotRegistered = 17,
-    NoAttestation        = 18,
-    AttestationStale     = 19,
-    IdentityNotVerified  = 20,
-    InvalidSmoothingBps  = 21,
+    NotEscalatable       = 17,
+    InvalidThresholdValue = 18,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -187,6 +160,20 @@ const LEDGER_SECONDS: u64 = 5;
 /// policy durations plus dispute-resolution time; capped to the network's
 /// max TTL at call time so `extend_ttl` never panics.
 const CLAIM_RETENTION_SECONDS: u64 = 365 * 24 * 60 * 60;
+
+/// How long a claim may sit Pending before anyone can escalate it, when the
+/// admin has not configured a threshold.
+///
+/// Seven days is long enough that ordinary keeper latency, oracle data still
+/// arriving, or a quiet weekend do not trip it, and short enough that a
+/// claimant is not left indefinitely without recourse. It is the point past
+/// which "still processing" stops being a plausible explanation.
+const DEFAULT_ESCALATION_THRESHOLD: u64 = 7 * 24 * 60 * 60;
+
+/// Shortest escalation threshold an admin may configure (1 hour). A near-zero
+/// threshold would let every claim be escalated on submission, which turns the
+/// signal into noise and defeats the purpose of having one.
+const MIN_ESCALATION_THRESHOLD: u64 = 60 * 60;
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
@@ -273,340 +260,6 @@ impl ClaimsProcessor {
             .unwrap_or(false)
     }
 
-    // ── Cross-Chain Verification (issue #380) ────────────────────────────────
-    //
-    // Stellar remains the canonical verification path: `evaluate_and_settle`
-    // (used by `process_claim`/`auto_process`) is untouched and always reads
-    // the Stellar oracle-verifier. This adds a second, explicit path for
-    // policies whose trigger condition can only be observed on another
-    // chain — a registered attestor (a relayer or bridge the admin trusts
-    // for that specific chain_id) submits a signed observation, which
-    // `process_cross_chain_claim` compares against the policy's trigger the
-    // same way the Stellar oracle path does. The trust boundary is explicit
-    // and per-chain: adding a chain means registering an attestor for it,
-    // never touches the Stellar oracle path, and each attestation is only
-    // ever used for the one policy it was submitted for.
-
-    /// Admin-only: authorize `attestor` to submit cross-chain attestations
-    /// for `chain_id`.
-    pub fn add_cross_chain_attestor(env: Env, admin: Address, chain_id: Symbol, attestor: Address) {
-        Self::require_admin(&env, &admin);
-        let key = StorageKey::CrossChainAttestor(chain_id.clone(), attestor.clone());
-        env.storage().persistent().set(&key, &true);
-        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
-
-        let list_key = StorageKey::CrossChainAttestorList(chain_id.clone());
-        let mut list: Vec<Address> = env.storage().instance()
-            .get(&list_key).unwrap_or_else(|| Vec::new(&env));
-        if list.first_index_of(attestor.clone()).is_none() {
-            list.push_back(attestor.clone());
-            env.storage().instance().set(&list_key, &list);
-        }
-
-        env.events().publish(
-            (Symbol::new(&env, "cross_chain_attestor_added"),),
-            CrossChainAttestorAdded { chain_id, attestor },
-        );
-    }
-
-    /// Admin-only: revoke `attestor`'s authorization for `chain_id`.
-    pub fn remove_cross_chain_attestor(env: Env, admin: Address, chain_id: Symbol, attestor: Address) {
-        Self::require_admin(&env, &admin);
-        env.storage().persistent()
-            .remove(&StorageKey::CrossChainAttestor(chain_id.clone(), attestor.clone()));
-
-        let list_key = StorageKey::CrossChainAttestorList(chain_id.clone());
-        let list: Vec<Address> = env.storage().instance()
-            .get(&list_key).unwrap_or_else(|| Vec::new(&env));
-        if let Some(idx) = list.first_index_of(attestor.clone()) {
-            let mut pruned = list;
-            pruned.remove(idx);
-            env.storage().instance().set(&list_key, &pruned);
-        }
-
-        env.events().publish(
-            (Symbol::new(&env, "cross_chain_attestor_removed"),),
-            CrossChainAttestorRemoved { chain_id, attestor },
-        );
-    }
-
-    /// Whether `attestor` is currently authorized for `chain_id`.
-    pub fn is_cross_chain_attestor(env: Env, chain_id: Symbol, attestor: Address) -> bool {
-        env.storage().persistent()
-            .get(&StorageKey::CrossChainAttestor(chain_id, attestor))
-            .unwrap_or(false)
-    }
-
-    /// Return the registered attestor addresses for `chain_id`.
-    pub fn get_cross_chain_attestors(env: Env, chain_id: Symbol) -> Vec<Address> {
-        env.storage().instance()
-            .get(&StorageKey::CrossChainAttestorList(chain_id))
-            .unwrap_or_else(|| Vec::new(&env))
-    }
-
-    /// Submit a cross-chain attestation for `policy_id`'s trigger condition.
-    ///
-    /// Only an address registered via `add_cross_chain_attestor` for
-    /// `chain_id` may call this. `proof_hash` is opaque to the contract — a
-    /// hash of whatever off-chain proof (light-client proof, relayer
-    /// message, oracle report) backs `observed_value`, kept for audit/
-    /// dispute purposes but not verified on-chain. Overwrites any prior
-    /// attestation for the same policy; only the latest is used to settle.
-    pub fn submit_cross_chain_attestation(
-        env: Env,
-        attestor: Address,
-        policy_id: u128,
-        chain_id: Symbol,
-        observed_value: i128,
-        proof_hash: BytesN<32>,
-        timestamp: u64,
-    ) {
-        attestor.require_auth();
-
-        let authorized: bool = env.storage().persistent()
-            .get(&StorageKey::CrossChainAttestor(chain_id.clone(), attestor.clone()))
-            .unwrap_or(false);
-        if !authorized {
-            panic_with_error!(&env, Error::AttestorNotRegistered);
-        }
-
-        let now = env.ledger().timestamp();
-        if timestamp > now {
-            panic_with_error!(&env, Error::AttestationStale);
-        }
-
-        let attestation = CrossChainAttestation {
-            chain_id: chain_id.clone(),
-            attestor: attestor.clone(),
-            observed_value,
-            proof_hash,
-            timestamp,
-        };
-        let key = StorageKey::CrossChainAttestation(policy_id);
-        env.storage().persistent().set(&key, &attestation);
-        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
-
-        env.events().publish(
-            (Symbol::new(&env, "cc_attestation_submitted"),),
-            CrossChainAttestationSubmitted {
-                policy_id,
-                chain_id,
-                attestor,
-                observed_value,
-                timestamp,
-            },
-        );
-    }
-
-    /// Return the most recent cross-chain attestation submitted for
-    /// `policy_id`, if any.
-    pub fn get_cross_chain_attestation(env: Env, policy_id: u128) -> Option<CrossChainAttestation> {
-        env.storage().persistent().get(&StorageKey::CrossChainAttestation(policy_id))
-    }
-
-    // ── Identity Verification (issue #384) ──────────────────────────────────
-
-    /// Admin-only: set the identity verifier contract address. The contract
-    /// must implement `is_verified(Address) -> bool`.
-    pub fn set_identity_verifier(env: Env, admin: Address, verifier: Address) {
-        Self::require_admin(&env, &admin);
-        Self::validate_stellar_address(&env, &verifier);
-        env.storage().instance().set(&StorageKey::IdentityVerifier, &verifier);
-        env.events().publish(
-            (Symbol::new(&env, "identity_verifier_set"),),
-            verifier,
-        );
-    }
-
-    /// Admin-only: enable or disable mandatory identity verification for
-    /// claimants. When enabled, `submit_claim` and `auto_process` check
-    /// that the policyholder has passed KYC via the configured identity
-    /// verifier before accepting or processing a claim.
-    pub fn set_kyc_required(env: Env, admin: Address, required: bool) {
-        Self::require_admin(&env, &admin);
-        env.storage().instance().set(&StorageKey::IdentityVerificationRequired, &required);
-        env.events().publish(
-            (Symbol::new(&env, "kyc_required_toggled"),),
-            required,
-        );
-    }
-
-    /// Whether identity verification is currently required.
-    pub fn is_kyc_required(env: Env) -> bool {
-        env.storage().instance()
-            .get(&StorageKey::IdentityVerificationRequired)
-            .unwrap_or(false)
-    }
-
-    /// Return the configured identity verifier contract address, if any.
-    pub fn get_identity_verifier(env: Env) -> Option<Address> {
-        env.storage().instance().get(&StorageKey::IdentityVerifier)
-    }
-
-    /// Panic with `IdentityNotVerified` if identity verification is enabled
-    /// and the claimant has not passed KYC via the identity verifier.
-    fn require_identity_verification(env: &Env, claimant: &Address) {
-        let required: bool = env.storage().instance()
-            .get(&StorageKey::IdentityVerificationRequired)
-            .unwrap_or(false);
-        if !required {
-            return;
-        }
-        let verifier_addr: Address = env.storage().instance()
-            .get(&StorageKey::IdentityVerifier)
-            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
-        let verified = IdentityVerifierClient::new(env, &verifier_addr)
-            .is_verified(claimant);
-        if !verified {
-            panic_with_error!(env, Error::IdentityNotVerified);
-        }
-    }
-
-    // ── Payout Stability (issue #398) ──────────────────────────────────────
-
-    /// Admin-only: set the stability fund address. When payout smoothing is
-    /// enabled, excess payouts (above the historical average) draw from this
-    /// fund, and below-average payouts deposit the surplus here.
-    pub fn set_stability_fund(env: Env, admin: Address, fund: Address) {
-        Self::require_admin(&env, &admin);
-        Self::validate_stellar_address(&env, &fund);
-        env.storage().instance().set(&StorageKey::StabilityFund, &fund);
-        env.events().publish(
-            (Symbol::new(&env, "stability_fund_set"),),
-            fund,
-        );
-    }
-
-    /// Admin-only: configure payout smoothing. `smoothing_bps` controls how
-    /// aggressively payouts are blended toward the historical average:
-    ///   - 0 = no smoothing (default, payout = coverage_amount)
-    ///   - 5000 = 50% smoothing (payout = 50% coverage + 50% avg)
-    ///   - 10000 = full smoothing (payout always = historical average)
-    ///
-    /// Requires a stability fund to be set first.
-    pub fn set_payout_smoothing_bps(env: Env, admin: Address, smoothing_bps: u32) {
-        Self::require_admin(&env, &admin);
-        if smoothing_bps > 10_000 {
-            panic_with_error!(&env, Error::InvalidSmoothingBps);
-        }
-        if smoothing_bps > 0 {
-            // Ensure stability fund is configured when smoothing is enabled
-            if !env.storage().instance().has(&StorageKey::StabilityFund) {
-                panic_with_error!(&env, Error::NotInitialized);
-            }
-        }
-        env.storage().instance().set(&StorageKey::PayoutSmoothingBps, &smoothing_bps);
-        env.events().publish(
-            (Symbol::new(&env, "payout_smoothing_updated"),),
-            smoothing_bps,
-        );
-    }
-
-    /// Return the current payout smoothing configuration.
-    pub fn get_payout_smoothing_bps(env: Env) -> u32 {
-        env.storage().instance()
-            .get(&StorageKey::PayoutSmoothingBps)
-            .unwrap_or(0)
-    }
-
-    /// Return the running historical average payout.
-    pub fn get_historical_average_payout(env: Env) -> i128 {
-        env.storage().instance()
-            .get(&StorageKey::HistoricalAveragePayout)
-            .unwrap_or(0)
-    }
-
-    /// Apply payout smoothing: blend the raw payout toward the historical
-    /// average and emit an event for the backend to handle the stability
-    /// fund transfer. Returns the smoothed payout amount.
-    fn apply_payout_smoothing(env: &Env, raw_payout: i128) -> i128 {
-        let smoothing_bps: u32 = env.storage().instance()
-            .get(&StorageKey::PayoutSmoothingBps)
-            .unwrap_or(0);
-        if smoothing_bps == 0 {
-            return raw_payout;
-        }
-
-        let avg: i128 = env.storage().instance()
-            .get(&StorageKey::HistoricalAveragePayout)
-            .unwrap_or(raw_payout);
-
-        // smoothed = (raw * (10000 - smoothing_bps) + avg * smoothing_bps) / 10000
-        let inv_bps = (10_000u32).saturating_sub(smoothing_bps) as i128;
-        let smooth_bps = smoothing_bps as i128;
-        let smoothed = (raw_payout * inv_bps + avg * smooth_bps) / 10_000;
-
-        // Update historical average with exponential moving average:
-        // new_avg = (old_avg * 9 + smoothed) / 10  (EMA with alpha=0.1)
-        let new_avg = (avg * 9 + smoothed) / 10;
-        env.storage().instance().set(&StorageKey::HistoricalAveragePayout, &new_avg);
-
-        // Emit event for backend to handle stability fund transfer
-        let diff = raw_payout - smoothed;
-        if diff != 0 {
-            if let Some(fund_addr) = env.storage().instance().get::<_, Address>(&StorageKey::StabilityFund) {
-                env.events().publish(
-                    (Symbol::new(env, "payout_stabilized"),),
-                    (raw_payout, smoothed, diff, fund_addr),
-                );
-            }
-        }
-
-        smoothed
-    }
-
-    /// Settle a claim using a previously submitted cross-chain attestation
-    /// instead of the Stellar oracle-verifier.
-    ///
-    /// Requires an attestation on file for the claim's policy, no older than
-    /// `staleness_threshold` seconds (the same freshness bar the Stellar
-    /// path enforces). The attestation's `observed_value` is compared
-    /// against the policy's trigger threshold/comparison exactly as the
-    /// Stellar oracle path does; payout/rejection then follows the same
-    /// settlement logic as `process_claim`.
-    pub fn process_cross_chain_claim(
-        env: Env,
-        keeper: Address,
-        claim_id: u128,
-        partial_payout_bps: Option<u32>,
-    ) -> ClaimResult {
-        Self::require_keeper(&env, &keeper);
-        Self::require_not_paused(&env);
-        let mut claim: Claim = env.storage().persistent()
-            .get(&StorageKey::Claim(claim_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
-
-        if claim.status != ClaimStatus::Pending {
-            return ClaimResult::AlreadyProcessed;
-        }
-
-        let policy_engine: Address = env.storage().instance()
-            .get(&StorageKey::PolicyEngine)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-        let policy = PolicyEngineClient::new(&env, &policy_engine)
-            .get_policy(&claim.policy_id);
-
-        let attestation: CrossChainAttestation = env.storage().persistent()
-            .get(&StorageKey::CrossChainAttestation(claim.policy_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NoAttestation));
-
-        let staleness_threshold: u64 = env.storage().instance()
-            .get(&StorageKey::StalenessThreshold)
-            .unwrap_or(604_800u64);
-        let now = env.ledger().timestamp();
-        if now.saturating_sub(attestation.timestamp) > staleness_threshold {
-            panic_with_error!(&env, Error::AttestationStale);
-        }
-
-        let trigger_met = evaluate_comparison(
-            attestation.observed_value,
-            policy.trigger_threshold,
-            &policy.trigger_comparison,
-        );
-
-        Self::settle_claim(&env, &mut claim, partial_payout_bps, trigger_met)
-    }
-
     // ── Claim Submission ─────────────────────────────────────────────────────
 
     /// Manually submit a claim for a policy. Returns the new claim ID.
@@ -614,7 +267,6 @@ impl ClaimsProcessor {
     pub fn submit_claim(env: Env, claimant: Address, policy_id: u128) -> u128 {
         claimant.require_auth();
         Self::require_not_paused(&env);
-        Self::require_identity_verification(&env, &claimant);
 
         // Guard: one claim per policy
         if env.storage().persistent().has(&StorageKey::PolicyClaim(policy_id)) {
@@ -751,8 +403,6 @@ impl ClaimsProcessor {
             parashield_policy_engine::PolicyStatus::Cancelled  => return ClaimResult::PolicyNotActive,
             parashield_policy_engine::PolicyStatus::Active     => {}
         }
-
-        Self::require_identity_verification(&env, &policy.policyholder);
 
         // Check if policy has expired with no trigger
         let now = env.ledger().timestamp();
@@ -1290,6 +940,165 @@ impl ClaimsProcessor {
         // if old_version < 3 && new_version >= 3 { Self::migrate_v2_to_v3(env); }
     }
 
+    // ── Escalation (issue #376) ───────────────────────────────────────────────
+
+    /// Set how long a claim may sit Pending before it can be escalated.
+    ///
+    /// Floored at `MIN_ESCALATION_THRESHOLD` (1 hour): a near-zero threshold
+    /// would make every claim escalatable the moment it is submitted, which
+    /// turns the signal into noise and leaves genuinely stuck claims no easier
+    /// to find than they are today.
+    pub fn set_escalation_threshold(env: Env, admin: Address, threshold: u64) {
+        Self::require_admin(&env, &admin);
+
+        if threshold < MIN_ESCALATION_THRESHOLD {
+            panic_with_error!(&env, Error::InvalidThresholdValue);
+        }
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::EscalationThreshold, &threshold);
+
+        env.events().publish(
+            (Symbol::new(&env, "escalation_threshold_set"),),
+            EscalationThresholdUpdated { threshold },
+        );
+    }
+
+    /// The escalation threshold in seconds (default: 7 days).
+    pub fn get_escalation_threshold(env: Env) -> u64 {
+        Self::escalation_threshold(&env)
+    }
+
+    /// How long a claim has been waiting, and whether it can be escalated yet.
+    ///
+    /// Returns a value rather than panicking, so a claimant's UI can show
+    /// "escalatable in 2 days" instead of offering a button that reverts.
+    pub fn get_claim_age(env: Env, claim_id: u128) -> ClaimAgeInfo {
+        let claim: Claim = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+
+        let threshold = Self::escalation_threshold(&env);
+        let now = env.ledger().timestamp();
+        let is_pending = claim.status == ClaimStatus::Pending;
+        let pending_for = if is_pending {
+            now.saturating_sub(claim.submitted_at)
+        } else {
+            0
+        };
+
+        ClaimAgeInfo {
+            claim_id,
+            status: claim.status,
+            submitted_at: claim.submitted_at,
+            pending_for,
+            escalation_threshold: threshold,
+            escalatable: is_pending && pending_for >= threshold,
+            seconds_until_escalatable: if !is_pending {
+                0
+            } else {
+                threshold.saturating_sub(pending_for)
+            },
+        }
+    }
+
+    /// Escalate a claim that has been Pending past the threshold.
+    ///
+    /// A claim that nothing processes is worse than a rejected one: a
+    /// rejection can be disputed, but a claim stuck in Pending gives the
+    /// claimant nothing to act on and no signal that anything is wrong. This
+    /// moves it to `Escalated`, emits `ClaimEscalated`, and takes it out of the
+    /// automated pending queue so manual review can pick it up.
+    ///
+    /// Permissionless by design. The person with the strongest interest in
+    /// escalating is the claimant who is waiting, and requiring a keeper or the
+    /// admin to do it would mean the party responsible for the delay is also
+    /// the only party able to flag it.
+    ///
+    /// Escalation does not decide the claim. It records that processing is
+    /// overdue and hands it to review — the outcome still comes from a normal
+    /// resolution path.
+    pub fn escalate_claim(env: Env, caller: Address, claim_id: u128) {
+        caller.require_auth();
+        Self::require_not_paused(&env);
+
+        let mut claim: Claim = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+
+        if claim.status != ClaimStatus::Pending {
+            panic_with_error!(&env, Error::NotEscalatable);
+        }
+
+        let now = env.ledger().timestamp();
+        let pending_for = now.saturating_sub(claim.submitted_at);
+        if pending_for < Self::escalation_threshold(&env) {
+            panic_with_error!(&env, Error::NotEscalatable);
+        }
+
+        claim.status = ClaimStatus::Escalated;
+        let policy_id = claim.policy_id;
+        let claimant = claim.claimant.clone();
+
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Claim(claim_id), &claim);
+        Self::extend_claim_ttl(&env, &StorageKey::Claim(claim_id));
+
+        // Drop it from the automated queue — a keeper sweeping pending claims
+        // should not keep retrying one that has been handed to review.
+        Self::remove_from_pending(&env, claim_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "claim_escalated"),),
+            ClaimEscalated {
+                claim_id,
+                policy_id,
+                claimant,
+                pending_for,
+                escalated_by: caller,
+            },
+        );
+    }
+
+    /// Claim IDs that are Pending and past the escalation threshold.
+    ///
+    /// Lets a monitoring job find stuck claims in one call rather than probing
+    /// each one, which is what makes the threshold actionable in practice.
+    pub fn get_escalatable_claims(env: Env) -> Vec<u128> {
+        let pending: Vec<u128> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PendingClaims)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let threshold = Self::escalation_threshold(&env);
+        let now = env.ledger().timestamp();
+        let mut overdue: Vec<u128> = Vec::new(&env);
+
+        for i in 0..pending.len() {
+            let cid = pending.get_unchecked(i);
+            if let Some(claim) = env
+                .storage()
+                .persistent()
+                .get::<_, Claim>(&StorageKey::Claim(cid))
+            {
+                if claim.status == ClaimStatus::Pending
+                    && now.saturating_sub(claim.submitted_at) >= threshold
+                {
+                    overdue.push_back(cid);
+                }
+            }
+        }
+
+        overdue
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     /// Evaluate a pending claim and settle it against the configured oracle trigger.
@@ -1320,6 +1129,12 @@ impl ClaimsProcessor {
         let oracle_verifier: Address = env.storage().instance()
             .get(&StorageKey::OracleVerifier)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        let policy_engine: Address = env.storage().instance()
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        let risk_pool: Address = env.storage().instance()
+            .get(&StorageKey::RiskPool)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         // Configurable staleness threshold (default 7 days = 604_800 s if not set)
         let staleness_threshold: u64 = env.storage().instance()
             .get(&StorageKey::StalenessThreshold)
@@ -1343,27 +1158,6 @@ impl ClaimsProcessor {
                 &staleness_threshold,
             );
 
-        Self::settle_claim(env, claim, partial_payout_bps, trigger_met)
-    }
-
-    /// Shared settlement path used by both the Stellar-oracle evaluation
-    /// (`evaluate_and_settle`) and the cross-chain path
-    /// (`process_cross_chain_claim`) — the only difference between the two
-    /// verification routes is how `trigger_met` was decided; once it's
-    /// known, paying out, rejecting, and bookkeeping are identical.
-    fn settle_claim(
-        env: &Env,
-        claim: &mut Claim,
-        partial_payout_bps: Option<u32>,
-        trigger_met: bool,
-    ) -> ClaimResult {
-        let policy_engine: Address = env.storage().instance()
-            .get(&StorageKey::PolicyEngine)
-            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
-        let risk_pool: Address = env.storage().instance()
-            .get(&StorageKey::RiskPool)
-            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
-
         claim.trigger_met  = trigger_met;
         claim.processed_at = Some(env.ledger().timestamp());
 
@@ -1373,11 +1167,9 @@ impl ClaimsProcessor {
             let effective_bps = if bps > 10_000 { 10_000 } else { bps };
 
             if effective_bps >= 10_000 {
-                // Full payment — apply payout smoothing if configured
-                let raw_payout = claim.coverage_amount;
-                let smoothed_payout = Self::apply_payout_smoothing(env, raw_payout);
+                // Full payment
                 claim.status = ClaimStatus::Paid;
-                claim.paid_amount = Some(smoothed_payout);
+                claim.paid_amount = Some(claim.coverage_amount);
                 claim.partial_payout_bps = Some(10_000);
                 PolicyEngineClient::new(env, &policy_engine)
                     .pay_claim(&env.current_contract_address(), &claim.policy_id);
@@ -1386,11 +1178,10 @@ impl ClaimsProcessor {
                     .release_for_claim(&env.current_contract_address(), &claim.policy_id);
                 ClaimResult::Paid
             } else {
-                // Partial payment: calculate proportional payout, then smooth
-                let raw_paid = claim.coverage_amount * (effective_bps as i128) / 10_000;
-                let smoothed_paid = Self::apply_payout_smoothing(env, raw_paid);
+                // Partial payment: calculate proportional payout
+                let paid = claim.coverage_amount * (effective_bps as i128) / 10_000;
                 claim.status = ClaimStatus::PartiallyPaid;
-                claim.paid_amount = Some(smoothed_paid);
+                claim.paid_amount = Some(paid);
                 claim.partial_payout_bps = Some(effective_bps);
                 PolicyEngineClient::new(env, &policy_engine)
                     .pay_claim(&env.current_contract_address(), &claim.policy_id);
@@ -1434,6 +1225,15 @@ impl ClaimsProcessor {
     }
 
     /// Remove a claim id from the pending queue, if present.
+
+    /// The configured escalation threshold, or the default.
+    fn escalation_threshold(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::EscalationThreshold)
+            .unwrap_or(DEFAULT_ESCALATION_THRESHOLD)
+    }
+
     fn remove_from_pending(env: &Env, claim_id: u128) {
         let mut pending: Vec<u128> = env.storage().instance()
             .get(&StorageKey::PendingClaims)
@@ -1509,22 +1309,6 @@ impl ClaimsProcessor {
         if buf[0] != b'G' && buf[0] != b'C' {
             panic_with_error!(env, Error::InvalidAddress);
         }
-    }
-}
-
-/// Evaluate a policy's trigger comparison directly against an observed
-/// value, without going through the oracle-verifier contract. Used by the
-/// cross-chain attestation path, which has no oracle data of its own to
-/// aggregate — only whatever single value the attestor reported.
-fn evaluate_comparison(
-    observed: i128,
-    threshold: i128,
-    comparison: &parashield_policy_engine::TriggerComparison,
-) -> bool {
-    match comparison {
-        parashield_policy_engine::TriggerComparison::LessThan => observed < threshold,
-        parashield_policy_engine::TriggerComparison::GreaterThan => observed > threshold,
-        parashield_policy_engine::TriggerComparison::Equal => observed == threshold,
     }
 }
 

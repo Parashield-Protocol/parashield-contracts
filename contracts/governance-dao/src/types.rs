@@ -176,6 +176,34 @@ pub struct EffectiveQuorum {
     pub decayed: bool,
 }
 
+/// A standing delegation of voting power from one holder to another.
+///
+/// Delegation transfers *authority*, never tokens. The delegator keeps custody
+/// throughout — the DAO simply counts their balance toward the delegate's vote
+/// at the moment that vote is cast.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Delegation {
+    pub delegator: Address,
+    pub delegate: Address,
+    pub delegated_at: u64,
+}
+
+/// A delegate's standing, for display and for pre-vote checks.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegateInfo {
+    pub delegate: Address,
+    /// Addresses currently delegating to this account.
+    pub delegators: Vec<Address>,
+    /// Sum of those delegators' live token balances.
+    pub delegated_weight: i128,
+    /// The delegate's own balance.
+    pub own_weight: i128,
+    /// `own_weight + delegated_weight` — what a vote right now would carry.
+    pub total_weight: i128,
+}
+
 // ─── Events ──────────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -236,6 +264,21 @@ pub struct DaoConfigUpdated {
     pub total_supply: i128,
     pub voting_period: u64,
     pub proposal_timelock: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VotingPowerDelegated {
+    pub delegator: Address,
+    pub delegate: Address,
+    pub weight: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegationRevoked {
+    pub delegator: Address,
+    pub delegate: Address,
 }
 
 #[contracttype]
