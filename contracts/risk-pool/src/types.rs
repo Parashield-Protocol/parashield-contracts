@@ -41,6 +41,29 @@ pub struct LpPosition {
     pub yield_debt:        i128,
     pub deposited_at:      u64,
     pub last_yield_claim:  u64,
+    /// Whether this LP has opted into compound yield (reinvest instead of claim).
+    pub compound_enabled:  bool,
+}
+
+/// A soulbound NFT representing an LP's position in the pool.
+/// Non-transferable by design — only the provider can interact with it.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LpNft {
+    /// Unique token ID (sequential, minted on first deposit).
+    pub token_id:    u64,
+    /// The LP provider address.
+    pub provider:    Address,
+    /// Pool category this NFT represents.
+    pub category:    Symbol,
+    /// Timestamp when the NFT was minted (first deposit).
+    pub minted_at:   u64,
+    /// Current share count held by this position.
+    pub shares:      i128,
+    /// Total deposited amount.
+    pub deposited:   i128,
+    /// Whether the position is still active (shares > 0).
+    pub active:      bool,
 }
 
 /// A capital lock placed on the pool when a policy is active.
@@ -289,4 +312,30 @@ pub struct ParameterChangeExecuted {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParameterChangeCancelled {
     pub admin: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LpNftMinted {
+    pub token_id:  u64,
+    pub provider:  Address,
+    pub category:  Symbol,
+    pub minted_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LpNftUpdated {
+    pub token_id:  u64,
+    pub provider:  Address,
+    pub shares:    i128,
+    pub deposited: i128,
+    pub active:    bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompoundYieldToggled {
+    pub provider:  Address,
+    pub enabled:   bool,
 }

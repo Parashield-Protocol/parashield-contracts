@@ -289,6 +289,8 @@ impl ClaimsProcessor {
             submitted_at: now,
             processed_at: None,
             dispute_reason: None,
+            paid_amount: None,
+            partial_payout_bps: None,
         };
         env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
         env.storage().persistent().extend_ttl(&StorageKey::Claim(claim_id), TTL_THRESHOLD, TTL_EXTEND_TO);
@@ -314,7 +316,16 @@ impl ClaimsProcessor {
     }
 
     /// Process an existing pending claim. Reads oracle data and pays out or rejects.
-    pub fn process_claim(env: Env, keeper: Address, claim_id: u128) -> ClaimResult {
+    ///
+    /// `partial_payout_bps` is an optional payout ratio in basis points (0-10000).
+    /// - `None` or `Some(10000)` → full coverage payment (default behavior).
+    /// - `Some(bps)` where bps < 10000 → proportional partial payment, e.g. `Some(5000)` pays 50%.
+    pub fn process_claim(
+        env: Env,
+        keeper: Address,
+        claim_id: u128,
+        partial_payout_bps: Option<u32>,
+    ) -> ClaimResult {
         Self::require_keeper(&env, &keeper);
         Self::require_not_paused(&env);
         let mut claim: Claim = env.storage().persistent()
@@ -331,13 +342,20 @@ impl ClaimsProcessor {
         let policy = PolicyEngineClient::new(&env, &policy_engine)
             .get_policy(&claim.policy_id);
 
-        Self::evaluate_and_settle(&env, &mut claim, &policy)
+        Self::evaluate_and_settle(&env, &mut claim, &policy, partial_payout_bps)
     }
 
     /// Keeper-triggered automatic processing — no prior `submit_claim` needed.
     /// This is the primary flow for parametric insurance.
     /// Returns AlreadyClaimed / Expired idempotently if policy is already settled.
-    pub fn auto_process(env: Env, keeper: Address, policy_id: u128) -> ClaimResult {
+    ///
+    /// `partial_payout_bps` — see `process_claim` for details.
+    pub fn auto_process(
+        env: Env,
+        keeper: Address,
+        policy_id: u128,
+        partial_payout_bps: Option<u32>,
+    ) -> ClaimResult {
         Self::require_keeper(&env, &keeper);
         Self::require_not_paused(&env);
 
@@ -402,6 +420,8 @@ impl ClaimsProcessor {
                 submitted_at: now,
                 processed_at: None,
                 dispute_reason: None,
+                paid_amount: None,
+                partial_payout_bps: None,
             };
             env.storage().persistent().set(&StorageKey::Claim(cid), &claim);
             env.storage().persistent().extend_ttl(&StorageKey::Claim(cid), TTL_THRESHOLD, TTL_EXTEND_TO);
@@ -433,7 +453,7 @@ impl ClaimsProcessor {
         if claim.status != ClaimStatus::Pending {
             return ClaimResult::AlreadyProcessed;
         }
-        Self::evaluate_and_settle(&env, &mut claim, &policy)
+        Self::evaluate_and_settle(&env, &mut claim, &policy, partial_payout_bps)
     }
 
     /// Process up to `limit` pending claims parametrically in one call.
@@ -475,7 +495,7 @@ impl ClaimsProcessor {
 
             let policy = PolicyEngineClient::new(&env, &policy_engine)
                 .get_policy(&claim.policy_id);
-            let result = Self::evaluate_and_settle(&env, &mut claim, &policy);
+            let result = Self::evaluate_and_settle(&env, &mut claim, &policy, None);
             results.push_back((claim_id, result));
         }
         results
@@ -492,11 +512,12 @@ impl ClaimsProcessor {
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
         if claim.claimant != claimant { panic_with_error!(&env, Error::Unauthorized); }
-        // Only open (Pending) or rejected claims are disputable. Paid claims are
-        // already settled (USDC transferred), Disputed claims are already open,
-        // and Expired claims should not be reopened through a dispute flow.
+        // Only open (Pending), rejected, or partially-paid claims are disputable.
+        // Fully Paid claims are already settled (USDC transferred), Disputed
+        // claims are already open, and Expired claims should not be reopened.
         if claim.status != ClaimStatus::Pending
             && claim.status != ClaimStatus::Rejected
+            && claim.status != ClaimStatus::PartiallyPaid
         {
             panic_with_error!(&env, Error::AlreadyProcessed);
         }
@@ -918,7 +939,12 @@ impl ClaimsProcessor {
     /// as rejected and no payout is issued. In either case, the claim record is
     /// persisted, its pending-queue entry is removed, and a settlement event is
     /// emitted so the outcome is observable off-chain.
-    fn evaluate_and_settle(env: &Env, claim: &mut Claim, policy: &parashield_policy_engine::Policy) -> ClaimResult {
+    fn evaluate_and_settle(
+        env: &Env,
+        claim: &mut Claim,
+        policy: &parashield_policy_engine::Policy,
+        partial_payout_bps: Option<u32>,
+    ) -> ClaimResult {
         // Validate claim is in Pending state before transitioning (atomic state guard)  
         if claim.status != ClaimStatus::Pending {
             panic_with_error!(env, Error::AlreadyProcessed);
@@ -959,14 +985,34 @@ impl ClaimsProcessor {
         claim.processed_at = Some(env.ledger().timestamp());
 
         let result = if trigger_met {
-            claim.status = ClaimStatus::Paid;
-            PolicyEngineClient::new(env, &policy_engine)
-                .pay_claim(&env.current_contract_address(), &claim.policy_id);
-            // Atomic lock release: release coverage lock after successful payment.
-            // If release fails, the entire transaction reverts, leaving state unchanged.
-            RiskPoolClient::new(env, &risk_pool)
-                .release_for_claim(&env.current_contract_address(), &claim.policy_id);
-            ClaimResult::Paid
+            // Determine payout: full or partial based on partial_payout_bps.
+            let bps = partial_payout_bps.unwrap_or(10_000);
+            let effective_bps = if bps > 10_000 { 10_000 } else { bps };
+
+            if effective_bps >= 10_000 {
+                // Full payment
+                claim.status = ClaimStatus::Paid;
+                claim.paid_amount = Some(claim.coverage_amount);
+                claim.partial_payout_bps = Some(10_000);
+                PolicyEngineClient::new(env, &policy_engine)
+                    .pay_claim(&env.current_contract_address(), &claim.policy_id);
+                // Atomic lock release
+                RiskPoolClient::new(env, &risk_pool)
+                    .release_for_claim(&env.current_contract_address(), &claim.policy_id);
+                ClaimResult::Paid
+            } else {
+                // Partial payment: calculate proportional payout
+                let paid = claim.coverage_amount * (effective_bps as i128) / 10_000;
+                claim.status = ClaimStatus::PartiallyPaid;
+                claim.paid_amount = Some(paid);
+                claim.partial_payout_bps = Some(effective_bps);
+                PolicyEngineClient::new(env, &policy_engine)
+                    .pay_claim(&env.current_contract_address(), &claim.policy_id);
+                // Atomic lock release
+                RiskPoolClient::new(env, &risk_pool)
+                    .release_for_claim(&env.current_contract_address(), &claim.policy_id);
+                ClaimResult::PartiallyPaid
+            }
         } else {
             claim.status = ClaimStatus::Rejected;
             ClaimResult::Rejected

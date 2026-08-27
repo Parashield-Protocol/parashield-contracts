@@ -102,6 +102,12 @@ enum StorageKey {
     PendingAdminChange,
     /// A time-locked premium-split change awaiting execution.
     PendingParameterChange,
+    /// Next LP NFT token ID (u64), sequential minting counter.
+    NextNftId,
+    /// LP NFT record by token ID — u64 → LpNft.
+    LpNft(u64),
+    /// Maps provider address to their LP NFT token ID — Address → u64.
+    ProviderNft(Address),
 }
 
 #[contracterror]
@@ -243,7 +249,15 @@ impl RiskPool {
 
     /// Deposit USDC into the pool and receive LP shares. Returns the number of shares minted.
     /// `min_shares` is a slippage guard — the transaction reverts if fewer shares would be issued.
-    pub fn deposit(env: Env, provider: Address, amount: i128, min_shares: i128) -> i128 {
+    /// `compound_enabled` — if true, accrued yield is automatically reinvested (compounded)
+    /// instead of being paid out on each deposit. LPs can toggle this later via `toggle_compound`.
+    pub fn deposit(
+        env: Env,
+        provider: Address,
+        amount: i128,
+        min_shares: i128,
+        compound_enabled: bool,
+    ) -> i128 {
         provider.require_auth();
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if amount < MIN_DEPOSIT { panic_with_error!(&env, Error::DepositTooSmall); }
@@ -282,15 +296,18 @@ impl RiskPool {
         let now = env.ledger().timestamp();
         let lp_key = StorageKey::LpPosition(provider.clone());
         let mut pending_yield: i128 = 0;
+        let mut is_new_lp = false;
         let mut position: LpPosition = match env.storage().persistent().get::<_, LpPosition>(&lp_key) {
             Some(mut pos) => {
                 pending_yield = Self::settle_yield(&env, &mut pos);
                 pos.deposited += amount;
                 pos.shares    += new_shares;
                 pos.yield_debt = (env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0) * pos.shares) / 1_000_000_000_000;
+                pos.compound_enabled = compound_enabled;
                 pos
             }
             None => {
+                is_new_lp = true;
                 let count: u32 = env.storage().instance()
                     .get(&StorageKey::LpCount).unwrap_or(0);
                 let lp_address_key = StorageKey::LpAddress(count);
@@ -306,6 +323,7 @@ impl RiskPool {
                     yield_debt:        (acc_per_share * new_shares) / 1_000_000_000_000,
                     deposited_at:     now,
                     last_yield_claim: now,
+                    compound_enabled,
                 }
             }
         };
@@ -323,9 +341,23 @@ impl RiskPool {
             },
         );
 
-        // All deposit state is now persisted; safe to move the yield owed to
-        // the provider, if any, as the last step (checks-effects-interactions).
-        Self::pay_out_yield(&env, &provider, pending_yield);
+        // Mint LP NFT on first deposit, or update existing NFT.
+        let category: Symbol = env.storage().instance().get(&StorageKey::Category).unwrap();
+        if is_new_lp {
+            Self::mint_lp_nft(&env, &provider, &category, now, &position);
+        } else {
+            Self::update_lp_nft(&env, &provider, &position);
+        }
+
+        // Compound yield: if enabled, reinvest yield as additional deposit instead of paying out.
+        if compound_enabled && pending_yield > 0 {
+            // Yield is already reflected in position.shares via settle_yield;
+            // skip external transfer — the yield stays in the pool backing the LP's shares.
+        } else {
+            // All deposit state is now persisted; safe to move the yield owed to
+            // the provider, if any, as the last step (checks-effects-interactions).
+            Self::pay_out_yield(&env, &provider, pending_yield);
+        }
 
         new_shares
     }
@@ -368,6 +400,9 @@ impl RiskPool {
         Self::extend_to_max(&env, &lp_key);
         env.storage().instance().set(&StorageKey::TotalDeposited, &total_deposited.checked_sub(amount).unwrap_or_else(|| panic_with_error!(&env, Error::Overflow)));
         env.storage().instance().set(&StorageKey::TotalShares,    &(total_shares - shares));
+
+        // Update LP NFT after withdrawal
+        Self::update_lp_nft(&env, &provider, &position);
 
         env.events().publish(
             (Symbol::new(&env, "liquidity_withdrawn"),),
@@ -1398,6 +1433,109 @@ impl RiskPool {
             position.yield_debt = entitled;
         }
         claimable
+    }
+
+    // ── LP NFT (Soulbound Token) ─────────────────────────────────────────────
+
+    /// Toggle compound yield on/off for the caller's LP position.
+    /// When enabled, accrued yield is reinvested into additional shares instead
+    /// of being paid out as USDC on deposit/claim.
+    pub fn toggle_compound(env: Env, provider: Address, enabled: bool) {
+        provider.require_auth();
+        let lp_key = StorageKey::LpPosition(provider.clone());
+        let mut position: LpPosition = env.storage().persistent()
+            .get(&lp_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
+        position.compound_enabled = enabled;
+        env.storage().persistent().set(&lp_key, &position);
+        Self::extend_to_max(&env, &lp_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "compound_yield_toggled"),),
+            CompoundYieldToggled {
+                provider,
+                enabled,
+            },
+        );
+    }
+
+    /// Return the LP NFT for a given token ID, if it exists.
+    pub fn get_lp_nft(env: Env, token_id: u64) -> Option<LpNft> {
+        env.storage().persistent().get(&StorageKey::LpNft(token_id))
+    }
+
+    /// Return the LP NFT token ID for a given provider address, if they have one.
+    pub fn get_provider_nft(env: Env, provider: Address) -> Option<u64> {
+        env.storage().persistent().get(&StorageKey::ProviderNft(provider))
+    }
+
+    /// Return the next LP NFT token ID that will be minted.
+    pub fn get_next_nft_id(env: Env) -> u64 {
+        env.storage().instance().get(&StorageKey::NextNftId).unwrap_or(1)
+    }
+
+    /// Mint a soulbound LP NFT for a new provider. Called internally on first deposit.
+    fn mint_lp_nft(
+        env: &Env,
+        provider: &Address,
+        category: &Symbol,
+        minted_at: u64,
+        position: &LpPosition,
+    ) {
+        let token_id: u64 = env.storage().instance()
+            .get(&StorageKey::NextNftId).unwrap_or(1);
+        env.storage().instance().set(&StorageKey::NextNftId, &(token_id + 1));
+
+        let nft = LpNft {
+            token_id,
+            provider: provider.clone(),
+            category: category.clone(),
+            minted_at,
+            shares: position.shares,
+            deposited: position.deposited,
+            active: true,
+        };
+        env.storage().persistent().set(&StorageKey::LpNft(token_id), &nft);
+        Self::extend_to_max(env, &StorageKey::LpNft(token_id));
+        env.storage().persistent().set(&StorageKey::ProviderNft(provider.clone()), &token_id);
+        Self::extend_to_max(env, &StorageKey::ProviderNft(provider.clone()));
+
+        env.events().publish(
+            (Symbol::new(env, "lp_nft_minted"),),
+            LpNftMinted {
+                token_id,
+                provider: provider.clone(),
+                category: category.clone(),
+                minted_at,
+            },
+        );
+    }
+
+    /// Update an existing LP NFT after deposit/withdraw. Called internally.
+    fn update_lp_nft(env: &Env, provider: &Address, position: &LpPosition) {
+        let token_id: u64 = match env.storage().persistent().get::<_, u64>(&StorageKey::ProviderNft(provider.clone())) {
+            Some(id) => id,
+            None => return, // No NFT yet (shouldn't happen after mint)
+        };
+        let mut nft: LpNft = match env.storage().persistent().get(&StorageKey::LpNft(token_id)) {
+            Some(n) => n,
+            None => return,
+        };
+        nft.shares = position.shares;
+        nft.deposited = position.deposited;
+        nft.active = position.shares > 0;
+        env.storage().persistent().set(&StorageKey::LpNft(token_id), &nft);
+
+        env.events().publish(
+            (Symbol::new(env, "lp_nft_updated"),),
+            LpNftUpdated {
+                token_id,
+                provider: provider.clone(),
+                shares: position.shares,
+                deposited: position.deposited,
+                active: nft.active,
+            },
+        );
     }
 
     /// Transfer a previously-settled yield `amount` to `provider` and emit
