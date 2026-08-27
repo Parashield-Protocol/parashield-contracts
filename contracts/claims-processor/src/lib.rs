@@ -120,6 +120,13 @@ enum StorageKey {
     GuardianThreshold,
     /// A pending, not-yet-executed contract upgrade awaiting guardian approvals.
     PendingUpgrade,
+    /// Whether `attestor` is authorized to submit cross-chain attestations
+    /// for `chain_id` — (chain_id, attestor) → bool.
+    CrossChainAttestor(Symbol, Address),
+    /// Registered attestor addresses for a chain_id (`Vec<Address>`).
+    CrossChainAttestorList(Symbol),
+    /// The most recent cross-chain attestation submitted for a policy_id.
+    CrossChainAttestation(u128),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -144,6 +151,9 @@ pub enum Error {
     NoPendingUpgrade     = 14,
     InvalidThreshold     = 15,
     AdminTimelockNotExpired = 16,
+    AttestorNotRegistered = 17,
+    NoAttestation        = 18,
+    AttestationStale     = 19,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -240,6 +250,189 @@ impl ClaimsProcessor {
         env.storage().persistent()
             .get(&StorageKey::Keeper(keeper))
             .unwrap_or(false)
+    }
+
+    // ── Cross-Chain Verification (issue #380) ────────────────────────────────
+    //
+    // Stellar remains the canonical verification path: `evaluate_and_settle`
+    // (used by `process_claim`/`auto_process`) is untouched and always reads
+    // the Stellar oracle-verifier. This adds a second, explicit path for
+    // policies whose trigger condition can only be observed on another
+    // chain — a registered attestor (a relayer or bridge the admin trusts
+    // for that specific chain_id) submits a signed observation, which
+    // `process_cross_chain_claim` compares against the policy's trigger the
+    // same way the Stellar oracle path does. The trust boundary is explicit
+    // and per-chain: adding a chain means registering an attestor for it,
+    // never touches the Stellar oracle path, and each attestation is only
+    // ever used for the one policy it was submitted for.
+
+    /// Admin-only: authorize `attestor` to submit cross-chain attestations
+    /// for `chain_id`.
+    pub fn add_cross_chain_attestor(env: Env, admin: Address, chain_id: Symbol, attestor: Address) {
+        Self::require_admin(&env, &admin);
+        let key = StorageKey::CrossChainAttestor(chain_id.clone(), attestor.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        let list_key = StorageKey::CrossChainAttestorList(chain_id.clone());
+        let mut list: Vec<Address> = env.storage().instance()
+            .get(&list_key).unwrap_or_else(|| Vec::new(&env));
+        if list.first_index_of(attestor.clone()).is_none() {
+            list.push_back(attestor.clone());
+            env.storage().instance().set(&list_key, &list);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "cross_chain_attestor_added"),),
+            CrossChainAttestorAdded { chain_id, attestor },
+        );
+    }
+
+    /// Admin-only: revoke `attestor`'s authorization for `chain_id`.
+    pub fn remove_cross_chain_attestor(env: Env, admin: Address, chain_id: Symbol, attestor: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage().persistent()
+            .remove(&StorageKey::CrossChainAttestor(chain_id.clone(), attestor.clone()));
+
+        let list_key = StorageKey::CrossChainAttestorList(chain_id.clone());
+        let list: Vec<Address> = env.storage().instance()
+            .get(&list_key).unwrap_or_else(|| Vec::new(&env));
+        if let Some(idx) = list.first_index_of(attestor.clone()) {
+            let mut pruned = list;
+            pruned.remove(idx);
+            env.storage().instance().set(&list_key, &pruned);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "cross_chain_attestor_removed"),),
+            CrossChainAttestorRemoved { chain_id, attestor },
+        );
+    }
+
+    /// Whether `attestor` is currently authorized for `chain_id`.
+    pub fn is_cross_chain_attestor(env: Env, chain_id: Symbol, attestor: Address) -> bool {
+        env.storage().persistent()
+            .get(&StorageKey::CrossChainAttestor(chain_id, attestor))
+            .unwrap_or(false)
+    }
+
+    /// Return the registered attestor addresses for `chain_id`.
+    pub fn get_cross_chain_attestors(env: Env, chain_id: Symbol) -> Vec<Address> {
+        env.storage().instance()
+            .get(&StorageKey::CrossChainAttestorList(chain_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Submit a cross-chain attestation for `policy_id`'s trigger condition.
+    ///
+    /// Only an address registered via `add_cross_chain_attestor` for
+    /// `chain_id` may call this. `proof_hash` is opaque to the contract — a
+    /// hash of whatever off-chain proof (light-client proof, relayer
+    /// message, oracle report) backs `observed_value`, kept for audit/
+    /// dispute purposes but not verified on-chain. Overwrites any prior
+    /// attestation for the same policy; only the latest is used to settle.
+    pub fn submit_cross_chain_attestation(
+        env: Env,
+        attestor: Address,
+        policy_id: u128,
+        chain_id: Symbol,
+        observed_value: i128,
+        proof_hash: BytesN<32>,
+        timestamp: u64,
+    ) {
+        attestor.require_auth();
+
+        let authorized: bool = env.storage().persistent()
+            .get(&StorageKey::CrossChainAttestor(chain_id.clone(), attestor.clone()))
+            .unwrap_or(false);
+        if !authorized {
+            panic_with_error!(&env, Error::AttestorNotRegistered);
+        }
+
+        let now = env.ledger().timestamp();
+        if timestamp > now {
+            panic_with_error!(&env, Error::AttestationStale);
+        }
+
+        let attestation = CrossChainAttestation {
+            chain_id: chain_id.clone(),
+            attestor: attestor.clone(),
+            observed_value,
+            proof_hash,
+            timestamp,
+        };
+        let key = StorageKey::CrossChainAttestation(policy_id);
+        env.storage().persistent().set(&key, &attestation);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.events().publish(
+            (Symbol::new(&env, "cc_attestation_submitted"),),
+            CrossChainAttestationSubmitted {
+                policy_id,
+                chain_id,
+                attestor,
+                observed_value,
+                timestamp,
+            },
+        );
+    }
+
+    /// Return the most recent cross-chain attestation submitted for
+    /// `policy_id`, if any.
+    pub fn get_cross_chain_attestation(env: Env, policy_id: u128) -> Option<CrossChainAttestation> {
+        env.storage().persistent().get(&StorageKey::CrossChainAttestation(policy_id))
+    }
+
+    /// Settle a claim using a previously submitted cross-chain attestation
+    /// instead of the Stellar oracle-verifier.
+    ///
+    /// Requires an attestation on file for the claim's policy, no older than
+    /// `staleness_threshold` seconds (the same freshness bar the Stellar
+    /// path enforces). The attestation's `observed_value` is compared
+    /// against the policy's trigger threshold/comparison exactly as the
+    /// Stellar oracle path does; payout/rejection then follows the same
+    /// settlement logic as `process_claim`.
+    pub fn process_cross_chain_claim(
+        env: Env,
+        keeper: Address,
+        claim_id: u128,
+        partial_payout_bps: Option<u32>,
+    ) -> ClaimResult {
+        Self::require_keeper(&env, &keeper);
+        Self::require_not_paused(&env);
+        let mut claim: Claim = env.storage().persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+
+        if claim.status != ClaimStatus::Pending {
+            return ClaimResult::AlreadyProcessed;
+        }
+
+        let policy_engine: Address = env.storage().instance()
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        let policy = PolicyEngineClient::new(&env, &policy_engine)
+            .get_policy(&claim.policy_id);
+
+        let attestation: CrossChainAttestation = env.storage().persistent()
+            .get(&StorageKey::CrossChainAttestation(claim.policy_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoAttestation));
+
+        let staleness_threshold: u64 = env.storage().instance()
+            .get(&StorageKey::StalenessThreshold)
+            .unwrap_or(604_800u64);
+        let now = env.ledger().timestamp();
+        if now.saturating_sub(attestation.timestamp) > staleness_threshold {
+            panic_with_error!(&env, Error::AttestationStale);
+        }
+
+        let trigger_met = evaluate_comparison(
+            attestation.observed_value,
+            policy.trigger_threshold,
+            &policy.trigger_comparison,
+        );
+
+        Self::settle_claim(&env, &mut claim, partial_payout_bps, trigger_met)
     }
 
     // ── Claim Submission ─────────────────────────────────────────────────────
@@ -952,12 +1145,6 @@ impl ClaimsProcessor {
         let oracle_verifier: Address = env.storage().instance()
             .get(&StorageKey::OracleVerifier)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
-        let policy_engine: Address = env.storage().instance()
-            .get(&StorageKey::PolicyEngine)
-            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
-        let risk_pool: Address = env.storage().instance()
-            .get(&StorageKey::RiskPool)
-            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         // Configurable staleness threshold (default 7 days = 604_800 s if not set)
         let staleness_threshold: u64 = env.storage().instance()
             .get(&StorageKey::StalenessThreshold)
@@ -980,6 +1167,27 @@ impl ClaimsProcessor {
                 &condition,
                 &staleness_threshold,
             );
+
+        Self::settle_claim(env, claim, partial_payout_bps, trigger_met)
+    }
+
+    /// Shared settlement path used by both the Stellar-oracle evaluation
+    /// (`evaluate_and_settle`) and the cross-chain path
+    /// (`process_cross_chain_claim`) — the only difference between the two
+    /// verification routes is how `trigger_met` was decided; once it's
+    /// known, paying out, rejecting, and bookkeeping are identical.
+    fn settle_claim(
+        env: &Env,
+        claim: &mut Claim,
+        partial_payout_bps: Option<u32>,
+        trigger_met: bool,
+    ) -> ClaimResult {
+        let policy_engine: Address = env.storage().instance()
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        let risk_pool: Address = env.storage().instance()
+            .get(&StorageKey::RiskPool)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
 
         claim.trigger_met  = trigger_met;
         claim.processed_at = Some(env.ledger().timestamp());
@@ -1123,6 +1331,22 @@ impl ClaimsProcessor {
         if buf[0] != b'G' && buf[0] != b'C' {
             panic_with_error!(env, Error::InvalidAddress);
         }
+    }
+}
+
+/// Evaluate a policy's trigger comparison directly against an observed
+/// value, without going through the oracle-verifier contract. Used by the
+/// cross-chain attestation path, which has no oracle data of its own to
+/// aggregate — only whatever single value the attestor reported.
+fn evaluate_comparison(
+    observed: i128,
+    threshold: i128,
+    comparison: &parashield_policy_engine::TriggerComparison,
+) -> bool {
+    match comparison {
+        parashield_policy_engine::TriggerComparison::LessThan => observed < threshold,
+        parashield_policy_engine::TriggerComparison::GreaterThan => observed > threshold,
+        parashield_policy_engine::TriggerComparison::Equal => observed == threshold,
     }
 }
 

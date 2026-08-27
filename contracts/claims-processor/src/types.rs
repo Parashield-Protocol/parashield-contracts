@@ -138,3 +138,48 @@ pub struct AdminUpdated {
     pub new_admin: Address,
 }
 
+/// A cross-chain trigger observation submitted by a registered attestor for
+/// one policy, used by `process_cross_chain_claim` in place of the Stellar
+/// oracle-verifier.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossChainAttestation {
+    /// Which chain this observation came from.
+    pub chain_id: Symbol,
+    /// The registered attestor that submitted it.
+    pub attestor: Address,
+    /// The observed value, in the same fixed-point units as
+    /// `Policy.trigger_threshold`.
+    pub observed_value: i128,
+    /// Hash of the off-chain proof (light-client proof, relayer message,
+    /// oracle report) backing `observed_value`. Opaque to the contract —
+    /// kept for audit/dispute purposes, not verified on-chain.
+    pub proof_hash: BytesN<32>,
+    /// Unix timestamp of the observation.
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossChainAttestorAdded {
+    pub chain_id: Symbol,
+    pub attestor: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossChainAttestorRemoved {
+    pub chain_id: Symbol,
+    pub attestor: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossChainAttestationSubmitted {
+    pub policy_id: u128,
+    pub chain_id: Symbol,
+    pub attestor: Address,
+    pub observed_value: i128,
+    pub timestamp: u64,
+}
+
