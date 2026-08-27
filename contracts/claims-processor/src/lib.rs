@@ -354,6 +354,35 @@ impl ClaimsProcessor {
         claim_id
     }
 
+    /// Submit multiple claims in a single transaction up to MAX_BATCH_SIZE.
+    pub fn batch_submit_claims(env: Env, claimant: Address, policy_ids: Vec<u128>) -> Vec<u128> {
+        claimant.require_auth();
+        Self::require_not_paused(&env);
+
+        let mut claim_ids = Vec::new(&env);
+        let count = if policy_ids.len() > MAX_BATCH_SIZE {
+            MAX_BATCH_SIZE
+        } else {
+            policy_ids.len()
+        };
+
+        for i in 0..count {
+            let pid = policy_ids.get_unchecked(i);
+            let cid = Self::submit_claim(env.clone(), claimant.clone(), pid);
+            claim_ids.push_back(cid);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_claims_submitted"),),
+            BatchClaimsSubmitted {
+                claimant,
+                count,
+            },
+        );
+
+        claim_ids
+    }
+
     /// Process an existing pending claim. Reads oracle data and pays out or rejects.
     ///
     /// `partial_payout_bps` is an optional payout ratio in basis points (0-10000).
@@ -383,6 +412,41 @@ impl ClaimsProcessor {
 
         Self::evaluate_and_settle(&env, &mut claim, &policy, partial_payout_bps)
     }
+
+    /// Process multiple existing claims in a single transaction up to MAX_BATCH_SIZE.
+    pub fn batch_process_claims(
+        env: Env,
+        keeper: Address,
+        claim_ids: Vec<u128>,
+        partial_payout_bps: Option<u32>,
+    ) -> Vec<(u128, ClaimResult)> {
+        Self::require_keeper(&env, &keeper);
+        Self::require_not_paused(&env);
+
+        let mut results = Vec::new(&env);
+        let count = if claim_ids.len() > MAX_BATCH_SIZE {
+            MAX_BATCH_SIZE
+        } else {
+            claim_ids.len()
+        };
+
+        for i in 0..count {
+            let cid = claim_ids.get_unchecked(i);
+            let res = Self::process_claim(env.clone(), keeper.clone(), cid, partial_payout_bps);
+            results.push_back((cid, res));
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_claims_processed"),),
+            BatchClaimsProcessed {
+                keeper,
+                count,
+            },
+        );
+
+        results
+    }
+
 
     /// Keeper-triggered automatic processing — no prior `submit_claim` needed.
     /// This is the primary flow for parametric insurance.

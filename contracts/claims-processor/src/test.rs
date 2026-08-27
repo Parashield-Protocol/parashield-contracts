@@ -1278,3 +1278,36 @@ fn test_resolve_dispute_paid_claim_fails() {
     
     cp.resolve_dispute(&w.admin, &claim_id);
 }
+
+// ── Batch Claim Processing (Issue #427) ──────────────────────────────────────
+
+#[test]
+fn test_batch_submit_and_process_claims() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id1 = buy_crop_policy(&w, &buyer, pid);
+    let pol_id2 = buy_crop_policy(&w, &buyer, pid);
+
+    submit_rainfall(&w, 20_000_000); // 20mm < 50mm threshold
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    let mut policy_ids = soroban_sdk::Vec::new(&w.env);
+    policy_ids.push_back(pol_id1);
+    policy_ids.push_back(pol_id2);
+
+    let claim_ids = cp.batch_submit_claims(&buyer, &policy_ids);
+    assert_eq!(claim_ids.len(), 2);
+
+    let pending = cp.get_pending_claims();
+    assert_eq!(pending.len(), 2);
+
+    let results = cp.batch_process_claims(&w.keeper, &claim_ids, &None);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results.get_unchecked(0).1, ClaimResult::Paid);
+    assert_eq!(results.get_unchecked(1).1, ClaimResult::Paid);
+
+    assert_eq!(cp.get_pending_claims().len(), 0);
+}
+

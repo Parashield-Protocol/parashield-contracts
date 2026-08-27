@@ -118,6 +118,21 @@ pub struct ClaimSubmitted {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchClaimsSubmitted {
+    pub claimant: Address,
+    pub count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchClaimsProcessed {
+    pub keeper: Address,
+    pub count: u32,
+}
+
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaimProcessed {
     pub claim_id: u128,
     pub policy_id: u128,
