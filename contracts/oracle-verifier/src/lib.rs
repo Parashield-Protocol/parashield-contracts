@@ -37,6 +37,12 @@ const TTL_THRESHOLD: u32 = 518_400; // ~30 days
 /// with no submissions.
 const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year
 
+/// Grace period between an admin transfer being fully proposed/approved and the
+/// proposed admin being able to `accept_admin` (issue #356). Hand-synced across
+/// the 4 contracts that expose admin rotation (policy-engine, risk-pool,
+/// oracle-verifier, claims-processor).
+const ADMIN_TRANSFER_TIMELOCK: u64 = 48 * 60 * 60;
+
 /// Maximum number of registered oracles. Bounds the median aggregation loop and
 /// the worst-case weighted sum (MAX_ORACLES * max_weight * max_value) so it
 /// cannot overflow i128.
@@ -69,6 +75,9 @@ enum StorageKey {
     MinConfidence,
     MaxDataAge,
     PendingAdmin,
+    /// Ledger timestamp (u64) at which the current `PendingAdmin` was set,
+    /// used to enforce `ADMIN_TRANSFER_TIMELOCK` before `accept_admin`.
+    PendingAdminSince,
     MinOracleCount,
     /// Minimum seconds between submissions from the same oracle for a given
     /// data_type (u64)
@@ -96,6 +105,8 @@ enum StorageKey {
     PendingUpgrade,
     /// A pending admin-transfer proposal awaiting guardian approvals.
     PendingAdminChange,
+    /// OracleReputation for (data_type, oracle_address).
+    Reputation(Symbol, Address),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -126,6 +137,7 @@ pub enum Error {
     AlreadyApprovedAction = 20,
     NoPendingUpgrade = 21,
     InvalidThreshold = 22,
+    AdminTimelockNotExpired = 23,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -339,6 +351,9 @@ impl OracleVerifier {
             env.storage()
                 .instance()
                 .set(&StorageKey::PendingAdmin, &new_admin);
+            env.storage()
+                .instance()
+                .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
             return;
         }
 
@@ -399,6 +414,9 @@ impl OracleVerifier {
             env.storage()
                 .instance()
                 .set(&StorageKey::PendingAdmin, &new_admin);
+            env.storage()
+                .instance()
+                .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
         } else {
             env.storage()
                 .instance()
@@ -430,6 +448,13 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::NotInitialized);
         }
 
+        // Enforce the admin-rotation timelock (issue #356).
+        let since: u64 = env.storage().instance()
+            .get(&StorageKey::PendingAdminSince).unwrap_or(0);
+        if env.ledger().timestamp() < since.saturating_add(ADMIN_TRANSFER_TIMELOCK) {
+            panic_with_error!(&env, Error::AdminTimelockNotExpired);
+        }
+
         env.storage().instance().set(&StorageKey::Admin, &admin);
 
         // Clear the slot explicitly using a clean None type hint
@@ -437,6 +462,7 @@ impl OracleVerifier {
         env.storage()
             .instance()
             .set(&StorageKey::PendingAdmin, &no_pending);
+        env.storage().instance().remove(&StorageKey::PendingAdminSince);
 
         env.events().publish(
             (Symbol::new(&env, "admin_updated"),),
@@ -753,6 +779,13 @@ impl OracleVerifier {
     /// Return the pending upgrade awaiting guardian approvals, if any.
     pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
         env.storage().instance().get(&StorageKey::PendingUpgrade)
+    }
+
+    /// Ledger timestamp at which the current pending admin transfer was
+    /// registered, or `0` if none. `accept_admin` succeeds only once
+    /// `now >= this + ADMIN_TRANSFER_TIMELOCK` (issue #356).
+    pub fn get_pending_admin_since(env: Env) -> u64 {
+        env.storage().instance().get(&StorageKey::PendingAdminSince).unwrap_or(0)
     }
 
     /// Guardian approval for the pending upgrade. Once enough guardians have

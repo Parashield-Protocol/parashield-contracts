@@ -5,7 +5,7 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::Address as _,
+    testutils::{Address as _, Ledger as _},
     token, Address, Env, Symbol,
 };
 
@@ -98,4 +98,26 @@ fn get_stats_reflects_all_operations() {
     assert_eq!(stats.total_deposited,     400_0000000i128);
     assert_eq!(stats.total_locked,        80_0000000i128);
     assert_eq!(stats.accumulated_premium, 80_0000000i128);  // 80% of 100
+}
+
+// ── #356: admin transfer timelock ────────────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #30)")]
+fn accept_admin_rejected_before_timelock() {
+    let (env, pool, _, admin, _, _, _) = setup_multi();
+    let new_admin = Address::generate(&env);
+    pool.propose_new_admin(&admin, &new_admin);
+    pool.accept_admin(&new_admin);
+}
+
+#[test]
+fn accept_admin_succeeds_after_timelock() {
+    let (env, pool, _, admin, _, _, _) = setup_multi();
+    let new_admin = Address::generate(&env);
+    pool.propose_new_admin(&admin, &new_admin);
+    env.ledger().with_mut(|l| l.timestamp += 48 * 60 * 60 + 1);
+    pool.accept_admin(&new_admin);
+    assert_eq!(pool.get_admin(), new_admin);
+    assert_eq!(pool.get_pending_admin_since(), 0);
 }

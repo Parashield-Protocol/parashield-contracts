@@ -252,3 +252,41 @@ pub struct PendingAdminChange {
     pub new_admin: Address,
     pub approvals: Vec<Address>,
 }
+
+/// A time-locked change to the premium-split ratios, awaiting execution once
+/// `executable_after` has passed. LPs can exit during the timelock window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingParameterChange {
+    pub new_lp_bps: i128,
+    pub new_treas_bps: i128,
+    pub new_backstop_bps: i128,
+    pub proposed_at: u64,
+    pub executable_after: u64,
+    pub executed: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParameterChangeScheduled {
+    pub admin: Address,
+    pub new_lp_bps: i128,
+    pub new_treas_bps: i128,
+    pub new_backstop_bps: i128,
+    pub executable_after: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParameterChangeExecuted {
+    pub admin: Address,
+    pub lp_bps: i128,
+    pub treas_bps: i128,
+    pub backstop_bps: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParameterChangeCancelled {
+    pub admin: Address,
+}

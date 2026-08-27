@@ -70,6 +70,12 @@ const TTL_THRESHOLD: u32 = 518_400;
 /// survive long enough to be processed.
 const TTL_EXTEND_TO: u32 = 6_312_000;
 
+/// Grace period between an admin transfer being fully proposed/approved and the
+/// proposed admin being able to `accept_admin` (issue #356). Hand-synced across
+/// the 4 contracts that expose admin rotation (policy-engine, risk-pool,
+/// oracle-verifier, claims-processor).
+const ADMIN_TRANSFER_TIMELOCK: u64 = 48 * 60 * 60;
+
 // ─── Batch processing ─────────────────────────────────────────────────────────
 
 /// Hard ceiling on how many claims a single `batch_auto_process` call may
@@ -98,6 +104,13 @@ enum StorageKey {
     PendingClaims,       // Vec<u128>
     Keeper(Address),     // keeper whitelist: address → bool
     Paused,              // bool — emergency pause state
+    /// Proposed next admin awaiting `accept_admin` (issue #356).
+    PendingAdmin,
+    /// Ledger timestamp (u64) at which `PendingAdmin` was set, used to enforce
+    /// `ADMIN_TRANSFER_TIMELOCK` before `accept_admin` succeeds.
+    PendingAdminSince,
+    /// A pending admin-transfer proposal awaiting guardian approvals.
+    PendingAdminChange,
     /// Contract version (u32) for storage migration tracking
     Version,
     /// Guardian addresses authorized to approve critical actions (Vec<Address>).
@@ -130,6 +143,7 @@ pub enum Error {
     AlreadyApprovedAction = 13,
     NoPendingUpgrade     = 14,
     InvalidThreshold     = 15,
+    AdminTimelockNotExpired = 16,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -741,6 +755,139 @@ impl ClaimsProcessor {
             panic_with_error!(&env, Error::NoPendingUpgrade);
         }
         env.storage().instance().remove(&StorageKey::PendingUpgrade);
+    }
+
+    // ── Admin rotation (issue #356) ─────────────────────────────────────────
+
+    /// Propose a new admin. Only the current admin can call this.
+    ///
+    /// If a guardian threshold > 0 is configured (`set_guardians`), the
+    /// proposal is not armed until `threshold` guardians call
+    /// `approve_admin_change`. Once armed, `new_admin` must call `accept_admin`
+    /// — and that only succeeds after `ADMIN_TRANSFER_TIMELOCK` has elapsed, so
+    /// a hostile or mistaken rotation has a 48h window to be noticed and
+    /// countered with a fresh `propose_new_admin`.
+    pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
+        Self::require_admin(&env, &admin);
+        Self::validate_stellar_address(&env, &new_admin);
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0);
+        if threshold == 0 {
+            env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
+            env.storage()
+                .instance()
+                .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
+            return;
+        }
+
+        let pending = PendingAdminChange {
+            new_admin,
+            approvals: Vec::new(&env),
+        };
+        env.storage()
+            .instance()
+            .set(&StorageKey::PendingAdminChange, &pending);
+    }
+
+    /// Guardian approval for a pending admin-change proposal. Once enough
+    /// guardians have approved (>= threshold) the transfer is armed and the
+    /// `ADMIN_TRANSFER_TIMELOCK` clock starts; `new_admin` must still call
+    /// `accept_admin`.
+    pub fn approve_admin_change(env: Env, guardian: Address, new_admin: Address) {
+        guardian.require_auth();
+
+        let guardians: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut is_guardian = false;
+        for g in guardians.iter() {
+            if g == guardian {
+                is_guardian = true;
+                break;
+            }
+        }
+        if !is_guardian {
+            panic_with_error!(&env, Error::NotGuardian);
+        }
+
+        let mut pending: PendingAdminChange = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PendingAdminChange)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingUpgrade));
+        if pending.new_admin != new_admin {
+            panic_with_error!(&env, Error::NoPendingUpgrade);
+        }
+        for a in pending.approvals.iter() {
+            if a == guardian {
+                panic_with_error!(&env, Error::AlreadyApprovedAction);
+            }
+        }
+        pending.approvals.push_back(guardian);
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0);
+
+        if pending.approvals.len() >= threshold {
+            env.storage().instance().remove(&StorageKey::PendingAdminChange);
+            env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
+            env.storage()
+                .instance()
+                .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
+        } else {
+            env.storage()
+                .instance()
+                .set(&StorageKey::PendingAdminChange, &pending);
+        }
+    }
+
+    /// Accept the proposed admin. Only the proposed admin can call this, and
+    /// only once `ADMIN_TRANSFER_TIMELOCK` has elapsed since the transfer was
+    /// armed (issue #356).
+    pub fn accept_admin(env: Env, admin: Address) {
+        let pending_admin: Address = env.storage().instance()
+            .get(&StorageKey::PendingAdmin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Unauthorized));
+        if admin != pending_admin {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        admin.require_auth();
+
+        let since: u64 = env.storage().instance()
+            .get(&StorageKey::PendingAdminSince).unwrap_or(0);
+        if env.ledger().timestamp() < since.saturating_add(ADMIN_TRANSFER_TIMELOCK) {
+            panic_with_error!(&env, Error::AdminTimelockNotExpired);
+        }
+
+        env.storage().instance().set(&StorageKey::Admin, &admin);
+        env.storage().instance().remove(&StorageKey::PendingAdmin);
+        env.storage().instance().remove(&StorageKey::PendingAdminSince);
+
+        env.events().publish(
+            (Symbol::new(&env, "admin_updated"),),
+            AdminUpdated { new_admin: admin },
+        );
+    }
+
+    /// Return the proposed next admin, if a transfer is pending.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&StorageKey::PendingAdmin)
+    }
+
+    /// Ledger timestamp at which the current pending admin transfer was armed,
+    /// or `0` if none. `accept_admin` succeeds only once
+    /// `now >= this + ADMIN_TRANSFER_TIMELOCK` (issue #356).
+    pub fn get_pending_admin_since(env: Env) -> u64 {
+        env.storage().instance().get(&StorageKey::PendingAdminSince).unwrap_or(0)
     }
 
     /// Run storage migrations from old_version to new_version.

@@ -44,6 +44,12 @@ const TIMELOCK_SECONDS: u64 = 7 * 24 * 60 * 60;
 /// Shorter than withdrawal timelock since parameter changes are less risky.
 const PARAMETER_TIMELOCK_SECONDS: u64 = 2 * 24 * 60 * 60;
 
+/// Grace period between an admin transfer being fully proposed/approved and the
+/// proposed admin being able to `accept_admin` (issue #356). Hand-synced across
+/// the 4 contracts that expose admin rotation (policy-engine, risk-pool,
+/// oracle-verifier, claims-processor).
+const ADMIN_TRANSFER_TIMELOCK: u64 = 48 * 60 * 60;
+
 /// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
 /// (at ~5s/ledger).
 // Issue #342: kept in sync by hand across all 5 contracts (governance-dao,
@@ -76,6 +82,9 @@ enum StorageKey {
     Lock(u128),
     AdminWithdrawalRequest,
     PendingAdmin,
+    /// Ledger timestamp (u64) at which the current `PendingAdmin` was set,
+    /// used to enforce `ADMIN_TRANSFER_TIMELOCK` before `accept_admin`.
+    PendingAdminSince,
     PolicyEngine,
     ClaimsProcessor,
     /// Contract version (u32) for storage migration tracking
@@ -91,6 +100,8 @@ enum StorageKey {
     PendingUpgrade,
     /// A pending admin-transfer proposal awaiting guardian approvals.
     PendingAdminChange,
+    /// A time-locked premium-split change awaiting execution.
+    PendingParameterChange,
 }
 
 #[contracterror]
@@ -123,6 +134,10 @@ pub enum Error {
     AlreadyApprovedAction = 24,
     NoPendingUpgrade    = 25,
     InvalidThreshold    = 26,
+    ParameterChangePending    = 27,
+    NoPendingParameterChange  = 28,
+    ParameterChangeNotReady   = 29,
+    AdminTimelockNotExpired   = 30,
 }
 
 #[contract]
@@ -1078,6 +1093,13 @@ impl RiskPool {
         env.storage().instance().get(&StorageKey::PendingUpgrade)
     }
 
+    /// Ledger timestamp at which the current pending admin transfer was
+    /// registered, or `0` if none. `accept_admin` succeeds only once
+    /// `now >= this + ADMIN_TRANSFER_TIMELOCK` (issue #356).
+    pub fn get_pending_admin_since(env: Env) -> u64 {
+        env.storage().instance().get(&StorageKey::PendingAdminSince).unwrap_or(0)
+    }
+
     /// Guardian approval for the pending upgrade. Once enough guardians have
     /// approved (>= threshold), the upgrade executes immediately.
     pub fn approve_upgrade(env: Env, guardian: Address, new_wasm_hash: soroban_sdk::BytesN<32>) {
@@ -1180,6 +1202,9 @@ impl RiskPool {
             .unwrap_or(0);
         if threshold == 0 {
             env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
+            env.storage()
+                .instance()
+                .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
             return;
         }
 
@@ -1238,6 +1263,9 @@ impl RiskPool {
         if pending.approvals.len() >= threshold {
             env.storage().instance().remove(&StorageKey::PendingAdminChange);
             env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
+            env.storage()
+                .instance()
+                .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
         } else {
             env.storage()
                 .instance()
@@ -1245,7 +1273,9 @@ impl RiskPool {
         }
     }
 
-    /// Accept the proposed admin. Only the proposed admin can call this.
+    /// Accept the proposed admin. Only the proposed admin can call this, and
+    /// only once `ADMIN_TRANSFER_TIMELOCK` has elapsed since the transfer was
+    /// registered (issue #356).
     pub fn accept_admin(env: Env, admin: Address) {
         let pending_admin: Address = env.storage().instance()
             .get(&StorageKey::PendingAdmin)
@@ -1255,10 +1285,16 @@ impl RiskPool {
             panic_with_error!(&env, Error::Unauthorized);
         }
         admin.require_auth();
+        let since: u64 = env.storage().instance()
+            .get(&StorageKey::PendingAdminSince).unwrap_or(0);
+        if env.ledger().timestamp() < since.saturating_add(ADMIN_TRANSFER_TIMELOCK) {
+            panic_with_error!(&env, Error::AdminTimelockNotExpired);
+        }
         // Update admin
         env.storage().instance().set(&StorageKey::Admin, &admin);
         // Clear the proposal
         env.storage().instance().remove(&StorageKey::PendingAdmin);
+        env.storage().instance().remove(&StorageKey::PendingAdminSince);
         // Emit event
         env.events().publish(
             (Symbol::new(&env, "admin_updated"),),

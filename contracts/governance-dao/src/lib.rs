@@ -39,6 +39,10 @@ const TTL_THRESHOLD: u32 = 518_400; // ~30 days
 const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year
 /// Minimum delay after vote_end before finalize() can be called
 const FINALIZE_DELAY: u64 = 300; // 5 minutes
+/// Lower bound on `DaoConfig.quorum_bps` (issue #355). Without a floor the
+/// admin could configure `quorum_bps = 0`, letting a proposal pass on
+/// negligible turnout. 1000 = 10% of total supply must participate.
+const MIN_QUORUM_BPS: u32 = 1_000;
 
 #[contracttype]
 enum StorageKey {
@@ -88,6 +92,7 @@ pub enum Error {
     AlreadyApprovedAction = 21,
     NoPendingUpgrade = 22,
     InvalidThreshold = 23,
+    QuorumTooLow = 24,
 }
 
 #[contract]
@@ -135,6 +140,9 @@ impl GovernanceDao {
         }
         if config.voting_period > MAX_VOTING_PERIOD {
             panic_with_error!(&env, Error::VotingPeriodTooLong);
+        }
+        if config.quorum_bps < MIN_QUORUM_BPS {
+            panic_with_error!(&env, Error::QuorumTooLow);
         }
         env.storage().instance().set(&StorageKey::Admin, &admin);
         env.storage().instance().set(&StorageKey::Config, &config);
@@ -469,7 +477,11 @@ impl GovernanceDao {
             .and_then(|v| v.checked_div(10_000))
             .unwrap_or(i128::MAX);
 
-        if total_votes < quorum_needed {
+        if total_votes == 0 {
+            // No participation at all — always fails, even for a legacy
+            // proposal that snapshotted total_supply == 0 (quorum_needed == 0).
+            proposal.status = ProposalStatus::Failed;
+        } else if total_votes < quorum_needed {
             proposal.status = ProposalStatus::Failed;
         } else {
             // Guard: prevent division by zero if total_votes == 0
@@ -655,6 +667,9 @@ impl GovernanceDao {
         }
         if config.voting_period > MAX_VOTING_PERIOD {
             panic_with_error!(&env, Error::VotingPeriodTooLong);
+        }
+        if config.quorum_bps < MIN_QUORUM_BPS {
+            panic_with_error!(&env, Error::QuorumTooLow);
         }
         env.storage().instance().set(&StorageKey::Config, &config);
 

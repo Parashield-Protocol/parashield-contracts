@@ -665,3 +665,41 @@ fn test_mixed_submit_and_auto_process_same_policy() {
     let bal = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
     assert_eq!(bal, 5_000_000_000 - 4_109_589 + COVERAGE);
 }
+
+// ── #356: admin transfer timelock ────────────────────────────────────────────
+
+fn deploy_bare() -> (Env, ClaimsProcessorClient<'static>, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let claims_id = env.register(ClaimsProcessor, ());
+    let cp = ClaimsProcessorClient::new(&env, &claims_id);
+    cp.initialize(
+        &admin,
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &604_800u64,
+    );
+    (env, cp, admin)
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn accept_admin_rejected_before_timelock() {
+    let (env, cp, admin) = deploy_bare();
+    let new_admin = Address::generate(&env);
+    cp.propose_new_admin(&admin, &new_admin);
+    cp.accept_admin(&new_admin);
+}
+
+#[test]
+fn accept_admin_succeeds_after_timelock() {
+    let (env, cp, admin) = deploy_bare();
+    let new_admin = Address::generate(&env);
+    cp.propose_new_admin(&admin, &new_admin);
+    env.ledger().with_mut(|l| l.timestamp += 48 * 60 * 60 + 1);
+    cp.accept_admin(&new_admin);
+    assert_eq!(cp.get_admin(), new_admin);
+    assert_eq!(cp.get_pending_admin_since(), 0);
+}
