@@ -235,6 +235,13 @@ pub struct MinOracleCountUpdated {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DataTypeMinOracleCountUpdated {
+    pub data_type: Symbol,
+    pub min_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MinSubmitIntervalUpdated {
     pub seconds: u64,
 }
