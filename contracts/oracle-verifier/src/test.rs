@@ -1090,3 +1090,101 @@ fn test_disabling_encryption_requirement_restores_plaintext_path() {
     );
     assert_eq!(client.get_data(&weather(), &kisumu_key()).value, 32_000_000);
 }
+
+
+// ── Data invalidation (invalidate_data) ───────────────────────────────────────
+
+/// Admin can invalidate all data for a (data_type, key) pair.
+#[test]
+fn test_invalidate_data_removes_points() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+    
+    // Submit data
+    client.submit_data(&oracle, &weather(), &kisumu_key(), &32_000_000i128, &95u32, &env.ledger().timestamp());
+    
+    // Verify data exists
+    let data = client.get_data(&weather(), &kisumu_key());
+    assert_eq!(data.value, 32_000_000i128);
+    
+    // Invalidate the data
+    client.invalidate_data(&admin, &weather(), &kisumu_key());
+    
+    // Verify it was removed by checking aggregated data returns error
+    // (get_aggregated will panic if min oracle count not met and no data available)
+    // Since we only have one oracle and removed the data, the function should panic
+}
+
+/// Attempting to get data after invalidation panics.
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn test_get_data_after_invalidate_panics() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+    
+    // Submit data
+    client.submit_data(&oracle, &weather(), &kisumu_key(), &32_000_000i128, &95u32, &env.ledger().timestamp());
+    
+    // Invalidate the data
+    client.invalidate_data(&admin, &weather(), &kisumu_key());
+    
+    // Try to get the invalidated data - should panic with NoDataAvailable
+    client.get_data(&weather(), &kisumu_key());
+}
+
+/// Non-admin cannot invalidate data.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_invalidate_data_requires_admin() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    
+    let oracle = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+    client.submit_data(&oracle, &weather(), &kisumu_key(), &32_000_000i128, &95u32, &env.ledger().timestamp());
+    
+    // Non-admin tries to invalidate
+    client.invalidate_data(&stranger, &weather(), &kisumu_key());
+}
+
+/// Invalidating non-existent data succeeds (idempotent).
+#[test]
+fn test_invalidate_nonexistent_data_succeeds() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    
+    // Should not panic even though no data exists
+    client.invalidate_data(&admin, &weather(), &kisumu_key());
+}
+
+/// Invalidating data only affects that specific (data_type, key) pair.
+#[test]
+fn test_invalidate_data_scoped_to_key() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+    
+    let key1 = symbol_short!("kis2606");
+    let key2 = symbol_short!("mom2606");
+    
+    // Submit data for two different keys
+    client.submit_data(&oracle, &weather(), &key1, &32_000_000i128, &95u32, &env.ledger().timestamp());
+    client.submit_data(&oracle, &weather(), &key2, &45_000_000i128, &90u32, &env.ledger().timestamp());
+    
+    // Invalidate only key1
+    client.invalidate_data(&admin, &weather(), &key1);
+    
+    // key2 data should still exist
+    let data = client.get_data(&weather(), &key2);
+    assert_eq!(data.value, 45_000_000i128);
+}

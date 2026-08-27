@@ -1164,3 +1164,117 @@ fn test_removed_attestor_cannot_submit_attestation() {
         &w.env.ledger().timestamp(),
     );
 }
+
+
+// ── Dispute resolution (resolve_dispute feature) ─────────────────────────────
+
+/// Admin can resolve a disputed claim, moving it back to Pending status and
+/// re-adding it to the pending queue for re-processing by a keeper.
+#[test]
+fn test_resolve_dispute_succeeds() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    
+    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("disagree"));
+    assert_eq!(cp.get_claim(&claim_id).status, ClaimStatus::Disputed);
+    assert_eq!(cp.get_pending_claims().len(), 0);
+    
+    cp.resolve_dispute(&w.admin, &claim_id);
+    
+    let claim = cp.get_claim(&claim_id);
+    assert_eq!(claim.status, ClaimStatus::Pending);
+    assert_eq!(claim.dispute_reason, None);
+    assert_eq!(cp.get_pending_claims().len(), 1);
+    assert_eq!(cp.get_pending_claims().get_unchecked(0), claim_id);
+}
+
+/// Resolving a non-existent claim must fail with ClaimNotFound.
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_resolve_dispute_nonexistent_claim_fails() {
+    let w = deploy();
+    ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .resolve_dispute(&w.admin, &999_999u128);
+}
+
+/// Only admin can call resolve_dispute; non-admin is rejected.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_resolve_dispute_non_admin_fails() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("disagree"));
+    
+    let stranger = Address::generate(&w.env);
+    cp.resolve_dispute(&stranger, &claim_id);
+}
+
+/// Resolving a claim that is not in Disputed status must fail.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_resolve_dispute_non_disputed_claim_fails() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    
+    cp.resolve_dispute(&w.admin, &claim_id);
+}
+
+/// After resolving a dispute, the claim can be successfully processed by keeper.
+#[test]
+fn test_resolved_dispute_can_be_processed() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    
+    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("disagree"));
+    cp.resolve_dispute(&w.admin, &claim_id);
+    
+    let result = cp.process_claim(&w.keeper, &claim_id, &None);
+    assert_eq!(result, ClaimResult::Paid);
+    
+    let claim = cp.get_claim(&claim_id);
+    assert_eq!(claim.status, ClaimStatus::Paid);
+    
+    let balance = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
+    assert_eq!(balance, 5_000_000_000 - 4_109_589 + 1_000_000_000);
+}
+
+/// Resolving a Paid claim must fail with AlreadyProcessed.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_resolve_dispute_paid_claim_fails() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    cp.process_claim(&w.keeper, &claim_id, &None);
+    
+    cp.resolve_dispute(&w.admin, &claim_id);
+}

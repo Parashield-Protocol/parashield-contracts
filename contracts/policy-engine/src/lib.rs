@@ -957,6 +957,57 @@ impl PolicyEngine {
         Self::load_policy(&env, policy_id)
     }
 
+    /// Return aggregated statistics for a product: total policies, active count,
+    /// total coverage, and total premiums collected. Returns zeros if the product
+    /// does not exist or has no policies.
+    pub fn get_product_stats(env: Env, product_id: u128) -> ProductStats {
+        // Verify product exists
+        let _product = match env.storage().persistent()
+            .get::<_, InsuranceProduct>(&StorageKey::Product(product_id)) {
+            Some(p) => p,
+            None => return ProductStats {
+                product_id,
+                total_policies: 0,
+                active_policies: 0,
+                total_coverage: 0,
+                total_premium_collected: 0,
+            },
+        };
+
+        // Aggregate stats across all policies for this product
+        let mut total_policies: u32 = 0;
+        let mut active_policies: u32 = 0;
+        let mut total_coverage: i128 = 0;
+        let mut total_premium_collected: i128 = 0;
+
+        // Iterate through next_policy_id to find all policies
+        let next_id: u128 = env.storage().instance()
+            .get(&StorageKey::NextPolicyId)
+            .unwrap_or(1);
+
+        for pid in 1..next_id {
+            if let Some(policy) = env.storage().persistent()
+                .get::<_, Policy>(&StorageKey::Policy(pid)) {
+                if policy.product_id == product_id {
+                    total_policies += 1;
+                    if policy.status == PolicyStatus::Active {
+                        active_policies += 1;
+                    }
+                    total_coverage = total_coverage.saturating_add(policy.coverage_amount);
+                    total_premium_collected = total_premium_collected.saturating_add(policy.premium_paid);
+                }
+            }
+        }
+
+        ProductStats {
+            product_id,
+            total_policies,
+            active_policies,
+            total_coverage,
+            total_premium_collected,
+        }
+    }
+
     /// Return a paginated slice of policy IDs owned by `user`. `offset` is the zero-based
     /// start index; `limit` caps the number of IDs returned and is itself clamped to
     /// `MAX_PAGE_SIZE`.
@@ -1027,12 +1078,21 @@ impl PolicyEngine {
     pub fn emergency_pause(env: Env, admin: Address) {
         Self::require_admin(&env, &admin);
         env.storage().instance().set(&StorageKey::Paused, &true);
+        env.events().publish(
+            (Symbol::new(&env, "contract_paused"),),
+            ContractPaused { admin: admin.clone() },
+        );
     }
 
-pub fn emergency_resume(env: Env, admin: Address) {
-         Self::require_admin(&env, &admin);
-         env.storage().instance().set(&StorageKey::Paused, &false);
-     }
+    /// Emergency resume — re-enables buy_policy for all products.
+    pub fn emergency_resume(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&StorageKey::Paused, &false);
+        env.events().publish(
+            (Symbol::new(&env, "contract_resumed"),),
+            ContractResumed { admin: admin.clone() },
+        );
+    }
 
      /// Propose a new admin. Only the current admin can call this.
      ///
