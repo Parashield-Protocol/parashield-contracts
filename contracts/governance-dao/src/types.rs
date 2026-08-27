@@ -88,6 +88,9 @@ pub struct Proposal {
     pub total_supply: i128,
     /// Whether this is a generic call or a contract-upgrade proposal.
     pub kind: ProposalKind,
+    /// Mandatory impact analysis describing potential consequences of this proposal.
+    /// Max 4096 bytes to provide comprehensive risk assessment.
+    pub impact_analysis: Bytes,
 }
 
 /// A single vote record stored per (proposal_id, voter) key.

@@ -595,6 +595,134 @@ impl ClaimsProcessor {
             .get(&StorageKey::PolicyClaim(policy_id))
     }
 
+    /// Schedule installment payouts for a large claim.
+    /// This allows claims to be paid out over time rather than as a single lump sum.
+    ///
+    /// Parameters:
+    /// - `claim_id`: The claim to schedule installments for
+    /// - `amount_per_installment`: Amount to pay per installment
+    /// - `num_installments`: Total number of installments
+    /// - `interval_seconds`: Seconds between each installment
+    pub fn schedule_installments(
+        env: Env,
+        caller: Address,
+        claim_id: u128,
+        amount_per_installment: i128,
+        num_installments: u32,
+        interval_seconds: u64,
+    ) {
+        Self::require_keeper(&env, &caller);
+        Self::require_not_paused(&env);
+
+        let mut claim = Self::get_claim(&env, claim_id);
+        
+        // Only schedule installments for approved claims
+        if claim.status != ClaimStatus::Paid && claim.status != ClaimStatus::PartiallyPaid {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
+        // Total installment amount should not exceed coverage
+        let total_amount = amount_per_installment.saturating_mul(num_installments as i128);
+        if total_amount > claim.coverage_amount {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
+        let now = env.ledger().timestamp();
+        let schedule = InstallmentSchedule {
+            total_amount,
+            amount_per_installment,
+            num_installments,
+            interval_seconds,
+            first_installment_at: now.saturating_add(interval_seconds),
+            paid_count: 0,
+        };
+
+        claim.installments = Some(schedule.clone());
+        env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
+        env.storage().persistent().extend_ttl(&StorageKey::Claim(claim_id), TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.events().publish(
+            (Symbol::new(&env, "installment_payout_scheduled"),),
+            InstallmentPayoutScheduled {
+                claim_id,
+                policy_id: claim.policy_id,
+                claimant: claim.claimant.clone(),
+                total_amount,
+                num_installments,
+                interval_seconds,
+                first_installment_at: schedule.first_installment_at,
+            },
+        );
+    }
+
+    /// Claim the next installment for a scheduled claim.
+    /// Can be called by the claimant to collect available installments.
+    pub fn claim_installment(env: Env, claimant: Address, claim_id: u128) -> i128 {
+        claimant.require_auth();
+        Self::require_not_paused(&env);
+
+        let mut claim = Self::get_claim(&env, claim_id);
+        
+        if claim.claimant != claimant {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        let schedule = claim.installments.as_ref()
+            .unwrap_or_else(|| panic_with_error!(&env, Error::InvalidInput));
+
+        // Check if there are remaining installments
+        if schedule.paid_count >= schedule.num_installments {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
+        let now = env.ledger().timestamp();
+        
+        // Calculate which installments are now available
+        let installments_available = if now >= schedule.first_installment_at {
+            ((now - schedule.first_installment_at) / schedule.interval_seconds).saturating_add(1)
+                .min(schedule.num_installments as u64) as u32
+        } else {
+            0
+        };
+
+        if installments_available <= schedule.paid_count {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
+        // Pay out all available installments
+        let amount_to_pay = schedule.amount_per_installment
+            .saturating_mul((installments_available - schedule.paid_count) as i128);
+
+        // Transfer funds from risk pool
+        let risk_pool: Address = env.storage().instance()
+            .get(&StorageKey::RiskPool)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        
+        let pool_client = RiskPoolClient::new(&env, &risk_pool);
+        pool_client.release_for_claim(&env.current_contract_address(), &claim.policy_id);
+
+        // Update installment schedule
+        if let Some(ref mut sched) = claim.installments {
+            sched.paid_count = installments_available;
+        }
+
+        env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
+        env.storage().persistent().extend_ttl(&StorageKey::Claim(claim_id), TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.events().publish(
+            (Symbol::new(&env, "installment_paid"),),
+            InstallmentPaid {
+                claim_id,
+                claimant,
+                amount: amount_to_pay,
+                paid_count: installments_available,
+                total_installments: schedule.num_installments,
+            },
+        );
+
+        amount_to_pay
+    }
+
     /// Return the list of claim IDs that are currently in `Pending` status.
     pub fn get_pending_claims(env: Env) -> Vec<u128> {
         env.storage().instance()

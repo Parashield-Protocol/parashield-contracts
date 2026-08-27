@@ -431,6 +431,26 @@ pub struct ExitDelayUpdated {
     pub delay_seconds: u64,
 }
 
+/// Dynamic fee adjustment configuration based on market conditions.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicFeeConfig {
+    /// Base fee in basis points (0-10000).
+    pub base_fee_bps: u32,
+    /// Maximum fee in basis points (0-10000).
+    pub max_fee_bps: u32,
+    /// Minimum fee in basis points (0-10000).
+    pub min_fee_bps: u32,
+    /// Utilization threshold at which fees start increasing (basis points).
+    pub utilization_threshold_bps: u32,
+    /// Fee adjustment per 1% increase in utilization above threshold (basis points).
+    pub fee_adjustment_per_1pct_bps: u32,
+    /// Whether dynamic fee adjustment is enabled.
+    pub enabled: bool,
+    /// Last time the dynamic fee was updated.
+    pub last_updated: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExitRequested {
@@ -466,6 +486,26 @@ pub struct MinReserveUpdated {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReserveFundUpdated {
     pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicFeeAdjusted {
+    pub previous_fee_bps: u32,
+    pub new_fee_bps: u32,
+    pub utilization_bps: u32,
+    pub adjusted_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicFeeConfigUpdated {
+    pub base_fee_bps: u32,
+    pub max_fee_bps: u32,
+    pub min_fee_bps: u32,
+    pub utilization_threshold_bps: u32,
+    pub fee_adjustment_per_1pct_bps: u32,
+    pub enabled: bool,
 }
 
 #[contracttype]

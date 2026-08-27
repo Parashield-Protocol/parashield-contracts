@@ -134,6 +134,9 @@ enum StorageKey {
     /// Total shares currently reserved by queued exits (i128), so the pool can
     /// see committed outflow before it happens.
     QueuedExitShares,
+    /// Dynamic fee adjustment configuration (DynamicFeeConfig).
+    /// Allows pool fees to automatically adjust based on market conditions and utilization.
+    DynamicFeeConfig,
 }
 
 #[contracterror]
@@ -1069,6 +1072,108 @@ impl RiskPool {
             .saturating_mul((10_000u128).saturating_add(util as u128))
             / 10_000u128;
         u32::try_from(scaled).unwrap_or(u32::MAX)
+    }
+
+    /// Set dynamic fee adjustment configuration based on market conditions.
+    /// Allows pool fees to automatically adjust based on pool utilization.
+    ///
+    /// Parameters:
+    /// - `base_fee_bps`: Base fee in basis points
+    /// - `max_fee_bps`: Maximum fee cap in basis points
+    /// - `min_fee_bps`: Minimum fee floor in basis points
+    /// - `utilization_threshold_bps`: Utilization threshold (in bps) at which fees start increasing
+    /// - `fee_adjustment_per_1pct_bps`: Fee increase per 1% utilization above threshold
+    /// - `enabled`: Whether dynamic fee adjustment is active
+    pub fn set_dynamic_fee_config(
+        env: Env,
+        admin: Address,
+        base_fee_bps: u32,
+        max_fee_bps: u32,
+        min_fee_bps: u32,
+        utilization_threshold_bps: u32,
+        fee_adjustment_per_1pct_bps: u32,
+        enabled: bool,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        // Validate thresholds
+        if base_fee_bps > 10000 || max_fee_bps > 10000 || min_fee_bps > 10000 {
+            panic_with_error!(&env, Error::InvalidParameter);
+        }
+        if min_fee_bps > base_fee_bps || base_fee_bps > max_fee_bps {
+            panic_with_error!(&env, Error::InvalidParameter);
+        }
+        if utilization_threshold_bps > 10000 {
+            panic_with_error!(&env, Error::InvalidParameter);
+        }
+
+        let config = DynamicFeeConfig {
+            base_fee_bps,
+            max_fee_bps,
+            min_fee_bps,
+            utilization_threshold_bps,
+            fee_adjustment_per_1pct_bps,
+            enabled,
+            last_updated: env.ledger().timestamp(),
+        };
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::DynamicFeeConfig, &config);
+
+        env.events().publish(
+            (Symbol::new(&env, "dynamic_fee_config_updated"),),
+            DynamicFeeConfigUpdated {
+                base_fee_bps,
+                max_fee_bps,
+                min_fee_bps,
+                utilization_threshold_bps,
+                fee_adjustment_per_1pct_bps,
+                enabled,
+            },
+        );
+    }
+
+    /// Get current dynamic fee configuration.
+    pub fn get_dynamic_fee_config(env: Env) -> DynamicFeeConfig {
+        env.storage()
+            .instance()
+            .get(&StorageKey::DynamicFeeConfig)
+            .unwrap_or_else(|| DynamicFeeConfig {
+                base_fee_bps: 0,
+                max_fee_bps: 1000,
+                min_fee_bps: 0,
+                utilization_threshold_bps: 7000,
+                fee_adjustment_per_1pct_bps: 10,
+                enabled: false,
+                last_updated: 0,
+            })
+    }
+
+    /// Calculate the current dynamic fee based on pool utilization.
+    /// Returns adjusted fee in basis points within the configured min/max bounds.
+    pub fn calculate_dynamic_fee(env: Env) -> u32 {
+        let config = Self::get_dynamic_fee_config(&env);
+        if !config.enabled {
+            return config.base_fee_bps;
+        }
+
+        let status = Self::get_capacity_status(&env);
+        let util_bps = status.utilization_bps;
+
+        // If below threshold, use base fee
+        if util_bps <= config.utilization_threshold_bps {
+            return config.base_fee_bps;
+        }
+
+        // Calculate fee increase based on utilization above threshold
+        let util_above_threshold = util_bps.saturating_sub(config.utilization_threshold_bps);
+        // Convert basis points (1/100th of 1%) to 1% increments
+        let pct_above_threshold = util_above_threshold / 100;
+        let fee_increase = (pct_above_threshold as u32).saturating_mul(config.fee_adjustment_per_1pct_bps);
+
+        let adjusted_fee = config.base_fee_bps.saturating_add(fee_increase);
+        adjusted_fee.min(config.max_fee_bps).max(config.min_fee_bps)
     }
 
     /// Return the current admin address. Panics with `NotInitialized` if not set up.
