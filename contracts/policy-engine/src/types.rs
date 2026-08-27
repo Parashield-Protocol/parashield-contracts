@@ -140,6 +140,12 @@ pub struct ClaimsProcessorUpdated {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RiskPoolUpdated {
+    pub risk_pool: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProductCreated {
     pub product_id: u128,
     pub name: Symbol,

@@ -1048,6 +1048,29 @@ impl RiskPool {
         }
     }
 
+    /// Return the dynamic premium rate (basis points) for a given base rate,
+    /// adjusted for the pool's current risk as measured by utilization.
+    ///
+    /// Premiums are static by default (`InsuranceProduct.premium_rate_bps`),
+    /// which means the protocol charges the same rate whether the pool is
+    /// nearly empty or almost fully committed. A pool running hot has a thinner
+    /// buffer to absorb a correlated payout, so its coverage is objectively
+    /// riskier — and should cost more (issue #386).
+    ///
+    /// The adjustment scales the base rate linearly with utilization: at 0%
+    /// utilization the rate is unchanged, and at 100% utilization it doubles
+    /// (`rate * (10_000 + utilization_bps) / 10_000`). Utilization is capped at
+    /// 10_000 bps so the multiplier never exceeds 2x. The policy engine calls
+    /// this on every purchase and uses the result in place of the static rate.
+    pub fn get_dynamic_premium_rate(env: Env, base_rate_bps: u32) -> u32 {
+        let status = Self::get_capacity_status(env);
+        let util = status.utilization_bps.min(10_000);
+        let scaled = (base_rate_bps as u128)
+            .saturating_mul((10_000u128).saturating_add(util as u128))
+            / 10_000u128;
+        u32::try_from(scaled).unwrap_or(u32::MAX)
+    }
+
     /// Return the current admin address. Panics with `NotInitialized` if not set up.
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&StorageKey::Admin)

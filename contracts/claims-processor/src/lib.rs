@@ -122,6 +122,10 @@ enum StorageKey {
     PendingUpgrade,
     /// Seconds a claim may sit Pending before it can be escalated (u64).
     EscalationThreshold,
+    /// Maximum seconds after a policy's `end_time` during which a claim may
+    /// still be submitted for the triggering event (u64). `0` means a claim
+    /// can only be filed while the policy is Active (behaves as before).
+    ClaimDeadline,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -148,6 +152,9 @@ pub enum Error {
     AdminTimelockNotExpired = 16,
     NotEscalatable       = 17,
     InvalidThresholdValue = 18,
+    /// A `submit_claim` arrived after `end_time + claim_deadline` had elapsed,
+    /// so the window to file a claim for the triggering event has closed.
+    ClaimDeadlinePassed  = 19,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -174,6 +181,13 @@ const DEFAULT_ESCALATION_THRESHOLD: u64 = 7 * 24 * 60 * 60;
 /// threshold would let every claim be escalated on submission, which turns the
 /// signal into noise and defeats the purpose of having one.
 const MIN_ESCALATION_THRESHOLD: u64 = 60 * 60;
+
+/// Default window after a policy's `end_time` during which a claim may still be
+/// submitted. 30 days is long enough to cover keeper latency, oracle data
+/// still arriving, or a claimant simply not noticing the trigger immediately,
+/// while still putting a firm upper bound on how long a claim can be filed
+/// after the event it relates to (issue #386).
+const DEFAULT_CLAIM_DEADLINE: u64 = 30 * 24 * 60 * 60;
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
@@ -216,6 +230,7 @@ impl ClaimsProcessor {
         env.storage().instance().set(&StorageKey::NextClaimId, &1u128);
         env.storage().instance().set(&StorageKey::PendingClaims, &Vec::<u128>::new(&env));
         env.storage().instance().set(&StorageKey::Paused, &false);
+        env.storage().instance().set(&StorageKey::ClaimDeadline, &DEFAULT_CLAIM_DEADLINE);
 
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
@@ -289,10 +304,16 @@ impl ClaimsProcessor {
 
         // Guard: reject expired policies even if status hasn't been updated yet.
         // A direct contract caller could bypass the backend's status check, so
-        // we verify end_time at the contract level.
+        // we verify end_time at the contract level. A claim may still be filed
+        // for a bounded window after the policy ends (`claim_deadline`); once
+        // that window closes the triggering event is too old to act on and the
+        // submission is rejected (issue #386).
         let now = env.ledger().timestamp();
-        if policy.end_time > 0 && now > policy.end_time {
-            panic_with_error!(&env, Error::PolicyExpired);
+        if policy.end_time > 0 {
+            let cutoff = policy.end_time.saturating_add(Self::claim_deadline(&env));
+            if now > cutoff {
+                panic_with_error!(&env, Error::ClaimDeadlinePassed);
+            }
         }
 
         let claim_id   = Self::next_claim_id(&env);
@@ -1005,6 +1026,38 @@ impl ClaimsProcessor {
         }
     }
 
+    /// Set how long after a policy's `end_time` a claim may still be submitted.
+    ///
+    /// The deadline bounds how stale a triggering event may be when a claim is
+    /// filed. Without it, a policyholder (or anyone) could open a claim
+    /// indefinitely far after the event, so a disputed or rejected claim could
+    /// resurface years later against data nobody can still verify. A larger
+    /// value is more forgiving to claimants; a smaller one tightens the link
+    /// between the claim and the oracle data that backs it. `0` restores the
+    /// historical behaviour: claims only while the policy is Active.
+    ///
+    /// Floored at `MIN_ESCALATION_THRESHOLD` (1 hour) so the deadline is never
+    /// so short that a single missed ledger makes a valid claim impossible.
+    pub fn set_claim_deadline(env: Env, admin: Address, deadline: u64) {
+        Self::require_admin(&env, &admin);
+
+        if deadline != 0 && deadline < MIN_ESCALATION_THRESHOLD {
+            panic_with_error!(&env, Error::InvalidThresholdValue);
+        }
+
+        env.storage().instance().set(&StorageKey::ClaimDeadline, &deadline);
+
+        env.events().publish(
+            (Symbol::new(&env, "claim_deadline_set"),),
+            ClaimDeadlineUpdated { deadline },
+        );
+    }
+
+    /// The claim submission deadline in seconds (default: 30 days).
+    pub fn get_claim_deadline(env: Env) -> u64 {
+        Self::claim_deadline(&env)
+    }
+
     /// Escalate a claim that has been Pending past the threshold.
     ///
     /// A claim that nothing processes is worse than a rejected one: a
@@ -1232,6 +1285,14 @@ impl ClaimsProcessor {
             .instance()
             .get(&StorageKey::EscalationThreshold)
             .unwrap_or(DEFAULT_ESCALATION_THRESHOLD)
+    }
+
+    /// The configured claim submission deadline, or the default.
+    fn claim_deadline(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::ClaimDeadline)
+            .unwrap_or(DEFAULT_CLAIM_DEADLINE)
     }
 
     fn remove_from_pending(env: &Env, claim_id: u128) {

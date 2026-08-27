@@ -144,13 +144,15 @@ pub enum Error {
     AlreadyDelegated = 28,
     WeightAlreadyCounted = 29,
     TooManyDelegators = 30,
-    ProposalNotExpired = 26,
-    TemplateNotFound = 27,
-    TemplateInactive = 28,
-    TitleTooShort = 29,
-    ArgCountMismatch = 30,
-    DiscussionPeriodNotEnded = 31,
-    DiscussionPeriodNotRequired = 32,
+    ProposalNotExpired = 33,
+    TemplateNotFound = 34,
+    TemplateInactive = 35,
+    TitleTooShort = 36,
+    ArgCountMismatch = 37,
+    DiscussionPeriodNotEnded = 38,
+    DiscussionPeriodNotRequired = 39,
+    /// `vote_batch` was called with an empty proposal list.
+    NoProposals = 40,
 }
 
 #[contract]
@@ -621,18 +623,6 @@ impl GovernanceDao {
         let own_weight = gov_token.balance(&voter);
         if own_weight <= 0 {
             panic_with_error!(&env, Error::InsufficientWeight);
-        let mut weight = gov_token.balance(&voter);
-        if weight <= 0 {
-            // Check for delegated LP shares even if wallet balance is zero
-            let lp_weight = Self::get_delegated_lp_weight(&env, &voter);
-            if lp_weight <= 0 {
-                panic_with_error!(&env, Error::InsufficientWeight);
-            }
-            weight = lp_weight;
-        } else {
-            // Add any delegated LP shares on top of wallet balance
-            let lp_weight = Self::get_delegated_lp_weight(&env, &voter);
-            weight = weight.saturating_add(lp_weight);
         }
 
         // 2. Lock tokens in the DAO contract to prevent token cycling / double-voting
@@ -682,6 +672,123 @@ impl GovernanceDao {
         );
     }
 
+    /// Cast the same `choice` across several proposals in a single transaction
+    /// (issue #387). Voting on related proposals one at a time is tedious and
+    /// re-authorizes the same tokens repeatedly; a batch of bundled parameter
+    /// changes should be decided together, with a single vote.
+    ///
+    /// The caller's own tokens are locked exactly once for the whole batch —
+    /// they are custodied by the DAO for the duration of any still-active
+    /// proposal. The real lock is attributed to the first proposal; the others
+    /// share it (see `withdraw_tokens`, which no-ops for the shared ones, and
+    /// refunds the full amount exactly once through the first).
+    pub fn vote_batch(env: Env, voter: Address, proposal_ids: Vec<u64>, choice: VoteChoice) {
+        voter.require_auth();
+
+        if proposal_ids.is_empty() {
+            panic_with_error!(&env, Error::NoProposals);
+        }
+
+        // A holder who has delegated away their vote cannot also vote it.
+        if env
+            .storage()
+            .persistent()
+            .has(&StorageKey::DelegateOf(voter.clone()))
+        {
+            panic_with_error!(&env, Error::WeightAlreadyCounted);
+        }
+
+        // Pass 1 — validate every proposal before mutating any state, so a
+        // batch is all-or-nothing and never leaves a partial tally behind.
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let mut proposals: Vec<Proposal> = Vec::new(&env);
+        for i in 0..proposal_ids.len() {
+            let proposal_id = proposal_ids.get_unchecked(i);
+            let proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&StorageKey::Proposal(proposal_id))
+                .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+            if proposal.status == ProposalStatus::Discussion {
+                panic_with_error!(&env, Error::DiscussionPeriodNotEnded);
+            }
+            if proposal.status != ProposalStatus::Active {
+                panic_with_error!(&env, Error::ProposalNotActive);
+            }
+            if env.ledger().timestamp() > proposal.vote_end {
+                panic_with_error!(&env, Error::VotingClosed);
+            }
+            let vote_key = StorageKey::VoteRecord(proposal_id, voter.clone());
+            if env.storage().persistent().has(&vote_key) {
+                panic_with_error!(&env, Error::AlreadyVoted);
+            }
+            if env
+                .storage()
+                .persistent()
+                .has(&StorageKey::DelegatedVote(proposal_id, voter.clone()))
+            {
+                panic_with_error!(&env, Error::WeightAlreadyCounted);
+            }
+            proposals.push_back(proposal);
+        }
+
+        // Pass 2 — lock the voter's own tokens once, then tally each proposal.
+        let gov_token = token::Client::new(&env, &config.gov_token);
+        let own_weight = gov_token.balance(&voter);
+        if own_weight <= 0 {
+            panic_with_error!(&env, Error::InsufficientWeight);
+        }
+        gov_token.transfer(&voter, &env.current_contract_address(), &own_weight);
+
+        for i in 0..proposal_ids.len() {
+            let proposal_id = proposal_ids.get_unchecked(i);
+            let mut proposal = proposals.get_unchecked(i);
+
+            let delegated_weight =
+                Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
+            let weight = own_weight.saturating_add(delegated_weight);
+
+            match choice {
+                VoteChoice::For => proposal.votes_for += weight,
+                VoteChoice::Against => proposal.votes_against += weight,
+                VoteChoice::Abstain => proposal.votes_abstain += weight,
+            }
+
+            let vote_key = StorageKey::VoteRecord(proposal_id, voter.clone());
+            env.storage().persistent().set(
+                &vote_key,
+                &VoteRecord {
+                    voter: voter.clone(),
+                    choice: choice.clone(),
+                    weight,
+                },
+            );
+
+            // The tokens were locked once for the whole batch. Attribute the
+            // real lock to the first proposal only; `withdraw_tokens` treats the
+            // rest as sharing that lock and no-ops for them.
+            let lock_amount = if i == 0 { own_weight } else { 0 };
+            env.storage()
+                .persistent()
+                .set(&StorageKey::LockedBalance(proposal_id, voter.clone()), &lock_amount);
+
+            env.storage()
+                .persistent()
+                .set(&StorageKey::Proposal(proposal_id), &proposal);
+
+            env.events().publish(
+                (Symbol::new(&env, "vote_cast"),),
+                VoteCast {
+                    proposal_id,
+                    voter: voter.clone(),
+                    choice: choice.clone(),
+                    weight,
+                },
+            );
+        }
+    }
+
     /// Withdraw gov tokens that were locked by `vote()` on `proposal_id`.
     ///
     /// Only available once the proposal is no longer Active (i.e. after
@@ -705,6 +812,19 @@ impl GovernanceDao {
         let locked_amount: i128 = env.storage().persistent().get(&lock_key).unwrap_or(0);
 
         if locked_amount <= 0 {
+            // A `vote_batch` call locks the voter's tokens once and attributes
+            // the real lock to its first proposal. The remaining proposals in
+            // the batch share that lock, so they correctly have no refundable
+            // balance of their own — the tokens are returned exactly once via
+            // the first proposal. If a vote record exists, this is that shared
+            // case; otherwise there is genuinely nothing to withdraw.
+            if env
+                .storage()
+                .persistent()
+                .has(&StorageKey::VoteRecord(proposal_id, voter.clone()))
+            {
+                return;
+            }
             panic_with_error!(&env, Error::InsufficientWeight);
         }
 

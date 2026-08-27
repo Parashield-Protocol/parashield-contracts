@@ -29,6 +29,15 @@ use soroban_sdk::{
 pub mod types;
 pub use types::*;
 
+// ─── Cross-contract client interfaces ────────────────────────────────────────
+
+/// Minimal client for the risk-pool, used to fetch a utilization-adjusted
+/// premium rate at purchase time (issue #386).
+#[soroban_sdk::contractclient(name = "RiskPoolClient")]
+trait IRiskPool {
+    fn get_dynamic_premium_rate(env: Env, base_rate_bps: u32) -> u32;
+}
+
 // ─── Storage TTL ──────────────────────────────────────────────────────────────
 
 /// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
@@ -89,6 +98,10 @@ enum StorageKey {
     /// Maps (category, oracle_key) -> product_id for uniqueness constraint
     ProductKey((Symbol, Symbol)),
     PendingAdmin,
+    /// Optional risk-pool contract used to price premiums dynamically. When set,
+    /// `buy_policy` queries it for a utilization-adjusted rate instead of using
+    /// the product's static `premium_rate_bps` (issue #386).
+    RiskPool,
     /// Ledger timestamp (u64) at which the current `PendingAdmin` was set, used
     /// to enforce `ADMIN_TRANSFER_TIMELOCK` before `accept_admin` succeeds.
     PendingAdminSince,
@@ -273,6 +286,22 @@ impl PolicyEngine {
             (Symbol::new(&env, "claims_processor_updated"),),
             ClaimsProcessorUpdated {
                 claims_processor: claims_processor.clone(),
+            },
+        );
+    }
+
+    /// Set the Risk Pool address used for dynamic premium pricing. When set,
+    /// `buy_policy` asks the pool for a utilization-adjusted premium rate
+    /// instead of charging the product's static `premium_rate_bps` (issue #386).
+    /// Pass the zero/empty behavior is not supported — provide a valid contract.
+    pub fn set_risk_pool(env: Env, admin: Address, risk_pool: Address) {
+        Self::require_admin(&env, &admin);
+        Self::validate_stellar_address(&env, &risk_pool);
+        env.storage().instance().set(&StorageKey::RiskPool, &risk_pool);
+        env.events().publish(
+            (Symbol::new(&env, "risk_pool_updated"),),
+            RiskPoolUpdated {
+                risk_pool: risk_pool.clone(),
             },
         );
     }
@@ -503,8 +532,22 @@ impl PolicyEngine {
         if coverage_amount > 1_000_000_000_000 {
             panic_with_error!(&env, Error::CoverageOutOfRange);
         }
+
+        // Static rate from the product, optionally adjusted by live pool risk.
+        // When a risk pool is configured, utilization raises the rate so a hot
+        // pool (thinner buffer against correlated payouts) charges more — this
+        // is the dynamic pricing required by issue #386. With no pool set, the
+        // product's static rate is used unchanged (backward compatible).
+        let base_rate_bps = product.premium_rate_bps;
+        let effective_rate_bps = match env.storage().instance().get(&StorageKey::RiskPool) {
+            Some(risk_pool) => {
+                RiskPoolClient::new(&env, &risk_pool).get_dynamic_premium_rate(&base_rate_bps)
+            }
+            None => base_rate_bps,
+        };
+
         let premium = coverage_amount
-            .checked_mul(product.premium_rate_bps as i128)
+            .checked_mul(effective_rate_bps as i128)
             .and_then(|v| v.checked_mul(duration_days as i128))
             .and_then(|v| v.checked_div(365))
             .and_then(|v| v.checked_div(10_000))

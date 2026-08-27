@@ -1454,6 +1454,31 @@ impl OracleVerifier {
         result
     }
 
+    /// Like `verify_trigger` but also returns the aggregated oracle data —
+    /// including the aggregated `confidence` score — alongside the boolean
+    /// verdict. A caller can thus act on the trigger result and reason about how
+    /// trustworthy that result is in a single call, instead of having to call
+    /// `get_aggregated` separately to obtain the confidence (issue #388).
+    pub fn verify_trigger_with_confidence(
+        env: Env,
+        data_type: Symbol,
+        key: Symbol,
+        condition: TriggerCondition,
+    ) -> (bool, AggregatedData) {
+        let agg = Self::get_aggregated(env.clone(), data_type.clone(), key.clone());
+        let median = agg.median_value;
+        let result = match condition.comparison {
+            TriggerComparison::LessThan => median < condition.threshold,
+            TriggerComparison::GreaterThan => median > condition.threshold,
+            TriggerComparison::Equal => median == condition.threshold,
+            TriggerComparison::EqualWithTolerance => {
+                let diff = median.saturating_sub(condition.threshold);
+                diff.abs() <= condition.tolerance
+            }
+        };
+        (result, agg)
+    }
+
     /// Return the most recent submission from any oracle for (data_type, key).
     /// Panics with NoDataAvailable if no submissions exist.
     pub fn get_data(env: Env, data_type: Symbol, key: Symbol) -> OracleDataPoint {
