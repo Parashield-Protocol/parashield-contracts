@@ -135,6 +135,9 @@ enum StorageKey {
     /// type with high-value triggers may require more independent submissions
     /// before the aggregation is considered valid.
     DataTypeMinOracleCount(Symbol),
+    /// Per-product consensus threshold configuration (ConsensusThreshold).
+    /// Specifies different oracle agreement levels for different data types/products.
+    ConsensusThreshold(Symbol),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -727,6 +730,58 @@ impl OracleVerifier {
     /// override when set, otherwise the global value.
     pub fn get_data_type_min_oracle_count(env: Env, data_type: Symbol) -> u32 {
         Self::effective_min_oracle_count(&env, &data_type)
+    }
+
+    /// Set per-product configurable consensus threshold for oracle agreement.
+    /// Allows specifying different consensus requirements for different data types/products.
+    ///
+    /// The threshold is in basis points: 10000 = unanimous, 5000 = majority, etc.
+    /// This replaces fixed consensus thresholds with flexible, per-product configuration.
+    pub fn set_consensus_threshold(
+        env: Env,
+        admin: Address,
+        data_type: Symbol,
+        agreement_threshold_bps: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+        
+        // Validate threshold is between 0 and 10000 basis points
+        if agreement_threshold_bps > 10000 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        
+        let threshold = ConsensusThreshold {
+            data_type: data_type.clone(),
+            agreement_threshold_bps,
+        };
+        
+        env.storage()
+            .instance()
+            .set(&StorageKey::ConsensusThreshold(data_type.clone()), &threshold);
+        
+        env.events().publish(
+            (Symbol::new(&env, "consensus_threshold_updated"),),
+            ConsensusThresholdUpdated { 
+                data_type, 
+                agreement_threshold_bps 
+            },
+        );
+    }
+
+    /// Get the consensus threshold for a specific data type/product.
+    /// Returns the configured threshold, or a default of 5000 (50%, simple majority) if not configured.
+    pub fn get_consensus_threshold(env: Env, data_type: Symbol) -> ConsensusThreshold {
+        match env
+            .storage()
+            .instance()
+            .get::<_, ConsensusThreshold>(&StorageKey::ConsensusThreshold(data_type.clone()))
+        {
+            Some(threshold) => threshold,
+            None => ConsensusThreshold {
+                data_type,
+                agreement_threshold_bps: 5000, // Default to simple majority
+            },
+        }
     }
 
     /// Set the minimum number of seconds a single oracle must wait between

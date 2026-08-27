@@ -233,10 +233,21 @@ impl GovernanceDao {
         title: Bytes,
         target: Address,
         function: Symbol,
-        args: Vec<Val>, // <--- ADD THIS ARGUMENT
+        args: Vec<Val>,
+        impact_analysis: Bytes,
     ) -> u64 {
         proposer.require_auth();
         Self::validate_stellar_address(&env, &target);
+        
+        // Validate impact analysis is provided (non-empty)
+        if impact_analysis.is_empty() {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        // Enforce maximum length for impact analysis (4096 bytes)
+        if impact_analysis.len() > 4096 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        
         let config: DaoConfig = env
             .storage()
             .instance()
@@ -279,7 +290,7 @@ impl GovernanceDao {
             title,
             target: target.clone(),
             function: function.clone(),
-            args, // <--- BIND TO STRUCT
+            args,
             deposit,
             status,
             votes_for: 0,
@@ -290,6 +301,7 @@ impl GovernanceDao {
             execution_time: 0,
             total_supply: config.total_supply,
             kind: ProposalKind::Standard,
+            impact_analysis,
         };
 
         let proposal_key = StorageKey::Proposal(proposal_id);
@@ -328,9 +340,20 @@ impl GovernanceDao {
         title: Bytes,
         target: Address,
         new_wasm_hash: BytesN<32>,
+        impact_analysis: Bytes,
     ) -> u64 {
         proposer.require_auth();
         Self::validate_stellar_address(&env, &target);
+        
+        // Validate impact analysis is provided (non-empty)
+        if impact_analysis.is_empty() {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        // Enforce maximum length for impact analysis (4096 bytes)
+        if impact_analysis.len() > 4096 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        
         let config: DaoConfig = env
             .storage()
             .instance()
@@ -381,6 +404,7 @@ impl GovernanceDao {
             execution_time: 0,
             total_supply: config.total_supply,
             kind: ProposalKind::Upgrade,
+            impact_analysis,
         };
 
         let proposal_key = StorageKey::Proposal(proposal_id);

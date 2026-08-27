@@ -56,6 +56,26 @@ pub struct Claim {
     /// For PartiallyPaid claims: payout ratio in basis points (0-10000).
     /// 10000 = full coverage; lower = proportional partial payment.
     pub partial_payout_bps: Option<u32>,
+    /// Installment payout configuration for large claims.
+    pub installments: Option<InstallmentSchedule>,
+}
+
+/// Configuration for installment-based claim payouts.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstallmentSchedule {
+    /// Total amount to be paid out in installments.
+    pub total_amount: i128,
+    /// Amount per installment.
+    pub amount_per_installment: i128,
+    /// Total number of installments.
+    pub num_installments: u32,
+    /// Interval in seconds between installments.
+    pub interval_seconds: u64,
+    /// Timestamp when first installment becomes claimable.
+    pub first_installment_at: u64,
+    /// Number of installments already paid out.
+    pub paid_count: u32,
 }
 
 /// How overdue a pending claim is.
@@ -225,5 +245,27 @@ pub struct CrossChainAttestationSubmitted {
     pub attestor: Address,
     pub observed_value: i128,
     pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstallmentPayoutScheduled {
+    pub claim_id: u128,
+    pub policy_id: u128,
+    pub claimant: Address,
+    pub total_amount: i128,
+    pub num_installments: u32,
+    pub interval_seconds: u64,
+    pub first_installment_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstallmentPaid {
+    pub claim_id: u128,
+    pub claimant: Address,
+    pub amount: i128,
+    pub paid_count: u32,
+    pub total_installments: u32,
 }
 

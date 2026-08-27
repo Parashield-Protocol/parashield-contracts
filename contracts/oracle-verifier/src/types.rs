@@ -253,10 +253,28 @@ pub struct DataTypeMinOracleCountUpdated {
     pub min_count: u32,
 }
 
+/// Per-product consensus threshold configuration.
+/// Allows specifying minimum oracle agreement levels per data type/product.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConsensusThreshold {
+    pub data_type: Symbol,
+    /// Minimum number of agreeing oracles required for consensus (basis points).
+    /// 10000 = unanimous, 5000 = majority, etc.
+    pub agreement_threshold_bps: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MinSubmitIntervalUpdated {
     pub seconds: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConsensusThresholdUpdated {
+    pub data_type: Symbol,
+    pub agreement_threshold_bps: u32,
 }
 
 #[contracttype]
