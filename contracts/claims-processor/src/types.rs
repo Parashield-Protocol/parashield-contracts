@@ -9,6 +9,8 @@ pub enum ClaimStatus {
     Disputed,
     /// Claim was resolved as expired before it could be processed.
     Expired,
+    /// Claim was partially paid (proportional payout based on trigger severity).
+    PartiallyPaid,
 }
 
 /// Result returned by `process_claim` and `auto_process`.
@@ -26,6 +28,8 @@ pub enum ClaimResult {
     /// Policy is not in Active state (cancelled etc.).
     PolicyNotActive,
     AlreadyProcessed,
+    /// Trigger was met but payout was proportional (partial payment).
+    PartiallyPaid,
 }
 
 /// A claim record stored on-chain.
@@ -43,6 +47,11 @@ pub struct Claim {
     pub submitted_at: u64,
     pub processed_at: Option<u64>,
     pub dispute_reason: Option<Symbol>,
+    /// For PartiallyPaid claims: the actual USDC amount paid out.
+    pub paid_amount: Option<i128>,
+    /// For PartiallyPaid claims: payout ratio in basis points (0-10000).
+    /// 10000 = full coverage; lower = proportional partial payment.
+    pub partial_payout_bps: Option<u32>,
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
