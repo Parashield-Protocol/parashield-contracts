@@ -138,6 +138,8 @@ enum StorageKey {
     /// Per-product consensus threshold configuration (ConsensusThreshold).
     /// Specifies different oracle agreement levels for different data types/products.
     ConsensusThreshold(Symbol),
+    /// Geographic weighting (data_type, oracle_address, region) -> geo_weight_bps (u32).
+    GeoWeight(Symbol, Address, Symbol),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -897,6 +899,145 @@ impl OracleVerifier {
             .persistent()
             .get(&StorageKey::OracleStakeAmt(data_type, oracle))
             .unwrap_or(0)
+    }
+
+    // ── Geographic Weighting (Issue #426) ───────────────────────────────────
+
+    /// Admin-only: Set geographic weighting multiplier for an oracle in basis points (10000 = 1.0x).
+    pub fn set_oracle_geo_weight(
+        env: Env,
+        admin: Address,
+        oracle: Address,
+        data_type: Symbol,
+        region: Symbol,
+        geo_weight_bps: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+        if geo_weight_bps == 0 {
+            panic_with_error!(&env, Error::InvalidConfidence);
+        }
+        let key = StorageKey::GeoWeight(data_type.clone(), oracle.clone(), region.clone());
+        env.storage().persistent().set(&key, &geo_weight_bps);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.events().publish(
+            (Symbol::new(&env, "geo_weight_updated"),),
+            GeoWeightUpdated {
+                oracle,
+                data_type,
+                region,
+                geo_weight_bps,
+            },
+        );
+    }
+
+    /// Return the geographic weighting multiplier in basis points for (data_type, oracle, region).
+    /// Defaults to 10,000 (1.0x baseline weight) if unconfigured.
+    pub fn get_oracle_geo_weight(
+        env: Env,
+        oracle: Address,
+        data_type: Symbol,
+        region: Symbol,
+    ) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::GeoWeight(data_type, oracle, region))
+            .unwrap_or(10_000)
+    }
+
+    /// Return aggregated data for a specific geographic region, applying geographic weighting to active oracles.
+    pub fn get_aggregated_for_region(
+        env: Env,
+        data_type: Symbol,
+        key: Symbol,
+        max_age_seconds: u64,
+        target_region: Symbol,
+    ) -> AggregatedData {
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoDataAvailable));
+        if points.is_empty() {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
+        let now = env.ledger().timestamp();
+        let min_confidence: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
+
+        let mut values = [(0i128, 0u32); 100];
+        let mut count: usize = 0;
+        let mut total_effective_weight: u32 = 0;
+        let mut weighted_confidence_sum: u64 = 0;
+        let mut min_conf: u32 = 100;
+        let mut newest_timestamp: u64 = 0;
+
+        for i in 0..points.len() {
+            let p = points.get_unchecked(i);
+            let age = now.saturating_sub(p.timestamp);
+            if age <= max_age_seconds && p.confidence >= min_confidence {
+                let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+                let base_weight = match env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+                    Some(entry) if entry.active => entry.weight,
+                    _ => continue,
+                };
+
+                let geo_multiplier = Self::get_oracle_geo_weight(env.clone(), p.oracle.clone(), data_type.clone(), target_region.clone());
+                let effective_weight = ((base_weight as u64 * geo_multiplier as u64) / 10_000) as u32;
+                let effective_weight = if effective_weight == 0 { 1 } else { effective_weight };
+
+                if count < 100 {
+                    values[count] = (p.value, effective_weight);
+                    count += 1;
+                }
+
+                total_effective_weight += effective_weight;
+                weighted_confidence_sum += p.confidence as u64 * effective_weight as u64;
+                if p.confidence < min_conf {
+                    min_conf = p.confidence;
+                }
+                if p.timestamp > newest_timestamp {
+                    newest_timestamp = p.timestamp;
+                }
+            }
+        }
+
+        if count == 0 {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
+        let slice = &mut values[..count];
+        slice.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let half_weight = total_effective_weight / 2;
+        let mut accum: u32 = 0;
+        let mut median: i128 = slice[0].0;
+        for &(val, weight) in slice.iter() {
+            accum += weight;
+            if accum >= half_weight {
+                median = val;
+                break;
+            }
+        }
+
+        let avg_confidence = if total_effective_weight > 0 {
+            (weighted_confidence_sum / total_effective_weight as u64) as u32
+        } else {
+            0
+        };
+
+        AggregatedData {
+            median_value: median,
+            oracle_count: count as u32,
+            active_oracle_count: count as u32,
+            confidence: avg_confidence,
+            min_confidence: min_conf,
+            last_updated: newest_timestamp,
+        }
     }
 
     /// Withdraw the caller's full stake for `data_type`. Only permitted once

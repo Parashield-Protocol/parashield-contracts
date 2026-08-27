@@ -1188,3 +1188,54 @@ fn test_invalidate_data_scoped_to_key() {
     let data = client.get_data(&weather(), &key2);
     assert_eq!(data.value, 45_000_000i128);
 }
+
+// ── Geographic Weighting (Issue #426) ──────────────────────────────────────────
+
+#[test]
+fn test_geo_weight_set_and_get() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    let region = symbol_short!("AFR");
+
+    client.add_oracle(&admin, &oracle, &weather(), &50u32);
+    assert_eq!(client.get_oracle_geo_weight(&oracle, &weather(), &region), 10_000);
+
+    client.set_oracle_geo_weight(&admin, &oracle, &weather(), &region, &20_000u32);
+    assert_eq!(client.get_oracle_geo_weight(&oracle, &weather(), &region), 20_000);
+}
+
+#[test]
+fn test_geo_weight_aggregation_prioritizes_local_oracle() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle1 = Address::generate(&env);
+    let oracle2 = Address::generate(&env);
+    let region = symbol_short!("AFR");
+
+    client.add_oracle(&admin, &oracle1, &weather(), &50u32);
+    client.add_oracle(&admin, &oracle2, &weather(), &50u32);
+
+    let ts = env.ledger().timestamp();
+    client.submit_data(&oracle1, &weather(), &kisumu_key(), &10_000_000i128, &90u32, &ts);
+    client.submit_data(&oracle2, &weather(), &kisumu_key(), &30_000_000i128, &90u32, &ts);
+
+    // Give oracle2 a 3x geographic weighting in AFR region
+    client.set_oracle_geo_weight(&admin, &oracle2, &weather(), &region, &30_000u32);
+
+    let agg = client.get_aggregated_for_region(&weather(), &kisumu_key(), &3600u64, &region);
+    assert_eq!(agg.median_value, 30_000_000i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_non_admin_cannot_set_geo_weight() {
+    let (env, _admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    let impostor = Address::generate(&env);
+    let region = symbol_short!("AFR");
+
+    client.set_oracle_geo_weight(&impostor, &oracle, &weather(), &region, &20_000u32);
+}
+
