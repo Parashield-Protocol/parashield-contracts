@@ -422,17 +422,17 @@ impl ClaimsProcessor {
     /// claimants. When enabled, `submit_claim` and `auto_process` check
     /// that the policyholder has passed KYC via the configured identity
     /// verifier before accepting or processing a claim.
-    pub fn set_identity_verification_required(env: Env, admin: Address, required: bool) {
+    pub fn set_kyc_required(env: Env, admin: Address, required: bool) {
         Self::require_admin(&env, &admin);
         env.storage().instance().set(&StorageKey::IdentityVerificationRequired, &required);
         env.events().publish(
-            (Symbol::new(&env, "identity_verification_toggled"),),
+            (Symbol::new(&env, "kyc_required_toggled"),),
             required,
         );
     }
 
     /// Whether identity verification is currently required.
-    pub fn is_identity_verification_required(env: Env) -> bool {
+    pub fn is_kyc_required(env: Env) -> bool {
         env.storage().instance()
             .get(&StorageKey::IdentityVerificationRequired)
             .unwrap_or(false)
