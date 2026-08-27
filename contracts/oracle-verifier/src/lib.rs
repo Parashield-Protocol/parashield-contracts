@@ -1526,6 +1526,7 @@ impl OracleVerifier {
             .unwrap_or(0);
 
         let mut values = [(0i128, 0u32); 100];
+        let mut timestamps = [0u64; 100];
         let mut total_weight: u32 = 0;
         let mut n = 0;
 
@@ -1556,6 +1557,7 @@ impl OracleVerifier {
                             panic_with_error!(&env, Error::TooManyOracles);
                         }
                         values[n] = (p.value, entry.weight);
+                        timestamps[n] = p.timestamp;
                         n += 1;
                         total_weight += entry.weight;
                     }
@@ -1577,12 +1579,16 @@ impl OracleVerifier {
         // actually evaluated against. This previously computed its own median
         // inline, which silently ignored the configured aggregation method.
         let active_values = &mut values[0..n];
+        let active_timestamps = &timestamps[0..n];
         let median_value = match Self::effective_aggregation_method(&env, &data_type) {
             AggregationMethod::WeightedMedian => Self::weighted_median(active_values, total_weight),
             AggregationMethod::WeightedAverage => {
                 Self::weighted_average(active_values, total_weight)
             }
             AggregationMethod::Mean => Self::mean(active_values),
+            AggregationMethod::TimeWeightedAverage => {
+                Self::time_weighted_average(&env, active_values, active_timestamps)
+            }
         };
 
         let confidence = match weighted_confidence_sum.checked_div(total_weight_sum) {
@@ -2124,6 +2130,7 @@ impl OracleVerifier {
 
         // Collect values and weights on the stack (capped by MAX_DATA_POINTS)
         let mut values = [(0i128, 0u32); 100];
+        let mut timestamps = [0u64; 100];
         let mut total_weight: u32 = 0;
         let mut n = 0;
 
@@ -2142,6 +2149,7 @@ impl OracleVerifier {
                             panic_with_error!(env, Error::TooManyOracles);
                         }
                         values[n] = (p.value, entry.weight);
+                        timestamps[n] = p.timestamp;
                         n += 1;
                         total_weight += entry.weight;
                     }
@@ -2159,11 +2167,15 @@ impl OracleVerifier {
         }
 
         let active_values = &mut values[0..n];
+        let active_timestamps = &timestamps[0..n];
 
         match Self::effective_aggregation_method(env, data_type) {
             AggregationMethod::WeightedMedian => Self::weighted_median(active_values, total_weight),
             AggregationMethod::WeightedAverage => Self::weighted_average(active_values, total_weight),
             AggregationMethod::Mean => Self::mean(active_values),
+            AggregationMethod::TimeWeightedAverage => {
+                Self::time_weighted_average(env, active_values, active_timestamps)
+            }
         }
     }
 
@@ -2226,6 +2238,62 @@ impl OracleVerifier {
             sum = sum.saturating_add(val);
         }
         sum / (values.len() as i128)
+    }
+
+    /// Oracle-weight- and time-weighted average.
+    ///
+    /// Oracles only ever submit point-in-time observations — there is no
+    /// interval or duration attached to a single reading. TWA reconstructs
+    /// a time-weighted average from those snapshots: sorted by timestamp,
+    /// each value is treated as holding from its own timestamp until the
+    /// next (later) submission's timestamp, or until "now" for the newest
+    /// one, and contributes to the average in proportion to that duration
+    /// times its oracle's registered weight. A plain average (weighted or
+    /// not) would let a burst of submissions clustered in a short window
+    /// dominate the result as heavily as one that held for hours; TWA
+    /// corrects for that by weighting on how long each value actually
+    /// prevailed.
+    ///
+    /// `values` and `timestamps` are parallel slices (same length, same
+    /// index refers to the same submission) — callers build them from the
+    /// same loop that already collects `(value, weight)` pairs for the
+    /// other aggregation methods.
+    fn time_weighted_average(env: &Env, values: &[(i128, u32)], timestamps: &[u64]) -> i128 {
+        let n = values.len();
+        if n == 1 {
+            return values[0].0;
+        }
+
+        // Pair each (value, weight) with its timestamp and sort by time —
+        // `values`/`timestamps` are capped at MAX_DATA_POINTS (100), so
+        // this stays on the stack like the other aggregation methods.
+        let mut by_time = [(0i128, 0u32, 0u64); 100];
+        for i in 0..n {
+            let (val, wt) = values[i];
+            by_time[i] = (val, wt, timestamps[i]);
+        }
+        let active = &mut by_time[0..n];
+        active.sort_unstable_by_key(|&(_, _, ts)| ts);
+
+        let now = env.ledger().timestamp();
+        let mut weighted_sum: i128 = 0;
+        let mut total_weighted_duration: i128 = 0;
+        for i in 0..n {
+            let (val, wt, ts) = active[i];
+            let end = if i + 1 < n { active[i + 1].2 } else { now.max(ts) };
+            // A submission sharing its timestamp with the next (or with
+            // "now") held for zero observed seconds; floor at 1 second so
+            // it still contributes rather than vanishing from the average.
+            let duration = end.saturating_sub(ts).max(1) as i128;
+            let weighted_duration = duration.saturating_mul(wt as i128);
+            weighted_sum = weighted_sum.saturating_add(val.saturating_mul(weighted_duration));
+            total_weighted_duration = total_weighted_duration.saturating_add(weighted_duration);
+        }
+
+        if total_weighted_duration == 0 {
+            return active[n - 1].0;
+        }
+        weighted_sum / total_weighted_duration
     }
 }
 

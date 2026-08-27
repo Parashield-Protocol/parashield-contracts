@@ -35,7 +35,10 @@ pub struct ReputationUpdated {
 /// value cannot move it — which is what you want for adversarial or
 /// error-prone feeds. A weighted average uses every submission in proportion
 /// to its registered weight, which tracks small genuine variations more
-/// smoothly but lets a single extreme value drag the result.
+/// smoothly but lets a single extreme value drag the result. A time-weighted
+/// average additionally accounts for how long each submission held before
+/// being superseded, so a feed with irregular submission cadence isn't
+/// skewed by a burst of readings clustered in a short window.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AggregationMethod {
@@ -48,6 +51,16 @@ pub enum AggregationMethod {
     /// Unweighted arithmetic mean: every valid submission counts equally.
     /// Use when registered weights are not meaningful for this data type.
     Mean,
+    /// Oracle-weight- and time-weighted average: each eligible submission
+    /// is weighted by its registered oracle weight *and* by how many
+    /// seconds it was the most recent reading for its oracle — from its
+    /// own timestamp until the next later submission's timestamp (or
+    /// "now" for the newest one). Only point-in-time values are ever
+    /// submitted; this reconstructs a time-weighted average (TWAP-style)
+    /// over the observation window from those snapshots, rather than
+    /// treating every snapshot as equally significant regardless of how
+    /// long it held.
+    TimeWeightedAverage,
 }
 
 /// How the trigger threshold is compared against the observed value.
