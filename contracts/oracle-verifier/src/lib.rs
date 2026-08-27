@@ -122,6 +122,14 @@ enum StorageKey {
     /// (data_type, key), stored separately from plaintext `DataPoints` since
     /// they are never aggregated or compared on-chain.
     EncryptedDataPoints(Symbol, Symbol),
+    /// Maximum age (in seconds) for oracle submission timestamps to be accepted.
+    /// Submissions older than `now - MaxTimestampAge` are rejected. Defaults to
+    /// 90 days. Admin-configurable via `set_max_timestamp_age`.
+    MaxTimestampAge,
+    /// Maximum number of seconds into the future a submission timestamp may be.
+    /// Protects against submissions with clocks far ahead of the ledger.
+    /// Defaults to 60 seconds. Admin-configurable via `set_timestamp_future_buffer`.
+    TimestampFutureBuffer,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -155,6 +163,7 @@ pub enum Error {
     AdminTimelockNotExpired = 23,
     InvalidMaxAge = 24,
     EncryptionRequiredForType = 25,
+    TimestampOutOfRange = 26,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -346,6 +355,50 @@ impl OracleVerifier {
             (Symbol::new(&env, "max_data_age_updated"),),
             MaxDataAgeUpdated { max_age },
         );
+    }
+
+    /// Set the maximum acceptable age for oracle submission timestamps (in seconds).
+    /// Submissions with timestamps older than `now - max_timestamp_age` are rejected.
+    /// Defaults to 90 days (7,776,000 seconds). Admin-only.
+    pub fn set_max_timestamp_age(env: Env, admin: Address, max_timestamp_age: u64) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::MaxTimestampAge, &max_timestamp_age);
+        env.events().publish(
+            (Symbol::new(&env, "max_timestamp_age_updated"),),
+            MaxTimestampAgeUpdated { max_timestamp_age },
+        );
+    }
+
+    /// Return the configured max timestamp age (defaults to 90 days).
+    pub fn get_max_timestamp_age(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::MaxTimestampAge)
+            .unwrap_or(90 * 24 * 60 * 60)
+    }
+
+    /// Set the maximum number of seconds a submission timestamp may be ahead of
+    /// the ledger. Protects against oracles with clocks far ahead of reality.
+    /// Defaults to 60 seconds. Admin-only.
+    pub fn set_timestamp_future_buffer(env: Env, admin: Address, seconds: u64) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::TimestampFutureBuffer, &seconds);
+        env.events().publish(
+            (Symbol::new(&env, "timestamp_future_buffer_updated"),),
+            TimestampFutureBufferUpdated { seconds },
+        );
+    }
+
+    /// Return the configured future buffer (defaults to 60 seconds).
+    pub fn get_timestamp_future_buffer(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::TimestampFutureBuffer)
+            .unwrap_or(60)
     }
 
     /// Propose a new admin. Only the current admin can call this.
@@ -1041,11 +1094,20 @@ impl OracleVerifier {
         }
 
         let now = env.ledger().timestamp();
-        if timestamp > now {
+        let future_buffer: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TimestampFutureBuffer)
+            .unwrap_or(60);
+        if timestamp > now.saturating_add(future_buffer) {
             panic_with_error!(&env, Error::InvalidTimestamp);
         }
-        let ninety_days = 90 * 24 * 60 * 60;
-        if timestamp < now.saturating_sub(ninety_days) {
+        let max_timestamp_age: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MaxTimestampAge)
+            .unwrap_or(90 * 24 * 60 * 60);
+        if timestamp < now.saturating_sub(max_timestamp_age) {
             panic_with_error!(&env, Error::InvalidTimestamp);
         }
 
@@ -1557,11 +1619,20 @@ impl OracleVerifier {
             }
 
             let now = env.ledger().timestamp();
-            if timestamp > now {
+            let future_buffer: u64 = env
+                .storage()
+                .instance()
+                .get(&StorageKey::TimestampFutureBuffer)
+                .unwrap_or(60);
+            if timestamp > now.saturating_add(future_buffer) {
                 panic_with_error!(&env, Error::InvalidTimestamp);
             }
-            let ninety_days = 90 * 24 * 60 * 60;
-            if timestamp < now.saturating_sub(ninety_days) {
+            let max_timestamp_age: u64 = env
+                .storage()
+                .instance()
+                .get(&StorageKey::MaxTimestampAge)
+                .unwrap_or(90 * 24 * 60 * 60);
+            if timestamp < now.saturating_sub(max_timestamp_age) {
                 panic_with_error!(&env, Error::InvalidTimestamp);
             }
 
@@ -1643,7 +1714,20 @@ impl OracleVerifier {
                 panic_with_error!(&env, Error::InvalidConfidence);
             }
             let now = env.ledger().timestamp();
-            if sub.timestamp > now {
+            let future_buffer: u64 = env
+                .storage()
+                .instance()
+                .get(&StorageKey::TimestampFutureBuffer)
+                .unwrap_or(60);
+            if sub.timestamp > now.saturating_add(future_buffer) {
+                panic_with_error!(&env, Error::InvalidTimestamp);
+            }
+            let max_timestamp_age: u64 = env
+                .storage()
+                .instance()
+                .get(&StorageKey::MaxTimestampAge)
+                .unwrap_or(90 * 24 * 60 * 60);
+            if sub.timestamp < now.saturating_sub(max_timestamp_age) {
                 panic_with_error!(&env, Error::InvalidTimestamp);
             }
             let dp_key = StorageKey::DataPoints(data_type.clone(), sub.key.clone());

@@ -122,6 +122,8 @@ pub enum Error {
     TemplateInactive = 28,
     TitleTooShort = 29,
     ArgCountMismatch = 30,
+    DiscussionPeriodNotEnded = 31,
+    DiscussionPeriodNotRequired = 32,
 }
 
 #[contract]
@@ -234,6 +236,14 @@ impl GovernanceDao {
             .unwrap_or(0);
         let now = env.ledger().timestamp();
 
+        let discussion_period = config.discussion_period;
+        let (status, vote_end) = if discussion_period > 0 {
+            // Proposal enters Discussion; voting opens after the period elapses.
+            (ProposalStatus::Discussion, now.saturating_add(discussion_period).saturating_add(config.voting_period))
+        } else {
+            (ProposalStatus::Active, now.saturating_add(config.voting_period))
+        };
+
         let proposal = Proposal {
             id: proposal_id,
             proposer: proposer.clone(),
@@ -242,12 +252,12 @@ impl GovernanceDao {
             function: function.clone(),
             args, // <--- BIND TO STRUCT
             deposit,
-            status: ProposalStatus::Active,
+            status,
             votes_for: 0,
             votes_against: 0,
             votes_abstain: 0,
             created_at: now,
-            vote_end: now.saturating_add(config.voting_period),
+            vote_end,
             execution_time: 0,
             total_supply: config.total_supply,
             kind: ProposalKind::Standard,
@@ -318,6 +328,13 @@ impl GovernanceDao {
         args.push_back(new_wasm_hash.into_val(&env));
         let function = Symbol::new(&env, "upgrade");
 
+        let discussion_period = config.discussion_period;
+        let (status, vote_end) = if discussion_period > 0 {
+            (ProposalStatus::Discussion, now.saturating_add(discussion_period).saturating_add(config.voting_period))
+        } else {
+            (ProposalStatus::Active, now.saturating_add(config.voting_period))
+        };
+
         let proposal = Proposal {
             id: proposal_id,
             proposer: proposer.clone(),
@@ -326,12 +343,12 @@ impl GovernanceDao {
             function: function.clone(),
             args,
             deposit,
-            status: ProposalStatus::Active,
+            status,
             votes_for: 0,
             votes_against: 0,
             votes_abstain: 0,
             created_at: now,
-            vote_end: now.saturating_add(config.voting_period),
+            vote_end,
             execution_time: 0,
             total_supply: config.total_supply,
             kind: ProposalKind::Upgrade,
@@ -376,6 +393,9 @@ impl GovernanceDao {
             .get(&StorageKey::Proposal(proposal_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
 
+        if proposal.status == ProposalStatus::Discussion {
+            panic_with_error!(&env, Error::DiscussionPeriodNotEnded);
+        }
         if proposal.status != ProposalStatus::Active {
             panic_with_error!(&env, Error::ProposalNotActive);
         }
@@ -688,7 +708,7 @@ impl GovernanceDao {
             .get(&StorageKey::Proposal(proposal_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
 
-        if proposal.status != ProposalStatus::Active {
+        if proposal.status != ProposalStatus::Active && proposal.status != ProposalStatus::Discussion {
             panic_with_error!(&env, Error::ProposalNotActive);
         }
 
@@ -708,6 +728,46 @@ impl GovernanceDao {
         env.events().publish(
             (Symbol::new(&env, "proposal_cancelled"),),
             ProposalCancelled { proposal_id },
+        );
+    }
+
+    /// Transition a proposal from Discussion to Active once its discussion
+    /// period has elapsed. Callable by anyone — the discussion period is a
+    /// time-based gate, not a permission gate.
+    ///
+    /// If no discussion period is configured (`discussion_period == 0`), the
+    /// proposal was created directly in Active status and this function
+    /// panics with `DiscussionPeriodNotRequired`.
+    pub fn start_voting(env: Env, proposal_id: u64) {
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        if proposal.status != ProposalStatus::Discussion {
+            panic_with_error!(&env, Error::ProposalNotActive);
+        }
+
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        if config.discussion_period == 0 {
+            panic_with_error!(&env, Error::DiscussionPeriodNotRequired);
+        }
+
+        // The discussion period ended when created_at + discussion_period passed.
+        let discussion_end = proposal.created_at.saturating_add(config.discussion_period);
+        if env.ledger().timestamp() < discussion_end {
+            panic_with_error!(&env, Error::DiscussionPeriodNotEnded);
+        }
+
+        proposal.status = ProposalStatus::Active;
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "discussion_period_ended"),),
+            DiscussionPeriodEnded { proposal_id },
         );
     }
 

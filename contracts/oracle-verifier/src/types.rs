@@ -364,10 +364,22 @@ pub struct EncryptionRequiredUpdated {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaxTimestampAgeUpdated {
+    pub max_timestamp_age: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OracleEncryptedDataSubmitted {
     pub oracle: Address,
     pub data_type: Symbol,
     pub key: Symbol,
     pub confidence: u32,
     pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimestampFutureBufferUpdated {
+    pub seconds: u64,
 }

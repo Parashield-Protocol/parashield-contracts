@@ -108,6 +108,11 @@ enum StorageKey {
     LpNft(u64),
     /// Maps provider address to their LP NFT token ID — Address → u64.
     ProviderNft(Address),
+    /// Minimum reserve requirement (i128 in USDC stroops). Deposits and
+    /// withdrawals must leave at least this much in the pool.
+    MinReserve,
+    /// Insurance fund reserve amount (i128 in USDC stroops).
+    ReserveFund,
 }
 
 #[contracterror]
@@ -144,6 +149,7 @@ pub enum Error {
     NoPendingParameterChange  = 28,
     ParameterChangeNotReady   = 29,
     AdminTimelockNotExpired   = 30,
+    ReserveTooLow             = 31,
 }
 
 #[contract]
@@ -392,6 +398,15 @@ impl RiskPool {
         if amount == 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if amount > available_liquidity { panic_with_error!(&env, Error::Undercollateralized); }
 
+        // Enforce reserve fund: withdrawal must not deplete pool below minimum reserve.
+        let min_reserve: i128 = env.storage().instance().get(&StorageKey::MinReserve).unwrap_or(0);
+        if min_reserve > 0 {
+            let remaining = available_liquidity.saturating_sub(amount);
+            if remaining < min_reserve {
+                panic_with_error!(&env, Error::ReserveTooLow);
+            }
+        }
+
         let pending_yield = Self::settle_yield(&env, &mut position);
         position.deposited = position.deposited.saturating_sub(amount);
         position.shares   -= shares;
@@ -550,6 +565,15 @@ impl RiskPool {
         let total_locked: i128    = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
         let available = total_deposited.saturating_sub(total_locked);
         if available < amount { panic_with_error!(&env, Error::Undercollateralized); }
+
+        // Enforce reserve fund: locking capital must not deplete the pool below the minimum reserve.
+        let min_reserve: i128 = env.storage().instance().get(&StorageKey::MinReserve).unwrap_or(0);
+        if min_reserve > 0 {
+            let remaining = available.saturating_sub(amount);
+            if remaining < min_reserve {
+                panic_with_error!(&env, Error::ReserveTooLow);
+            }
+        }
         if env.storage().persistent().has(&StorageKey::Lock(policy_id)) { panic_with_error!(&env, Error::AlreadyLocked); }
 
         let lock_key = StorageKey::Lock(policy_id);
@@ -1030,6 +1054,49 @@ impl RiskPool {
             (Symbol::new(&env, "admin_withdrawal_cancelled"),),
             AdminWithdrawalCancelled { admin: admin.clone() },
         );
+    }
+
+    // ── Reserve Fund ──────────────────────────────────────────────────────────
+
+    /// Admin-only: set the minimum reserve requirement in USDC stroops.
+    /// When set, the pool must always keep at least this amount in available
+    /// liquidity after all capital locks and withdrawals. Deposits and
+    /// withdrawals that would breach the reserve are rejected.
+    /// Set to 0 to disable the reserve requirement.
+    pub fn set_min_reserve(env: Env, admin: Address, min_reserve: i128) {
+        Self::require_admin(&env, &admin);
+        if min_reserve < 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+        env.storage().instance().set(&StorageKey::MinReserve, &min_reserve);
+        env.events().publish(
+            (Symbol::new(&env, "min_reserve_updated"),),
+            MinReserveUpdated { min_reserve },
+        );
+    }
+
+    /// Return the currently configured minimum reserve requirement (defaults to 0).
+    pub fn get_min_reserve(env: Env) -> i128 {
+        env.storage().instance().get(&StorageKey::MinReserve).unwrap_or(0)
+    }
+
+    /// Admin-only: set the insurance fund reserve amount in USDC stroops.
+    /// This represents the target balance for catastrophic loss coverage.
+    pub fn set_reserve_fund(env: Env, admin: Address, amount: i128) {
+        Self::require_admin(&env, &admin);
+        if amount < 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+        env.storage().instance().set(&StorageKey::ReserveFund, &amount);
+        env.events().publish(
+            (Symbol::new(&env, "reserve_fund_updated"),),
+            ReserveFundUpdated { amount },
+        );
+    }
+
+    /// Return the currently configured insurance fund reserve amount (defaults to 0).
+    pub fn get_reserve_fund(env: Env) -> i128 {
+        env.storage().instance().get(&StorageKey::ReserveFund).unwrap_or(0)
     }
 
     /// Upgrade the contract WASM in-place. Only the admin may call this.
