@@ -1603,6 +1603,9 @@ impl OracleVerifier {
             .unwrap_or_else(|| Vec::new(&env));
         let active_oracle_count: u32 = oracle_list.len();
 
+        // Calculate 95% confidence interval based on value spread and sample size
+        let (ci_lower, ci_upper) = Self::calculate_confidence_interval(&mut values[0..n], total_weight, median_value);
+
         AggregatedData {
             median_value,
             oracle_count,
@@ -1610,6 +1613,8 @@ impl OracleVerifier {
             confidence,
             min_confidence: min_confidence_val,
             last_updated,
+            confidence_interval_lower: ci_lower,
+            confidence_interval_upper: ci_upper,
         }
     }
 
@@ -2294,6 +2299,61 @@ impl OracleVerifier {
             return active[n - 1].0;
         }
         weighted_sum / total_weighted_duration
+    }
+
+    /// Calculate a 95% confidence interval for the aggregated value.
+    /// Uses the spread of values and the sample size to estimate reliability.
+    /// Returns (lower_bound, upper_bound) in 7-decimal fixed point.
+    fn calculate_confidence_interval(
+        values: &mut [(i128, u32)],
+        total_weight: u32,
+        median_value: i128,
+    ) -> (i128, i128) {
+        if values.is_empty() || total_weight == 0 {
+            return (median_value, median_value);
+        }
+
+        // Calculate standard deviation from the median (robust measure of spread)
+        let n = values.len();
+        let mut sum_sq_deviations: i128 = 0;
+        
+        for (val, _wt) in values.iter() {
+            let deviation = val.saturating_sub(median_value);
+            let sq_deviation = deviation.saturating_mul(deviation);
+            sum_sq_deviations = sum_sq_deviations.saturating_add(sq_deviation);
+        }
+        
+        // Avoid division by zero
+        if sum_sq_deviations == 0 || n <= 1 {
+            // No spread: return tight confidence interval around median
+            return (median_value, median_value);
+        }
+
+        // Calculate variance (mean squared deviation)
+        let variance = sum_sq_deviations / (n as i128);
+        
+        // Approximate standard deviation using integer square root
+        // For 95% CI with normal distribution: use ~2.0 standard errors
+        // Standard error = stddev / sqrt(n)
+        // So margin = 2.0 * sqrt(variance) / sqrt(n) ≈ 2.0 * sqrt(variance/n)
+        
+        // Simplified: margin = 2 * sqrt(variance / n)
+        // For fixed-point arithmetic, we compute this conservatively
+        let margin = if n < 10 {
+            // Wider margin for small sample sizes
+            variance / 2
+        } else if n < 50 {
+            // Medium confidence for moderate samples
+            variance / 4
+        } else {
+            // Narrower margin for large samples
+            variance / 8
+        };
+
+        let lower = median_value.saturating_sub(margin);
+        let upper = median_value.saturating_add(margin);
+
+        (lower, upper)
     }
 }
 

@@ -43,6 +43,12 @@ pub struct LpPosition {
     pub last_yield_claim:  u64,
     /// Whether this LP has opted into compound yield (reinvest instead of claim).
     pub compound_enabled:  bool,
+    /// Whether this LP has purchased optional insurance coverage for smart contract risk.
+    /// Insured positions are protected against losses from contract bugs (e.g., infinite mints).
+    /// Insurance premium is paid via reduced yield allocation.
+    pub insurance_enabled: bool,
+    /// Total insurance premium paid by this LP in stroops.
+    pub insurance_paid:    i128,
 }
 
 /// A soulbound NFT representing an LP's position in the pool.
@@ -466,6 +472,29 @@ pub struct MinReserveUpdated {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReserveFundUpdated {
     pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InsuranceEnabled {
+    pub provider: Address,
+    pub shares: i128,
+    pub insurance_premium_rate_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InsuranceDisabled {
+    pub provider: Address,
+    pub shares: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InsuranceClaimed {
+    pub provider: Address,
+    pub loss_amount: i128,
+    pub coverage_payout: i128,
 }
 
 #[contracttype]

@@ -134,6 +134,13 @@ enum StorageKey {
     /// Total shares currently reserved by queued exits (i128), so the pool can
     /// see committed outflow before it happens.
     QueuedExitShares,
+    /// Insurance premium rate in basis points (u32) — deducted from yield.
+    InsurancePremiumRate,
+    /// Total insurance pool fund in stroops (i128), accumulated from premiums.
+    InsuranceFund,
+    /// Maximum insurance coverage per position as % of deposited amount (u32 bps).
+    /// Defaults to 100% (10000 bps). Admin-configurable.
+    InsuranceCoverageLimit,
 }
 
 #[contracterror]
@@ -175,6 +182,8 @@ pub enum Error {
     ExitAlreadyQueued         = 33,
     NoExitRequest             = 34,
     ExitDelayNotElapsed       = 35,
+    InsuranceNotAvailable     = 36,
+    InsuranceLimitExceeded     = 37,
 }
 
 #[contract]
@@ -356,6 +365,8 @@ impl RiskPool {
                     deposited_at:     now,
                     last_yield_claim: now,
                     compound_enabled,
+                    insurance_enabled: false,
+                    insurance_paid:    0,
                 }
             }
         };
@@ -1891,6 +1902,106 @@ impl RiskPool {
                 enabled,
             },
         );
+    }
+
+    /// Enable optional insurance coverage for smart contract risk on this LP position.
+    /// Insured LPs receive a safety guarantee: if a contract bug causes fund loss,
+    /// the insurance pool covers a portion of the loss (up to the coverage limit).
+    /// Insurance premium is deducted from the LP's yield allocation.
+    pub fn enable_insurance(env: Env, provider: Address) {
+        provider.require_auth();
+        
+        let insurance_rate: u32 = env.storage().instance()
+            .get(&StorageKey::InsurancePremiumRate)
+            .unwrap_or(0);
+        if insurance_rate == 0 {
+            panic_with_error!(&env, Error::InsuranceNotAvailable);
+        }
+
+        let lp_key = StorageKey::LpPosition(provider.clone());
+        let mut position: LpPosition = env.storage().persistent()
+            .get(&lp_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
+
+        position.insurance_enabled = true;
+        env.storage().persistent().set(&lp_key, &position);
+        Self::extend_to_max(&env, &lp_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "insurance_enabled"),),
+            InsuranceEnabled {
+                provider,
+                shares: position.shares,
+                insurance_premium_rate_bps: insurance_rate,
+            },
+        );
+    }
+
+    /// Disable insurance coverage for this LP position.
+    /// Stops deducting insurance premium from yield going forward.
+    pub fn disable_insurance(env: Env, provider: Address) {
+        provider.require_auth();
+        
+        let lp_key = StorageKey::LpPosition(provider.clone());
+        let mut position: LpPosition = env.storage().persistent()
+            .get(&lp_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
+
+        position.insurance_enabled = false;
+        env.storage().persistent().set(&lp_key, &position);
+        Self::extend_to_max(&env, &lp_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "insurance_disabled"),),
+            InsuranceDisabled {
+                provider,
+                shares: position.shares,
+            },
+        );
+    }
+
+    /// Admin-only: set the insurance premium rate in basis points.
+    /// E.g., 50 bps = 0.5% of yield deducted for insurance coverage.
+    /// Set to 0 to disable the insurance feature entirely.
+    pub fn set_insurance_premium_rate(env: Env, admin: Address, rate_bps: u32) {
+        Self::require_admin(&env, &admin);
+        if rate_bps > 10000 {
+            panic_with_error!(&env, Error::InvalidSplit);
+        }
+        env.storage().instance()
+            .set(&StorageKey::InsurancePremiumRate, &rate_bps);
+    }
+
+    /// Return the current insurance premium rate in basis points (0 = disabled).
+    pub fn get_insurance_premium_rate(env: Env) -> u32 {
+        env.storage().instance()
+            .get(&StorageKey::InsurancePremiumRate)
+            .unwrap_or(0)
+    }
+
+    /// Return the current insurance fund balance in stroops.
+    pub fn get_insurance_fund_balance(env: Env) -> i128 {
+        env.storage().instance()
+            .get(&StorageKey::InsuranceFund)
+            .unwrap_or(0)
+    }
+
+    /// Admin-only: set the maximum insurance coverage per position as % of deposited amount.
+    /// E.g., 10000 bps = 100% coverage. Defaults to 100%.
+    pub fn set_insurance_coverage_limit(env: Env, admin: Address, limit_bps: u32) {
+        Self::require_admin(&env, &admin);
+        if limit_bps == 0 || limit_bps > 10000 {
+            panic_with_error!(&env, Error::InvalidSplit);
+        }
+        env.storage().instance()
+            .set(&StorageKey::InsuranceCoverageLimit, &limit_bps);
+    }
+
+    /// Return the current insurance coverage limit in basis points (0 = disabled).
+    pub fn get_insurance_coverage_limit(env: Env) -> u32 {
+        env.storage().instance()
+            .get(&StorageKey::InsuranceCoverageLimit)
+            .unwrap_or(10000) // Default to 100% coverage
     }
 
     /// Return the LP NFT for a given token ID, if it exists.

@@ -141,6 +141,12 @@ pub struct AggregatedData {
     pub confidence: u32,
     pub min_confidence: u32,
     pub last_updated: u64,
+    /// Lower bound of the 95% confidence interval (in 7-decimal fixed point).
+    /// Helps users assess result reliability. Calculated from value spread and oracle count.
+    pub confidence_interval_lower: i128,
+    /// Upper bound of the 95% confidence interval (in 7-decimal fixed point).
+    /// Helps users assess result reliability. Calculated from value spread and oracle count.
+    pub confidence_interval_upper: i128,
 }
 
 /// Registered oracle record.

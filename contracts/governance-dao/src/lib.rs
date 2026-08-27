@@ -153,6 +153,8 @@ pub enum Error {
     DiscussionPeriodNotRequired = 39,
     /// `vote_batch` was called with an empty proposal list.
     NoProposals = 40,
+    /// Proposal has been vetoed by a guardian and cannot be executed.
+    ProposalVetoed = 41,
 }
 
 #[contract]
@@ -290,6 +292,7 @@ impl GovernanceDao {
             execution_time: 0,
             total_supply: config.total_supply,
             kind: ProposalKind::Standard,
+            is_vetoed: false,
         };
 
         let proposal_key = StorageKey::Proposal(proposal_id);
@@ -381,6 +384,7 @@ impl GovernanceDao {
             execution_time: 0,
             total_supply: config.total_supply,
             kind: ProposalKind::Upgrade,
+            is_vetoed: false,
         };
 
         let proposal_key = StorageKey::Proposal(proposal_id);
@@ -1020,6 +1024,10 @@ impl GovernanceDao {
         if proposal.status != ProposalStatus::Passed {
             panic_with_error!(&env, Error::ProposalNotPassed);
         }
+        // Guardian veto check: proposals vetoed by guardians cannot be executed
+        if proposal.is_vetoed {
+            panic_with_error!(&env, Error::ProposalVetoed);
+        }
         if env.ledger().timestamp() < proposal.execution_time {
             panic_with_error!(&env, Error::TimelockNotExpired);
         }
@@ -1604,6 +1612,56 @@ impl GovernanceDao {
             panic_with_error!(&env, Error::NoPendingUpgrade);
         }
         env.storage().instance().remove(&StorageKey::PendingUpgrade);
+    }
+
+    /// Guardian veto for a security-critical proposal.
+    /// Only guardians can veto. Once vetoed, a proposal cannot be executed,
+    /// even if it passes voting and the timelock expires.
+    /// Use this to halt potentially malicious proposals before execution.
+    pub fn veto_proposal(env: Env, guardian: Address, proposal_id: u64, reason: Symbol) {
+        guardian.require_auth();
+
+        let guardians: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        
+        let mut is_guardian = false;
+        for g in guardians.iter() {
+            if g == guardian {
+                is_guardian = true;
+                break;
+            }
+        }
+        if !is_guardian {
+            panic_with_error!(&env, Error::NotGuardian);
+        }
+
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        // Can only veto before execution
+        if proposal.status == ProposalStatus::Executed {
+            panic_with_error!(&env, Error::AlreadyExecuted);
+        }
+
+        proposal.is_vetoed = true;
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_vetoed"),),
+            ProposalVetoed {
+                proposal_id,
+                guardian,
+                reason,
+            },
+        );
     }
 
     /// Run storage migrations from old_version to new_version.

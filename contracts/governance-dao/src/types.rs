@@ -88,6 +88,9 @@ pub struct Proposal {
     pub total_supply: i128,
     /// Whether this is a generic call or a contract-upgrade proposal.
     pub kind: ProposalKind,
+    /// Whether a guardian has vetoed this proposal (security-critical proposals only).
+    /// When true, the proposal cannot be executed even if it passes voting.
+    pub is_vetoed: bool,
 }
 
 /// A single vote record stored per (proposal_id, voter) key.
@@ -248,6 +251,14 @@ pub struct ProposalExecuted {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProposalCancelled {
     pub proposal_id: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalVetoed {
+    pub proposal_id: u64,
+    pub guardian: Address,
+    pub reason: Symbol,
 }
 
 #[contracttype]
