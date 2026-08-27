@@ -90,6 +90,84 @@ pub struct PoolStats {
     pub status:               PoolStatus,
 }
 
+/// Capacity limits governing how much risk the pool will take on.
+///
+/// A pool with no ceiling is a pool that can be talked into insuring more than
+/// it can pay. Two different limits matter, and conflating them hides the
+/// second one:
+///
+/// - `max_total_deposited` bounds how much capital the pool holds. This is a
+///   solvency-of-share-value concern.
+/// - `max_utilization_bps` bounds how much of that capital may be committed to
+///   active coverage at once. This is the correlated-risk concern: a pool 100%
+///   committed to weather policies in one region is one storm away from
+///   insolvency regardless of how much capital it holds.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolCapacity {
+    /// Ceiling on cumulative deposits, in 7-decimal USDC stroops.
+    pub max_total_deposited: i128,
+    /// Ceiling on `total_locked / total_deposited`, in basis points.
+    /// 10_000 = the pool may commit every unit of capital it holds.
+    pub max_utilization_bps: u32,
+}
+
+/// A snapshot of how much of the pool's capacity is currently consumed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapacityStatus {
+    pub total_deposited: i128,
+    pub total_locked: i128,
+    pub max_total_deposited: i128,
+    /// Current `total_locked / total_deposited` in basis points.
+    pub utilization_bps: u32,
+    pub max_utilization_bps: u32,
+    /// Capital that may still be deposited before the ceiling is reached.
+    pub remaining_deposit_capacity: i128,
+    /// Coverage that may still be underwritten before the utilization cap
+    /// is reached.
+    pub remaining_coverage_capacity: i128,
+}
+
+/// One LP's queued exit request.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExitRequest {
+    pub provider: Address,
+    /// Shares reserved for this exit. They stay in the LP's position and keep
+    /// earning until the exit is claimed, but cannot be queued twice.
+    pub shares: i128,
+    /// When the request was made.
+    pub requested_at: u64,
+    /// Earliest timestamp at which `claim_exit` will succeed.
+    pub claimable_at: u64,
+}
+
+/// Where a queued exit stands.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExitStatus {
+    /// No request outstanding for this provider.
+    None,
+    /// Requested, still inside the delay window.
+    Pending,
+    /// Delay elapsed — `claim_exit` will settle it.
+    Claimable,
+}
+
+/// Full view of a provider's exit request, safe to call for any address.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExitInfo {
+    pub provider: Address,
+    pub status: ExitStatus,
+    pub shares: i128,
+    pub requested_at: u64,
+    pub claimable_at: u64,
+    /// Seconds still to wait, or 0 once claimable.
+    pub seconds_remaining: u64,
+}
+
 // ─── Events ──────────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -338,4 +416,42 @@ pub struct LpNftUpdated {
 pub struct CompoundYieldToggled {
     pub provider:  Address,
     pub enabled:   bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolCapacityUpdated {
+    pub max_total_deposited: i128,
+    pub max_utilization_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExitDelayUpdated {
+    pub delay_seconds: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExitRequested {
+    pub provider: Address,
+    pub shares: i128,
+    pub claimable_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExitCancelled {
+    pub provider: Address,
+    pub shares: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExitClaimed {
+    pub provider: Address,
+    pub shares_burned: i128,
+    pub amount_returned: i128,
+    /// Seconds the provider actually waited between request and claim.
+    pub waited: u64,
 }

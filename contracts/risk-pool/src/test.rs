@@ -8,7 +8,7 @@ use soroban_sdk::{
     token, Address, Env, Symbol,
 };
 
-use crate::{RiskPool, RiskPoolClient};
+use crate::{ExitStatus, RiskPool, RiskPoolClient};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -777,4 +777,333 @@ fn test_pool_depletion_scenarios() {
     let stats = pool.get_stats();
     assert_eq!(stats.total_deposited, 0);
     assert_eq!(pool.get_available_liquidity(), 0);
+}
+
+/// Like `setup()`, but also returns the policy-engine address so tests can
+/// drive `lock_for_policy` directly.
+fn setup_with_engine() -> (Env, RiskPoolClient<'static>, Address, Address, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let lp1 = Address::generate(&env);
+    let policy_engine = Address::generate(&env);
+    let claims_processor = Address::generate(&env);
+
+    let usdc_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let backstop_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let pool_id = env.register(RiskPool, ());
+    let pool = RiskPoolClient::new(&env, &pool_id);
+
+    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp1, &1_000_000_000_0000000i128);
+
+    pool.initialize(
+        &admin,
+        &usdc_id,
+        &treasury,
+        &backstop_id,
+        &Symbol::new(&env, "crop"),
+        &policy_engine,
+        &claims_processor,
+    );
+
+    (env, pool, admin, lp1, policy_engine)
+}
+
+// ── Capacity limits (issue #373) ─────────────────────────────────────────────
+
+#[test]
+fn capacity_defaults_preserve_historical_behaviour() {
+    let (_env, pool, _usdc, _admin, _t, _lp1) = setup();
+
+    let cap = pool.get_capacity();
+
+    // 100M USDC deposit ceiling and 100% utilization — exactly what the
+    // hardcoded constant allowed before it was configurable.
+    assert_eq!(cap.max_total_deposited, 1_000_000_000_000_000i128);
+    assert_eq!(cap.max_utilization_bps, 10_000);
+}
+
+#[test]
+fn admin_can_lower_the_deposit_ceiling() {
+    let (_env, pool, _usdc, admin, _t, _lp1) = setup();
+
+    pool.set_capacity(&admin, &500_000_0000000i128, &8_000u32);
+
+    let cap = pool.get_capacity();
+    assert_eq!(cap.max_total_deposited, 500_000_0000000i128);
+    assert_eq!(cap.max_utilization_bps, 8_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn deposit_beyond_the_configured_ceiling_is_refused() {
+    let (_env, pool, _usdc, admin, _t, lp1) = setup();
+
+    pool.set_capacity(&admin, &100_000_0000000i128, &10_000u32);
+
+    // Ceiling is 100k USDC; this asks for 200k.
+    pool.deposit(&lp1, &200_000_0000000i128, &0i128, &false);
+}
+
+#[test]
+fn deposit_up_to_the_ceiling_still_succeeds() {
+    let (_env, pool, _usdc, admin, _t, lp1) = setup();
+
+    pool.set_capacity(&admin, &100_000_0000000i128, &10_000u32);
+    pool.deposit(&lp1, &100_000_0000000i128, &0i128, &false);
+
+    assert_eq!(pool.get_capacity_status().remaining_deposit_capacity, 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #32)")]
+fn zero_deposit_ceiling_is_rejected() {
+    let (_env, pool, _usdc, admin, _t, _lp1) = setup();
+
+    pool.set_capacity(&admin, &0i128, &10_000u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #32)")]
+fn utilization_above_one_hundred_percent_is_rejected() {
+    let (_env, pool, _usdc, admin, _t, _lp1) = setup();
+
+    pool.set_capacity(&admin, &1_000_0000000i128, &10_001u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn set_capacity_requires_admin() {
+    let (env, pool, _usdc, _admin, _t, _lp1) = setup();
+
+    let impostor = Address::generate(&env);
+    pool.set_capacity(&impostor, &1_000_0000000i128, &5_000u32);
+}
+
+#[test]
+fn capacity_status_reports_utilization() {
+    let (_env, pool, admin, lp1, policy_engine) = setup_with_engine();
+
+    pool.deposit(&lp1, &10_000_0000000i128, &0i128, &false);
+    pool.set_capacity(&admin, &1_000_000_0000000i128, &10_000u32);
+
+    // Commit 40% of the pool to coverage.
+    pool.lock_for_policy(&policy_engine, &1u128, &4_000_0000000i128);
+
+    let status = pool.get_capacity_status();
+    assert_eq!(status.total_locked, 4_000_0000000i128);
+    assert_eq!(status.utilization_bps, 4_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #31)")]
+fn locking_past_the_utilization_cap_is_refused() {
+    let (_env, pool, admin, lp1, policy_engine) = setup_with_engine();
+
+    pool.deposit(&lp1, &10_000_0000000i128, &0i128, &false);
+    // Never commit more than half the pool — the correlated-risk buffer.
+    pool.set_capacity(&admin, &1_000_000_0000000i128, &5_000u32);
+
+    // The pool *has* the capital, but committing it would breach the buffer.
+    pool.lock_for_policy(&policy_engine, &1u128, &6_000_0000000i128);
+}
+
+#[test]
+fn locking_within_the_utilization_cap_succeeds() {
+    let (_env, pool, admin, lp1, policy_engine) = setup_with_engine();
+
+    pool.deposit(&lp1, &10_000_0000000i128, &0i128, &false);
+    pool.set_capacity(&admin, &1_000_000_0000000i128, &5_000u32);
+
+    pool.lock_for_policy(&policy_engine, &1u128, &5_000_0000000i128);
+
+    let status = pool.get_capacity_status();
+    assert_eq!(status.utilization_bps, 5_000);
+    assert_eq!(status.remaining_coverage_capacity, 0);
+}
+
+#[test]
+fn lowering_capacity_below_current_usage_is_allowed() {
+    let (_env, pool, _usdc, admin, _t, lp1) = setup();
+
+    pool.deposit(&lp1, &10_000_0000000i128, &0i128, &false);
+
+    // An admin discovering the pool is overexposed must be able to stop it
+    // growing; refusing this would leave them with no lever at all.
+    pool.set_capacity(&admin, &1_000_0000000i128, &10_000u32);
+
+    let status = pool.get_capacity_status();
+    assert_eq!(status.remaining_deposit_capacity, 0, "already over the line");
+    // Existing capital is untouched.
+    assert_eq!(status.total_deposited, 10_000_0000000i128);
+}
+
+// ── Exit queue (issue #377) ──────────────────────────────────────────────────
+
+#[test]
+fn exit_delay_defaults_to_instant() {
+    let (_env, pool, _usdc, _admin, _t, _lp1) = setup();
+
+    assert_eq!(pool.get_exit_delay(), 0, "unchanged behaviour by default");
+}
+
+#[test]
+fn admin_can_set_an_exit_delay() {
+    let (_env, pool, _usdc, admin, _t, _lp1) = setup();
+
+    pool.set_exit_delay(&admin, &(2 * 24 * 60 * 60));
+
+    assert_eq!(pool.get_exit_delay(), 2 * 24 * 60 * 60);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #32)")]
+fn exit_delay_beyond_the_maximum_is_rejected() {
+    let (_env, pool, _usdc, admin, _t, _lp1) = setup();
+
+    // A delay this long is indistinguishable from freezing LP funds.
+    pool.set_exit_delay(&admin, &(60 * 24 * 60 * 60));
+}
+
+#[test]
+fn address_with_no_request_reports_none() {
+    let (_env, pool, _usdc, _admin, _t, lp1) = setup();
+
+    let info = pool.get_exit_info(&lp1);
+
+    assert_eq!(info.status, ExitStatus::None);
+    assert_eq!(info.shares, 0);
+}
+
+#[test]
+fn requesting_an_exit_queues_it() {
+    let (_env, pool, _usdc, admin, _t, lp1) = setup();
+
+    let shares = pool.deposit(&lp1, &10_000_0000000i128, &0i128, &false);
+    pool.set_exit_delay(&admin, &3_600u64);
+
+    pool.request_exit(&lp1, &shares);
+
+    let info = pool.get_exit_info(&lp1);
+    assert_eq!(info.status, ExitStatus::Pending);
+    assert_eq!(info.shares, shares);
+    assert_eq!(info.seconds_remaining, 3_600);
+    assert_eq!(pool.get_queued_exit_shares(), shares);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #35)")]
+fn claiming_before_the_delay_elapses_is_refused() {
+    let (_env, pool, _usdc, admin, _t, lp1) = setup();
+
+    let shares = pool.deposit(&lp1, &10_000_0000000i128, &0i128, &false);
+    pool.set_exit_delay(&admin, &3_600u64);
+    pool.request_exit(&lp1, &shares);
+
+    pool.claim_exit(&lp1);
+}
+
+#[test]
+fn claiming_after_the_delay_settles_the_withdrawal() {
+    let (env, pool, _usdc, admin, _t, lp1) = setup();
+
+    let shares = pool.deposit(&lp1, &10_000_0000000i128, &0i128, &false);
+    pool.set_exit_delay(&admin, &3_600u64);
+    pool.request_exit(&lp1, &shares);
+
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + 3_601);
+
+    let amount = pool.claim_exit(&lp1);
+
+    assert_eq!(amount, 10_000_0000000i128);
+    // The request is consumed, and its reservation released.
+    assert_eq!(pool.get_exit_info(&lp1).status, ExitStatus::None);
+    assert_eq!(pool.get_queued_exit_shares(), 0);
+}
+
+#[test]
+fn becomes_claimable_once_the_window_passes() {
+    let (env, pool, _usdc, admin, _t, lp1) = setup();
+
+    let shares = pool.deposit(&lp1, &10_000_0000000i128, &0i128, &false);
+    pool.set_exit_delay(&admin, &3_600u64);
+    pool.request_exit(&lp1, &shares);
+
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + 3_600);
+
+    let info = pool.get_exit_info(&lp1);
+    assert_eq!(info.status, ExitStatus::Claimable);
+    assert_eq!(info.seconds_remaining, 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #33)")]
+fn queuing_twice_is_refused() {
+    let (_env, pool, _usdc, admin, _t, lp1) = setup();
+
+    let shares = pool.deposit(&lp1, &10_000_0000000i128, &0i128, &false);
+    pool.set_exit_delay(&admin, &3_600u64);
+
+    pool.request_exit(&lp1, &(shares / 2));
+    // A second request would let the reserved total exceed what the LP holds.
+    pool.request_exit(&lp1, &(shares / 2));
+}
+
+#[test]
+fn cancelling_releases_the_reservation() {
+    let (_env, pool, _usdc, admin, _t, lp1) = setup();
+
+    let shares = pool.deposit(&lp1, &10_000_0000000i128, &0i128, &false);
+    pool.set_exit_delay(&admin, &3_600u64);
+    pool.request_exit(&lp1, &shares);
+
+    pool.cancel_exit(&lp1);
+
+    assert_eq!(pool.get_exit_info(&lp1).status, ExitStatus::None);
+    assert_eq!(pool.get_queued_exit_shares(), 0);
+    // And the LP can queue again afterwards.
+    pool.request_exit(&lp1, &shares);
+    assert_eq!(pool.get_exit_info(&lp1).status, ExitStatus::Pending);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #34)")]
+fn cancelling_without_a_request_is_refused() {
+    let (_env, pool, _usdc, _admin, _t, lp1) = setup();
+
+    pool.cancel_exit(&lp1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #34)")]
+fn claiming_without_a_request_is_refused() {
+    let (_env, pool, _usdc, _admin, _t, lp1) = setup();
+
+    pool.claim_exit(&lp1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn requesting_more_shares_than_held_is_refused() {
+    let (_env, pool, _usdc, _admin, _t, lp1) = setup();
+
+    let shares = pool.deposit(&lp1, &10_000_0000000i128, &0i128, &false);
+
+    pool.request_exit(&lp1, &(shares + 1));
+}
+
+#[test]
+fn direct_withdraw_still_works_when_no_delay_is_set() {
+    let (_env, pool, _usdc, _admin, _t, lp1) = setup();
+
+    let shares = pool.deposit(&lp1, &10_000_0000000i128, &0i128, &false);
+
+    // Delay defaults to 0, so nothing about the existing path changes.
+    let amount = pool.withdraw(&lp1, &shares);
+
+    assert_eq!(amount, 10_000_0000000i128);
 }

@@ -37,6 +37,21 @@ const MAX_TOTAL_DEPOSITED: i128 = 1_000_000_000_000_000;
 /// Minimum deposit amount (1_000_000 stroops).
 const MIN_DEPOSIT: i128 = 1_000_000;
 
+/// Default ceiling on `total_locked / total_deposited`, in basis points.
+///
+/// 10_000 (100%) preserves the historical behaviour exactly: before this was
+/// configurable the pool would commit every unit of capital it held. Lowering
+/// it is how an admin expresses "keep a buffer against correlated risk", and
+/// that has to be an explicit choice rather than a silent change to how much
+/// coverage an existing pool can write.
+const DEFAULT_MAX_UTILIZATION_BPS: u32 = 10_000;
+
+/// Longest withdrawal delay an admin may configure (30 days).
+///
+/// An unbounded delay is indistinguishable from freezing LP funds, so the
+/// ceiling is part of what makes the queue safe to hand to an admin at all.
+const MAX_EXIT_DELAY: u64 = 30 * 24 * 60 * 60;
+
 /// Timelock duration for admin withdrawals: 7 days in seconds.
 const TIMELOCK_SECONDS: u64 = 7 * 24 * 60 * 60;
 
@@ -108,6 +123,17 @@ enum StorageKey {
     LpNft(u64),
     /// Maps provider address to their LP NFT token ID — Address → u64.
     ProviderNft(Address),
+    /// Admin-configured capacity limits (`PoolCapacity`). Falls back to the
+    /// compile-time defaults when unset.
+    Capacity,
+    /// Withdrawal delay in seconds (u64). 0 = instant withdrawals, the
+    /// historical behaviour and the default.
+    ExitDelay,
+    /// A provider's outstanding queued exit — Address → ExitRequest.
+    ExitReq(Address),
+    /// Total shares currently reserved by queued exits (i128), so the pool can
+    /// see committed outflow before it happens.
+    QueuedExitShares,
 }
 
 #[contracterror]
@@ -144,6 +170,11 @@ pub enum Error {
     NoPendingParameterChange  = 28,
     ParameterChangeNotReady   = 29,
     AdminTimelockNotExpired   = 30,
+    UtilizationCapExceeded    = 31,
+    InvalidCapacity           = 32,
+    ExitAlreadyQueued         = 33,
+    NoExitRequest             = 34,
+    ExitDelayNotElapsed       = 35,
 }
 
 #[contract]
@@ -268,8 +299,9 @@ impl RiskPool {
         let total_shares: i128 = env.storage().instance()
             .get(&StorageKey::TotalShares).unwrap_or(0);
 
-        // Enforce the global pool size cap before accepting new liquidity.
-        if total_deposited + amount > MAX_TOTAL_DEPOSITED {
+        // Enforce the configured pool size cap before accepting new liquidity.
+        let capacity = Self::capacity(&env);
+        if total_deposited + amount > capacity.max_total_deposited {
             panic_with_error!(&env, Error::PoolCapExceeded);
         }
 
@@ -367,6 +399,15 @@ impl RiskPool {
     /// is insufficient to cover the redemption.
     pub fn withdraw(env: Env, provider: Address, shares: i128) -> i128 {
         provider.require_auth();
+        Self::withdraw_inner(env, provider, shares)
+    }
+
+    /// Settlement body shared by `withdraw` and `claim_exit`.
+    ///
+    /// Takes no authorization of its own: the caller has already established
+    /// it. Calling `withdraw` from `claim_exit` instead would re-authorize a
+    /// frame that is already authorized, which the host rejects outright.
+    fn withdraw_inner(env: Env, provider: Address, shares: i128) -> i128 {
         // Guard: check for zero or negative shares input
         if shares <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         Self::assert_withdrawable(&env);
@@ -535,11 +576,317 @@ impl RiskPool {
         claimed
     }
 
+    // ── Capacity limits (issue #373) ──────────────────────────────────────────
+
+    /// Set the pool's capacity limits.
+    ///
+    /// Two ceilings, because two different things can go wrong:
+    ///
+    /// - `max_total_deposited` bounds the capital held, so share value cannot
+    ///   become infinitesimal and `total_shares` cannot overflow.
+    /// - `max_utilization_bps` bounds how much of that capital may be
+    ///   committed to active coverage at once. This is the correlated-risk
+    ///   limit: a pool fully committed to one category in one region is a
+    ///   single event away from insolvency however much capital it holds, and
+    ///   nothing in the deposit ceiling prevents that.
+    ///
+    /// Lowering a limit below current usage is allowed and does not claw
+    /// anything back — existing deposits and locks stand, and the pool simply
+    /// accepts nothing further until it is back under the line. Refusing the
+    /// change would leave an admin unable to stop an overexposed pool from
+    /// growing, which is the opposite of what this exists for.
+    pub fn set_capacity(
+        env: Env,
+        admin: Address,
+        max_total_deposited: i128,
+        max_utilization_bps: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        if max_total_deposited <= 0 || max_utilization_bps == 0 || max_utilization_bps > 10_000 {
+            panic_with_error!(&env, Error::InvalidCapacity);
+        }
+
+        env.storage().instance().set(
+            &StorageKey::Capacity,
+            &PoolCapacity {
+                max_total_deposited,
+                max_utilization_bps,
+            },
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "capacity_updated"),),
+            PoolCapacityUpdated {
+                max_total_deposited,
+                max_utilization_bps,
+            },
+        );
+    }
+
+    /// The configured capacity limits, or the built-in defaults.
+    pub fn get_capacity(env: Env) -> PoolCapacity {
+        Self::capacity(&env)
+    }
+
+    /// How much of the pool's capacity is currently consumed, and how much
+    /// room is left on each limit.
+    ///
+    /// Exposed so a front-end can tell an LP "this pool is full" and a policy
+    /// engine can tell a buyer "this coverage cannot be written right now"
+    /// before either submits a transaction that would revert.
+    pub fn get_capacity_status(env: Env) -> CapacityStatus {
+        let total_deposited: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TotalDeposited)
+            .unwrap_or(0);
+        let total_locked: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TotalLocked)
+            .unwrap_or(0);
+        let cap = Self::capacity(&env);
+
+        let utilization_bps = Self::utilization_bps(total_locked, total_deposited);
+
+        // What may still be underwritten before the utilization cap binds.
+        let max_lockable = total_deposited
+            .saturating_mul(cap.max_utilization_bps as i128)
+            / 10_000;
+
+        CapacityStatus {
+            total_deposited,
+            total_locked,
+            max_total_deposited: cap.max_total_deposited,
+            utilization_bps,
+            max_utilization_bps: cap.max_utilization_bps,
+            remaining_deposit_capacity: cap
+                .max_total_deposited
+                .saturating_sub(total_deposited)
+                .max(0),
+            remaining_coverage_capacity: max_lockable.saturating_sub(total_locked).max(0),
+        }
+    }
+
+    // ── Exit queue (issue #377) ───────────────────────────────────────────────
+
+    /// Set the withdrawal delay in seconds. 0 restores instant withdrawals.
+    ///
+    /// The delay exists because instant exit is a bank run waiting to happen:
+    /// when a pool looks stressed, the LPs who move first are made whole out
+    /// of the liquidity the remaining LPs were relying on. A queue makes every
+    /// LP wait the same interval, which removes the advantage of panicking and
+    /// gives the pool a window to see committed outflow coming.
+    ///
+    /// Capped at `MAX_EXIT_DELAY` (30 days). An unbounded delay would be
+    /// indistinguishable from freezing LP funds.
+    pub fn set_exit_delay(env: Env, admin: Address, delay_seconds: u64) {
+        Self::require_admin(&env, &admin);
+
+        if delay_seconds > MAX_EXIT_DELAY {
+            panic_with_error!(&env, Error::InvalidCapacity);
+        }
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::ExitDelay, &delay_seconds);
+
+        env.events().publish(
+            (Symbol::new(&env, "exit_delay_updated"),),
+            ExitDelayUpdated { delay_seconds },
+        );
+    }
+
+    /// The configured withdrawal delay in seconds (default 0 — instant).
+    pub fn get_exit_delay(env: Env) -> u64 {
+        Self::exit_delay(&env)
+    }
+
+    /// Queue a withdrawal of `shares`, claimable once the delay has elapsed.
+    ///
+    /// The shares stay in the LP's position and keep earning yield until the
+    /// exit is claimed — queuing is a commitment to leave, not a forfeiture.
+    /// What it does prevent is queuing twice: one outstanding request per
+    /// provider, so the reserved total cannot be inflated past what the LP
+    /// actually holds.
+    ///
+    /// Panics with `ExitAlreadyQueued` if a request is already outstanding;
+    /// cancel it first to change the amount.
+    pub fn request_exit(env: Env, provider: Address, shares: i128) {
+        provider.require_auth();
+        if shares <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+        Self::assert_withdrawable(&env);
+
+        let position: LpPosition = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::LpPosition(provider.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
+        if position.shares < shares {
+            panic_with_error!(&env, Error::InsufficientFunds);
+        }
+
+        let req_key = StorageKey::ExitReq(provider.clone());
+        if env.storage().persistent().has(&req_key) {
+            panic_with_error!(&env, Error::ExitAlreadyQueued);
+        }
+
+        let now = env.ledger().timestamp();
+        let claimable_at = now.saturating_add(Self::exit_delay(&env));
+
+        env.storage().persistent().set(
+            &req_key,
+            &ExitRequest {
+                provider: provider.clone(),
+                shares,
+                requested_at: now,
+                claimable_at,
+            },
+        );
+        Self::extend_to_max(&env, &req_key);
+
+        let queued: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::QueuedExitShares)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&StorageKey::QueuedExitShares, &queued.saturating_add(shares));
+
+        env.events().publish(
+            (Symbol::new(&env, "exit_requested"),),
+            ExitRequested {
+                provider,
+                shares,
+                claimable_at,
+            },
+        );
+    }
+
+    /// Withdraw a queued request whose delay has elapsed.
+    ///
+    /// Settlement runs through the same path as a direct `withdraw`, so the
+    /// amount is priced at the share value *at claim time* rather than at
+    /// request time. An LP cannot lock in a favourable price and wait to see
+    /// whether the pool takes a loss in the meantime — that would hand queued
+    /// LPs an option paid for by everyone else.
+    pub fn claim_exit(env: Env, provider: Address) -> i128 {
+        provider.require_auth();
+
+        let req_key = StorageKey::ExitReq(provider.clone());
+        let request: ExitRequest = env
+            .storage()
+            .persistent()
+            .get(&req_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoExitRequest));
+
+        let now = env.ledger().timestamp();
+        if now < request.claimable_at {
+            panic_with_error!(&env, Error::ExitDelayNotElapsed);
+        }
+
+        // Release the reservation before settling, so a failed withdrawal
+        // cannot leave the request stuck and double-counted.
+        Self::clear_exit_reservation(&env, &provider, request.shares);
+
+        let amount = Self::withdraw_inner(env.clone(), provider.clone(), request.shares);
+
+        env.events().publish(
+            (Symbol::new(&env, "exit_claimed"),),
+            ExitClaimed {
+                provider,
+                shares_burned: request.shares,
+                amount_returned: amount,
+                waited: now.saturating_sub(request.requested_at),
+            },
+        );
+
+        amount
+    }
+
+    /// Cancel an outstanding exit request and release its reservation.
+    ///
+    /// Always available, including before the delay elapses: an LP who changes
+    /// their mind should not be forced out, and a queue nobody can leave is a
+    /// worse trap than the instant withdrawals it replaced.
+    pub fn cancel_exit(env: Env, provider: Address) {
+        provider.require_auth();
+
+        let req_key = StorageKey::ExitReq(provider.clone());
+        let request: ExitRequest = env
+            .storage()
+            .persistent()
+            .get(&req_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoExitRequest));
+
+        Self::clear_exit_reservation(&env, &provider, request.shares);
+
+        env.events().publish(
+            (Symbol::new(&env, "exit_cancelled"),),
+            ExitCancelled {
+                provider,
+                shares: request.shares,
+            },
+        );
+    }
+
+    /// Where a provider's exit stands. Safe to call for any address — an
+    /// address with no request reports `ExitStatus::None` rather than panicking.
+    pub fn get_exit_info(env: Env, provider: Address) -> ExitInfo {
+        let request: Option<ExitRequest> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::ExitReq(provider.clone()));
+
+        match request {
+            None => ExitInfo {
+                provider,
+                status: ExitStatus::None,
+                shares: 0,
+                requested_at: 0,
+                claimable_at: 0,
+                seconds_remaining: 0,
+            },
+            Some(req) => {
+                let now = env.ledger().timestamp();
+                let claimable = now >= req.claimable_at;
+                ExitInfo {
+                    provider,
+                    status: if claimable {
+                        ExitStatus::Claimable
+                    } else {
+                        ExitStatus::Pending
+                    },
+                    shares: req.shares,
+                    requested_at: req.requested_at,
+                    claimable_at: req.claimable_at,
+                    seconds_remaining: req.claimable_at.saturating_sub(now),
+                }
+            }
+        }
+    }
+
+    /// Total shares reserved by all outstanding exit requests.
+    ///
+    /// This is the pool's forward view of committed outflow — the number that
+    /// makes a queue useful for anything beyond delay.
+    pub fn get_queued_exit_shares(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::QueuedExitShares)
+            .unwrap_or(0)
+    }
+
     // ── Capital locks ─────────────────────────────────────────────────────────
 
     /// Earmark `amount` USDC as collateral for `policy_id`. Only the policy engine or
     /// claims processor may call this. Panics if the pool is under-collateralised or if
     /// a lock for this policy already exists.
+
     pub fn lock_for_policy(env: Env, caller: Address, policy_id: u128, amount: i128) {
         Self::require_protocol_caller(&env, &caller);
         Self::assert_active(&env);
@@ -550,6 +897,21 @@ impl RiskPool {
         let total_locked: i128    = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
         let available = total_deposited.saturating_sub(total_locked);
         if available < amount { panic_with_error!(&env, Error::Undercollateralized); }
+
+        // Enforce the utilization ceiling. `available` alone only asks whether
+        // the pool *can* commit the capital; this asks whether it *should* —
+        // a pool committed to the last unit has no buffer left for correlated
+        // losses across the policies it already wrote.
+        let capacity = Self::capacity(&env);
+        if capacity.max_utilization_bps < 10_000 {
+            let max_lockable = total_deposited
+                .saturating_mul(capacity.max_utilization_bps as i128)
+                / 10_000;
+            if total_locked.saturating_add(amount) > max_lockable {
+                panic_with_error!(&env, Error::UtilizationCapExceeded);
+            }
+        }
+
         if env.storage().persistent().has(&StorageKey::Lock(policy_id)) { panic_with_error!(&env, Error::AlreadyLocked); }
 
         let lock_key = StorageKey::Lock(policy_id);
@@ -1391,6 +1753,55 @@ impl RiskPool {
 
     /// Withdrawals are allowed while the pool is `Active` or `WindingDown`, but not
     /// while `Paused`.
+    /// Configured capacity limits, or the built-in defaults.
+    ///
+    /// The default `max_total_deposited` is the historical `MAX_TOTAL_DEPOSITED`
+    /// constant and the default utilization ceiling is 100%, so an existing
+    /// pool behaves exactly as before until an admin sets a limit.
+    fn capacity(env: &Env) -> PoolCapacity {
+        env.storage()
+            .instance()
+            .get(&StorageKey::Capacity)
+            .unwrap_or(PoolCapacity {
+                max_total_deposited: MAX_TOTAL_DEPOSITED,
+                max_utilization_bps: DEFAULT_MAX_UTILIZATION_BPS,
+            })
+    }
+
+    /// Configured withdrawal delay in seconds (default 0 — instant).
+    fn exit_delay(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::ExitDelay)
+            .unwrap_or(0)
+    }
+
+    /// `total_locked / total_deposited` in basis points. An empty pool is 0%
+    /// utilized rather than a division by zero.
+    fn utilization_bps(total_locked: i128, total_deposited: i128) -> u32 {
+        if total_deposited <= 0 {
+            return 0;
+        }
+        let bps = total_locked.saturating_mul(10_000) / total_deposited;
+        bps.clamp(0, 10_000) as u32
+    }
+
+    /// Remove a provider's exit request and release its share reservation.
+    fn clear_exit_reservation(env: &Env, provider: &Address, shares: i128) {
+        env.storage()
+            .persistent()
+            .remove(&StorageKey::ExitReq(provider.clone()));
+
+        let queued: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::QueuedExitShares)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&StorageKey::QueuedExitShares, &queued.saturating_sub(shares).max(0));
+    }
+
     fn assert_withdrawable(env: &Env) {
         let status: PoolStatus = env.storage().instance()
             .get(&StorageKey::Status).unwrap_or(PoolStatus::Active);
