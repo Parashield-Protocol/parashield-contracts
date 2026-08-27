@@ -636,3 +636,247 @@ fn test_cancel_refunds_deposit_to_proposer() {
     
     assert_eq!(gov_token.balance(&voter1), balance_before);
 }
+
+// ── adaptive quorum (issue #374) ──────────────────────────────────────────────
+
+/// Create a proposal, cast `votes`, and finalize it. Returns the status.
+fn run_proposal(
+    env: &Env,
+    dao: &GovernanceDaoClient,
+    proposer: &Address,
+    target: &Address,
+    votes: &[(Address, VoteChoice)],
+) -> ProposalStatus {
+    let args: Vec<Val> = Vec::new(env);
+    let pid = dao.create_proposal(
+        proposer,
+        &Bytes::from_slice(env, b"proposal"),
+        target,
+        &Symbol::new(env, "update"),
+        &args,
+    );
+
+    for (voter, choice) in votes.iter() {
+        dao.vote(voter, &pid, choice);
+    }
+
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + VOTING_PERIOD + 301);
+    dao.finalize(&pid);
+
+    dao.get_proposal(&pid).status
+}
+
+#[test]
+fn quorum_decay_is_disabled_by_default() {
+    let (_env, dao, _admin, _v1, _v2, _target) = setup();
+
+    let decay = dao.get_quorum_decay();
+
+    // An existing DAO's behaviour must not change until it opts in.
+    assert!(!decay.enabled);
+}
+
+#[test]
+fn effective_quorum_matches_config_with_no_history() {
+    let (_env, dao, _admin, _v1, _v2, _target) = setup();
+
+    let eff = dao.get_effective_quorum();
+
+    assert_eq!(eff.quorum_bps, 1_000);
+    assert_eq!(eff.base_bps, 1_000);
+    assert!(!eff.decayed, "no history is not evidence of low turnout");
+}
+
+#[test]
+fn admin_can_enable_quorum_decay() {
+    let (_env, dao, admin, _v1, _v2, _target) = setup();
+
+    dao.set_quorum_decay(&admin, &true, &500u32, &100u32, &3u32);
+
+    let decay = dao.get_quorum_decay();
+    assert!(decay.enabled);
+    assert_eq!(decay.decay_per_period_bps, 100);
+    assert_eq!(decay.window, 3);
+}
+
+#[test]
+fn quorum_floor_is_clamped_to_the_contract_minimum() {
+    let (_env, dao, admin, _v1, _v2, _target) = setup();
+
+    // Ask for a 1% floor; the contract refuses to go below its own 10% MIN.
+    dao.set_quorum_decay(&admin, &true, &100u32, &100u32, &3u32);
+
+    assert_eq!(
+        dao.get_quorum_decay().floor_bps,
+        1_000,
+        "decay must never take quorum below MIN_QUORUM_BPS"
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #25)")]
+fn floor_at_or_above_base_quorum_is_rejected() {
+    let (_env, dao, admin, _v1, _v2, _target) = setup();
+
+    // A floor >= the configured quorum makes decay a no-op — a config
+    // mistake worth surfacing rather than silently accepting.
+    dao.set_quorum_decay(&admin, &true, &1_000u32, &100u32, &3u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #25)")]
+fn zero_decay_step_is_rejected() {
+    let (_env, dao, admin, _v1, _v2, _target) = setup();
+
+    dao.set_quorum_decay(&admin, &true, &500u32, &0u32, &3u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #25)")]
+fn oversized_participation_window_is_rejected() {
+    let (_env, dao, admin, _v1, _v2, _target) = setup();
+
+    dao.set_quorum_decay(&admin, &true, &500u32, &100u32, &50u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn set_quorum_decay_requires_admin() {
+    let (env, dao, _admin, _v1, _v2, _target) = setup();
+
+    let impostor = Address::generate(&env);
+    dao.set_quorum_decay(&impostor, &true, &500u32, &100u32, &3u32);
+}
+
+#[test]
+fn participation_is_recorded_on_finalize() {
+    let (env, dao, _admin, voter1, _v2, target) = setup();
+
+    assert_eq!(dao.get_participation_history().total_recorded, 0);
+
+    run_proposal(
+        &env,
+        &dao,
+        &voter1,
+        &target,
+        &[(voter1.clone(), VoteChoice::For)],
+    );
+
+    let history = dao.get_participation_history();
+    assert_eq!(history.total_recorded, 1);
+    assert_eq!(history.recent_bps.len(), 1);
+}
+
+#[test]
+fn participation_is_recorded_for_failed_proposals_too() {
+    let (env, dao, _admin, voter1, _v2, target) = setup();
+
+    // Against-only: fails on majority, but turnout still happened and the
+    // history should reflect actual participation, not only successes.
+    let status = run_proposal(
+        &env,
+        &dao,
+        &voter1,
+        &target,
+        &[(voter1.clone(), VoteChoice::Against)],
+    );
+
+    assert_eq!(status, ProposalStatus::Failed);
+    assert_eq!(dao.get_participation_history().total_recorded, 1);
+}
+
+#[test]
+fn low_turnout_history_decays_the_effective_quorum() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+
+    // Base quorum 10%; allow decay down to a 5%-equivalent floor, clamped to
+    // the contract minimum.
+    dao.set_quorum_decay(&admin, &true, &500u32, &100u32, &3u32);
+
+    // admin holds 100k of 1.6M supply — about 6.25% turnout, below the bar.
+    run_proposal(
+        &env,
+        &dao,
+        &voter1,
+        &target,
+        &[(admin.clone(), VoteChoice::For)],
+    );
+
+    let eff = dao.get_effective_quorum();
+    let _ = voter2;
+
+    assert!(eff.avg_participation_bps < 1_000, "turnout was below quorum");
+    assert!(eff.quorum_bps <= eff.base_bps);
+    assert!(
+        eff.quorum_bps >= 1_000,
+        "never below MIN_QUORUM_BPS, whatever the history"
+    );
+}
+
+#[test]
+fn healthy_turnout_does_not_decay_quorum() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+
+    dao.set_quorum_decay(&admin, &true, &500u32, &100u32, &3u32);
+
+    // voter1 holds 1M of 1.6M — well above the 10% bar.
+    run_proposal(
+        &env,
+        &dao,
+        &voter1,
+        &target,
+        &[(voter1.clone(), VoteChoice::For)],
+    );
+
+    let eff = dao.get_effective_quorum();
+
+    assert!(eff.avg_participation_bps >= 1_000);
+    assert!(!eff.decayed, "participation at or above the bar decays nothing");
+    assert_eq!(eff.quorum_bps, eff.base_bps);
+}
+
+#[test]
+fn disabled_decay_leaves_quorum_untouched_despite_low_turnout() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+
+    // Decay left off — the default.
+    run_proposal(
+        &env,
+        &dao,
+        &voter1,
+        &target,
+        &[(admin.clone(), VoteChoice::For)],
+    );
+
+    let eff = dao.get_effective_quorum();
+
+    assert!(eff.avg_participation_bps < 1_000, "turnout really was low");
+    assert!(!eff.decayed);
+    assert_eq!(eff.quorum_bps, 1_000, "static quorum stands when opted out");
+}
+
+#[test]
+fn participation_window_drops_the_oldest_entry() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+
+    dao.set_quorum_decay(&admin, &true, &500u32, &100u32, &2u32);
+
+    for round in 0..3u64 {
+        run_proposal(
+            &env,
+            &dao,
+            &voter1,
+            &target,
+            &[(voter1.clone(), VoteChoice::For)],
+        );
+        // Voting locks the voter's balance against that proposal; release it
+        // so the same holder can vote in the next round.
+        dao.withdraw_tokens(&voter1, &round);
+    }
+
+    let history = dao.get_participation_history();
+
+    assert_eq!(history.total_recorded, 3);
+    assert_eq!(history.recent_bps.len(), 2, "window bounds stored history");
+}

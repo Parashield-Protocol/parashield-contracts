@@ -43,6 +43,12 @@ const FINALIZE_DELAY: u64 = 300; // 5 minutes
 /// admin could configure `quorum_bps = 0`, letting a proposal pass on
 /// negligible turnout. 1000 = 10% of total supply must participate.
 const MIN_QUORUM_BPS: u32 = 1_000;
+/// Number of recent proposals averaged for participation when adaptive quorum
+/// is enabled without an explicit window.
+const DEFAULT_PARTICIPATION_WINDOW: u32 = 5;
+/// Upper bound on the participation window. Bounds both the stored history and
+/// the averaging loop.
+const MAX_PARTICIPATION_WINDOW: u32 = 20;
 
 #[contracttype]
 enum StorageKey {
@@ -62,7 +68,10 @@ enum StorageKey {
     GuardianThreshold,
     /// A pending, not-yet-executed contract upgrade awaiting guardian approvals.
     PendingUpgrade,
-
+    /// Adaptive-quorum settings (`QuorumDecayConfig`).
+    QuorumDecay,
+    /// Rolling turnout history used to compute adaptive quorum.
+    Participation,
 }
 
 #[contracterror]
@@ -93,6 +102,7 @@ pub enum Error {
     NoPendingUpgrade = 22,
     InvalidThreshold = 23,
     QuorumTooLow = 24,
+    InvalidQuorumDecay = 25,
 }
 
 #[contract]
@@ -472,8 +482,26 @@ impl GovernanceDao {
         let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
         let total_supply = proposal.total_supply;
         let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
+
+        // Adaptive quorum: after a run of low-turnout votes the requirement
+        // relaxes toward the configured floor, so a quiet DAO stays governable
+        // instead of deadlocking on proposals nobody can pass. Disabled by
+        // default, and never able to fall below MIN_QUORUM_BPS.
+        let effective = Self::effective_quorum(&env, &config);
+        if effective.decayed {
+            env.events().publish(
+                (Symbol::new(&env, "quorum_decay_applied"),),
+                QuorumDecayApplied {
+                    proposal_id,
+                    base_bps: effective.base_bps,
+                    effective_bps: effective.quorum_bps,
+                    avg_participation_bps: effective.avg_participation_bps,
+                },
+            );
+        }
+
         let quorum_needed = total_supply
-            .checked_mul(config.quorum_bps as i128)
+            .checked_mul(effective.quorum_bps as i128)
             .and_then(|v| v.checked_div(10_000))
             .unwrap_or(i128::MAX);
 
@@ -497,6 +525,11 @@ impl GovernanceDao {
                 proposal.status = ProposalStatus::Failed;
             }
         }
+
+        // Record this vote's turnout so it feeds the next proposal's adaptive
+        // quorum. Recorded for every finalized proposal, pass or fail, so the
+        // history reflects actual participation rather than only successes.
+        Self::record_participation(&env, total_votes, total_supply);
 
         let gov_token = token::Client::new(&env, &config.gov_token);
         // Refund exactly what was locked at creation — never re-read the
@@ -603,6 +636,92 @@ impl GovernanceDao {
             (Symbol::new(&env, "proposal_cancelled"),),
             ProposalCancelled { proposal_id },
         );
+    }
+
+
+    // ── Adaptive quorum ───────────────────────────────────────────────────────
+
+    /// Configure adaptive quorum decay.
+    ///
+    /// Disabled by default: an existing DAO keeps its static quorum until it
+    /// deliberately opts in. `floor_bps` is clamped up to `MIN_QUORUM_BPS` —
+    /// decay can relax the requirement toward the floor but can never take it
+    /// below the level the contract considers safe at all.
+    pub fn set_quorum_decay(
+        env: Env,
+        admin: Address,
+        enabled: bool,
+        floor_bps: u32,
+        decay_per_period_bps: u32,
+        window: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        let config: DaoConfig = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+
+        // A floor at or above the configured quorum would make decay a no-op,
+        // which is a configuration mistake worth surfacing rather than
+        // silently accepting.
+        if enabled && floor_bps >= config.quorum_bps {
+            panic_with_error!(&env, Error::InvalidQuorumDecay);
+        }
+        if enabled && (window == 0 || window > MAX_PARTICIPATION_WINDOW) {
+            panic_with_error!(&env, Error::InvalidQuorumDecay);
+        }
+        if enabled && decay_per_period_bps == 0 {
+            panic_with_error!(&env, Error::InvalidQuorumDecay);
+        }
+
+        let effective_floor = floor_bps.max(MIN_QUORUM_BPS);
+
+        let decay = QuorumDecayConfig {
+            enabled,
+            floor_bps: effective_floor,
+            decay_per_period_bps,
+            window,
+        };
+        env.storage()
+            .instance()
+            .set(&StorageKey::QuorumDecay, &decay);
+
+        env.events().publish(
+            (Symbol::new(&env, "quorum_decay_updated"),),
+            QuorumDecayConfigUpdated {
+                enabled,
+                floor_bps: effective_floor,
+                decay_per_period_bps,
+                window,
+            },
+        );
+    }
+
+    /// The current adaptive-quorum settings.
+    pub fn get_quorum_decay(env: Env) -> QuorumDecayConfig {
+        Self::quorum_decay_config(&env)
+    }
+
+    /// Rolling participation history used to compute adaptive quorum.
+    pub fn get_participation_history(env: Env) -> ParticipationHistory {
+        Self::participation_history(&env)
+    }
+
+    /// The quorum that would be applied to a proposal finalized right now,
+    /// and the participation figure behind it.
+    ///
+    /// Exposed so voters can see the bar before they vote rather than
+    /// discovering it at finalize.
+    pub fn get_effective_quorum(env: Env) -> EffectiveQuorum {
+        let config: DaoConfig = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+
+        Self::effective_quorum(&env, &config)
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
@@ -863,6 +982,136 @@ impl GovernanceDao {
         
         // Future migrations follow the pattern:
         // if old_version < 3 && new_version >= 3 { Self::migrate_v2_to_v3(env); }
+    }
+
+
+    /// Adaptive-quorum settings, or the disabled default.
+    fn quorum_decay_config(env: &Env) -> QuorumDecayConfig {
+        env.storage()
+            .instance()
+            .get(&StorageKey::QuorumDecay)
+            .unwrap_or(QuorumDecayConfig {
+                enabled: false,
+                floor_bps: MIN_QUORUM_BPS,
+                decay_per_period_bps: 0,
+                window: 0,
+            })
+    }
+
+    /// Rolling participation history, or an empty one.
+    fn participation_history(env: &Env) -> ParticipationHistory {
+        env.storage()
+            .instance()
+            .get(&StorageKey::Participation)
+            .unwrap_or(ParticipationHistory {
+                recent_bps: Vec::new(env),
+                total_recorded: 0,
+            })
+    }
+
+    /// Average turnout across the recorded window, in basis points.
+    /// Returns `None` when there is no history to average.
+    fn average_participation_bps(history: &ParticipationHistory) -> Option<u32> {
+        let len = history.recent_bps.len();
+        if len == 0 {
+            return None;
+        }
+
+        let mut sum: u64 = 0;
+        for i in 0..len {
+            sum += history.recent_bps.get_unchecked(i) as u64;
+        }
+        Some((sum / len as u64) as u32)
+    }
+
+    /// The quorum requirement in force, after any decay.
+    ///
+    /// Decay is proportional to the shortfall: the further average turnout has
+    /// fallen below the configured requirement, the more the requirement
+    /// relaxes — bounded by `floor_bps`, which itself can never sit below
+    /// `MIN_QUORUM_BPS`.
+    ///
+    /// With no history at all, the base requirement stands. A DAO's very first
+    /// proposals should not get a discount for the absence of evidence.
+    fn effective_quorum(env: &Env, config: &DaoConfig) -> EffectiveQuorum {
+        let base_bps = config.quorum_bps;
+        let decay = Self::quorum_decay_config(env);
+        let history = Self::participation_history(env);
+        let avg = Self::average_participation_bps(&history);
+
+        let avg_bps = avg.unwrap_or(0);
+
+        if !decay.enabled || avg.is_none() {
+            return EffectiveQuorum {
+                quorum_bps: base_bps,
+                base_bps,
+                avg_participation_bps: avg_bps,
+                decayed: false,
+            };
+        }
+
+        // Participation at or above the bar is not a low-participation period,
+        // so nothing decays.
+        if avg_bps >= base_bps {
+            return EffectiveQuorum {
+                quorum_bps: base_bps,
+                base_bps,
+                avg_participation_bps: avg_bps,
+                decayed: false,
+            };
+        }
+
+        // How many whole decay steps the shortfall represents. Each
+        // `decay_per_period_bps` of shortfall relaxes the bar by the same
+        // amount, so the requirement tracks observed turnout rather than
+        // collapsing to the floor at the first quiet vote.
+        let shortfall = base_bps - avg_bps;
+        let steps = shortfall / decay.decay_per_period_bps.max(1);
+        let reduction = steps.saturating_mul(decay.decay_per_period_bps);
+
+        let decayed_bps = base_bps.saturating_sub(reduction).max(decay.floor_bps);
+
+        EffectiveQuorum {
+            quorum_bps: decayed_bps,
+            base_bps,
+            avg_participation_bps: avg_bps,
+            decayed: decayed_bps < base_bps,
+        }
+    }
+
+    /// Record a finalized proposal's turnout into the rolling window.
+    ///
+    /// Turnout is measured against the supply snapshotted at proposal
+    /// creation, matching how quorum itself is measured, so the two figures
+    /// are always comparable.
+    fn record_participation(env: &Env, total_votes: i128, total_supply: i128) {
+        let decay = Self::quorum_decay_config(env);
+        let window = if decay.window == 0 {
+            DEFAULT_PARTICIPATION_WINDOW
+        } else {
+            decay.window
+        };
+
+        let turnout_bps: u32 = if total_supply <= 0 {
+            0
+        } else {
+            total_votes
+                .checked_mul(10_000)
+                .map(|v| v / total_supply)
+                .unwrap_or(10_000)
+                .clamp(0, 10_000) as u32
+        };
+
+        let mut history = Self::participation_history(env);
+        history.recent_bps.push_back(turnout_bps);
+        while history.recent_bps.len() > window {
+            history.recent_bps.pop_front();
+        }
+        history.total_recorded = history.total_recorded.saturating_add(1);
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::Participation, &history);
     }
 
     fn require_admin(env: &Env, caller: &Address) {

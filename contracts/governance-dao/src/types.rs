@@ -117,6 +117,60 @@ pub struct DaoConfig {
     pub proposal_timelock: u64,
 }
 
+/// Settings controlling adaptive (decaying) quorum.
+///
+/// A static quorum assumes participation is stable. It is not: token holders
+/// drift away, delegates go quiet, and a DAO that was healthy at 20% turnout
+/// can spend months unable to pass anything — including the proposals that
+/// would fix its own participation problem. Governance deadlock is itself a
+/// failure mode.
+///
+/// Decay lowers the bar as participation falls, but only down to `floor_bps`,
+/// which can never go below the contract's hard `MIN_QUORUM_BPS`. The
+/// intent is to keep a quiet DAO governable, not to let a handful of holders
+/// quietly take it over.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuorumDecayConfig {
+    /// Whether adaptive quorum is applied at all. Off by default, so an
+    /// existing DAO's behaviour does not change until it opts in.
+    pub enabled: bool,
+    /// Absolute lower bound the decayed quorum can reach, in basis points.
+    /// Clamped up to the contract's `MIN_QUORUM_BPS` if set below it.
+    pub floor_bps: u32,
+    /// Basis points of decay applied per consecutive low-participation
+    /// proposal, subtracted from the configured `quorum_bps`.
+    pub decay_per_period_bps: u32,
+    /// Number of recent proposals whose turnout is averaged to decide whether
+    /// participation counts as low.
+    pub window: u32,
+}
+
+/// Rolling record of recent participation, used to compute adaptive quorum.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParticipationHistory {
+    /// Turnout in basis points for each of the last `window` finalized
+    /// proposals, oldest first.
+    pub recent_bps: Vec<u32>,
+    /// Number of finalized proposals recorded so far (saturating).
+    pub total_recorded: u64,
+}
+
+/// The quorum actually applied to a proposal, and why.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffectiveQuorum {
+    /// The quorum requirement in effect, in basis points.
+    pub quorum_bps: u32,
+    /// The configured, undecayed requirement.
+    pub base_bps: u32,
+    /// Average turnout across the participation window, in basis points.
+    pub avg_participation_bps: u32,
+    /// True when decay actually lowered the requirement below `base_bps`.
+    pub decayed: bool,
+}
+
 // ─── Events ──────────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -171,6 +225,25 @@ pub struct DaoConfigUpdated {
     pub total_supply: i128,
     pub voting_period: u64,
     pub proposal_timelock: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuorumDecayConfigUpdated {
+    pub enabled: bool,
+    pub floor_bps: u32,
+    pub decay_per_period_bps: u32,
+    pub window: u32,
+}
+
+/// Emitted at finalize when the applied quorum differed from the configured one.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuorumDecayApplied {
+    pub proposal_id: u64,
+    pub base_bps: u32,
+    pub effective_bps: u32,
+    pub avg_participation_bps: u32,
 }
 
 #[contracttype]
