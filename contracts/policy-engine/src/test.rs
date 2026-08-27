@@ -995,3 +995,241 @@ fn test_cancel_policy_zero_total_duration_refunds_full_premium() {
         "total_duration == 0 must refund the full premium via the explicit branch"
     );
 }
+
+// ── Expiry notification (issue #372) ─────────────────────────────────────────
+
+/// Buy one 30-day policy and return `(buyer, policy_id)`.
+fn buy_30_day_policy(
+    env: &Env,
+    client: &PolicyEngineClient,
+    admin: &Address,
+    usdc: &Address,
+    pid: u128,
+) -> (Address, u128) {
+    let buyer = Address::generate(env);
+    StellarAssetClient::new(env, usdc).mint(&buyer, &10_000_000_000i128);
+    let _ = admin;
+    let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+    (buyer, policy_id)
+}
+
+#[test]
+fn test_expiry_warning_window_defaults_to_seven_days() {
+    let (env, _admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+
+    assert_eq!(client.get_expiry_warning_window(), 7 * 24 * 60 * 60);
+}
+
+#[test]
+fn test_admin_can_set_expiry_warning_window() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+
+    client.set_expiry_warning_window(&admin, &(3 * 24 * 60 * 60));
+
+    assert_eq!(client.get_expiry_warning_window(), 3 * 24 * 60 * 60);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #32)")]
+fn test_zero_expiry_warning_window_is_rejected() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+
+    // A zero window would fire the warning at the instant cover lapses,
+    // which is exactly what this mechanism exists to avoid.
+    client.set_expiry_warning_window(&admin, &0u64);
+}
+
+#[test]
+fn test_fresh_policy_is_not_expiring_soon() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let (_buyer, policy_id) = buy_30_day_policy(&env, &client, &admin, &usdc, pid);
+
+    let info = client.get_policy_expiry_info(&policy_id);
+
+    assert_eq!(info.state, ExpiryState::Active);
+    assert!(!info.warned);
+    assert!(info.seconds_remaining > 7 * 24 * 60 * 60);
+}
+
+#[test]
+fn test_policy_enters_warning_window() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let (_buyer, policy_id) = buy_30_day_policy(&env, &client, &admin, &usdc, pid);
+
+    let end_time = client.get_policy(&policy_id).end_time;
+    // Three days out — inside the default seven-day window.
+    env.ledger().set_timestamp(end_time - 3 * 24 * 60 * 60);
+
+    let info = client.get_policy_expiry_info(&policy_id);
+
+    assert_eq!(info.state, ExpiryState::ExpiringSoon);
+    assert_eq!(info.seconds_remaining, 3 * 24 * 60 * 60);
+}
+
+#[test]
+fn test_lapsed_policy_reports_lapsed_before_being_marked_expired() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let (_buyer, policy_id) = buy_30_day_policy(&env, &client, &admin, &usdc, pid);
+
+    let end_time = client.get_policy(&policy_id).end_time;
+    env.ledger().set_timestamp(end_time + 1);
+
+    let info = client.get_policy_expiry_info(&policy_id);
+
+    // Still `Active` in storage, but cover has actually gone — the gap this
+    // issue is about.
+    assert_eq!(info.state, ExpiryState::Lapsed);
+    assert_eq!(info.seconds_remaining, 0);
+}
+
+#[test]
+fn test_notify_emits_once_inside_the_window() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let (_buyer, policy_id) = buy_30_day_policy(&env, &client, &admin, &usdc, pid);
+
+    let end_time = client.get_policy(&policy_id).end_time;
+    env.ledger().set_timestamp(end_time - 24 * 60 * 60);
+
+    client.notify_policy_expiring(&policy_id);
+
+    assert!(client.get_policy_expiry_info(&policy_id).warned);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #31)")]
+fn test_notify_is_rejected_outside_the_window() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let (_buyer, policy_id) = buy_30_day_policy(&env, &client, &admin, &usdc, pid);
+
+    // 30 days left, 7-day window — far too early.
+    client.notify_policy_expiring(&policy_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #31)")]
+fn test_notify_cannot_be_repeated_for_the_same_policy() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let (_buyer, policy_id) = buy_30_day_policy(&env, &client, &admin, &usdc, pid);
+
+    let end_time = client.get_policy(&policy_id).end_time;
+    env.ledger().set_timestamp(end_time - 24 * 60 * 60);
+
+    client.notify_policy_expiring(&policy_id);
+    // A permissionless entry point must not be usable to flood the event log.
+    client.notify_policy_expiring(&policy_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #31)")]
+fn test_notify_is_rejected_once_the_policy_has_lapsed() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let (_buyer, policy_id) = buy_30_day_policy(&env, &client, &admin, &usdc, pid);
+
+    let end_time = client.get_policy(&policy_id).end_time;
+    env.ledger().set_timestamp(end_time + 1);
+
+    // Past end_time this is `expire_policy`'s job, not a warning.
+    client.notify_policy_expiring(&policy_id);
+}
+
+#[test]
+fn test_notify_is_permissionless() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let (_buyer, policy_id) = buy_30_day_policy(&env, &client, &admin, &usdc, pid);
+
+    let end_time = client.get_policy(&policy_id).end_time;
+    env.ledger().set_timestamp(end_time - 60);
+
+    // No admin, no policyholder auth — a keeper anyone runs can do this, which
+    // is the point: coverage continuity must not depend on the admin.
+    client.notify_policy_expiring(&policy_id);
+
+    assert!(client.get_policy_expiry_info(&policy_id).warned);
+}
+
+#[test]
+fn test_batch_notify_emits_for_eligible_policies_only() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &100_000_000_000i128);
+
+    // Two policies with different durations, bought at the same moment.
+    let short_id = client.buy_policy(&buyer, &pid, &COVERAGE, &10u32, &symbol_short!("kis2606"));
+    let long_id = client.buy_policy(&buyer, &pid, &COVERAGE, &90u32, &symbol_short!("kis2606"));
+
+    let short_end = client.get_policy(&short_id).end_time;
+    // Inside the window for the 10-day policy, nowhere near it for the 90-day.
+    env.ledger().set_timestamp(short_end - 24 * 60 * 60);
+
+    let emitted = client.notify_expiring_policies(&buyer, &0u32);
+
+    assert_eq!(emitted, 1);
+    assert!(client.get_policy_expiry_info(&short_id).warned);
+    assert!(!client.get_policy_expiry_info(&long_id).warned);
+}
+
+#[test]
+fn test_batch_notify_skips_already_warned_instead_of_failing() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let (buyer, policy_id) = buy_30_day_policy(&env, &client, &admin, &usdc, pid);
+
+    let end_time = client.get_policy(&policy_id).end_time;
+    env.ledger().set_timestamp(end_time - 24 * 60 * 60);
+
+    assert_eq!(client.notify_expiring_policies(&buyer, &0u32), 1);
+    // A second sweep is a no-op rather than an abort — one already-warned
+    // policy must not cost a keeper the whole batch.
+    assert_eq!(client.notify_expiring_policies(&buyer, &0u32), 0);
+}
+
+#[test]
+fn test_batch_notify_on_user_with_no_policies_is_a_no_op() {
+    let (env, _admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+
+    let stranger = Address::generate(&env);
+
+    assert_eq!(client.notify_expiring_policies(&stranger, &0u32), 0);
+}
+
+#[test]
+fn test_expired_policy_reports_not_active() {
+    let (env, admin, oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let (_buyer, policy_id) = buy_30_day_policy(&env, &client, &admin, &usdc, pid);
+
+    client.set_claims_processor(&admin, &oracle);
+    let end_time = client.get_policy(&policy_id).end_time;
+    env.ledger().set_timestamp(end_time + 1);
+    client.expire_policy(&oracle, &policy_id);
+
+    assert_eq!(
+        client.get_policy_expiry_info(&policy_id).state,
+        ExpiryState::NotActive
+    );
+}

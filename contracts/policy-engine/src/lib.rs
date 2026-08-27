@@ -103,12 +103,31 @@ enum StorageKey {
     PendingUpgrade,
     /// A pending admin-transfer proposal awaiting guardian approvals.
     PendingAdminChange,
+    /// How long before `end_time` a policy counts as expiring soon (u64
+    /// seconds). Defaults to `DEFAULT_EXPIRY_WARNING_WINDOW`.
+    ExpiryWarningWindow,
+    /// Marks that a `PolicyExpiringSoon` event has already been emitted for a
+    /// policy, so repeat calls cannot spam the event log.
+    ExpiryWarned(u128),
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
 /// wall-clock TTL windows into ledger counts for `extend_ttl`.
 #[allow(dead_code)]
 const LEDGER_SECONDS: u64 = 5;
+
+/// How long before `end_time` a policy is considered to be expiring soon,
+/// when the admin has not configured a window.
+///
+/// Seven days is chosen to be long enough that a holder who checks in weekly
+/// still sees the warning while cover is live, and short enough that the
+/// warning means something — a 90-day window on a 90-day policy would fire
+/// immediately and be ignored.
+const DEFAULT_EXPIRY_WARNING_WINDOW: u64 = 7 * 24 * 60 * 60;
+
+/// Maximum policies a single `notify_expiring_policies` call will scan.
+/// Bounds the instruction budget of a permissionless entry point.
+const MAX_EXPIRY_SCAN: u32 = 50;
 
 /// Extra time added on top of a policy's own duration when extending the TTL
 /// of its `Policy` entry, so the Claims Processor still has time to evaluate
@@ -152,6 +171,8 @@ pub enum Error {
     AdminTimelockNotExpired = 28,
     EmptyBatch              = 29,
     BatchTooLarge           = 30,
+    NotExpiringSoon         = 31,
+    InvalidWarningWindow    = 32,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -695,6 +716,192 @@ impl PolicyEngine {
         );
     }
 
+
+    // ── Expiry notification ───────────────────────────────────────────────────
+
+    /// Set how long before `end_time` a policy counts as expiring soon.
+    ///
+    /// The window must be non-zero: a zero window would make the warning fire
+    /// at the same instant cover lapses, which is the situation this mechanism
+    /// exists to avoid.
+    pub fn set_expiry_warning_window(env: Env, admin: Address, window: u64) {
+        Self::require_admin(&env, &admin);
+        if window == 0 {
+            panic_with_error!(&env, Error::InvalidWarningWindow);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::ExpiryWarningWindow, &window);
+        env.events().publish(
+            (Symbol::new(&env, "expiry_window_updated"),),
+            ExpiryWarningWindowUpdated { window },
+        );
+    }
+
+    /// The configured expiry warning window in seconds (default: 7 days).
+    pub fn get_expiry_warning_window(env: Env) -> u64 {
+        Self::expiry_warning_window(&env)
+    }
+
+    /// Report where a policy sits relative to its own expiry, without panicking
+    /// on state and without emitting anything.
+    ///
+    /// A caller deciding whether to renew, or a keeper deciding whether a
+    /// notification is worth paying for, needs this as a value rather than as
+    /// a transaction that might abort.
+    pub fn get_policy_expiry_info(env: Env, policy_id: u128) -> PolicyExpiryInfo {
+        let policy: Policy = Self::load_policy(&env, policy_id);
+        let now = env.ledger().timestamp();
+        let window = Self::expiry_warning_window(&env);
+
+        let seconds_remaining = policy.end_time.saturating_sub(now);
+        let state = if policy.status != PolicyStatus::Active {
+            ExpiryState::NotActive
+        } else if now >= policy.end_time {
+            ExpiryState::Lapsed
+        } else if seconds_remaining <= window {
+            ExpiryState::ExpiringSoon
+        } else {
+            ExpiryState::Active
+        };
+
+        PolicyExpiryInfo {
+            policy_id,
+            state,
+            end_time: policy.end_time,
+            seconds_remaining,
+            warned: env
+                .storage()
+                .persistent()
+                .has(&StorageKey::ExpiryWarned(policy_id)),
+        }
+    }
+
+    /// Emit `PolicyExpiringSoon` for a policy that has entered its warning
+    /// window, so off-chain infrastructure can notify the holder.
+    ///
+    /// Permissionless on purpose. The party who most needs the reminder is the
+    /// holder, and requiring the admin to trigger it would make coverage
+    /// continuity depend on the admin running a keeper — exactly the kind of
+    /// silent dependency that leaves users uncovered.
+    ///
+    /// Emits at most once per policy: the first successful call records a flag
+    /// and later calls panic with `NotExpiringSoon`, so a permissionless entry
+    /// point cannot be used to flood the event log.
+    ///
+    /// Panics with `NotExpiringSoon` when the policy is not Active, has not
+    /// yet entered the window, has already lapsed, or has already been warned.
+    pub fn notify_policy_expiring(env: Env, policy_id: u128) {
+        let policy: Policy = Self::load_policy(&env, policy_id);
+
+        if policy.status != PolicyStatus::Active {
+            panic_with_error!(&env, Error::PolicyNotActive);
+        }
+
+        let now = env.ledger().timestamp();
+        let window = Self::expiry_warning_window(&env);
+
+        // Already lapsed is `expire_policy`'s job, not a warning.
+        if now >= policy.end_time {
+            panic_with_error!(&env, Error::NotExpiringSoon);
+        }
+
+        let seconds_remaining = policy.end_time - now;
+        if seconds_remaining > window {
+            panic_with_error!(&env, Error::NotExpiringSoon);
+        }
+
+        let warned_key = StorageKey::ExpiryWarned(policy_id);
+        if env.storage().persistent().has(&warned_key) {
+            panic_with_error!(&env, Error::NotExpiringSoon);
+        }
+
+        env.storage().persistent().set(&warned_key, &true);
+        Self::extend_to_max(&env, &warned_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "policy_expiring_soon"),),
+            PolicyExpiringSoon {
+                policy_id,
+                policyholder: policy.policyholder,
+                product_id: policy.product_id,
+                coverage_amount: policy.coverage_amount,
+                end_time: policy.end_time,
+                seconds_remaining,
+            },
+        );
+    }
+
+    /// Scan one user's policies and emit `PolicyExpiringSoon` for each that has
+    /// entered its warning window and has not been warned yet.
+    ///
+    /// Returns the number of events emitted. Policies that are ineligible are
+    /// skipped rather than aborting the call — a keeper sweeping a user's book
+    /// should not lose the whole batch because one policy was already warned.
+    ///
+    /// Scans at most `MAX_EXPIRY_SCAN` policies per call to bound the
+    /// instruction budget of a permissionless entry point.
+    pub fn notify_expiring_policies(env: Env, user: Address, offset: u32) -> u32 {
+        let ids: Vec<u128> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::UserPolicies(user))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let now = env.ledger().timestamp();
+        let window = Self::expiry_warning_window(&env);
+        let mut emitted = 0u32;
+        let mut scanned = 0u32;
+
+        let mut i = offset;
+        while i < ids.len() && scanned < MAX_EXPIRY_SCAN {
+            scanned += 1;
+            let policy_id = ids.get_unchecked(i);
+            i += 1;
+
+            let policy: Policy = match env
+                .storage()
+                .persistent()
+                .get(&StorageKey::Policy(policy_id))
+            {
+                Some(p) => p,
+                None => continue,
+            };
+
+            if policy.status != PolicyStatus::Active || now >= policy.end_time {
+                continue;
+            }
+
+            let seconds_remaining = policy.end_time - now;
+            if seconds_remaining > window {
+                continue;
+            }
+
+            let warned_key = StorageKey::ExpiryWarned(policy_id);
+            if env.storage().persistent().has(&warned_key) {
+                continue;
+            }
+
+            env.storage().persistent().set(&warned_key, &true);
+            Self::extend_to_max(&env, &warned_key);
+
+            env.events().publish(
+                (Symbol::new(&env, "policy_expiring_soon"),),
+                PolicyExpiringSoon {
+                    policy_id,
+                    policyholder: policy.policyholder,
+                    product_id: policy.product_id,
+                    coverage_amount: policy.coverage_amount,
+                    end_time: policy.end_time,
+                    seconds_remaining,
+                },
+            );
+            emitted += 1;
+        }
+
+        emitted
+    }
+
     // ── Queries ───────────────────────────────────────────────────────────────
 
     /// Return the `InsuranceProduct` for the given ID. Panics if the product does not exist.
@@ -1089,6 +1296,14 @@ pub fn emergency_resume(env: Env, admin: Address) {
     /// Extend a persistent entry's TTL to the network maximum. Used for
     /// Product/ProductKey/UserPolicies records, which are admin- or
     /// user-index data with no natural expiry.
+    /// The configured expiry warning window, or the default when unset.
+    fn expiry_warning_window(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::ExpiryWarningWindow)
+            .unwrap_or(DEFAULT_EXPIRY_WARNING_WINDOW)
+    }
+
     fn extend_to_max(env: &Env, key: &StorageKey) {
         let max_ttl = env.storage().max_ttl();
         env.storage().persistent().extend_ttl(key, max_ttl, max_ttl);
