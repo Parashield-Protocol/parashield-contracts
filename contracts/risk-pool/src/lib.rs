@@ -113,6 +113,8 @@ enum StorageKey {
     MinReserve,
     /// Insurance fund reserve amount (i128 in USDC stroops).
     ReserveFund,
+    /// LP vote delegation: provider Address → delegate Address.
+    VoteDelegation(Address),
 }
 
 #[contracterror]
@@ -150,6 +152,7 @@ pub enum Error {
     ParameterChangeNotReady   = 29,
     AdminTimelockNotExpired   = 30,
     ReserveTooLow             = 31,
+    NoDelegation              = 32,
 }
 
 #[contract]
@@ -1524,6 +1527,78 @@ impl RiskPool {
                 enabled,
             },
         );
+    }
+
+    // ── LP Vote Delegation (issue #399) ────────────────────────────────────
+
+    /// Delegate the caller's LP voting power to `delegate`. The delegate
+    /// can then vote on governance proposals using the caller's LP share
+    /// weight. Only the LP provider may delegate their own position.
+    ///
+    /// Delegation is all-or-nothing: the delegate receives voting power
+    /// proportional to the provider's full share count. A provider may
+    /// change or revoke delegation at any time.
+    pub fn delegate_votes(env: Env, provider: Address, delegate: Address) {
+        provider.require_auth();
+        Self::validate_stellar_address(&env, &delegate);
+
+        // Ensure the provider has an active LP position
+        let lp_key = StorageKey::LpPosition(provider.clone());
+        let position: LpPosition = env.storage().persistent()
+            .get(&lp_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
+        if position.shares <= 0 {
+            panic_with_error!(&env, Error::NoShares);
+        }
+
+        let key = StorageKey::VoteDelegation(provider.clone());
+        env.storage().persistent().set(&key, &delegate);
+        Self::extend_to_max(&env, &key);
+
+        env.events().publish(
+            (Symbol::new(&env, "votes_delegated"),),
+            VotesDelegated {
+                provider,
+                delegate,
+            },
+        );
+    }
+
+    /// Revoke a previously delegated vote. The provider's voting power
+    /// reverts to their wallet balance only (no LP share delegation).
+    pub fn undelegate_votes(env: Env, provider: Address) {
+        provider.require_auth();
+        let key = StorageKey::VoteDelegation(provider.clone());
+        if !env.storage().persistent().has(&key) {
+            panic_with_error!(&env, Error::NoDelegation);
+        }
+        env.storage().persistent().remove(&key);
+
+        env.events().publish(
+            (Symbol::new(&env, "votes_undelegated"),),
+            provider,
+        );
+    }
+
+    /// Return the delegate for `provider`, if any.
+    pub fn get_vote_delegate(env: Env, provider: Address) -> Option<Address> {
+        env.storage().persistent().get(&StorageKey::VoteDelegation(provider))
+    }
+
+    /// Return the LP share count available for voting delegation from
+    /// `provider`. Returns 0 if the provider has no active position or
+    /// has not delegated.
+    pub fn get_delegated_shares(env: Env, provider: Address) -> i128 {
+        // Only return shares if delegation is active
+        if !env.storage().persistent().has(&StorageKey::VoteDelegation(provider.clone())) {
+            return 0;
+        }
+        let lp_key = StorageKey::LpPosition(provider);
+        let position: LpPosition = match env.storage().persistent().get(&lp_key) {
+            Some(p) => p,
+            None => return 0,
+        };
+        position.shares
     }
 
     /// Return the LP NFT for a given token ID, if it exists.

@@ -351,3 +351,10 @@ pub struct MinReserveUpdated {
 pub struct ReserveFundUpdated {
     pub amount: i128,
 }
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VotesDelegated {
+    pub provider: Address,
+    pub delegate: Address,
+}
