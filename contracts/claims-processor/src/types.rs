@@ -11,6 +11,10 @@ pub enum ClaimStatus {
     Expired,
     /// Claim was partially paid (proportional payout based on trigger severity).
     PartiallyPaid,
+    /// Claim sat Pending past the escalation threshold and was escalated for
+    /// manual review. Still unresolved — this records that it is overdue, not
+    /// that it was decided.
+    Escalated,
 }
 
 /// Result returned by `process_claim` and `auto_process`.
@@ -54,6 +58,23 @@ pub struct Claim {
     pub partial_payout_bps: Option<u32>,
 }
 
+/// How overdue a pending claim is.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimAgeInfo {
+    pub claim_id: u128,
+    pub status: ClaimStatus,
+    pub submitted_at: u64,
+    /// Seconds the claim has been waiting. 0 once it is resolved.
+    pub pending_for: u64,
+    /// Threshold in force for escalation.
+    pub escalation_threshold: u64,
+    /// True when the claim is Pending and past the threshold.
+    pub escalatable: bool,
+    /// Seconds until it becomes escalatable, or 0 if it already is.
+    pub seconds_until_escalatable: u64,
+}
+
 // ─── Events ──────────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -90,6 +111,25 @@ pub struct ClaimDisputed {
     pub claim_id: u128,
     pub claimant: Address,
     pub reason: Symbol,
+}
+
+/// Emitted when an overdue claim is escalated for manual review.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimEscalated {
+    pub claim_id: u128,
+    pub policy_id: u128,
+    pub claimant: Address,
+    /// Seconds the claim had been Pending when it was escalated.
+    pub pending_for: u64,
+    /// Who triggered the escalation.
+    pub escalated_by: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscalationThresholdUpdated {
+    pub threshold: u64,
 }
 
 #[contracttype]

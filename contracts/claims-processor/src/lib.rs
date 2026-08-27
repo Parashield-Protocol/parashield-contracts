@@ -120,6 +120,8 @@ enum StorageKey {
     GuardianThreshold,
     /// A pending, not-yet-executed contract upgrade awaiting guardian approvals.
     PendingUpgrade,
+    /// Seconds a claim may sit Pending before it can be escalated (u64).
+    EscalationThreshold,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -144,6 +146,8 @@ pub enum Error {
     NoPendingUpgrade     = 14,
     InvalidThreshold     = 15,
     AdminTimelockNotExpired = 16,
+    NotEscalatable       = 17,
+    InvalidThresholdValue = 18,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -156,6 +160,20 @@ const LEDGER_SECONDS: u64 = 5;
 /// policy durations plus dispute-resolution time; capped to the network's
 /// max TTL at call time so `extend_ttl` never panics.
 const CLAIM_RETENTION_SECONDS: u64 = 365 * 24 * 60 * 60;
+
+/// How long a claim may sit Pending before anyone can escalate it, when the
+/// admin has not configured a threshold.
+///
+/// Seven days is long enough that ordinary keeper latency, oracle data still
+/// arriving, or a quiet weekend do not trip it, and short enough that a
+/// claimant is not left indefinitely without recourse. It is the point past
+/// which "still processing" stops being a plausible explanation.
+const DEFAULT_ESCALATION_THRESHOLD: u64 = 7 * 24 * 60 * 60;
+
+/// Shortest escalation threshold an admin may configure (1 hour). A near-zero
+/// threshold would let every claim be escalated on submission, which turns the
+/// signal into noise and defeats the purpose of having one.
+const MIN_ESCALATION_THRESHOLD: u64 = 60 * 60;
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
@@ -922,6 +940,165 @@ impl ClaimsProcessor {
         // if old_version < 3 && new_version >= 3 { Self::migrate_v2_to_v3(env); }
     }
 
+    // ── Escalation (issue #376) ───────────────────────────────────────────────
+
+    /// Set how long a claim may sit Pending before it can be escalated.
+    ///
+    /// Floored at `MIN_ESCALATION_THRESHOLD` (1 hour): a near-zero threshold
+    /// would make every claim escalatable the moment it is submitted, which
+    /// turns the signal into noise and leaves genuinely stuck claims no easier
+    /// to find than they are today.
+    pub fn set_escalation_threshold(env: Env, admin: Address, threshold: u64) {
+        Self::require_admin(&env, &admin);
+
+        if threshold < MIN_ESCALATION_THRESHOLD {
+            panic_with_error!(&env, Error::InvalidThresholdValue);
+        }
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::EscalationThreshold, &threshold);
+
+        env.events().publish(
+            (Symbol::new(&env, "escalation_threshold_set"),),
+            EscalationThresholdUpdated { threshold },
+        );
+    }
+
+    /// The escalation threshold in seconds (default: 7 days).
+    pub fn get_escalation_threshold(env: Env) -> u64 {
+        Self::escalation_threshold(&env)
+    }
+
+    /// How long a claim has been waiting, and whether it can be escalated yet.
+    ///
+    /// Returns a value rather than panicking, so a claimant's UI can show
+    /// "escalatable in 2 days" instead of offering a button that reverts.
+    pub fn get_claim_age(env: Env, claim_id: u128) -> ClaimAgeInfo {
+        let claim: Claim = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+
+        let threshold = Self::escalation_threshold(&env);
+        let now = env.ledger().timestamp();
+        let is_pending = claim.status == ClaimStatus::Pending;
+        let pending_for = if is_pending {
+            now.saturating_sub(claim.submitted_at)
+        } else {
+            0
+        };
+
+        ClaimAgeInfo {
+            claim_id,
+            status: claim.status,
+            submitted_at: claim.submitted_at,
+            pending_for,
+            escalation_threshold: threshold,
+            escalatable: is_pending && pending_for >= threshold,
+            seconds_until_escalatable: if !is_pending {
+                0
+            } else {
+                threshold.saturating_sub(pending_for)
+            },
+        }
+    }
+
+    /// Escalate a claim that has been Pending past the threshold.
+    ///
+    /// A claim that nothing processes is worse than a rejected one: a
+    /// rejection can be disputed, but a claim stuck in Pending gives the
+    /// claimant nothing to act on and no signal that anything is wrong. This
+    /// moves it to `Escalated`, emits `ClaimEscalated`, and takes it out of the
+    /// automated pending queue so manual review can pick it up.
+    ///
+    /// Permissionless by design. The person with the strongest interest in
+    /// escalating is the claimant who is waiting, and requiring a keeper or the
+    /// admin to do it would mean the party responsible for the delay is also
+    /// the only party able to flag it.
+    ///
+    /// Escalation does not decide the claim. It records that processing is
+    /// overdue and hands it to review — the outcome still comes from a normal
+    /// resolution path.
+    pub fn escalate_claim(env: Env, caller: Address, claim_id: u128) {
+        caller.require_auth();
+        Self::require_not_paused(&env);
+
+        let mut claim: Claim = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+
+        if claim.status != ClaimStatus::Pending {
+            panic_with_error!(&env, Error::NotEscalatable);
+        }
+
+        let now = env.ledger().timestamp();
+        let pending_for = now.saturating_sub(claim.submitted_at);
+        if pending_for < Self::escalation_threshold(&env) {
+            panic_with_error!(&env, Error::NotEscalatable);
+        }
+
+        claim.status = ClaimStatus::Escalated;
+        let policy_id = claim.policy_id;
+        let claimant = claim.claimant.clone();
+
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Claim(claim_id), &claim);
+        Self::extend_claim_ttl(&env, &StorageKey::Claim(claim_id));
+
+        // Drop it from the automated queue — a keeper sweeping pending claims
+        // should not keep retrying one that has been handed to review.
+        Self::remove_from_pending(&env, claim_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "claim_escalated"),),
+            ClaimEscalated {
+                claim_id,
+                policy_id,
+                claimant,
+                pending_for,
+                escalated_by: caller,
+            },
+        );
+    }
+
+    /// Claim IDs that are Pending and past the escalation threshold.
+    ///
+    /// Lets a monitoring job find stuck claims in one call rather than probing
+    /// each one, which is what makes the threshold actionable in practice.
+    pub fn get_escalatable_claims(env: Env) -> Vec<u128> {
+        let pending: Vec<u128> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PendingClaims)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let threshold = Self::escalation_threshold(&env);
+        let now = env.ledger().timestamp();
+        let mut overdue: Vec<u128> = Vec::new(&env);
+
+        for i in 0..pending.len() {
+            let cid = pending.get_unchecked(i);
+            if let Some(claim) = env
+                .storage()
+                .persistent()
+                .get::<_, Claim>(&StorageKey::Claim(cid))
+            {
+                if claim.status == ClaimStatus::Pending
+                    && now.saturating_sub(claim.submitted_at) >= threshold
+                {
+                    overdue.push_back(cid);
+                }
+            }
+        }
+
+        overdue
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     /// Evaluate a pending claim and settle it against the configured oracle trigger.
@@ -1048,6 +1225,15 @@ impl ClaimsProcessor {
     }
 
     /// Remove a claim id from the pending queue, if present.
+
+    /// The configured escalation threshold, or the default.
+    fn escalation_threshold(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::EscalationThreshold)
+            .unwrap_or(DEFAULT_ESCALATION_THRESHOLD)
+    }
+
     fn remove_from_pending(env: &Env, claim_id: u128) {
         let mut pending: Vec<u128> = env.storage().instance()
             .get(&StorageKey::PendingClaims)
