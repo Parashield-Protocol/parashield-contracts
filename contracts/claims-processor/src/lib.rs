@@ -57,6 +57,11 @@ trait IOracleVerifier {
     ) -> bool;
 }
 
+#[soroban_sdk::contractclient(name = "IdentityVerifierClient")]
+trait IIdentityVerifier {
+    fn is_verified(env: Env, address: Address) -> bool;
+}
+
 // ─── Storage TTL ──────────────────────────────────────────────────────────────
 
 /// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
@@ -127,6 +132,10 @@ enum StorageKey {
     CrossChainAttestorList(Symbol),
     /// The most recent cross-chain attestation submitted for a policy_id.
     CrossChainAttestation(u128),
+    /// Optional identity verifier contract address (Address).
+    IdentityVerifier,
+    /// Whether identity verification is required for claimants (bool).
+    IdentityVerificationRequired,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -154,6 +163,7 @@ pub enum Error {
     AttestorNotRegistered = 17,
     NoAttestation        = 18,
     AttestationStale     = 19,
+    IdentityNotVerified  = 20,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -383,6 +393,64 @@ impl ClaimsProcessor {
         env.storage().persistent().get(&StorageKey::CrossChainAttestation(policy_id))
     }
 
+    // ── Identity Verification (issue #384) ──────────────────────────────────
+
+    /// Admin-only: set the identity verifier contract address. The contract
+    /// must implement `is_verified(Address) -> bool`.
+    pub fn set_identity_verifier(env: Env, admin: Address, verifier: Address) {
+        Self::require_admin(&env, &admin);
+        Self::validate_stellar_address(&env, &verifier);
+        env.storage().instance().set(&StorageKey::IdentityVerifier, &verifier);
+        env.events().publish(
+            (Symbol::new(&env, "identity_verifier_set"),),
+            verifier,
+        );
+    }
+
+    /// Admin-only: enable or disable mandatory identity verification for
+    /// claimants. When enabled, `submit_claim` and `auto_process` check
+    /// that the policyholder has passed KYC via the configured identity
+    /// verifier before accepting or processing a claim.
+    pub fn set_identity_verification_required(env: Env, admin: Address, required: bool) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&StorageKey::IdentityVerificationRequired, &required);
+        env.events().publish(
+            (Symbol::new(&env, "identity_verification_toggled"),),
+            required,
+        );
+    }
+
+    /// Whether identity verification is currently required.
+    pub fn is_identity_verification_required(env: Env) -> bool {
+        env.storage().instance()
+            .get(&StorageKey::IdentityVerificationRequired)
+            .unwrap_or(false)
+    }
+
+    /// Return the configured identity verifier contract address, if any.
+    pub fn get_identity_verifier(env: Env) -> Option<Address> {
+        env.storage().instance().get(&StorageKey::IdentityVerifier)
+    }
+
+    /// Panic with `IdentityNotVerified` if identity verification is enabled
+    /// and the claimant has not passed KYC via the identity verifier.
+    fn require_identity_verification(env: &Env, claimant: &Address) {
+        let required: bool = env.storage().instance()
+            .get(&StorageKey::IdentityVerificationRequired)
+            .unwrap_or(false);
+        if !required {
+            return;
+        }
+        let verifier_addr: Address = env.storage().instance()
+            .get(&StorageKey::IdentityVerifier)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        let verified = IdentityVerifierClient::new(env, &verifier_addr)
+            .is_verified(claimant);
+        if !verified {
+            panic_with_error!(env, Error::IdentityNotVerified);
+        }
+    }
+
     /// Settle a claim using a previously submitted cross-chain attestation
     /// instead of the Stellar oracle-verifier.
     ///
@@ -442,6 +510,7 @@ impl ClaimsProcessor {
     pub fn submit_claim(env: Env, claimant: Address, policy_id: u128) -> u128 {
         claimant.require_auth();
         Self::require_not_paused(&env);
+        Self::require_identity_verification(&env, &claimant);
 
         // Guard: one claim per policy
         if env.storage().persistent().has(&StorageKey::PolicyClaim(policy_id)) {
@@ -578,6 +647,8 @@ impl ClaimsProcessor {
             parashield_policy_engine::PolicyStatus::Cancelled  => return ClaimResult::PolicyNotActive,
             parashield_policy_engine::PolicyStatus::Active     => {}
         }
+
+        Self::require_identity_verification(&env, &policy.policyholder);
 
         // Check if policy has expired with no trigger
         let now = env.ledger().timestamp();
