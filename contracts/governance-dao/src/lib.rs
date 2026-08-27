@@ -39,6 +39,16 @@ const TTL_THRESHOLD: u32 = 518_400; // ~30 days
 const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year
 /// Minimum delay after vote_end before finalize() can be called
 const FINALIZE_DELAY: u64 = 300; // 5 minutes
+/// How long a proposal must sit unfinalized past `vote_end` before its
+/// proposer (or anyone, on the proposer's behalf) can reclaim the deposit
+/// directly via `reclaim_deposit`, bypassing the quorum/majority computation
+/// `finalize()` performs. `finalize()` is already permissionless and already
+/// refunds the deposit on every outcome, but nothing obliges anyone to ever
+/// call it — a proposal that clearly failed quorum has no one economically
+/// incentivized to pay for finalizing it. This is the backstop so a deposit
+/// can never depend on that goodwill (issue #378). Set well beyond
+/// `FINALIZE_DELAY` so the normal finalize path always gets first chance.
+const DEPOSIT_RECLAIM_TIMEOUT: u64 = 14 * 24 * 3_600; // 14 days
 /// Lower bound on `DaoConfig.quorum_bps` (issue #355). Without a floor the
 /// admin could configure `quorum_bps = 0`, letting a proposal pass on
 /// negligible turnout. 1000 = 10% of total supply must participate.
@@ -72,6 +82,10 @@ enum StorageKey {
     QuorumDecay,
     /// Rolling turnout history used to compute adaptive quorum.
     Participation,
+    /// A registered proposal template (`ProposalTemplate`) by name.
+    Template(Symbol),
+    /// Names of all registered templates (`Vec<Symbol>`).
+    TemplateList,
 }
 
 #[contracterror]
@@ -103,6 +117,11 @@ pub enum Error {
     InvalidThreshold = 23,
     QuorumTooLow = 24,
     InvalidQuorumDecay = 25,
+    ProposalNotExpired = 26,
+    TemplateNotFound = 27,
+    TemplateInactive = 28,
+    TitleTooShort = 29,
+    ArgCountMismatch = 30,
 }
 
 #[contract]
@@ -553,6 +572,60 @@ impl GovernanceDao {
         );
     }
 
+    /// Reclaim a proposer's deposit on a proposal that was never finalized.
+    ///
+    /// `finalize()` is already permissionless and already refunds the
+    /// deposit regardless of whether quorum/majority was reached — but it
+    /// still requires *someone* to call it, and nobody is economically
+    /// incentivized to spend a transaction finalizing a proposal that
+    /// plainly failed quorum. Without this, such a deposit can sit locked
+    /// indefinitely waiting on goodwill (issue #378).
+    ///
+    /// Callable by anyone once `now > vote_end + DEPOSIT_RECLAIM_TIMEOUT` —
+    /// far past the point `finalize()` itself becomes callable — on a
+    /// proposal still `Active`. Settles the proposal as `Failed` (mirroring
+    /// what `finalize()` would compute for zero additional turnout) and
+    /// refunds the deposit to the original proposer.
+    pub fn reclaim_deposit(env: Env, proposal_id: u64) {
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        if proposal.status != ProposalStatus::Active {
+            panic_with_error!(&env, Error::ProposalNotActive);
+        }
+        if env.ledger().timestamp() <= proposal.vote_end.saturating_add(DEPOSIT_RECLAIM_TIMEOUT) {
+            panic_with_error!(&env, Error::ProposalNotExpired);
+        }
+
+        proposal.status = ProposalStatus::Failed;
+
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
+        Self::record_participation(&env, total_votes, proposal.total_supply);
+
+        let gov_token = token::Client::new(&env, &config.gov_token);
+        gov_token.transfer(
+            &env.current_contract_address(),
+            &proposal.proposer,
+            &proposal.deposit,
+        );
+
+        let proposal_key = StorageKey::Proposal(proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "deposit_reclaimed"),),
+            DepositReclaimed {
+                proposal_id,
+                proposer: proposal.proposer,
+                amount: proposal.deposit,
+            },
+        );
+    }
+
     /// Mark a Passed proposal as Executed once its timelock has expired.
     ///
     /// Requires `status == Passed` and `now >= execution_time`. This
@@ -722,6 +795,136 @@ impl GovernanceDao {
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
 
         Self::effective_quorum(&env, &config)
+    }
+
+    // ── Proposal templates ────────────────────────────────────────────────────
+
+    /// Admin-only: register (or update) a named proposal template.
+    ///
+    /// A template is a minimal structural contract for a common proposal
+    /// type: a minimum title length and an exact expected argument count.
+    /// `create_proposal_from_template` rejects proposals that don't match,
+    /// so reviewers no longer have to parse intent out of free-form,
+    /// inconsistent proposals for the categories a DAO cares to standardize
+    /// (issue #381).
+    pub fn register_template(
+        env: Env,
+        admin: Address,
+        name: Symbol,
+        description: Bytes,
+        min_title_len: u32,
+        required_arg_count: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        let template = ProposalTemplate {
+            name: name.clone(),
+            description,
+            min_title_len,
+            required_arg_count,
+            active: true,
+        };
+        env.storage()
+            .instance()
+            .set(&StorageKey::Template(name.clone()), &template);
+
+        let mut names: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TemplateList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut already_present = false;
+        for n in names.iter() {
+            if n == name {
+                already_present = true;
+                break;
+            }
+        }
+        if !already_present {
+            names.push_back(name.clone());
+            env.storage().instance().set(&StorageKey::TemplateList, &names);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "template_registered"),),
+            TemplateRegistered {
+                name,
+                min_title_len,
+                required_arg_count,
+            },
+        );
+    }
+
+    /// Admin-only: deactivate a template so it can no longer be used for new
+    /// proposals. Proposals already created from it are unaffected.
+    pub fn deactivate_template(env: Env, admin: Address, name: Symbol) {
+        Self::require_admin(&env, &admin);
+        let key = StorageKey::Template(name.clone());
+        let mut template: ProposalTemplate = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::TemplateNotFound));
+        template.active = false;
+        env.storage().instance().set(&key, &template);
+    }
+
+    /// Fetch a registered template by name.
+    pub fn get_template(env: Env, name: Symbol) -> ProposalTemplate {
+        env.storage()
+            .instance()
+            .get(&StorageKey::Template(name))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::TemplateNotFound))
+    }
+
+    /// List the names of all registered templates (active or not).
+    pub fn list_templates(env: Env) -> Vec<Symbol> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::TemplateList)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Create a proposal, validated against a registered template's
+    /// structure before creation: `title` must be at least
+    /// `template.min_title_len` bytes and `args` must have exactly
+    /// `template.required_arg_count` entries. Otherwise behaves exactly
+    /// like `create_proposal` (same deposit/threshold/lifecycle).
+    pub fn create_proposal_from_template(
+        env: Env,
+        proposer: Address,
+        template_name: Symbol,
+        title: Bytes,
+        target: Address,
+        function: Symbol,
+        args: Vec<Val>,
+    ) -> u64 {
+        let template: ProposalTemplate = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Template(template_name.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::TemplateNotFound));
+        if !template.active {
+            panic_with_error!(&env, Error::TemplateInactive);
+        }
+        if title.len() < template.min_title_len {
+            panic_with_error!(&env, Error::TitleTooShort);
+        }
+        if args.len() != template.required_arg_count {
+            panic_with_error!(&env, Error::ArgCountMismatch);
+        }
+
+        let proposal_id = Self::create_proposal(env.clone(), proposer, title, target, function, args);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_created_from_template"),),
+            ProposalCreatedFromTemplate {
+                proposal_id,
+                template_name,
+            },
+        );
+
+        proposal_id
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
