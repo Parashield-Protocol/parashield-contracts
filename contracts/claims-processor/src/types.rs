@@ -113,6 +113,13 @@ pub struct ClaimDisputed {
     pub reason: Symbol,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimResolved {
+    pub claim_id: u128,
+    pub resolver: Address,
+}
+
 /// Emitted when an overdue claim is escalated for manual review.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

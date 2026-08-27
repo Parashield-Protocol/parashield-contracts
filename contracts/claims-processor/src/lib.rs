@@ -580,6 +580,52 @@ impl ClaimsProcessor {
         );
     }
 
+    /// Admin-only: resolve a disputed claim and re-queue it for processing.
+    ///
+    /// When a claim is disputed, it is removed from the pending queue and sits in
+    /// Disputed status indefinitely. This function allows the admin to review the
+    /// dispute and either:
+    /// - Clear the dispute and return the claim to Pending for re-evaluation, or
+    /// - Perform an off-chain investigation and then call this to re-queue the claim.
+    ///
+    /// The claim transitions from Disputed → Pending and is added back to the pending
+    /// claims queue for the next keeper to process.
+    pub fn resolve_dispute(env: Env, admin: Address, claim_id: u128) {
+        Self::require_admin(&env, &admin);
+        
+        let mut claim: Claim = env.storage().persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+        
+        // Only Disputed claims can be resolved
+        if claim.status != ClaimStatus::Disputed {
+            panic_with_error!(&env, Error::AlreadyProcessed);
+        }
+        
+        // Clear dispute and return to Pending status
+        claim.status = ClaimStatus::Pending;
+        claim.dispute_reason = None;
+        
+        let claim_key = StorageKey::Claim(claim_id);
+        env.storage().persistent().set(&claim_key, &claim);
+        Self::extend_claim_ttl(&env, &claim_key);
+        
+        // Re-add the claim to the pending queue for re-processing
+        let mut pending: Vec<u128> = env.storage().instance()
+            .get(&StorageKey::PendingClaims)
+            .unwrap_or_else(|| Vec::new(&env));
+        pending.push_back(claim_id);
+        env.storage().instance().set(&StorageKey::PendingClaims, &pending);
+        
+        env.events().publish(
+            (Symbol::new(&env, "claim_resolved"),),
+            ClaimResolved {
+                claim_id,
+                resolver: admin,
+            },
+        );
+    }
+
     // ── Queries ───────────────────────────────────────────────────────────────
 
     /// Return the `Claim` record for the given `claim_id`. Panics with `ClaimNotFound` if it does not exist.

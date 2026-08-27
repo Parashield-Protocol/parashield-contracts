@@ -1249,6 +1249,21 @@ impl OracleVerifier {
         Self::encryption_required(&env, &data_type)
     }
 
+    /// Admin-only: Invalidate all oracle data points for a given (data_type, key) pair.
+    /// This removes bad or stale data from storage, preventing it from being used
+    /// in future trigger verifications or aggregations.
+    pub fn invalidate_data(env: Env, admin: Address, data_type: Symbol, key: Symbol) {
+        Self::require_admin(&env, &admin);
+        
+        let storage_key = StorageKey::DataPoints(data_type.clone(), key.clone());
+        env.storage().persistent().remove(&storage_key);
+        
+        env.events().publish(
+            (Symbol::new(&env, "oracle_data_invalidated"),),
+            (data_type, key),
+        );
+    }
+
     /// Submit an encrypted data point for a (data_type, key) pair.
     ///
     /// The contract never sees the plaintext value: `ciphertext` and `nonce`
