@@ -339,3 +339,15 @@ pub struct CompoundYieldToggled {
     pub provider:  Address,
     pub enabled:   bool,
 }
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MinReserveUpdated {
+    pub min_reserve: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReserveFundUpdated {
+    pub amount: i128,
+}

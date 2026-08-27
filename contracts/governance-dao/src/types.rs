@@ -21,6 +21,8 @@ pub const GOVERNANCE_TTL_BUFFER_SECONDS: u64 = 30 * 24 * 3600;
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProposalStatus {
+    /// In mandatory discussion period before voting opens.
+    Discussion,
     /// Accepting votes
     Active,
     /// Passed quorum + majority; ready to execute
@@ -115,6 +117,9 @@ pub struct DaoConfig {
     pub voting_period: u64,
     /// Timelock period in seconds before an approved proposal can be executed.
     pub proposal_timelock: u64,
+    /// Mandatory discussion period in seconds before voting opens.
+    /// Set to 0 to disable (proposals go straight to Active).
+    pub discussion_period: u64,
 }
 
 /// Settings controlling adaptive (decaying) quorum.
@@ -214,6 +219,12 @@ pub struct ProposalExecuted {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProposalCancelled {
+    pub proposal_id: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscussionPeriodEnded {
     pub proposal_id: u64,
 }
 
