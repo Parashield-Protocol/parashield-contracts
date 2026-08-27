@@ -988,3 +988,105 @@ fn test_add_oracle_validates_oracle_address() {
     assert_eq!(client.get_oracles(&weather()).len(), 1);
     assert_eq!(client.get_oracles(&weather()).get_unchecked(0), oracle);
 }
+
+// ── Optional data encryption (issue #379) ─────────────────────────────────────
+
+#[test]
+fn test_encryption_not_required_by_default() {
+    let (env, _admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    assert!(!client.get_encryption_required(&weather()));
+}
+
+#[test]
+fn test_submit_encrypted_data_stores_ciphertext() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+
+    let ciphertext = soroban_sdk::Bytes::from_slice(&env, b"totally-not-plaintext-32000000");
+    let nonce = soroban_sdk::BytesN::from_array(&env, &[7u8; 12]);
+    client.submit_encrypted_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &ciphertext,
+        &nonce,
+        &95u32,
+        &1748736000u64,
+    );
+
+    let points = client.get_encrypted_data(&weather(), &kisumu_key());
+    assert_eq!(points.len(), 1);
+    let p = points.get_unchecked(0);
+    assert_eq!(p.ciphertext, ciphertext);
+    assert_eq!(p.nonce, nonce);
+    assert_eq!(p.oracle, oracle);
+
+    // Encrypted submissions never leak into the plaintext aggregation path.
+    let err = client.try_get_data(&weather(), &kisumu_key());
+    assert!(err.is_err());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #25)")]
+fn test_plaintext_submission_rejected_when_encryption_required() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+    client.set_encryption_required(&admin, &weather(), &true);
+
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &32_000_000i128,
+        &95u32,
+        &1748736000u64,
+    );
+}
+
+#[test]
+fn test_encrypted_submission_allowed_when_encryption_required() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+    client.set_encryption_required(&admin, &weather(), &true);
+
+    let ciphertext = soroban_sdk::Bytes::from_slice(&env, b"ciphertext-blob");
+    let nonce = soroban_sdk::BytesN::from_array(&env, &[1u8; 12]);
+    client.submit_encrypted_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &ciphertext,
+        &nonce,
+        &95u32,
+        &1748736000u64,
+    );
+    assert_eq!(client.get_encrypted_data(&weather(), &kisumu_key()).len(), 1);
+}
+
+#[test]
+fn test_disabling_encryption_requirement_restores_plaintext_path() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+
+    client.set_encryption_required(&admin, &weather(), &true);
+    client.set_encryption_required(&admin, &weather(), &false);
+
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &32_000_000i128,
+        &95u32,
+        &1748736000u64,
+    );
+    assert_eq!(client.get_data(&weather(), &kisumu_key()).value, 32_000_000);
+}

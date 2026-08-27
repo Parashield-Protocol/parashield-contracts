@@ -17,7 +17,7 @@ extern crate alloc;
 
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
     BytesN, Env, Symbol, Vec,
 };
 
@@ -114,6 +114,14 @@ enum StorageKey {
     DataTypeMaxAge(Symbol),
     /// Per-data-type aggregation method. Falls back to `WeightedMedian`.
     AggregationMethod(Symbol),
+    /// Whether plaintext `submit_data`/`batch_submit_data` is refused for a
+    /// data_type (bool). Off by default — an existing deployment keeps
+    /// submitting plaintext until it opts a sensitive data_type in.
+    EncryptionRequired(Symbol),
+    /// Vec<EncryptedOracleDataPoint> — ciphertext submissions for
+    /// (data_type, key), stored separately from plaintext `DataPoints` since
+    /// they are never aggregated or compared on-chain.
+    EncryptedDataPoints(Symbol, Symbol),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -146,6 +154,7 @@ pub enum Error {
     InvalidThreshold = 22,
     AdminTimelockNotExpired = 23,
     InvalidMaxAge = 24,
+    EncryptionRequiredForType = 25,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -1024,6 +1033,9 @@ impl OracleVerifier {
         timestamp: u64,
     ) {
         oracle.require_auth();
+        if Self::encryption_required(&env, &data_type) {
+            panic_with_error!(&env, Error::EncryptionRequiredForType);
+        }
         if confidence == 0 || confidence > 100 {
             panic_with_error!(&env, Error::InvalidConfidence);
         }
@@ -1105,6 +1117,136 @@ impl OracleVerifier {
                 timestamp,
             },
         );
+    }
+
+    // ── Data Encryption (issue #379) ──────────────────────────────────────────
+
+    /// Require (or stop requiring) encrypted submissions for a data_type.
+    ///
+    /// Off by default — plaintext `submit_data`/`batch_submit_data` behave
+    /// exactly as before for any data_type that never opts in. Once enabled,
+    /// plaintext submissions for that data_type are refused and only
+    /// `submit_encrypted_data` is accepted, for data types whose values are
+    /// sensitive (private valuations, confidential off-chain metrics, etc.)
+    /// and should not sit in plaintext on a public ledger.
+    pub fn set_encryption_required(env: Env, admin: Address, data_type: Symbol, required: bool) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::EncryptionRequired(data_type.clone()), &required);
+        env.events().publish(
+            (Symbol::new(&env, "encryption_required_updated"),),
+            EncryptionRequiredUpdated { data_type, required },
+        );
+    }
+
+    /// Whether `data_type` currently requires encrypted submissions.
+    pub fn get_encryption_required(env: Env, data_type: Symbol) -> bool {
+        Self::encryption_required(&env, &data_type)
+    }
+
+    /// Submit an encrypted data point for a (data_type, key) pair.
+    ///
+    /// The contract never sees the plaintext value: `ciphertext` and `nonce`
+    /// are opaque to it and stored as-is. Encryption/decryption happens
+    /// entirely off-chain, between whichever parties hold the key for this
+    /// data_type — the contract's only job is tamper-evident storage and
+    /// making explicit, at the type level, that a submission is encrypted so
+    /// a consumer never mistakes ciphertext for a usable value. Encrypted
+    /// submissions are not fed into `verify_trigger`/`get_aggregated`, since
+    /// aggregation and threshold comparison require the plaintext value.
+    ///
+    /// Confidence and timestamp validation mirror `submit_data`.
+    pub fn submit_encrypted_data(
+        env: Env,
+        oracle: Address,
+        data_type: Symbol,
+        key: Symbol,
+        ciphertext: Bytes,
+        nonce: BytesN<12>,
+        confidence: u32,
+        timestamp: u64,
+    ) {
+        oracle.require_auth();
+        if confidence == 0 || confidence > 100 {
+            panic_with_error!(&env, Error::InvalidConfidence);
+        }
+
+        let now = env.ledger().timestamp();
+        if timestamp > now {
+            panic_with_error!(&env, Error::InvalidTimestamp);
+        }
+        let ninety_days = 90 * 24 * 60 * 60;
+        if timestamp < now.saturating_sub(ninety_days) {
+            panic_with_error!(&env, Error::InvalidTimestamp);
+        }
+
+        let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
+        let entry: OracleEntry = env
+            .storage()
+            .persistent()
+            .get(&oracle_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
+        if !entry.active {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        Self::enforce_rate_limit(&env, &data_type, &oracle, now);
+
+        let dp_key = StorageKey::EncryptedDataPoints(data_type.clone(), key.clone());
+        let mut points: Vec<EncryptedOracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&dp_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let new_point = EncryptedOracleDataPoint {
+            oracle: oracle.clone(),
+            ciphertext,
+            nonce,
+            confidence,
+            timestamp,
+        };
+        let mut found = false;
+        for i in 0..points.len() {
+            if points.get_unchecked(i).oracle == oracle {
+                points.set(i, new_point.clone());
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            if points.len() >= MAX_DATA_POINTS {
+                points.pop_front();
+            }
+            points.push_back(new_point);
+        }
+
+        env.storage().persistent().set(&dp_key, &points);
+        env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle_encrypted_data_submitted"),),
+            OracleEncryptedDataSubmitted {
+                oracle,
+                data_type,
+                key,
+                confidence,
+                timestamp,
+            },
+        );
+    }
+
+    /// Return all encrypted submissions stored for (data_type, key), for an
+    /// off-chain consumer holding the decryption key to decrypt and verify.
+    pub fn get_encrypted_data(env: Env, data_type: Symbol, key: Symbol) -> Vec<EncryptedOracleDataPoint> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::EncryptedDataPoints(data_type, key))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     // ── Verification ─────────────────────────────────────────────────────────
@@ -1389,6 +1531,9 @@ impl OracleVerifier {
         submissions: Vec<(Symbol, i128, u32, u64)>,
     ) {
         oracle.require_auth();
+        if Self::encryption_required(&env, &data_type) {
+            panic_with_error!(&env, Error::EncryptionRequiredForType);
+        }
         let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         let entry: OracleEntry = env
             .storage()
@@ -1472,6 +1617,9 @@ impl OracleVerifier {
         submissions: Vec<OracleDataSubmission>,
     ) {
         oracle.require_auth();
+        if Self::encryption_required(&env, &data_type) {
+            panic_with_error!(&env, Error::EncryptionRequiredForType);
+        }
 
         let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         let entry: OracleEntry = env
@@ -1699,6 +1847,15 @@ impl OracleVerifier {
             panic_with_error!(env, Error::Unauthorized);
         }
         caller.require_auth();
+    }
+
+    /// Whether `data_type` currently requires `submit_encrypted_data` instead
+    /// of plaintext submission. Off by default.
+    fn encryption_required(env: &Env, data_type: &Symbol) -> bool {
+        env.storage()
+            .instance()
+            .get(&StorageKey::EncryptionRequired(data_type.clone()))
+            .unwrap_or(false)
     }
 
     /// The max data age that applies to a data type: the per-type override
