@@ -267,3 +267,27 @@ fn test_verify_trigger_panics_when_all_oracles_deactivated() {
     };
     c.verify_trigger(&wt(), &kk(), &condition);
 }
+
+// ── #356: admin transfer timelock ────────────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn accept_admin_rejected_before_timelock() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let new_admin = Address::generate(&env);
+    c.propose_new_admin(&admin, &new_admin);
+    c.accept_admin(&new_admin);
+}
+
+#[test]
+fn accept_admin_succeeds_after_timelock() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let new_admin = Address::generate(&env);
+    c.propose_new_admin(&admin, &new_admin);
+    env.ledger().with_mut(|l| l.timestamp += 48 * 60 * 60 + 1);
+    c.accept_admin(&new_admin);
+    assert_eq!(c.get_admin(), new_admin);
+    assert_eq!(c.get_pending_admin_since(), 0);
+}

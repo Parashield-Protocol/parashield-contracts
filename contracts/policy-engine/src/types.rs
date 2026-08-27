@@ -63,6 +63,17 @@ pub struct InsuranceProduct {
     pub created_at: u64,
 }
 
+/// One line item for `batch_buy_policy` — the same four arguments `buy_policy`
+/// takes, bundled so several policies can be purchased in a single call.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchBuyItem {
+    pub product_id: u128,
+    pub coverage_amount: i128,
+    pub duration_days: u32,
+    pub oracle_key: Symbol,
+}
+
 /// Input struct for creating a new insurance product (avoids >10 param limit).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,6 +175,14 @@ pub struct PolicyCancelled {
     pub policy_id: u128,
     pub policyholder: Address,
     pub refund_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyTransferred {
+    pub policy_id: u128,
+    pub from: Address,
+    pub to: Address,
 }
 
 #[contracttype]

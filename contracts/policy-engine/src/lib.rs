@@ -42,6 +42,22 @@ const TTL_THRESHOLD: u32 = 518_400;
 /// products and policies don't get evicted from storage before they mature.
 const TTL_EXTEND_TO: u32 = 6_312_000;
 
+// ─── Admin rotation ───────────────────────────────────────────────────────────
+
+/// Grace period between an admin transfer being fully proposed/approved and
+/// the proposed admin being able to `accept_admin` (issue #356). Gives the
+/// wider system time to react to a hostile or mistaken rotation. Hand-synced
+/// across the 4 contracts that expose admin rotation (policy-engine,
+/// risk-pool, oracle-verifier, claims-processor).
+const ADMIN_TRANSFER_TIMELOCK: u64 = 48 * 60 * 60;
+
+// ─── Batch limits ─────────────────────────────────────────────────────────────
+
+/// Upper bound on the number of policies `batch_buy_policy` will create in one
+/// call, so a single transaction cannot blow Soroban's instruction budget.
+#[cfg(any(test, feature = "testutils", not(feature = "library")))]
+const MAX_BATCH_BUY: u32 = 20;
+
 // ─── Pagination ───────────────────────────────────────────────────────────────
 
 /// Upper bound on the number of entries a paginated query will return in one
@@ -73,6 +89,9 @@ enum StorageKey {
     /// Maps (category, oracle_key) -> product_id for uniqueness constraint
     ProductKey((Symbol, Symbol)),
     PendingAdmin,
+    /// Ledger timestamp (u64) at which the current `PendingAdmin` was set, used
+    /// to enforce `ADMIN_TRANSFER_TIMELOCK` before `accept_admin` succeeds.
+    PendingAdminSince,
     /// Contract version (u32) for storage migration tracking
     Version,
     /// Guardian addresses authorized to approve critical actions (Vec<Address>).
@@ -130,6 +149,9 @@ pub enum Error {
     AlreadyApprovedAction   = 25,
     NoPendingUpgrade        = 26,
     InvalidThreshold        = 27,
+    AdminTimelockNotExpired = 28,
+    EmptyBatch              = 29,
+    BatchTooLarge           = 30,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -396,9 +418,52 @@ impl PolicyEngine {
         oracle_key: Symbol,
     ) -> u128 {
         buyer.require_auth();
-        if env.storage().instance().get::<_, bool>(&StorageKey::Paused).unwrap_or(false) {
-            panic_with_error!(&env, Error::Unauthorized);
+        Self::ensure_not_paused(&env);
+        Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key)
+    }
+
+    /// Buy several policies in a single transaction (issue #357). The buyer
+    /// authorizes once and every line item is created atomically — if any item
+    /// is invalid the whole call reverts and no premium is transferred.
+    /// Returns the new policy IDs in the same order as `items`.
+    pub fn batch_buy_policy(env: Env, buyer: Address, items: Vec<BatchBuyItem>) -> Vec<u128> {
+        buyer.require_auth();
+        Self::ensure_not_paused(&env);
+
+        let n = items.len();
+        if n == 0 {
+            panic_with_error!(&env, Error::EmptyBatch);
         }
+        if n > MAX_BATCH_BUY {
+            panic_with_error!(&env, Error::BatchTooLarge);
+        }
+
+        let mut ids = Vec::new(&env);
+        for item in items.iter() {
+            ids.push_back(Self::buy_policy_inner(
+                &env,
+                &buyer,
+                item.product_id,
+                item.coverage_amount,
+                item.duration_days,
+                item.oracle_key,
+            ));
+        }
+        ids
+    }
+
+    /// Shared body of `buy_policy` / `batch_buy_policy`. Assumes the caller has
+    /// already run `buyer.require_auth()` and the not-paused check.
+    fn buy_policy_inner(
+        env: &Env,
+        buyer: &Address,
+        product_id: u128,
+        coverage_amount: i128,
+        duration_days: u32,
+        oracle_key: Symbol,
+    ) -> u128 {
+        let env = env.clone();
+        let buyer = buyer.clone();
         let product = Self::load_product(&env, product_id);
         if product.status != ProductStatus::Active {
             panic_with_error!(&env, Error::ProductNotActive);
@@ -527,6 +592,50 @@ impl PolicyEngine {
         refund
     }
 
+    /// Transfer ownership of an Active policy from `from` to `to` (issue #358).
+    ///
+    /// Both parties must authorize: the current holder consents to giving the
+    /// policy up and the recipient consents to taking it on (so a policy can
+    /// never be pushed onto an unwilling address). Coverage terms, premium
+    /// paid and timing are unchanged — only the payout recipient moves.
+    pub fn transfer_policy(env: Env, from: Address, to: Address, policy_id: u128) {
+        from.require_auth();
+        to.require_auth();
+        Self::ensure_not_paused(&env);
+        Self::validate_stellar_address(&env, &to);
+
+        let mut policy: Policy = Self::load_policy(&env, policy_id);
+        if policy.policyholder != from {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if policy.status != PolicyStatus::Active {
+            panic_with_error!(&env, Error::PolicyNotActive);
+        }
+        if from == to {
+            // No-op transfer — nothing to do, and skipping keeps the user
+            // index free of duplicate entries.
+            return;
+        }
+
+        policy.policyholder = to.clone();
+        env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
+        Self::extend_to_max(&env, &StorageKey::Policy(policy_id));
+
+        // Move the id from the sender's index to the recipient's.
+        Self::remove_policy_from_user(&env, &from, policy_id);
+        let to_key = StorageKey::UserPolicies(to.clone());
+        let mut to_policies: Vec<u128> = env.storage().persistent()
+            .get(&to_key).unwrap_or_else(|| Vec::new(&env));
+        to_policies.push_back(policy_id);
+        env.storage().persistent().set(&to_key, &to_policies);
+        env.storage().persistent().extend_ttl(&to_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.events().publish(
+            (Symbol::new(&env, "policy_transferred"),),
+            PolicyTransferred { policy_id, from, to },
+        );
+    }
+
     // ── Status updates (called by Claims Processor) ──────────────────────────
 
     /// Mark a policy as Claimed and pay coverage to the policyholder.
@@ -639,6 +748,13 @@ impl PolicyEngine {
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
     }
 
+    /// Return the ledger timestamp at which the current pending admin transfer
+    /// was registered, or `0` if none is pending. `accept_admin` succeeds only
+    /// once `now >= this + ADMIN_TRANSFER_TIMELOCK` (issue #356).
+    pub fn get_pending_admin_since(env: Env) -> u64 {
+        env.storage().instance().get(&StorageKey::PendingAdminSince).unwrap_or(0)
+    }
+
     /// Return the configured oracle verifier contract address.
     pub fn get_oracle(env: Env) -> Address {
         env.storage().instance().get(&StorageKey::OracleAddress)
@@ -686,6 +802,9 @@ pub fn emergency_resume(env: Env, admin: Address) {
              .unwrap_or(0);
          if threshold == 0 {
              env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
+             env.storage()
+                 .instance()
+                 .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
              return;
          }
 
@@ -744,6 +863,9 @@ pub fn emergency_resume(env: Env, admin: Address) {
          if pending.approvals.len() >= threshold {
              env.storage().instance().remove(&StorageKey::PendingAdminChange);
              env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
+             env.storage()
+                 .instance()
+                 .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
          } else {
              env.storage()
                  .instance()
@@ -889,10 +1011,17 @@ pub fn emergency_resume(env: Env, admin: Address) {
          let _current_admin: Address = env.storage().instance()
              .get(&StorageKey::Admin)
              .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+         // Enforce the admin-rotation timelock (issue #356).
+         let since: u64 = env.storage().instance()
+             .get(&StorageKey::PendingAdminSince).unwrap_or(0);
+         if env.ledger().timestamp() < since.saturating_add(ADMIN_TRANSFER_TIMELOCK) {
+             panic_with_error!(&env, Error::AdminTimelockNotExpired);
+         }
          // Update admin
          env.storage().instance().set(&StorageKey::Admin, &admin);
          // Clear the proposal
          env.storage().instance().remove(&StorageKey::PendingAdmin);
+         env.storage().instance().remove(&StorageKey::PendingAdminSince);
          // Emit event
          env.events().publish(
              (Symbol::new(&env, "admin_updated"),),
@@ -903,6 +1032,13 @@ pub fn emergency_resume(env: Env, admin: Address) {
      }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
+
+    /// Panic with `Unauthorized` if the contract is in emergency-pause mode.
+    fn ensure_not_paused(env: &Env) {
+        if env.storage().instance().get::<_, bool>(&StorageKey::Paused).unwrap_or(false) {
+            panic_with_error!(env, Error::Unauthorized);
+        }
+    }
 
     fn require_admin(env: &Env, caller: &Address) {
         let admin: Address = env.storage().instance().get(&StorageKey::Admin)

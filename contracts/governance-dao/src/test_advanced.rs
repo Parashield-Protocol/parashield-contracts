@@ -312,3 +312,55 @@ fn test_proposal_id_overflow_panics_with_limit_reached() {
         &args,
     );
 }
+
+// ── #355: minimum quorum floor ───────────────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #24)")]
+fn initialize_rejects_quorum_below_floor() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let gov_token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let dao_id = env.register(GovernanceDao, ());
+    let dao = GovernanceDaoClient::new(&env, &dao_id);
+    let mut cfg = base_config(gov_token_id);
+    cfg.quorum_bps = 999; // just under the 10% floor
+    dao.initialize(&admin, &cfg);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #24)")]
+fn update_config_rejects_quorum_below_floor() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (dao, admin, _, _) = make_dao(&env);
+    let mut cfg = dao.get_config();
+    cfg.quorum_bps = 0;
+    dao.update_config(&admin, &cfg);
+}
+
+#[test]
+fn finalize_fails_proposal_with_zero_votes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (dao, _admin, voter, target) = make_dao(&env);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter,
+        &Bytes::from_slice(&env, b"No turnout"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+
+    // Nobody votes.
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+    dao.finalize(&pid);
+
+    assert_eq!(dao.get_proposal(&pid).status, ProposalStatus::Failed);
+}

@@ -115,3 +115,17 @@ pub struct PendingUpgrade {
     pub approvals: Vec<Address>,
 }
 
+/// A pending admin-transfer proposal awaiting guardian approvals.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminChange {
+    pub new_admin: Address,
+    pub approvals: Vec<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminUpdated {
+    pub new_admin: Address,
+}
+
