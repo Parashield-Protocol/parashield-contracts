@@ -107,6 +107,13 @@ enum StorageKey {
     PendingAdminChange,
     /// OracleReputation for (data_type, oracle_address).
     Reputation(Symbol, Address),
+    /// Per-data-type max data age override (u64 seconds). Falls back to the
+    /// global `MaxDataAge` when unset. A flight-status feed goes stale in
+    /// minutes while a monthly rainfall total is valid for weeks — one global
+    /// number cannot serve both.
+    DataTypeMaxAge(Symbol),
+    /// Per-data-type aggregation method. Falls back to `WeightedMedian`.
+    AggregationMethod(Symbol),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -138,6 +145,7 @@ pub enum Error {
     NoPendingUpgrade = 21,
     InvalidThreshold = 22,
     AdminTimelockNotExpired = 23,
+    InvalidMaxAge = 24,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -476,6 +484,124 @@ impl OracleVerifier {
             .instance()
             .get(&StorageKey::MaxDataAge)
             .unwrap_or(604_800)
+    }
+
+    /// Set a max-data-age override for a single data type, in seconds.
+    ///
+    /// Freshness is not one number. A flight-status feed is worthless minutes
+    /// after the gate closes; a monthly rainfall total stays valid for weeks.
+    /// A single global `max_data_age` has to be loose enough for the slowest
+    /// feed, which leaves the fastest one accepting data long past the point
+    /// it describes reality.
+    ///
+    /// Pass `max_age = 0` to clear the override and fall back to the global
+    /// value.
+    pub fn set_data_type_max_age(env: Env, admin: Address, data_type: Symbol, max_age: u64) {
+        Self::require_admin(&env, &admin);
+
+        if max_age == 0 {
+            env.storage()
+                .instance()
+                .remove(&StorageKey::DataTypeMaxAge(data_type.clone()));
+        } else {
+            env.storage()
+                .instance()
+                .set(&StorageKey::DataTypeMaxAge(data_type.clone()), &max_age);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "dt_max_age_updated"),),
+            DataTypeMaxAgeUpdated { data_type, max_age },
+        );
+    }
+
+    /// The max data age actually applied to a data type: the per-type override
+    /// when one is set, otherwise the global value.
+    pub fn get_data_type_max_age(env: Env, data_type: Symbol) -> u64 {
+        Self::effective_max_age(&env, &data_type)
+    }
+
+    /// Choose how submissions for a data type are combined into one value.
+    ///
+    /// Defaults to [`AggregationMethod::WeightedMedian`], which is the safe
+    /// choice against a minority of bad or adversarial oracles. Switch to an
+    /// average only for feeds where every reporter is trusted and small
+    /// genuine variations should be reflected rather than discarded.
+    pub fn set_aggregation_method(
+        env: Env,
+        admin: Address,
+        data_type: Symbol,
+        method: AggregationMethod,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::AggregationMethod(data_type.clone()), &method);
+
+        env.events().publish(
+            (Symbol::new(&env, "agg_method_updated"),),
+            AggregationMethodUpdated { data_type, method },
+        );
+    }
+
+    /// The aggregation method applied to a data type (default: weighted median).
+    pub fn get_aggregation_method(env: Env, data_type: Symbol) -> AggregationMethod {
+        Self::effective_aggregation_method(&env, &data_type)
+    }
+
+    /// Report whether the data for `(data_type, key)` is fresh enough to use,
+    /// without panicking.
+    ///
+    /// Every other read path — `get_data`, `get_aggregated`, `verify_trigger` —
+    /// aborts the transaction when data is missing or stale. That is correct
+    /// for a claim evaluation but useless for a caller that wants to *decide*
+    /// whether to evaluate. This returns the same facts as a value, so a
+    /// front-end or a keeper can check first and a batch job can skip one
+    /// policy instead of losing the whole batch.
+    ///
+    /// A key with no submissions at all reports `is_fresh: false` and
+    /// `newest_age: u64::MAX` rather than failing.
+    pub fn check_freshness(env: Env, data_type: Symbol, key: Symbol) -> FreshnessReport {
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let max_age = Self::effective_max_age(&env, &data_type);
+        let now = env.ledger().timestamp();
+        let min_oracle_count: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinOracleCount)
+            .unwrap_or(1);
+
+        let mut newest_age = u64::MAX;
+        let mut fresh_count = 0u32;
+
+        for i in 0..points.len() {
+            let p = points.get_unchecked(i);
+            // A future-dated point has age 0 — it is not stale, and
+            // `submit_data` already rejects timestamps ahead of the ledger.
+            let age = now.saturating_sub(p.timestamp);
+            if age < newest_age {
+                newest_age = age;
+            }
+            if age <= max_age {
+                fresh_count += 1;
+            }
+        }
+
+        FreshnessReport {
+            data_type,
+            key,
+            is_fresh: fresh_count >= min_oracle_count.max(1),
+            newest_age,
+            fresh_count,
+            total_count: points.len(),
+            max_age,
+        }
     }
 
     /// Set the minimum number of oracle submissions required to form a consensus value.
@@ -944,11 +1070,7 @@ impl OracleVerifier {
             timestamp,
         };
         // Prune stale or unregistered/inactive oracle entries first
-        let max_data_age: u64 = env
-            .storage()
-            .instance()
-            .get(&StorageKey::MaxDataAge)
-            .unwrap_or(604_800);
+        let max_data_age = Self::effective_max_age(&env, &data_type);
         let mut pruned_points: Vec<OracleDataPoint> = Vec::new(&env);
         for i in 0..points.len() {
             let p = points.get_unchecked(i);
@@ -1028,11 +1150,7 @@ impl OracleVerifier {
             .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
             .unwrap_or_else(|| Vec::new(&env));
 
-        let max_data_age: u64 = env
-            .storage()
-            .instance()
-            .get(&StorageKey::MaxDataAge)
-            .unwrap_or(604_800);
+        let max_data_age = Self::effective_max_age(&env, &data_type);
         let now = env.ledger().timestamp();
         let min_confidence: u32 = env
             .storage()
@@ -1065,7 +1183,7 @@ impl OracleVerifier {
         let points: Vec<OracleDataPoint> = env
             .storage()
             .persistent()
-            .get(&StorageKey::DataPoints(data_type, key))
+            .get(&StorageKey::DataPoints(data_type.clone(), key))
             .unwrap_or_else(|| panic_with_error!(&env, Error::NoDataAvailable));
         if points.is_empty() {
             panic_with_error!(&env, Error::NoDataAvailable);
@@ -1078,11 +1196,7 @@ impl OracleVerifier {
                 latest = p;
             }
         }
-        let max_data_age: u64 = env
-            .storage()
-            .instance()
-            .get(&StorageKey::MaxDataAge)
-            .unwrap_or(604_800);
+        let max_data_age = Self::effective_max_age(&env, &data_type);
         let now = env.ledger().timestamp();
         if now.saturating_sub(latest.timestamp) > max_data_age {
             panic_with_error!(&env, Error::NoDataAvailable);
@@ -1101,11 +1215,7 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::NoDataAvailable);
         }
 
-        let max_data_age: u64 = env
-            .storage()
-            .instance()
-            .get(&StorageKey::MaxDataAge)
-            .unwrap_or(604_800);
+        let max_data_age = Self::effective_max_age(&env, &data_type);
         let now = env.ledger().timestamp();
         let min_confidence: u32 = env
             .storage()
@@ -1160,30 +1270,18 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::NoDataAvailable);
         }
 
+        // Aggregate through the same dispatcher `verify_trigger` uses, so the
+        // value reported here can never disagree with the value a claim is
+        // actually evaluated against. This previously computed its own median
+        // inline, which silently ignored the configured aggregation method.
         let active_values = &mut values[0..n];
-        active_values.sort_unstable_by_key(|&(val, _)| val);
-
-        let half = total_weight / 2;
-        let mut cumulative = 0;
-        let mut median_value = 0i128;
-        for i in 0..n {
-            let (val, wt) = active_values[i];
-            cumulative += wt;
-            if cumulative > half {
-                median_value = val;
-                break;
-            } else if cumulative == half && total_weight.is_multiple_of(2) {
-                if i + 1 < n {
-                    median_value = (val + active_values[i + 1].0) / 2;
-                } else {
-                    median_value = val;
-                }
-                break;
+        let median_value = match Self::effective_aggregation_method(&env, &data_type) {
+            AggregationMethod::WeightedMedian => Self::weighted_median(active_values, total_weight),
+            AggregationMethod::WeightedAverage => {
+                Self::weighted_average(active_values, total_weight)
             }
-        }
-        if median_value == 0 && cumulative <= half {
-            median_value = active_values[n - 1].0;
-        }
+            AggregationMethod::Mean => Self::mean(active_values),
+        };
 
         let confidence = match weighted_confidence_sum.checked_div(total_weight_sum) {
             Some(c) => u32::try_from(c).unwrap_or(u32::MAX),
@@ -1257,11 +1355,7 @@ impl OracleVerifier {
         );
 
         // Update reputation for all contributing oracles
-        let max_data_age: u64 = env
-            .storage()
-            .instance()
-            .get(&StorageKey::MaxDataAge)
-            .unwrap_or(604_800);
+        let max_data_age = Self::effective_max_age(&env, &data_type);
         let min_confidence: u32 = env
             .storage()
             .instance()
@@ -1607,6 +1701,30 @@ impl OracleVerifier {
         caller.require_auth();
     }
 
+    /// The max data age that applies to a data type: the per-type override
+    /// when set, otherwise the global value (default 7 days).
+    fn effective_max_age(env: &Env, data_type: &Symbol) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::DataTypeMaxAge(data_type.clone()))
+            .unwrap_or_else(|| {
+                env.storage()
+                    .instance()
+                    .get(&StorageKey::MaxDataAge)
+                    .unwrap_or(604_800)
+            })
+    }
+
+    /// The aggregation method configured for a data type. Weighted median is
+    /// the default because it is the only one a minority of bad oracles
+    /// cannot move.
+    fn effective_aggregation_method(env: &Env, data_type: &Symbol) -> AggregationMethod {
+        env.storage()
+            .instance()
+            .get(&StorageKey::AggregationMethod(data_type.clone()))
+            .unwrap_or(AggregationMethod::WeightedMedian)
+    }
+
     /// Compute the weighted median of active, sufficiently fresh submissions.
     fn get_median_value(env: &Env, data_type: &Symbol, key: &Symbol) -> i128 {
         let points: Vec<OracleDataPoint> = env
@@ -1618,11 +1736,7 @@ impl OracleVerifier {
             panic_with_error!(env, Error::NoDataAvailable);
         }
 
-        let max_data_age: u64 = env
-            .storage()
-            .instance()
-            .get(&StorageKey::MaxDataAge)
-            .unwrap_or(604_800);
+        let max_data_age = Self::effective_max_age(env, data_type);
         let now = env.ledger().timestamp();
         let min_confidence: u32 = env
             .storage()
@@ -1666,27 +1780,74 @@ impl OracleVerifier {
             panic_with_error!(env, Error::NoDataAvailable);
         }
 
-        // Native sort on the stack slice: O(N log N)
         let active_values = &mut values[0..n];
-        active_values.sort_unstable_by_key(|&(val, _)| val);
+
+        match Self::effective_aggregation_method(env, data_type) {
+            AggregationMethod::WeightedMedian => Self::weighted_median(active_values, total_weight),
+            AggregationMethod::WeightedAverage => Self::weighted_average(active_values, total_weight),
+            AggregationMethod::Mean => Self::mean(active_values),
+        }
+    }
+
+    /// The value at the middle of cumulative weight.
+    ///
+    /// Because it picks an actual reported value rather than blending them, a
+    /// minority of oracles cannot move the result no matter how extreme their
+    /// submissions are. That property is why this is the default.
+    fn weighted_median(values: &mut [(i128, u32)], total_weight: u32) -> i128 {
+        // Native sort on the stack slice: O(N log N)
+        values.sort_unstable_by_key(|&(val, _)| val);
+        let n = values.len();
 
         let half = total_weight / 2;
         let mut cumulative = 0;
         for i in 0..n {
-            let (val, wt) = active_values[i];
+            let (val, wt) = values[i];
             cumulative += wt;
             if cumulative > half {
                 return val;
             } else if cumulative == half && total_weight.is_multiple_of(2) {
                 if i + 1 < n {
-                    return (val + active_values[i + 1].0) / 2;
+                    return (val + values[i + 1].0) / 2;
                 } else {
                     return val;
                 }
             }
         }
 
-        active_values[n - 1].0
+        values[n - 1].0
+    }
+
+    /// `sum(value * weight) / sum(weight)`, rounded toward zero.
+    ///
+    /// Every submission contributes in proportion to its registered weight, so
+    /// small genuine variations show up instead of being discarded. The
+    /// trade-off is the one the median avoids: a single extreme value drags
+    /// the result, in proportion to that oracle's weight.
+    ///
+    /// The accumulator is i128 and the caller has already capped the input at
+    /// `MAX_DATA_POINTS` (100) with weights bounded to 100, so the running sum
+    /// cannot overflow for any value an oracle can submit. `saturating_*` is
+    /// used regardless rather than trusting that reasoning to hold if those
+    /// bounds ever change.
+    fn weighted_average(values: &[(i128, u32)], total_weight: u32) -> i128 {
+        let mut weighted_sum: i128 = 0;
+        for &(val, wt) in values.iter() {
+            weighted_sum = weighted_sum.saturating_add(val.saturating_mul(wt as i128));
+        }
+        weighted_sum / (total_weight as i128)
+    }
+
+    /// Unweighted arithmetic mean — every valid submission counts equally.
+    ///
+    /// Use when registered weights carry no meaning for a data type and
+    /// treating them as significance would be misleading.
+    fn mean(values: &[(i128, u32)]) -> i128 {
+        let mut sum: i128 = 0;
+        for &(val, _) in values.iter() {
+            sum = sum.saturating_add(val);
+        }
+        sum / (values.len() as i128)
     }
 }
 
