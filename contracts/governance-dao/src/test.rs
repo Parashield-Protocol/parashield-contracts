@@ -880,3 +880,230 @@ fn participation_window_drops_the_oldest_entry() {
     assert_eq!(history.total_recorded, 3);
     assert_eq!(history.recent_bps.len(), 2, "window bounds stored history");
 }
+
+// ── delegation (issue #363) ───────────────────────────────────────────────────
+
+#[test]
+fn no_delegation_by_default() {
+    let (_env, dao, _admin, voter1, _v2, _target) = setup();
+
+    assert_eq!(dao.get_delegate(&voter1), None);
+}
+
+#[test]
+fn delegating_records_both_directions() {
+    let (_env, dao, _admin, voter1, voter2, _target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+
+    assert_eq!(dao.get_delegate(&voter1), Some(voter2.clone()));
+
+    let info = dao.get_delegate_info(&voter2);
+    assert_eq!(info.delegators.len(), 1);
+    assert_eq!(info.delegators.get_unchecked(0), voter1);
+}
+
+#[test]
+fn delegate_info_sums_live_balances() {
+    let (_env, dao, _admin, voter1, voter2, _target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+
+    let info = dao.get_delegate_info(&voter2);
+
+    // voter1 holds 1M, voter2 holds 500k.
+    assert_eq!(info.own_weight, 500_000_0000000i128);
+    assert_eq!(info.delegated_weight, 1_000_000_0000000i128);
+    assert_eq!(info.total_weight, 1_500_000_0000000i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn self_delegation_is_refused() {
+    let (_env, dao, _admin, voter1, _v2, _target) = setup();
+
+    dao.delegate(&voter1, &voter1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn delegation_chains_are_refused() {
+    let (env, dao, _admin, voter1, voter2, _target) = setup();
+
+    let third = Address::generate(&env);
+    dao.delegate(&voter2, &third);
+
+    // voter2 has already delegated away — pointing at them would build a
+    // chain, and the weight behind a vote would stop being visible.
+    dao.delegate(&voter1, &voter2);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn a_delegate_cannot_themselves_delegate() {
+    let (_env, dao, _admin, voter1, voter2, _target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+
+    // voter2 now holds delegated authority; letting them pass it on is the
+    // same ambiguity as a chain, one hop later.
+    dao.delegate(&voter2, &voter1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn delegating_twice_to_the_same_delegate_is_refused() {
+    let (_env, dao, _admin, voter1, voter2, _target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+    dao.delegate(&voter1, &voter2);
+}
+
+#[test]
+fn redirecting_a_delegation_detaches_from_the_old_delegate() {
+    let (env, dao, _admin, voter1, voter2, _target) = setup();
+
+    let third = Address::generate(&env);
+    dao.delegate(&voter1, &voter2);
+    dao.delegate(&voter1, &third);
+
+    assert_eq!(dao.get_delegate(&voter1), Some(third.clone()));
+    // The old delegate must not keep a stale entry.
+    assert_eq!(dao.get_delegate_info(&voter2).delegators.len(), 0);
+    assert_eq!(dao.get_delegate_info(&third).delegators.len(), 1);
+}
+
+#[test]
+fn revoking_clears_the_delegation() {
+    let (_env, dao, _admin, voter1, voter2, _target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+    dao.revoke_delegation(&voter1);
+
+    assert_eq!(dao.get_delegate(&voter1), None);
+    assert_eq!(dao.get_delegate_info(&voter2).delegators.len(), 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #27)")]
+fn revoking_without_a_delegation_is_refused() {
+    let (_env, dao, _admin, voter1, _v2, _target) = setup();
+
+    dao.revoke_delegation(&voter1);
+}
+
+#[test]
+fn a_delegate_votes_with_the_combined_weight() {
+    let (env, dao, _admin, voter1, voter2, target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter2,
+        &Bytes::from_slice(&env, b"delegated"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+
+    let proposal = dao.get_proposal(&pid);
+    // voter2's own balance plus voter1's delegated weight — one vote, both
+    // holders represented.
+    assert!(
+        proposal.votes_for > 500_000_0000000i128,
+        "delegated weight should exceed the delegate's own balance, got {}",
+        proposal.votes_for
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #29)")]
+fn a_delegator_cannot_also_vote() {
+    let (env, dao, _admin, voter1, voter2, target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter2,
+        &Bytes::from_slice(&env, b"delegated"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+
+    // Authority was handed over; voting too would count the same tokens twice.
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #29)")]
+fn a_delegator_cannot_vote_after_their_delegate_has() {
+    let (env, dao, _admin, voter1, voter2, target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter2,
+        &Bytes::from_slice(&env, b"delegated"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    dao.revoke_delegation(&voter1);
+
+    // Revoking after the fact must not unlock a second vote for weight that
+    // has already been counted.
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+}
+
+#[test]
+fn revoking_before_the_delegate_votes_restores_the_holder_s_vote() {
+    let (env, dao, _admin, voter1, voter2, target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+    dao.revoke_delegation(&voter1);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"restored"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+
+    assert!(dao.get_proposal(&pid).votes_for > 0);
+}
+
+#[test]
+fn only_the_delegate_s_own_tokens_are_locked() {
+    let (env, dao, _admin, voter1, voter2, target) = setup();
+
+    let gov_token = token::Client::new(&env, &dao.get_config().gov_token);
+    let delegator_before = gov_token.balance(&voter1);
+
+    dao.delegate(&voter1, &voter2);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter2,
+        &Bytes::from_slice(&env, b"custody"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+
+    // Delegation moves authority, not custody — the delegator's balance is
+    // untouched by their delegate voting.
+    assert_eq!(gov_token.balance(&voter1), delegator_before);
+}
