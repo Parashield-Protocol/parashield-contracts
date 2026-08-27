@@ -136,6 +136,16 @@ enum StorageKey {
     IdentityVerifier,
     /// Whether identity verification is required for claimants (bool).
     IdentityVerificationRequired,
+    /// Optional stability fund contract address for payout smoothing (Address).
+    StabilityFund,
+    /// Payout smoothing factor in basis points (0-10000). When set, the
+    /// actual payout is blended toward the historical average to reduce
+    /// volatility. 0 = no smoothing (default); 10000 = full smoothing
+    /// (payout always equals the historical average).
+    PayoutSmoothingBps,
+    /// Running historical average payout in USDC stroops (i128), updated
+    /// with exponential moving average on each settlement.
+    HistoricalAveragePayout,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -164,6 +174,7 @@ pub enum Error {
     NoAttestation        = 18,
     AttestationStale     = 19,
     IdentityNotVerified  = 20,
+    InvalidSmoothingBps  = 21,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -449,6 +460,99 @@ impl ClaimsProcessor {
         if !verified {
             panic_with_error!(env, Error::IdentityNotVerified);
         }
+    }
+
+    // ── Payout Stability (issue #398) ──────────────────────────────────────
+
+    /// Admin-only: set the stability fund address. When payout smoothing is
+    /// enabled, excess payouts (above the historical average) draw from this
+    /// fund, and below-average payouts deposit the surplus here.
+    pub fn set_stability_fund(env: Env, admin: Address, fund: Address) {
+        Self::require_admin(&env, &admin);
+        Self::validate_stellar_address(&env, &fund);
+        env.storage().instance().set(&StorageKey::StabilityFund, &fund);
+        env.events().publish(
+            (Symbol::new(&env, "stability_fund_set"),),
+            fund,
+        );
+    }
+
+    /// Admin-only: configure payout smoothing. `smoothing_bps` controls how
+    /// aggressively payouts are blended toward the historical average:
+    ///   - 0 = no smoothing (default, payout = coverage_amount)
+    ///   - 5000 = 50% smoothing (payout = 50% coverage + 50% avg)
+    ///   - 10000 = full smoothing (payout always = historical average)
+    ///
+    /// Requires a stability fund to be set first.
+    pub fn set_payout_smoothing_bps(env: Env, admin: Address, smoothing_bps: u32) {
+        Self::require_admin(&env, &admin);
+        if smoothing_bps > 10_000 {
+            panic_with_error!(&env, Error::InvalidSmoothingBps);
+        }
+        if smoothing_bps > 0 {
+            // Ensure stability fund is configured when smoothing is enabled
+            if !env.storage().instance().has(&StorageKey::StabilityFund) {
+                panic_with_error!(&env, Error::NotInitialized);
+            }
+        }
+        env.storage().instance().set(&StorageKey::PayoutSmoothingBps, &smoothing_bps);
+        env.events().publish(
+            (Symbol::new(&env, "payout_smoothing_updated"),),
+            smoothing_bps,
+        );
+    }
+
+    /// Return the current payout smoothing configuration.
+    pub fn get_payout_smoothing_bps(env: Env) -> u32 {
+        env.storage().instance()
+            .get(&StorageKey::PayoutSmoothingBps)
+            .unwrap_or(0)
+    }
+
+    /// Return the running historical average payout.
+    pub fn get_historical_average_payout(env: Env) -> i128 {
+        env.storage().instance()
+            .get(&StorageKey::HistoricalAveragePayout)
+            .unwrap_or(0)
+    }
+
+    /// Apply payout smoothing: blend the raw payout toward the historical
+    /// average and emit an event for the backend to handle the stability
+    /// fund transfer. Returns the smoothed payout amount.
+    fn apply_payout_smoothing(env: &Env, raw_payout: i128) -> i128 {
+        let smoothing_bps: u32 = env.storage().instance()
+            .get(&StorageKey::PayoutSmoothingBps)
+            .unwrap_or(0);
+        if smoothing_bps == 0 {
+            return raw_payout;
+        }
+
+        let avg: i128 = env.storage().instance()
+            .get(&StorageKey::HistoricalAveragePayout)
+            .unwrap_or(raw_payout);
+
+        // smoothed = (raw * (10000 - smoothing_bps) + avg * smoothing_bps) / 10000
+        let inv_bps = (10_000u32).saturating_sub(smoothing_bps) as i128;
+        let smooth_bps = smoothing_bps as i128;
+        let smoothed = (raw_payout * inv_bps + avg * smooth_bps) / 10_000;
+
+        // Update historical average with exponential moving average:
+        // new_avg = (old_avg * 9 + smoothed) / 10  (EMA with alpha=0.1)
+        let new_avg = (avg * 9 + smoothed) / 10;
+        env.storage().instance().set(&StorageKey::HistoricalAveragePayout, &new_avg);
+
+        // Emit event for backend to handle stability fund transfer
+        let diff = raw_payout - smoothed;
+        if diff != 0 {
+            if let Some(fund_addr) = env.storage().instance().get::<_, Address>(&StorageKey::StabilityFund) {
+                env.events().publish(
+                    (Symbol::new(env, "payout_stabilized"),),
+                    (raw_payout, smoothed, diff, fund_addr),
+                );
+            }
+        }
+
+        smoothed
     }
 
     /// Settle a claim using a previously submitted cross-chain attestation
@@ -1269,9 +1373,11 @@ impl ClaimsProcessor {
             let effective_bps = if bps > 10_000 { 10_000 } else { bps };
 
             if effective_bps >= 10_000 {
-                // Full payment
+                // Full payment — apply payout smoothing if configured
+                let raw_payout = claim.coverage_amount;
+                let smoothed_payout = Self::apply_payout_smoothing(env, raw_payout);
                 claim.status = ClaimStatus::Paid;
-                claim.paid_amount = Some(claim.coverage_amount);
+                claim.paid_amount = Some(smoothed_payout);
                 claim.partial_payout_bps = Some(10_000);
                 PolicyEngineClient::new(env, &policy_engine)
                     .pay_claim(&env.current_contract_address(), &claim.policy_id);
@@ -1280,10 +1386,11 @@ impl ClaimsProcessor {
                     .release_for_claim(&env.current_contract_address(), &claim.policy_id);
                 ClaimResult::Paid
             } else {
-                // Partial payment: calculate proportional payout
-                let paid = claim.coverage_amount * (effective_bps as i128) / 10_000;
+                // Partial payment: calculate proportional payout, then smooth
+                let raw_paid = claim.coverage_amount * (effective_bps as i128) / 10_000;
+                let smoothed_paid = Self::apply_payout_smoothing(env, raw_paid);
                 claim.status = ClaimStatus::PartiallyPaid;
-                claim.paid_amount = Some(paid);
+                claim.paid_amount = Some(smoothed_paid);
                 claim.partial_payout_bps = Some(effective_bps);
                 PolicyEngineClient::new(env, &policy_engine)
                     .pay_claim(&env.current_contract_address(), &claim.policy_id);
