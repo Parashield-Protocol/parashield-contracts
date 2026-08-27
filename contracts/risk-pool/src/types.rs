@@ -455,3 +455,22 @@ pub struct ExitClaimed {
     /// Seconds the provider actually waited between request and claim.
     pub waited: u64,
 }
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MinReserveUpdated {
+    pub min_reserve: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReserveFundUpdated {
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VotesDelegated {
+    pub provider: Address,
+    pub delegate: Address,
+}

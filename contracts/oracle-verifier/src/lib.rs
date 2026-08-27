@@ -17,7 +17,7 @@ extern crate alloc;
 
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
     BytesN, Env, Symbol, Vec,
 };
 
@@ -114,6 +114,27 @@ enum StorageKey {
     DataTypeMaxAge(Symbol),
     /// Per-data-type aggregation method. Falls back to `WeightedMedian`.
     AggregationMethod(Symbol),
+    /// Whether plaintext `submit_data`/`batch_submit_data` is refused for a
+    /// data_type (bool). Off by default — an existing deployment keeps
+    /// submitting plaintext until it opts a sensitive data_type in.
+    EncryptionRequired(Symbol),
+    /// Vec<EncryptedOracleDataPoint> — ciphertext submissions for
+    /// (data_type, key), stored separately from plaintext `DataPoints` since
+    /// they are never aggregated or compared on-chain.
+    EncryptedDataPoints(Symbol, Symbol),
+    /// Maximum age (in seconds) for oracle submission timestamps to be accepted.
+    /// Submissions older than `now - MaxTimestampAge` are rejected. Defaults to
+    /// 90 days. Admin-configurable via `set_max_timestamp_age`.
+    MaxTimestampAge,
+    /// Maximum number of seconds into the future a submission timestamp may be.
+    /// Protects against submissions with clocks far ahead of the ledger.
+    /// Defaults to 60 seconds. Admin-configurable via `set_timestamp_future_buffer`.
+    TimestampFutureBuffer,
+    /// Per-data-type minimum oracle participation count for valid aggregation
+    /// (u32). Falls back to the global `MinOracleCount` when unset. A data
+    /// type with high-value triggers may require more independent submissions
+    /// before the aggregation is considered valid.
+    DataTypeMinOracleCount(Symbol),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -146,6 +167,8 @@ pub enum Error {
     InvalidThreshold = 22,
     AdminTimelockNotExpired = 23,
     InvalidMaxAge = 24,
+    EncryptionRequiredForType = 25,
+    TimestampOutOfRange = 26,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -337,6 +360,50 @@ impl OracleVerifier {
             (Symbol::new(&env, "max_data_age_updated"),),
             MaxDataAgeUpdated { max_age },
         );
+    }
+
+    /// Set the maximum acceptable age for oracle submission timestamps (in seconds).
+    /// Submissions with timestamps older than `now - max_timestamp_age` are rejected.
+    /// Defaults to 90 days (7,776,000 seconds). Admin-only.
+    pub fn set_max_timestamp_age(env: Env, admin: Address, max_timestamp_age: u64) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::MaxTimestampAge, &max_timestamp_age);
+        env.events().publish(
+            (Symbol::new(&env, "max_timestamp_age_updated"),),
+            MaxTimestampAgeUpdated { max_timestamp_age },
+        );
+    }
+
+    /// Return the configured max timestamp age (defaults to 90 days).
+    pub fn get_max_timestamp_age(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::MaxTimestampAge)
+            .unwrap_or(90 * 24 * 60 * 60)
+    }
+
+    /// Set the maximum number of seconds a submission timestamp may be ahead of
+    /// the ledger. Protects against oracles with clocks far ahead of reality.
+    /// Defaults to 60 seconds. Admin-only.
+    pub fn set_timestamp_future_buffer(env: Env, admin: Address, seconds: u64) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::TimestampFutureBuffer, &seconds);
+        env.events().publish(
+            (Symbol::new(&env, "timestamp_future_buffer_updated"),),
+            TimestampFutureBufferUpdated { seconds },
+        );
+    }
+
+    /// Return the configured future buffer (defaults to 60 seconds).
+    pub fn get_timestamp_future_buffer(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::TimestampFutureBuffer)
+            .unwrap_or(60)
     }
 
     /// Propose a new admin. Only the current admin can call this.
@@ -623,6 +690,43 @@ impl OracleVerifier {
             .instance()
             .get(&StorageKey::MinOracleCount)
             .unwrap_or(1)
+    }
+
+    /// Set a per-data-type minimum oracle participation count override.
+    ///
+    /// Different data types have different risk profiles: a high-value
+    /// crop-insurance trigger may require 3+ independent oracle submissions
+    /// before the aggregation is trusted, while a low-stakes weather feed
+    /// may be fine with the global default.
+    ///
+    /// Pass `min_count = 0` to clear the override and fall back to the
+    /// global `MinOracleCount` value.
+    pub fn set_data_type_min_oracle_count(
+        env: Env,
+        admin: Address,
+        data_type: Symbol,
+        min_count: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+        if min_count == 0 {
+            env.storage()
+                .instance()
+                .remove(&StorageKey::DataTypeMinOracleCount(data_type.clone()));
+        } else {
+            env.storage()
+                .instance()
+                .set(&StorageKey::DataTypeMinOracleCount(data_type.clone()), &min_count);
+        }
+        env.events().publish(
+            (Symbol::new(&env, "dt_min_oracle_count_updated"),),
+            DataTypeMinOracleCountUpdated { data_type, min_count },
+        );
+    }
+
+    /// The effective minimum oracle count for a data type: the per-type
+    /// override when set, otherwise the global value.
+    pub fn get_data_type_min_oracle_count(env: Env, data_type: Symbol) -> u32 {
+        Self::effective_min_oracle_count(&env, &data_type)
     }
 
     /// Set the minimum number of seconds a single oracle must wait between
@@ -1024,16 +1128,28 @@ impl OracleVerifier {
         timestamp: u64,
     ) {
         oracle.require_auth();
+        if Self::encryption_required(&env, &data_type) {
+            panic_with_error!(&env, Error::EncryptionRequiredForType);
+        }
         if confidence == 0 || confidence > 100 {
             panic_with_error!(&env, Error::InvalidConfidence);
         }
 
         let now = env.ledger().timestamp();
-        if timestamp > now {
+        let future_buffer: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TimestampFutureBuffer)
+            .unwrap_or(60);
+        if timestamp > now.saturating_add(future_buffer) {
             panic_with_error!(&env, Error::InvalidTimestamp);
         }
-        let ninety_days = 90 * 24 * 60 * 60;
-        if timestamp < now.saturating_sub(ninety_days) {
+        let max_timestamp_age: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MaxTimestampAge)
+            .unwrap_or(90 * 24 * 60 * 60);
+        if timestamp < now.saturating_sub(max_timestamp_age) {
             panic_with_error!(&env, Error::InvalidTimestamp);
         }
 
@@ -1107,6 +1223,136 @@ impl OracleVerifier {
         );
     }
 
+    // ── Data Encryption (issue #379) ──────────────────────────────────────────
+
+    /// Require (or stop requiring) encrypted submissions for a data_type.
+    ///
+    /// Off by default — plaintext `submit_data`/`batch_submit_data` behave
+    /// exactly as before for any data_type that never opts in. Once enabled,
+    /// plaintext submissions for that data_type are refused and only
+    /// `submit_encrypted_data` is accepted, for data types whose values are
+    /// sensitive (private valuations, confidential off-chain metrics, etc.)
+    /// and should not sit in plaintext on a public ledger.
+    pub fn set_encryption_required(env: Env, admin: Address, data_type: Symbol, required: bool) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::EncryptionRequired(data_type.clone()), &required);
+        env.events().publish(
+            (Symbol::new(&env, "encryption_required_updated"),),
+            EncryptionRequiredUpdated { data_type, required },
+        );
+    }
+
+    /// Whether `data_type` currently requires encrypted submissions.
+    pub fn get_encryption_required(env: Env, data_type: Symbol) -> bool {
+        Self::encryption_required(&env, &data_type)
+    }
+
+    /// Submit an encrypted data point for a (data_type, key) pair.
+    ///
+    /// The contract never sees the plaintext value: `ciphertext` and `nonce`
+    /// are opaque to it and stored as-is. Encryption/decryption happens
+    /// entirely off-chain, between whichever parties hold the key for this
+    /// data_type — the contract's only job is tamper-evident storage and
+    /// making explicit, at the type level, that a submission is encrypted so
+    /// a consumer never mistakes ciphertext for a usable value. Encrypted
+    /// submissions are not fed into `verify_trigger`/`get_aggregated`, since
+    /// aggregation and threshold comparison require the plaintext value.
+    ///
+    /// Confidence and timestamp validation mirror `submit_data`.
+    pub fn submit_encrypted_data(
+        env: Env,
+        oracle: Address,
+        data_type: Symbol,
+        key: Symbol,
+        ciphertext: Bytes,
+        nonce: BytesN<12>,
+        confidence: u32,
+        timestamp: u64,
+    ) {
+        oracle.require_auth();
+        if confidence == 0 || confidence > 100 {
+            panic_with_error!(&env, Error::InvalidConfidence);
+        }
+
+        let now = env.ledger().timestamp();
+        if timestamp > now {
+            panic_with_error!(&env, Error::InvalidTimestamp);
+        }
+        let ninety_days = 90 * 24 * 60 * 60;
+        if timestamp < now.saturating_sub(ninety_days) {
+            panic_with_error!(&env, Error::InvalidTimestamp);
+        }
+
+        let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
+        let entry: OracleEntry = env
+            .storage()
+            .persistent()
+            .get(&oracle_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
+        if !entry.active {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        Self::enforce_rate_limit(&env, &data_type, &oracle, now);
+
+        let dp_key = StorageKey::EncryptedDataPoints(data_type.clone(), key.clone());
+        let mut points: Vec<EncryptedOracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&dp_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let new_point = EncryptedOracleDataPoint {
+            oracle: oracle.clone(),
+            ciphertext,
+            nonce,
+            confidence,
+            timestamp,
+        };
+        let mut found = false;
+        for i in 0..points.len() {
+            if points.get_unchecked(i).oracle == oracle {
+                points.set(i, new_point.clone());
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            if points.len() >= MAX_DATA_POINTS {
+                points.pop_front();
+            }
+            points.push_back(new_point);
+        }
+
+        env.storage().persistent().set(&dp_key, &points);
+        env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle_encrypted_data_submitted"),),
+            OracleEncryptedDataSubmitted {
+                oracle,
+                data_type,
+                key,
+                confidence,
+                timestamp,
+            },
+        );
+    }
+
+    /// Return all encrypted submissions stored for (data_type, key), for an
+    /// off-chain consumer holding the decryption key to decrypt and verify.
+    pub fn get_encrypted_data(env: Env, data_type: Symbol, key: Symbol) -> Vec<EncryptedOracleDataPoint> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::EncryptedDataPoints(data_type, key))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     // ── Verification ─────────────────────────────────────────────────────────
 
     /// Evaluate whether the aggregated oracle value satisfies a trigger condition.
@@ -1132,6 +1378,37 @@ impl OracleVerifier {
         key: Symbol,
         condition: TriggerCondition,
     ) -> bool {
+        // Enforce minimum oracle participation before aggregation so a single
+        // oracle cannot unilaterally determine the outcome.
+        let min_count = Self::effective_min_oracle_count(&env, &data_type);
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoDataAvailable));
+        let max_data_age = Self::effective_max_age(&env, &data_type);
+        let now = env.ledger().timestamp();
+        let min_confidence: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
+        let mut eligible_count = 0u32;
+        for i in 0..points.len() {
+            let p = points.get_unchecked(i);
+            if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence {
+                let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+                if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+                    if entry.active {
+                        eligible_count += 1;
+                    }
+                }
+            }
+        }
+        if eligible_count < min_count {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
         let median = Self::get_median_value(&env, &data_type, &key);
         let result = match condition.comparison {
             TriggerComparison::LessThan => median < condition.threshold,
@@ -1325,7 +1602,32 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::NoDataAvailable);
         }
 
+        // Enforce minimum oracle participation before aggregation so a single
+        // oracle cannot unilaterally determine the outcome.
+        let min_count = Self::effective_min_oracle_count(&env, &data_type);
         let now = env.ledger().timestamp();
+        let max_data_age = Self::effective_max_age(&env, &data_type);
+        let min_confidence_val: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
+        let mut eligible_count = 0u32;
+        for i in 0..points.len() {
+            let p = points.get_unchecked(i);
+            if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence_val {
+                let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+                if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+                    if entry.active {
+                        eligible_count += 1;
+                    }
+                }
+            }
+        }
+        if eligible_count < min_count {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
         let mut latest_ts = 0u64;
         for i in 0..points.len() {
             let ts = points.get_unchecked(i).timestamp;
@@ -1389,6 +1691,9 @@ impl OracleVerifier {
         submissions: Vec<(Symbol, i128, u32, u64)>,
     ) {
         oracle.require_auth();
+        if Self::encryption_required(&env, &data_type) {
+            panic_with_error!(&env, Error::EncryptionRequiredForType);
+        }
         let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         let entry: OracleEntry = env
             .storage()
@@ -1412,11 +1717,20 @@ impl OracleVerifier {
             }
 
             let now = env.ledger().timestamp();
-            if timestamp > now {
+            let future_buffer: u64 = env
+                .storage()
+                .instance()
+                .get(&StorageKey::TimestampFutureBuffer)
+                .unwrap_or(60);
+            if timestamp > now.saturating_add(future_buffer) {
                 panic_with_error!(&env, Error::InvalidTimestamp);
             }
-            let ninety_days = 90 * 24 * 60 * 60;
-            if timestamp < now.saturating_sub(ninety_days) {
+            let max_timestamp_age: u64 = env
+                .storage()
+                .instance()
+                .get(&StorageKey::MaxTimestampAge)
+                .unwrap_or(90 * 24 * 60 * 60);
+            if timestamp < now.saturating_sub(max_timestamp_age) {
                 panic_with_error!(&env, Error::InvalidTimestamp);
             }
 
@@ -1472,6 +1786,9 @@ impl OracleVerifier {
         submissions: Vec<OracleDataSubmission>,
     ) {
         oracle.require_auth();
+        if Self::encryption_required(&env, &data_type) {
+            panic_with_error!(&env, Error::EncryptionRequiredForType);
+        }
 
         let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         let entry: OracleEntry = env
@@ -1495,7 +1812,20 @@ impl OracleVerifier {
                 panic_with_error!(&env, Error::InvalidConfidence);
             }
             let now = env.ledger().timestamp();
-            if sub.timestamp > now {
+            let future_buffer: u64 = env
+                .storage()
+                .instance()
+                .get(&StorageKey::TimestampFutureBuffer)
+                .unwrap_or(60);
+            if sub.timestamp > now.saturating_add(future_buffer) {
+                panic_with_error!(&env, Error::InvalidTimestamp);
+            }
+            let max_timestamp_age: u64 = env
+                .storage()
+                .instance()
+                .get(&StorageKey::MaxTimestampAge)
+                .unwrap_or(90 * 24 * 60 * 60);
+            if sub.timestamp < now.saturating_sub(max_timestamp_age) {
                 panic_with_error!(&env, Error::InvalidTimestamp);
             }
             let dp_key = StorageKey::DataPoints(data_type.clone(), sub.key.clone());
@@ -1701,6 +2031,15 @@ impl OracleVerifier {
         caller.require_auth();
     }
 
+    /// Whether `data_type` currently requires `submit_encrypted_data` instead
+    /// of plaintext submission. Off by default.
+    fn encryption_required(env: &Env, data_type: &Symbol) -> bool {
+        env.storage()
+            .instance()
+            .get(&StorageKey::EncryptionRequired(data_type.clone()))
+            .unwrap_or(false)
+    }
+
     /// The max data age that applies to a data type: the per-type override
     /// when set, otherwise the global value (default 7 days).
     fn effective_max_age(env: &Env, data_type: &Symbol) -> u64 {
@@ -1723,6 +2062,20 @@ impl OracleVerifier {
             .instance()
             .get(&StorageKey::AggregationMethod(data_type.clone()))
             .unwrap_or(AggregationMethod::WeightedMedian)
+    }
+
+    /// The effective minimum oracle count for a data type: the per-type
+    /// override when set, otherwise the global value (default 1).
+    fn effective_min_oracle_count(env: &Env, data_type: &Symbol) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::DataTypeMinOracleCount(data_type.clone()))
+            .unwrap_or_else(|| {
+                env.storage()
+                    .instance()
+                    .get(&StorageKey::MinOracleCount)
+                    .unwrap_or(1)
+            })
     }
 
     /// Compute the weighted median of active, sufficiently fresh submissions.

@@ -6,7 +6,7 @@ extern crate std;
 
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, Address, Bytes, Env, Symbol, Val, Vec,
+    token, Address, Bytes, Env, IntoVal, Symbol, Val, Vec,
 };
 
 use crate::{DaoConfig, GovernanceDao, GovernanceDaoClient, ProposalStatus, VoteChoice};
@@ -1106,4 +1106,184 @@ fn only_the_delegate_s_own_tokens_are_locked() {
     // Delegation moves authority, not custody — the delegator's balance is
     // untouched by their delegate voting.
     assert_eq!(gov_token.balance(&voter1), delegator_before);
+}
+
+// ── deposit reclaim on timeout (issue #378) ───────────────────────────────────
+
+#[test]
+fn reclaim_deposit_refunds_proposer_after_timeout() {
+    let (env, dao, _admin, voter1, _v2, target) = setup();
+
+    let config = dao.get_config();
+    let gov_token = token::Client::new(&env, &config.gov_token);
+    let balance_before = gov_token.balance(&voter1);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Never finalized"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+    assert_eq!(gov_token.balance(&voter1), balance_before - config.proposal_threshold);
+
+    // Well past vote_end + DEPOSIT_RECLAIM_TIMEOUT, and nobody ever called finalize().
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + 14 * 24 * 3600 + 1);
+
+    dao.reclaim_deposit(&pid);
+
+    assert_eq!(gov_token.balance(&voter1), balance_before);
+    assert_eq!(dao.get_proposal(&pid).status, ProposalStatus::Failed);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn reclaim_deposit_before_timeout_fails() {
+    let (env, dao, _admin, voter1, _v2, target) = setup();
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Too early"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+    env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
+    dao.reclaim_deposit(&pid);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn reclaim_deposit_after_finalize_fails() {
+    let (env, dao, _admin, voter1, _v2, target) = setup();
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Finalized already"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + 301);
+    dao.finalize(&pid);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp += 14 * 24 * 3600 + 1);
+    dao.reclaim_deposit(&pid);
+}
+
+// ── proposal templates (issue #381) ───────────────────────────────────────────
+
+#[test]
+fn register_template_lists_it() {
+    let (env, dao, admin, _v1, _v2, _target) = setup();
+    dao.register_template(
+        &admin,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Treasury spend proposal"),
+        &10u32,
+        &2u32,
+    );
+    let names = dao.list_templates();
+    assert_eq!(names.len(), 1);
+    let t = dao.get_template(&Symbol::new(&env, "spend"));
+    assert_eq!(t.min_title_len, 10);
+    assert_eq!(t.required_arg_count, 2);
+    assert!(t.active);
+}
+
+#[test]
+fn create_proposal_from_template_enforces_structure() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+    dao.register_template(
+        &admin,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Treasury spend proposal"),
+        &10u32,
+        &1u32,
+    );
+
+    let mut args: Vec<Val> = Vec::new(&env);
+    args.push_back(1i128.into_val(&env));
+    let pid = dao.create_proposal_from_template(
+        &voter1,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Spend on audits"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+    assert_eq!(dao.proposal_count(), 1);
+    let _ = pid;
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #29)")]
+fn create_proposal_from_template_rejects_short_title() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+    dao.register_template(
+        &admin,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Treasury spend proposal"),
+        &50u32,
+        &0u32,
+    );
+    let args: Vec<Val> = Vec::new(&env);
+    dao.create_proposal_from_template(
+        &voter1,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"short"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #30)")]
+fn create_proposal_from_template_rejects_wrong_arg_count() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+    dao.register_template(
+        &admin,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Treasury spend proposal"),
+        &0u32,
+        &2u32,
+    );
+    let args: Vec<Val> = Vec::new(&env);
+    dao.create_proposal_from_template(
+        &voter1,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Spend on audits"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+}
+
+#[test]
+fn deactivated_template_cannot_be_used() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+    dao.register_template(
+        &admin,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Treasury spend proposal"),
+        &0u32,
+        &0u32,
+    );
+    dao.deactivate_template(&admin, &Symbol::new(&env, "spend"));
+
+    let args: Vec<Val> = Vec::new(&env);
+    let result = dao.try_create_proposal_from_template(
+        &voter1,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Spend on audits"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+    assert!(result.is_err());
 }

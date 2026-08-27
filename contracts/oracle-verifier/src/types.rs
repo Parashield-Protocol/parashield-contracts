@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Symbol, Vec};
 
 /// Reputation score for an oracle, tracking accuracy over time.
 #[contracttype]
@@ -235,6 +235,13 @@ pub struct MinOracleCountUpdated {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DataTypeMinOracleCountUpdated {
+    pub data_type: Symbol,
+    pub min_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MinSubmitIntervalUpdated {
     pub seconds: u64,
 }
@@ -333,4 +340,53 @@ pub struct PendingUpgrade {
 pub struct PendingAdminChange {
     pub new_admin: Address,
     pub approvals: Vec<Address>,
+}
+
+/// An encrypted data submission from one oracle.
+///
+/// `ciphertext`/`nonce` are opaque to the contract — decryption happens
+/// entirely off-chain by whichever parties hold the key for this data_type.
+/// Kept in a separate storage path from `OracleDataPoint` so a consumer can
+/// never accidentally treat ciphertext as a usable plaintext value.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncryptedOracleDataPoint {
+    pub oracle: Address,
+    pub ciphertext: Bytes,
+    /// Nonce/IV used for this submission's encryption. 12 bytes fits the
+    /// common AEAD schemes (e.g. AES-GCM, ChaCha20-Poly1305) off-chain
+    /// consumers are expected to use.
+    pub nonce: BytesN<12>,
+    /// Reliability score 0-100, same meaning as on a plaintext submission.
+    pub confidence: u32,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncryptionRequiredUpdated {
+    pub data_type: Symbol,
+    pub required: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaxTimestampAgeUpdated {
+    pub max_timestamp_age: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleEncryptedDataSubmitted {
+    pub oracle: Address,
+    pub data_type: Symbol,
+    pub key: Symbol,
+    pub confidence: u32,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimestampFutureBufferUpdated {
+    pub seconds: u64,
 }

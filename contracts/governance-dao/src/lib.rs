@@ -23,6 +23,13 @@ use soroban_sdk::{
 pub mod types;
 pub use types::*;
 
+// ─── Cross-contract client interfaces ────────────────────────────────────────
+
+#[soroban_sdk::contractclient(name = "RiskPoolClient")]
+trait IRiskPool {
+    fn get_delegated_shares(env: Env, provider: Address) -> i128;
+}
+
 /// Minimum voting period: 1 hour in seconds.
 const MIN_VOTING_PERIOD: u64 = 3_600;
 /// Maximum voting period: 30 days in seconds. Prevents an admin from setting
@@ -39,6 +46,16 @@ const TTL_THRESHOLD: u32 = 518_400; // ~30 days
 const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year
 /// Minimum delay after vote_end before finalize() can be called
 const FINALIZE_DELAY: u64 = 300; // 5 minutes
+/// How long a proposal must sit unfinalized past `vote_end` before its
+/// proposer (or anyone, on the proposer's behalf) can reclaim the deposit
+/// directly via `reclaim_deposit`, bypassing the quorum/majority computation
+/// `finalize()` performs. `finalize()` is already permissionless and already
+/// refunds the deposit on every outcome, but nothing obliges anyone to ever
+/// call it — a proposal that clearly failed quorum has no one economically
+/// incentivized to pay for finalizing it. This is the backstop so a deposit
+/// can never depend on that goodwill (issue #378). Set well beyond
+/// `FINALIZE_DELAY` so the normal finalize path always gets first chance.
+const DEPOSIT_RECLAIM_TIMEOUT: u64 = 14 * 24 * 3_600; // 14 days
 /// Lower bound on `DaoConfig.quorum_bps` (issue #355). Without a floor the
 /// admin could configure `quorum_bps = 0`, letting a proposal pass on
 /// negligible turnout. 1000 = 10% of total supply must participate.
@@ -85,6 +102,12 @@ enum StorageKey {
     /// Marks that a delegator's weight was already counted in a proposal, so
     /// they cannot also vote it themselves — (proposal_id, delegator).
     DelegatedVote(u64, Address),
+    /// A registered proposal template (`ProposalTemplate`) by name.
+    Template(Symbol),
+    /// Names of all registered templates (`Vec<Symbol>`).
+    TemplateList,
+    /// Risk pool contract address for querying LP vote delegation.
+    RiskPool,
 }
 
 #[contracterror]
@@ -121,6 +144,13 @@ pub enum Error {
     AlreadyDelegated = 28,
     WeightAlreadyCounted = 29,
     TooManyDelegators = 30,
+    ProposalNotExpired = 26,
+    TemplateNotFound = 27,
+    TemplateInactive = 28,
+    TitleTooShort = 29,
+    ArgCountMismatch = 30,
+    DiscussionPeriodNotEnded = 31,
+    DiscussionPeriodNotRequired = 32,
 }
 
 #[contract]
@@ -233,6 +263,14 @@ impl GovernanceDao {
             .unwrap_or(0);
         let now = env.ledger().timestamp();
 
+        let discussion_period = config.discussion_period;
+        let (status, vote_end) = if discussion_period > 0 {
+            // Proposal enters Discussion; voting opens after the period elapses.
+            (ProposalStatus::Discussion, now.saturating_add(discussion_period).saturating_add(config.voting_period))
+        } else {
+            (ProposalStatus::Active, now.saturating_add(config.voting_period))
+        };
+
         let proposal = Proposal {
             id: proposal_id,
             proposer: proposer.clone(),
@@ -241,12 +279,12 @@ impl GovernanceDao {
             function: function.clone(),
             args, // <--- BIND TO STRUCT
             deposit,
-            status: ProposalStatus::Active,
+            status,
             votes_for: 0,
             votes_against: 0,
             votes_abstain: 0,
             created_at: now,
-            vote_end: now.saturating_add(config.voting_period),
+            vote_end,
             execution_time: 0,
             total_supply: config.total_supply,
             kind: ProposalKind::Standard,
@@ -317,6 +355,13 @@ impl GovernanceDao {
         args.push_back(new_wasm_hash.into_val(&env));
         let function = Symbol::new(&env, "upgrade");
 
+        let discussion_period = config.discussion_period;
+        let (status, vote_end) = if discussion_period > 0 {
+            (ProposalStatus::Discussion, now.saturating_add(discussion_period).saturating_add(config.voting_period))
+        } else {
+            (ProposalStatus::Active, now.saturating_add(config.voting_period))
+        };
+
         let proposal = Proposal {
             id: proposal_id,
             proposer: proposer.clone(),
@@ -325,12 +370,12 @@ impl GovernanceDao {
             function: function.clone(),
             args,
             deposit,
-            status: ProposalStatus::Active,
+            status,
             votes_for: 0,
             votes_against: 0,
             votes_abstain: 0,
             created_at: now,
-            vote_end: now.saturating_add(config.voting_period),
+            vote_end,
             execution_time: 0,
             total_supply: config.total_supply,
             kind: ProposalKind::Upgrade,
@@ -534,6 +579,9 @@ impl GovernanceDao {
             .get(&StorageKey::Proposal(proposal_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
 
+        if proposal.status == ProposalStatus::Discussion {
+            panic_with_error!(&env, Error::DiscussionPeriodNotEnded);
+        }
         if proposal.status != ProposalStatus::Active {
             panic_with_error!(&env, Error::ProposalNotActive);
         }
@@ -573,6 +621,18 @@ impl GovernanceDao {
         let own_weight = gov_token.balance(&voter);
         if own_weight <= 0 {
             panic_with_error!(&env, Error::InsufficientWeight);
+        let mut weight = gov_token.balance(&voter);
+        if weight <= 0 {
+            // Check for delegated LP shares even if wallet balance is zero
+            let lp_weight = Self::get_delegated_lp_weight(&env, &voter);
+            if lp_weight <= 0 {
+                panic_with_error!(&env, Error::InsufficientWeight);
+            }
+            weight = lp_weight;
+        } else {
+            // Add any delegated LP shares on top of wallet balance
+            let lp_weight = Self::get_delegated_lp_weight(&env, &voter);
+            weight = weight.saturating_add(lp_weight);
         }
 
         // 2. Lock tokens in the DAO contract to prevent token cycling / double-voting
@@ -763,6 +823,60 @@ impl GovernanceDao {
         );
     }
 
+    /// Reclaim a proposer's deposit on a proposal that was never finalized.
+    ///
+    /// `finalize()` is already permissionless and already refunds the
+    /// deposit regardless of whether quorum/majority was reached — but it
+    /// still requires *someone* to call it, and nobody is economically
+    /// incentivized to spend a transaction finalizing a proposal that
+    /// plainly failed quorum. Without this, such a deposit can sit locked
+    /// indefinitely waiting on goodwill (issue #378).
+    ///
+    /// Callable by anyone once `now > vote_end + DEPOSIT_RECLAIM_TIMEOUT` —
+    /// far past the point `finalize()` itself becomes callable — on a
+    /// proposal still `Active`. Settles the proposal as `Failed` (mirroring
+    /// what `finalize()` would compute for zero additional turnout) and
+    /// refunds the deposit to the original proposer.
+    pub fn reclaim_deposit(env: Env, proposal_id: u64) {
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        if proposal.status != ProposalStatus::Active {
+            panic_with_error!(&env, Error::ProposalNotActive);
+        }
+        if env.ledger().timestamp() <= proposal.vote_end.saturating_add(DEPOSIT_RECLAIM_TIMEOUT) {
+            panic_with_error!(&env, Error::ProposalNotExpired);
+        }
+
+        proposal.status = ProposalStatus::Failed;
+
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
+        Self::record_participation(&env, total_votes, proposal.total_supply);
+
+        let gov_token = token::Client::new(&env, &config.gov_token);
+        gov_token.transfer(
+            &env.current_contract_address(),
+            &proposal.proposer,
+            &proposal.deposit,
+        );
+
+        let proposal_key = StorageKey::Proposal(proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "deposit_reclaimed"),),
+            DepositReclaimed {
+                proposal_id,
+                proposer: proposal.proposer,
+                amount: proposal.deposit,
+            },
+        );
+    }
+
     /// Mark a Passed proposal as Executed once its timelock has expired.
     ///
     /// Requires `status == Passed` and `now >= execution_time`. This
@@ -825,7 +939,7 @@ impl GovernanceDao {
             .get(&StorageKey::Proposal(proposal_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
 
-        if proposal.status != ProposalStatus::Active {
+        if proposal.status != ProposalStatus::Active && proposal.status != ProposalStatus::Discussion {
             panic_with_error!(&env, Error::ProposalNotActive);
         }
 
@@ -845,6 +959,46 @@ impl GovernanceDao {
         env.events().publish(
             (Symbol::new(&env, "proposal_cancelled"),),
             ProposalCancelled { proposal_id },
+        );
+    }
+
+    /// Transition a proposal from Discussion to Active once its discussion
+    /// period has elapsed. Callable by anyone — the discussion period is a
+    /// time-based gate, not a permission gate.
+    ///
+    /// If no discussion period is configured (`discussion_period == 0`), the
+    /// proposal was created directly in Active status and this function
+    /// panics with `DiscussionPeriodNotRequired`.
+    pub fn start_voting(env: Env, proposal_id: u64) {
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        if proposal.status != ProposalStatus::Discussion {
+            panic_with_error!(&env, Error::ProposalNotActive);
+        }
+
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        if config.discussion_period == 0 {
+            panic_with_error!(&env, Error::DiscussionPeriodNotRequired);
+        }
+
+        // The discussion period ended when created_at + discussion_period passed.
+        let discussion_end = proposal.created_at.saturating_add(config.discussion_period);
+        if env.ledger().timestamp() < discussion_end {
+            panic_with_error!(&env, Error::DiscussionPeriodNotEnded);
+        }
+
+        proposal.status = ProposalStatus::Active;
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "discussion_period_ended"),),
+            DiscussionPeriodEnded { proposal_id },
         );
     }
 
@@ -934,6 +1088,136 @@ impl GovernanceDao {
         Self::effective_quorum(&env, &config)
     }
 
+    // ── Proposal templates ────────────────────────────────────────────────────
+
+    /// Admin-only: register (or update) a named proposal template.
+    ///
+    /// A template is a minimal structural contract for a common proposal
+    /// type: a minimum title length and an exact expected argument count.
+    /// `create_proposal_from_template` rejects proposals that don't match,
+    /// so reviewers no longer have to parse intent out of free-form,
+    /// inconsistent proposals for the categories a DAO cares to standardize
+    /// (issue #381).
+    pub fn register_template(
+        env: Env,
+        admin: Address,
+        name: Symbol,
+        description: Bytes,
+        min_title_len: u32,
+        required_arg_count: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        let template = ProposalTemplate {
+            name: name.clone(),
+            description,
+            min_title_len,
+            required_arg_count,
+            active: true,
+        };
+        env.storage()
+            .instance()
+            .set(&StorageKey::Template(name.clone()), &template);
+
+        let mut names: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TemplateList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut already_present = false;
+        for n in names.iter() {
+            if n == name {
+                already_present = true;
+                break;
+            }
+        }
+        if !already_present {
+            names.push_back(name.clone());
+            env.storage().instance().set(&StorageKey::TemplateList, &names);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "template_registered"),),
+            TemplateRegistered {
+                name,
+                min_title_len,
+                required_arg_count,
+            },
+        );
+    }
+
+    /// Admin-only: deactivate a template so it can no longer be used for new
+    /// proposals. Proposals already created from it are unaffected.
+    pub fn deactivate_template(env: Env, admin: Address, name: Symbol) {
+        Self::require_admin(&env, &admin);
+        let key = StorageKey::Template(name.clone());
+        let mut template: ProposalTemplate = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::TemplateNotFound));
+        template.active = false;
+        env.storage().instance().set(&key, &template);
+    }
+
+    /// Fetch a registered template by name.
+    pub fn get_template(env: Env, name: Symbol) -> ProposalTemplate {
+        env.storage()
+            .instance()
+            .get(&StorageKey::Template(name))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::TemplateNotFound))
+    }
+
+    /// List the names of all registered templates (active or not).
+    pub fn list_templates(env: Env) -> Vec<Symbol> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::TemplateList)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Create a proposal, validated against a registered template's
+    /// structure before creation: `title` must be at least
+    /// `template.min_title_len` bytes and `args` must have exactly
+    /// `template.required_arg_count` entries. Otherwise behaves exactly
+    /// like `create_proposal` (same deposit/threshold/lifecycle).
+    pub fn create_proposal_from_template(
+        env: Env,
+        proposer: Address,
+        template_name: Symbol,
+        title: Bytes,
+        target: Address,
+        function: Symbol,
+        args: Vec<Val>,
+    ) -> u64 {
+        let template: ProposalTemplate = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Template(template_name.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::TemplateNotFound));
+        if !template.active {
+            panic_with_error!(&env, Error::TemplateInactive);
+        }
+        if title.len() < template.min_title_len {
+            panic_with_error!(&env, Error::TitleTooShort);
+        }
+        if args.len() != template.required_arg_count {
+            panic_with_error!(&env, Error::ArgCountMismatch);
+        }
+
+        let proposal_id = Self::create_proposal(env.clone(), proposer, title, target, function, args);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_created_from_template"),),
+            ProposalCreatedFromTemplate {
+                proposal_id,
+                template_name,
+            },
+        );
+
+        proposal_id
+    }
+
     // ── Queries ───────────────────────────────────────────────────────────────
 
     /// Fetch a proposal by id. Panics with `ProposalNotFound` if it doesn't exist.
@@ -966,6 +1250,25 @@ impl GovernanceDao {
             .instance()
             .get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
+    }
+
+    /// Admin-only: set the risk pool contract address. When set, the
+    /// `vote()` function queries the risk pool for any LP share delegation
+    /// the voter may have, adding delegated LP shares to their voting
+    /// weight on top of their gov-token balance.
+    pub fn set_risk_pool(env: Env, admin: Address, risk_pool: Address) {
+        Self::require_admin(&env, &admin);
+        Self::validate_stellar_address(&env, &risk_pool);
+        env.storage().instance().set(&StorageKey::RiskPool, &risk_pool);
+        env.events().publish(
+            (Symbol::new(&env, "risk_pool_set"),),
+            risk_pool,
+        );
+    }
+
+    /// Return the configured risk pool contract address, if any.
+    pub fn get_risk_pool(env: Env) -> Option<Address> {
+        env.storage().instance().get(&StorageKey::RiskPool)
     }
 
     /// Return the total number of proposals ever created (next proposal id).
@@ -1192,6 +1495,18 @@ impl GovernanceDao {
         
         // Future migrations follow the pattern:
         // if old_version < 3 && new_version >= 3 { Self::migrate_v2_to_v3(env); }
+    }
+
+    /// Query the risk pool for any LP share delegation the voter may have.
+    /// Returns the delegated LP share count, or 0 if no risk pool is
+    /// configured or the voter has no delegation.
+    fn get_delegated_lp_weight(env: &Env, voter: &Address) -> i128 {
+        let risk_pool_addr: Address = match env.storage().instance().get(&StorageKey::RiskPool) {
+            Some(addr) => addr,
+            None => return 0,
+        };
+        RiskPoolClient::new(env, &risk_pool_addr)
+            .get_delegated_shares(voter)
     }
 
 

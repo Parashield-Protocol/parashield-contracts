@@ -21,6 +21,8 @@ pub const GOVERNANCE_TTL_BUFFER_SECONDS: u64 = 30 * 24 * 3600;
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProposalStatus {
+    /// In mandatory discussion period before voting opens.
+    Discussion,
     /// Accepting votes
     Active,
     /// Passed quorum + majority; ready to execute
@@ -115,6 +117,9 @@ pub struct DaoConfig {
     pub voting_period: u64,
     /// Timelock period in seconds before an approved proposal can be executed.
     pub proposal_timelock: u64,
+    /// Mandatory discussion period in seconds before voting opens.
+    /// Set to 0 to disable (proposals go straight to Active).
+    pub discussion_period: u64,
 }
 
 /// Settings controlling adaptive (decaying) quorum.
@@ -247,6 +252,12 @@ pub struct ProposalCancelled {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscussionPeriodEnded {
+    pub proposal_id: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaoConfigUpdated {
     pub gov_token: Address,
     pub proposal_threshold: i128,
@@ -319,4 +330,49 @@ pub struct PendingUpgrade {
     pub new_wasm_hash: BytesN<32>,
     pub new_version: u32,
     pub approvals: Vec<Address>,
+}
+
+/// Emitted when a proposer (or anyone on their behalf) reclaims a deposit
+/// via `reclaim_deposit` on a proposal nobody ever finalized.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DepositReclaimed {
+    pub proposal_id: u64,
+    pub proposer: Address,
+    pub amount: i128,
+}
+
+/// A registered structural template for a common proposal type.
+///
+/// Standardizes the minimum shape a proposal of this kind must have —
+/// title length and argument count — so proposals created against it are
+/// consistent and reviewers spend less time parsing intent out of
+/// free-form submissions.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalTemplate {
+    pub name: Symbol,
+    /// Human-readable description of what this template is for.
+    pub description: Bytes,
+    /// Minimum number of bytes required in a proposal's `title`.
+    pub min_title_len: u32,
+    /// Exact number of entries required in a proposal's `args`.
+    pub required_arg_count: u32,
+    /// Whether new proposals may still be created from this template.
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TemplateRegistered {
+    pub name: Symbol,
+    pub min_title_len: u32,
+    pub required_arg_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalCreatedFromTemplate {
+    pub proposal_id: u64,
+    pub template_name: Symbol,
 }
