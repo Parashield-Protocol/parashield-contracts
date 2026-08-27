@@ -23,6 +23,13 @@ use soroban_sdk::{
 pub mod types;
 pub use types::*;
 
+// ─── Cross-contract client interfaces ────────────────────────────────────────
+
+#[soroban_sdk::contractclient(name = "RiskPoolClient")]
+trait IRiskPool {
+    fn get_delegated_shares(env: Env, provider: Address) -> i128;
+}
+
 /// Minimum voting period: 1 hour in seconds.
 const MIN_VOTING_PERIOD: u64 = 3_600;
 /// Maximum voting period: 30 days in seconds. Prevents an admin from setting
@@ -86,6 +93,8 @@ enum StorageKey {
     Template(Symbol),
     /// Names of all registered templates (`Vec<Symbol>`).
     TemplateList,
+    /// Risk pool contract address for querying LP vote delegation.
+    RiskPool,
 }
 
 #[contracterror]
@@ -411,9 +420,18 @@ impl GovernanceDao {
         let gov_token = token::Client::new(&env, &config.gov_token);
 
         // 1. Capture voting balance weight
-        let weight = gov_token.balance(&voter);
+        let mut weight = gov_token.balance(&voter);
         if weight <= 0 {
-            panic_with_error!(&env, Error::InsufficientWeight);
+            // Check for delegated LP shares even if wallet balance is zero
+            let lp_weight = Self::get_delegated_lp_weight(&env, &voter);
+            if lp_weight <= 0 {
+                panic_with_error!(&env, Error::InsufficientWeight);
+            }
+            weight = lp_weight;
+        } else {
+            // Add any delegated LP shares on top of wallet balance
+            let lp_weight = Self::get_delegated_lp_weight(&env, &voter);
+            weight = weight.saturating_add(lp_weight);
         }
 
         // 2. Lock tokens in the DAO contract to prevent token cycling / double-voting
@@ -1021,6 +1039,25 @@ impl GovernanceDao {
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
     }
 
+    /// Admin-only: set the risk pool contract address. When set, the
+    /// `vote()` function queries the risk pool for any LP share delegation
+    /// the voter may have, adding delegated LP shares to their voting
+    /// weight on top of their gov-token balance.
+    pub fn set_risk_pool(env: Env, admin: Address, risk_pool: Address) {
+        Self::require_admin(&env, &admin);
+        Self::validate_stellar_address(&env, &risk_pool);
+        env.storage().instance().set(&StorageKey::RiskPool, &risk_pool);
+        env.events().publish(
+            (Symbol::new(&env, "risk_pool_set"),),
+            risk_pool,
+        );
+    }
+
+    /// Return the configured risk pool contract address, if any.
+    pub fn get_risk_pool(env: Env) -> Option<Address> {
+        env.storage().instance().get(&StorageKey::RiskPool)
+    }
+
     /// Return the total number of proposals ever created (next proposal id).
     pub fn proposal_count(env: Env) -> u64 {
         env.storage()
@@ -1245,6 +1282,18 @@ impl GovernanceDao {
         
         // Future migrations follow the pattern:
         // if old_version < 3 && new_version >= 3 { Self::migrate_v2_to_v3(env); }
+    }
+
+    /// Query the risk pool for any LP share delegation the voter may have.
+    /// Returns the delegated LP share count, or 0 if no risk pool is
+    /// configured or the voter has no delegation.
+    fn get_delegated_lp_weight(env: &Env, voter: &Address) -> i128 {
+        let risk_pool_addr: Address = match env.storage().instance().get(&StorageKey::RiskPool) {
+            Some(addr) => addr,
+            None => return 0,
+        };
+        RiskPoolClient::new(env, &risk_pool_addr)
+            .get_delegated_shares(voter)
     }
 
 

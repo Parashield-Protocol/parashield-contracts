@@ -130,6 +130,11 @@ enum StorageKey {
     /// Protects against submissions with clocks far ahead of the ledger.
     /// Defaults to 60 seconds. Admin-configurable via `set_timestamp_future_buffer`.
     TimestampFutureBuffer,
+    /// Per-data-type minimum oracle participation count for valid aggregation
+    /// (u32). Falls back to the global `MinOracleCount` when unset. A data
+    /// type with high-value triggers may require more independent submissions
+    /// before the aggregation is considered valid.
+    DataTypeMinOracleCount(Symbol),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -685,6 +690,43 @@ impl OracleVerifier {
             .instance()
             .get(&StorageKey::MinOracleCount)
             .unwrap_or(1)
+    }
+
+    /// Set a per-data-type minimum oracle participation count override.
+    ///
+    /// Different data types have different risk profiles: a high-value
+    /// crop-insurance trigger may require 3+ independent oracle submissions
+    /// before the aggregation is trusted, while a low-stakes weather feed
+    /// may be fine with the global default.
+    ///
+    /// Pass `min_count = 0` to clear the override and fall back to the
+    /// global `MinOracleCount` value.
+    pub fn set_data_type_min_oracle_count(
+        env: Env,
+        admin: Address,
+        data_type: Symbol,
+        min_count: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+        if min_count == 0 {
+            env.storage()
+                .instance()
+                .remove(&StorageKey::DataTypeMinOracleCount(data_type.clone()));
+        } else {
+            env.storage()
+                .instance()
+                .set(&StorageKey::DataTypeMinOracleCount(data_type.clone()), &min_count);
+        }
+        env.events().publish(
+            (Symbol::new(&env, "dt_min_oracle_count_updated"),),
+            DataTypeMinOracleCountUpdated { data_type, min_count },
+        );
+    }
+
+    /// The effective minimum oracle count for a data type: the per-type
+    /// override when set, otherwise the global value.
+    pub fn get_data_type_min_oracle_count(env: Env, data_type: Symbol) -> u32 {
+        Self::effective_min_oracle_count(&env, &data_type)
     }
 
     /// Set the minimum number of seconds a single oracle must wait between
@@ -1336,6 +1378,37 @@ impl OracleVerifier {
         key: Symbol,
         condition: TriggerCondition,
     ) -> bool {
+        // Enforce minimum oracle participation before aggregation so a single
+        // oracle cannot unilaterally determine the outcome.
+        let min_count = Self::effective_min_oracle_count(&env, &data_type);
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoDataAvailable));
+        let max_data_age = Self::effective_max_age(&env, &data_type);
+        let now = env.ledger().timestamp();
+        let min_confidence: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
+        let mut eligible_count = 0u32;
+        for i in 0..points.len() {
+            let p = points.get_unchecked(i);
+            if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence {
+                let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+                if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+                    if entry.active {
+                        eligible_count += 1;
+                    }
+                }
+            }
+        }
+        if eligible_count < min_count {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
         let median = Self::get_median_value(&env, &data_type, &key);
         let result = match condition.comparison {
             TriggerComparison::LessThan => median < condition.threshold,
@@ -1529,7 +1602,32 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::NoDataAvailable);
         }
 
+        // Enforce minimum oracle participation before aggregation so a single
+        // oracle cannot unilaterally determine the outcome.
+        let min_count = Self::effective_min_oracle_count(&env, &data_type);
         let now = env.ledger().timestamp();
+        let max_data_age = Self::effective_max_age(&env, &data_type);
+        let min_confidence_val: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
+        let mut eligible_count = 0u32;
+        for i in 0..points.len() {
+            let p = points.get_unchecked(i);
+            if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence_val {
+                let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+                if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+                    if entry.active {
+                        eligible_count += 1;
+                    }
+                }
+            }
+        }
+        if eligible_count < min_count {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
         let mut latest_ts = 0u64;
         for i in 0..points.len() {
             let ts = points.get_unchecked(i).timestamp;
@@ -1964,6 +2062,20 @@ impl OracleVerifier {
             .instance()
             .get(&StorageKey::AggregationMethod(data_type.clone()))
             .unwrap_or(AggregationMethod::WeightedMedian)
+    }
+
+    /// The effective minimum oracle count for a data type: the per-type
+    /// override when set, otherwise the global value (default 1).
+    fn effective_min_oracle_count(env: &Env, data_type: &Symbol) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::DataTypeMinOracleCount(data_type.clone()))
+            .unwrap_or_else(|| {
+                env.storage()
+                    .instance()
+                    .get(&StorageKey::MinOracleCount)
+                    .unwrap_or(1)
+            })
     }
 
     /// Compute the weighted median of active, sufficiently fresh submissions.
