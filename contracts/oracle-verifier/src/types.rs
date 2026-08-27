@@ -28,6 +28,28 @@ pub struct ReputationUpdated {
     pub total: u64,
 }
 
+/// How multiple oracle submissions are combined into a single consensus value.
+///
+/// The right choice depends on the threat model for a data type. Median
+/// resists a minority of outliers completely — one oracle reporting an absurd
+/// value cannot move it — which is what you want for adversarial or
+/// error-prone feeds. A weighted average uses every submission in proportion
+/// to its registered weight, which tracks small genuine variations more
+/// smoothly but lets a single extreme value drag the result.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AggregationMethod {
+    /// Weight-aware median: the value at the middle of cumulative weight.
+    /// A minority of outliers cannot move it. This is the default.
+    WeightedMedian,
+    /// Weighted arithmetic mean: `sum(value * weight) / sum(weight)`.
+    /// Smooth, but one extreme submission moves the result.
+    WeightedAverage,
+    /// Unweighted arithmetic mean: every valid submission counts equally.
+    /// Use when registered weights are not meaningful for this data type.
+    Mean,
+}
+
 /// How the trigger threshold is compared against the observed value.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -163,6 +185,45 @@ pub struct MinConfidenceUpdated {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxDataAgeUpdated {
+    pub max_age: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DataTypeMaxAgeUpdated {
+    pub data_type: Symbol,
+    /// `None` is encoded as 0, meaning the override was cleared.
+    pub max_age: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregationMethodUpdated {
+    pub data_type: Symbol,
+    pub method: AggregationMethod,
+}
+
+/// Freshness report for a `(data_type, key)` pair.
+///
+/// Answers "can this data be used right now?" without panicking, so a caller
+/// can check before committing to a claim evaluation that would otherwise
+/// abort the whole transaction.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FreshnessReport {
+    pub data_type: Symbol,
+    pub key: Symbol,
+    /// True when at least `min_oracle_count` submissions are within the
+    /// effective max age for this data type.
+    pub is_fresh: bool,
+    /// Age in seconds of the newest submission. `u64::MAX` when there are no
+    /// submissions at all.
+    pub newest_age: u64,
+    /// Number of submissions still inside the freshness window.
+    pub fresh_count: u32,
+    /// Number of submissions held for this key, fresh or not.
+    pub total_count: u32,
+    /// The max age applied — the per-data-type override when set, else global.
     pub max_age: u64,
 }
 

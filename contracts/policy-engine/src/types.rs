@@ -199,6 +199,58 @@ pub struct PolicyExpired {
     pub policy_id: u128,
 }
 
+/// Emitted when a still-Active policy enters its expiry warning window.
+///
+/// Coverage lapsing is not a state change the chain announces on its own —
+/// `end_time` simply passes. Without this, the only on-chain signal is
+/// `PolicyExpired`, which fires *after* cover has already gone. An indexer
+/// watching for this topic can notify the holder while renewing still helps.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyExpiringSoon {
+    pub policy_id: u128,
+    pub policyholder: Address,
+    pub product_id: u128,
+    pub coverage_amount: i128,
+    pub end_time: u64,
+    /// Seconds remaining until `end_time` at the moment of emission.
+    pub seconds_remaining: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpiryWarningWindowUpdated {
+    pub window: u64,
+}
+
+/// Where a policy sits relative to its own expiry.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpiryState {
+    /// Not Active — claimed, cancelled, or already marked expired.
+    NotActive,
+    /// Active, and outside the warning window.
+    Active,
+    /// Active, inside the warning window, still covered.
+    ExpiringSoon,
+    /// `end_time` has passed but the policy has not been marked Expired yet.
+    Lapsed,
+}
+
+/// Expiry status for one policy, returned without panicking.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyExpiryInfo {
+    pub policy_id: u128,
+    pub state: ExpiryState,
+    pub end_time: u64,
+    /// Seconds until `end_time`, or 0 once it has passed.
+    pub seconds_remaining: u64,
+    /// True when a warning event has already been emitted for this policy, so
+    /// a keeper can skip it instead of paying to re-emit.
+    pub warned: bool,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminUpdated {
