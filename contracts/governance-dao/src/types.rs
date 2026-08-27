@@ -243,9 +243,26 @@ pub struct ProposalFinalized {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionAuditRecord {
+    pub proposal_id: u64,
+    pub executor: Address,
+    pub target: Address,
+    pub function: Symbol,
+    pub executed_at: u64,
+    pub votes_for: i128,
+    pub votes_against: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProposalExecuted {
     pub proposal_id: u64,
+    pub executor: Address,
+    pub target: Address,
+    pub function: Symbol,
+    pub executed_at: u64,
 }
+
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
