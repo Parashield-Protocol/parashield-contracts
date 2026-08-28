@@ -514,3 +514,27 @@ pub struct VotesDelegated {
     pub provider: Address,
     pub delegate: Address,
 }
+
+/// An LP fee tier based on deposit amount and/or lock duration.
+/// LPs with larger deposits or longer commitment get lower fees.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeTier {
+    /// Minimum deposit amount for this tier (7-decimal stroops). 0 = no minimum.
+    pub min_deposit: i128,
+    /// Minimum lock duration in seconds for this tier. 0 = no lock required.
+    pub min_lock_duration: u64,
+    /// Fee discount in basis points (0-10000). 0 = no discount, 10000 = 100% off.
+    pub discount_bps: u32,
+    /// Human-readable tier name.
+    pub name: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeTierUpdated {
+    pub tier_name: Symbol,
+    pub min_deposit: i128,
+    pub min_lock_duration: u64,
+    pub discount_bps: u32,
+}

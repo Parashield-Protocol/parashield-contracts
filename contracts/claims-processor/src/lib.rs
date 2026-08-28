@@ -126,6 +126,9 @@ enum StorageKey {
     /// still be submitted for the triggering event (u64). `0` means a claim
     /// can only be filed while the policy is Active (behaves as before).
     ClaimDeadline,
+    /// Configurable delay in seconds between claim approval and payout (u64).
+    /// 0 = immediate payout (default behavior).
+    PayoutDelay,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -155,6 +158,8 @@ pub enum Error {
     /// A `submit_claim` arrived after `end_time + claim_deadline` had elapsed,
     /// so the window to file a claim for the triggering event has closed.
     ClaimDeadlinePassed  = 19,
+    /// Payout delay has not yet elapsed — the claim cannot be settled now.
+    PayoutDelayNotElapsed = 20,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -330,6 +335,8 @@ impl ClaimsProcessor {
             dispute_reason: None,
             paid_amount: None,
             partial_payout_bps: None,
+            installments: None,
+            payout_ready_at: None,
         };
         env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
         env.storage().persistent().extend_ttl(&StorageKey::Claim(claim_id), TTL_THRESHOLD, TTL_EXTEND_TO);
@@ -461,6 +468,8 @@ impl ClaimsProcessor {
                 dispute_reason: None,
                 paid_amount: None,
                 partial_payout_bps: None,
+                installments: None,
+                payout_ready_at: None,
             };
             env.storage().persistent().set(&StorageKey::Claim(cid), &claim);
             env.storage().persistent().extend_ttl(&StorageKey::Claim(cid), TTL_THRESHOLD, TTL_EXTEND_TO);
@@ -1232,6 +1241,84 @@ impl ClaimsProcessor {
         Self::claim_deadline(&env)
     }
 
+    // ── Payout Delay (issue #432) ─────────────────────────────────────────────
+
+    /// Set the delay in seconds between claim approval and actual payout.
+    ///
+    /// When non-zero, a claim that passes evaluation enters `PaidPendingDelay`
+    /// status and the payout is held for `delay_seconds` before becoming
+    /// claimable. This gives the protocol a window to catch fraud or errors
+    /// before funds leave the pool. `0` restores immediate payout behavior.
+    pub fn set_payout_delay(env: Env, admin: Address, delay_seconds: u64) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&StorageKey::PayoutDelay, &delay_seconds);
+        env.events().publish(
+            (Symbol::new(&env, "payout_delay_set"),),
+            PayoutDelayUpdated { delay_seconds },
+        );
+    }
+
+    /// The configured payout delay in seconds (default: 0 — immediate).
+    pub fn get_payout_delay(env: Env) -> u64 {
+        Self::payout_delay(&env)
+    }
+
+    /// The configured payout delay, or the default.
+    fn payout_delay(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::PayoutDelay)
+            .unwrap_or(0)
+    }
+
+    /// Claim the payout for an approved claim after the payout delay has elapsed.
+    ///
+    /// When a payout delay is configured, approved claims enter Paid/PartiallyPaid
+    /// status but funds are not transferred until the delay passes. This function
+    /// completes the transfer. Callable by anyone — the claim is already approved.
+    pub fn claim_payout(env: Env, claim_id: u128) -> i128 {
+        Self::require_not_paused(&env);
+
+        let mut claim: Claim = env.storage().persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+
+        let payout_ready_at = claim.payout_ready_at
+            .unwrap_or_else(|| panic_with_error!(&env, Error::PayoutDelayNotElapsed));
+
+        let now = env.ledger().timestamp();
+        if now < payout_ready_at {
+            panic_with_error!(&env, Error::PayoutDelayNotElapsed);
+        }
+
+        let paid_amount = claim.paid_amount
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+
+        // Clear payout_ready_at so this cannot be called again
+        claim.payout_ready_at = None;
+        env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
+
+        // Execute the actual payout
+        let policy_engine: Address = env.storage().instance()
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        let risk_pool: Address = env.storage().instance()
+            .get(&StorageKey::RiskPool)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+
+        PolicyEngineClient::new(&env, &policy_engine)
+            .pay_claim(&env.current_contract_address(), &claim.policy_id);
+        RiskPoolClient::new(&env, &risk_pool)
+            .release_for_claim(&env.current_contract_address(), &claim.policy_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "payout_released"),),
+            (claim_id, claim.policy_id, paid_amount),
+        );
+
+        paid_amount
+    }
+
     /// Escalate a claim that has been Pending past the threshold.
     ///
     /// A claim that nothing processes is worse than a rejected one: a
@@ -1388,21 +1475,30 @@ impl ClaimsProcessor {
         claim.trigger_met  = trigger_met;
         claim.processed_at = Some(env.ledger().timestamp());
 
+        let payout_delay = Self::payout_delay(env);
+
         let result = if trigger_met {
             // Determine payout: full or partial based on partial_payout_bps.
             let bps = partial_payout_bps.unwrap_or(10_000);
             let effective_bps = if bps > 10_000 { 10_000 } else { bps };
+            let now = env.ledger().timestamp();
 
             if effective_bps >= 10_000 {
                 // Full payment
                 claim.status = ClaimStatus::Paid;
                 claim.paid_amount = Some(claim.coverage_amount);
                 claim.partial_payout_bps = Some(10_000);
-                PolicyEngineClient::new(env, &policy_engine)
-                    .pay_claim(&env.current_contract_address(), &claim.policy_id);
-                // Atomic lock release
-                RiskPoolClient::new(env, &risk_pool)
-                    .release_for_claim(&env.current_contract_address(), &claim.policy_id);
+
+                if payout_delay > 0 {
+                    // Delay payout: record when payout becomes available
+                    claim.payout_ready_at = Some(now.saturating_add(payout_delay));
+                } else {
+                    // Immediate payout
+                    PolicyEngineClient::new(env, &policy_engine)
+                        .pay_claim(&env.current_contract_address(), &claim.policy_id);
+                    RiskPoolClient::new(env, &risk_pool)
+                        .release_for_claim(&env.current_contract_address(), &claim.policy_id);
+                }
                 ClaimResult::Paid
             } else {
                 // Partial payment: calculate proportional payout
@@ -1410,11 +1506,15 @@ impl ClaimsProcessor {
                 claim.status = ClaimStatus::PartiallyPaid;
                 claim.paid_amount = Some(paid);
                 claim.partial_payout_bps = Some(effective_bps);
-                PolicyEngineClient::new(env, &policy_engine)
-                    .pay_claim(&env.current_contract_address(), &claim.policy_id);
-                // Atomic lock release
-                RiskPoolClient::new(env, &risk_pool)
-                    .release_for_claim(&env.current_contract_address(), &claim.policy_id);
+
+                if payout_delay > 0 {
+                    claim.payout_ready_at = Some(now.saturating_add(payout_delay));
+                } else {
+                    PolicyEngineClient::new(env, &policy_engine)
+                        .pay_claim(&env.current_contract_address(), &claim.policy_id);
+                    RiskPoolClient::new(env, &risk_pool)
+                        .release_for_claim(&env.current_contract_address(), &claim.policy_id);
+                }
                 ClaimResult::PartiallyPaid
             }
         } else {

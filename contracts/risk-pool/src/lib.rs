@@ -1,4 +1,4 @@
-﻿//! Parashield Risk Pool
+//! Parashield Risk Pool
 //!
 //! Liquidity providers deposit USDC into category-specific risk pools.
 //! Pool-share tokens represent proportional ownership.
@@ -137,6 +137,10 @@ enum StorageKey {
     /// Dynamic fee adjustment configuration (DynamicFeeConfig).
     /// Allows pool fees to automatically adjust based on market conditions and utilization.
     DynamicFeeConfig,
+    /// Fee tier configuration — Symbol (tier name) → FeeTier.
+    FeeTier(Symbol),
+    /// Names of all registered fee tiers (Vec<Symbol>).
+    FeeTierList,
 }
 
 #[contracterror]
@@ -178,6 +182,8 @@ pub enum Error {
     ExitAlreadyQueued         = 33,
     NoExitRequest             = 34,
     ExitDelayNotElapsed       = 35,
+    InvalidParameter          = 36,
+    InvalidFeeTier            = 37,
 }
 
 #[contract]
@@ -1174,6 +1180,136 @@ impl RiskPool {
 
         let adjusted_fee = config.base_fee_bps.saturating_add(fee_increase);
         adjusted_fee.min(config.max_fee_bps).max(config.min_fee_bps)
+    }
+
+    // ── Fee Tiers (issue #429) ────────────────────────────────────────────────
+
+    /// Add or update an LP fee tier. LPs meeting the tier's requirements
+    /// (minimum deposit and/or minimum lock duration) receive the discount
+    /// on protocol fees.
+    ///
+    /// `discount_bps` is in basis points: 500 = 5% discount, 1000 = 10%, etc.
+    /// Maximum 10000 (100% discount, i.e. zero fees).
+    pub fn set_fee_tier(
+        env: Env,
+        admin: Address,
+        name: Symbol,
+        min_deposit: i128,
+        min_lock_duration: u64,
+        discount_bps: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+        if discount_bps > 10_000 {
+            panic_with_error!(&env, Error::InvalidFeeTier);
+        }
+        if min_deposit < 0 {
+            panic_with_error!(&env, Error::InvalidFeeTier);
+        }
+
+        let tier = FeeTier {
+            min_deposit,
+            min_lock_duration,
+            discount_bps,
+            name: name.clone(),
+        };
+        env.storage().instance().set(&StorageKey::FeeTier(name.clone()), &tier);
+
+        // Track tier names
+        let mut names: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::FeeTierList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut found = false;
+        for i in 0..names.len() {
+            if names.get_unchecked(i) == name {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            names.push_back(name.clone());
+            env.storage().instance().set(&StorageKey::FeeTierList, &names);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "fee_tier_updated"),),
+            FeeTierUpdated {
+                tier_name: name,
+                min_deposit,
+                min_lock_duration,
+                discount_bps,
+            },
+        );
+    }
+
+    /// Remove an LP fee tier by name.
+    pub fn remove_fee_tier(env: Env, admin: Address, name: Symbol) {
+        Self::require_admin(&env, &admin);
+        let key = StorageKey::FeeTier(name.clone());
+        if !env.storage().instance().has(&key) {
+            panic_with_error!(&env, Error::InvalidFeeTier);
+        }
+        env.storage().instance().remove(&key);
+
+        let mut names: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::FeeTierList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut pruned: Vec<Symbol> = Vec::new(&env);
+        for i in 0..names.len() {
+            if names.get_unchecked(i) != name {
+                pruned.push_back(names.get_unchecked(i));
+            }
+        }
+        env.storage().instance().set(&StorageKey::FeeTierList, &pruned);
+    }
+
+    /// Get a specific fee tier by name.
+    pub fn get_fee_tier(env: Env, name: Symbol) -> Option<FeeTier> {
+        env.storage().instance().get(&StorageKey::FeeTier(name))
+    }
+
+    /// List all registered fee tier names.
+    pub fn get_fee_tier_names(env: Env) -> Vec<Symbol> {
+        env.storage().instance()
+            .get(&StorageKey::FeeTierList)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Get the effective fee discount for a provider based on their deposit
+    /// amount and lock duration. Returns the highest applicable discount.
+    pub fn get_lp_fee_discount(env: Env, provider: Address) -> u32 {
+        let position: LpPosition = match env.storage().persistent()
+            .get(&StorageKey::LpPosition(provider.clone()))
+        {
+            Some(p) => p,
+            None => return 0,
+        };
+
+        let names: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::FeeTierList)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let now = env.ledger().timestamp();
+        let mut best_discount: u32 = 0;
+
+        for i in 0..names.len() {
+            let tier_name = names.get_unchecked(i);
+            if let Some(tier) = env.storage().instance().get::<_, FeeTier>(&StorageKey::FeeTier(tier_name.clone())) {
+                let deposit_met = position.deposited >= tier.min_deposit;
+                let lock_duration = now.saturating_sub(position.deposited_at);
+                let lock_met = tier.min_lock_duration == 0 || lock_duration >= tier.min_lock_duration;
+                if deposit_met && lock_met && tier.discount_bps > best_discount {
+                    best_discount = tier.discount_bps;
+                }
+            }
+        }
+
+        best_discount
     }
 
     /// Return the current admin address. Panics with `NotInitialized` if not set up.
