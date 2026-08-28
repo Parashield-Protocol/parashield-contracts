@@ -390,3 +390,28 @@ pub struct ProposalCreatedFromTemplate {
 pub struct VoteWeightCapUpdated {
     pub vote_weight_cap: i128,
 }
+
+/// Emitted when a delegation's weight is used in a vote.
+///
+/// Tracks the moment delegated voting power is actually exercised,
+/// making it possible to see which delegations contributed to which
+/// proposals and how much weight they carried.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegationUsed {
+    pub proposal_id: u64,
+    pub delegate: Address,
+    pub delegator: Address,
+    pub weight: i128,
+}
+
+/// Emitted when a delegation is created or revoked, recording the
+/// full delegation graph at a point in time for off-chain indexing.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegationRecorded {
+    pub delegator: Address,
+    pub delegate: Address,
+    pub action: Symbol,
+    pub recorded_at: u64,
+}

@@ -512,9 +512,20 @@ impl GovernanceDao {
         env.events().publish(
             (Symbol::new(&env, "power_delegated"),),
             VotingPowerDelegated {
+                delegator: delegator.clone(),
+                delegate: delegate.clone(),
+                weight,
+            },
+        );
+
+        // Track delegation creation for off-chain indexing
+        env.events().publish(
+            (Symbol::new(&env, "delegation_recorded"),),
+            DelegationRecorded {
                 delegator,
                 delegate,
-                weight,
+                action: Symbol::new(&env, "created"),
+                recorded_at: env.ledger().timestamp(),
             },
         );
     }
@@ -542,8 +553,19 @@ impl GovernanceDao {
         env.events().publish(
             (Symbol::new(&env, "delegation_revoked"),),
             DelegationRevoked {
+                delegator: delegator.clone(),
+                delegate: delegate.clone(),
+            },
+        );
+
+        // Track delegation revocation for off-chain indexing
+        env.events().publish(
+            (Symbol::new(&env, "delegation_recorded"),),
+            DelegationRecorded {
                 delegator,
                 delegate,
+                action: Symbol::new(&env, "revoked"),
+                recorded_at: env.ledger().timestamp(),
             },
         );
     }
@@ -1857,6 +1879,17 @@ impl GovernanceDao {
             env.storage().persistent().set(&marker, &true);
 
             total = total.saturating_add(balance);
+
+            // Track delegation usage for off-chain indexing
+            env.events().publish(
+                (Symbol::new(env, "delegation_used"),),
+                DelegationUsed {
+                    proposal_id,
+                    delegate: voter.clone(),
+                    delegator,
+                    weight: balance,
+                },
+            );
         }
 
         total
