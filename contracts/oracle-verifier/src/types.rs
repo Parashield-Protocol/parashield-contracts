@@ -499,6 +499,26 @@ pub struct StalenessReport {
     pub freshness_ratio_bps: u32,
 }
 
+/// Temporal decay configuration for oracle submissions.
+/// Applies exponential decay to older submissions, giving more weight to recent data.
+/// Prevents stale oracles from permanently distorting aggregation as data ages.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TemporalDecayConfig {
+    pub data_type: Symbol,
+    /// Whether temporal decay weighting is enabled for this data type.
+    pub enabled: bool,
+    /// Half-life in seconds: age at which submission weight drops to 50%.
+    /// For example: 86400 = 1 day, 3600 = 1 hour.
+    pub half_life_seconds: u64,
+    /// Minimum weight floor (basis points). Submissions never drop below this.
+    /// 0 = no floor, 1000 = 10% minimum weight.
+    pub min_weight_bps: u32,
+    /// Maximum weight ceiling (basis points) for the newest submissions.
+    /// 10000 = no ceiling, newest always get full weight.
+    pub max_weight_bps: u32,
+}
+
 /// Emitted when stale oracle data is detected during submission or verification.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -509,4 +529,29 @@ pub struct StaleDataDetected {
     pub total_count: u32,
     pub oldest_age: u64,
     pub max_age: u64,
+}
+
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TemporalDecayConfigUpdated {
+    pub data_type: Symbol,
+    pub enabled: bool,
+    pub half_life_seconds: u64,
+    pub min_weight_bps: u32,
+    pub max_weight_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregatedDataWeighted {
+    pub data_type: Symbol,
+    pub key: Symbol,
+    pub median_value: i128,
+    /// Whether temporal decay weighting was applied.
+    pub temporal_decay_applied: bool,
+    /// Average age in seconds of submissions included in aggregation.
+    pub average_submission_age: u64,
+    /// Total decay factor applied (0-10000 basis points).
+    pub decay_factor_bps: u32,
 }
