@@ -58,6 +58,12 @@ pub struct Claim {
     pub partial_payout_bps: Option<u32>,
     /// Installment payout configuration for large claims.
     pub installments: Option<InstallmentSchedule>,
+    /// Whether the claimant's identity was verified (optional, for Sybil protection).
+    pub identity_verified: bool,
+    /// Type of identity verification performed (e.g., "kyc", "accreditation").
+    pub verification_type: Option<Symbol>,
+    /// Timestamp when identity verification occurred.
+    pub verification_time: Option<u64>,
     /// Timestamp at which payout becomes available (issue #432).
     /// `None` means payout is immediate or not applicable.
     pub payout_ready_at: Option<u64>,

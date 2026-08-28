@@ -127,6 +127,8 @@ enum StorageKey {
     /// Configurable delay in seconds between claim approval and payout (u64).
     /// 0 = immediate payout (default behavior).
     PayoutDelay,
+    /// Identity attestation requirement: product_id → Symbol (id_type required).
+    IdentityRequirement(u128),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -158,6 +160,8 @@ pub enum Error {
     ClaimDeadlinePassed  = 19,
     /// Payout delay has not yet elapsed — the claim cannot be settled now.
     PayoutDelayNotElapsed = 20,
+    /// Identity verification required for this claim category but not verified.
+    IdentityVerificationRequired = 21,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -1473,6 +1477,89 @@ impl ClaimsProcessor {
         }
 
         overdue
+    }
+
+    // ── Identity Verification ───────────────────────────────────────────────
+
+    /// Admin-only: mark a product/category as requiring identity verification.
+    /// Claimants must have verified identity (via oracle-verifier attestation)
+    /// to claim payouts for this product.
+    pub fn require_identity_for_category(
+        env: Env,
+        admin: Address,
+        product_id: u128,
+        id_type: Symbol,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        let key = StorageKey::IdentityRequirement(product_id);
+        env.storage().instance().set(&key, &id_type);
+
+        env.events().publish(
+            (Symbol::new(&env, "identity_requirement_set"),),
+            (product_id, id_type),
+        );
+    }
+
+    /// Admin-only: remove identity verification requirement for a product.
+    pub fn remove_identity_requirement(env: Env, admin: Address, product_id: u128) {
+        Self::require_admin(&env, &admin);
+
+        let key = StorageKey::IdentityRequirement(product_id);
+        env.storage().instance().remove(&key);
+
+        env.events().publish(
+            (Symbol::new(&env, "identity_requirement_removed"),),
+            product_id,
+        );
+    }
+
+    /// Admin-only: manually verify a claimant's identity for a claim.
+    /// Used when off-chain identity verification is completed or approved by DAO.
+    pub fn verify_claimant_identity(
+        env: Env,
+        admin: Address,
+        claim_id: u128,
+        id_type: Symbol,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        let mut claim: Claim = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+
+        let now = env.ledger().timestamp();
+        claim.identity_verified = true;
+        claim.verification_type = Some(id_type.clone());
+        claim.verification_time = Some(now);
+
+        let key = StorageKey::Claim(claim_id);
+        env.storage().persistent().set(&key, &claim);
+        Self::extend_claim_ttl(&env, &key);
+
+        env.events().publish(
+            (Symbol::new(&env, "identity_verified"),),
+            (claim_id, id_type, now),
+        );
+    }
+
+    /// Get the identity requirement for a product (if set).
+    pub fn get_identity_requirement(env: Env, product_id: u128) -> Option<Symbol> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::IdentityRequirement(product_id))
+    }
+
+    /// Check if a claimant's identity is verified for a particular ID type.
+    /// This is a utility for off-chain systems to verify attestation status.
+    pub fn is_identity_verified(env: Env, claim_id: u128) -> bool {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .map(|claim: Claim| claim.identity_verified)
+            .unwrap_or(false)
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────

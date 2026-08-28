@@ -1963,6 +1963,60 @@ impl OracleVerifier {
         (result, agg)
     }
 
+    /// Get weighted confidence score taking oracle reputation into account.
+    /// Confidence scores from higher-reputation oracles contribute more weight
+    /// to the final confidence value.
+    pub fn get_reputation_weighted_confidence(
+        env: Env,
+        data_type: Symbol,
+        key: Symbol,
+    ) -> u32 {
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoDataAvailable));
+        if points.is_empty() {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
+        let max_data_age = Self::effective_max_age(&env, &data_type);
+        let now = env.ledger().timestamp();
+        let min_confidence: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
+
+        let mut weighted_sum: u64 = 0;
+        let mut total_weight: u64 = 0;
+
+        for i in 0..points.len().min(100) {
+            let p = points.get_unchecked(i);
+            if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence {
+                let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+                if let Some(entry) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, OracleEntry>(&oracle_key)
+                {
+                    if entry.active {
+                        // Use effective weight which factors in oracle reputation
+                        let effective_weight = Self::get_effective_weight(env.clone(), p.oracle.clone(), data_type.clone());
+                        weighted_sum = weighted_sum.saturating_add((p.confidence as u64) * (effective_weight as u64));
+                        total_weight = total_weight.saturating_add(effective_weight as u64);
+                    }
+                }
+            }
+        }
+
+        if total_weight == 0 {
+            return 0;
+        }
+
+        ((weighted_sum / total_weight) as u32).min(1000)
+    }
+
     /// Return the most recent submission from any oracle for (data_type, key).
     /// Panics with NoDataAvailable if no submissions exist.
     pub fn get_data(env: Env, data_type: Symbol, key: Symbol) -> OracleDataPoint {
@@ -2637,7 +2691,9 @@ impl OracleVerifier {
                         if n >= 100 {
                             panic_with_error!(env, Error::TooManyOracles);
                         }
-                        values[n] = (p.value, entry.weight);
+                        // Use effective weight which factors in oracle reputation
+                        let effective_weight = Self::get_effective_weight(env.clone(), p.oracle.clone(), data_type.clone());
+                        values[n] = (p.value, effective_weight);
                         timestamps[n] = p.timestamp;
                         n += 1;
                         total_weight += entry.weight;
