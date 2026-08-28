@@ -752,3 +752,116 @@ fn test_set_data_type_max_age_requires_admin() {
     let impostor = Address::generate(&env);
     client.set_data_type_max_age(&impostor, &wt(), &600u64);
 }
+
+// ── outlier detection (issue #383) ──────────────────────────────────────────
+
+#[test]
+fn outlier_config_disabled_by_default() {
+    let (env, _admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let cfg = c.get_outlier_config(&wt());
+    assert!(!cfg.enabled);
+    assert_eq!(cfg.threshold_bps, DEFAULT_OUTLIER_THRESHOLD_BPS);
+    assert_eq!(cfg.min_sample_size, DEFAULT_OUTLIER_MIN_SAMPLE_SIZE);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #27)")]
+fn set_outlier_config_rejects_zero_threshold() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    c.set_outlier_config(&admin, &wt(), &true, &0u32, &4u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #27)")]
+fn set_outlier_config_rejects_tiny_sample_size() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    c.set_outlier_config(&admin, &wt(), &true, &50_000u32, &2u32);
+}
+
+/// Five oracles, four in tight agreement and one reporting a value 1000x
+/// larger. With outlier detection off, `Mean` (which has no built-in
+/// resistance to outliers the way `WeightedMedian` does) is dragged far
+/// above what every well-behaved oracle actually reported.
+#[test]
+fn mean_without_outlier_filtering_is_skewed_by_one_bad_oracle() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    c.set_aggregation_method(&admin, &wt(), &AggregationMethod::Mean);
+
+    let oracles: std::vec::Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
+    for o in oracles.iter() {
+        c.add_oracle(&admin, o, &wt(), &50u32);
+    }
+
+    env.ledger().set_timestamp(1);
+    let good = 100_0000000i128;
+    let bad = 100_000_0000000i128; // 1000x the honest value
+    for o in oracles.iter().take(4) {
+        c.submit_data(o, &wt(), &kk(), &good, &90u32, &1u64);
+    }
+    c.submit_data(&oracles[4], &wt(), &kk(), &bad, &90u32, &1u64);
+
+    let agg = c.get_aggregated(&wt(), &kk());
+    // (4*100 + 100_000) / 5 = 20_080 — nowhere near the honest value of 100.
+    assert!(agg.median_value > good * 100);
+}
+
+/// Same five submissions as above, but with outlier detection enabled for
+/// the data type. The lone extreme submission is dropped before
+/// aggregation, so `Mean` reflects only the four honest oracles.
+#[test]
+fn outlier_filtering_protects_mean_from_one_bad_oracle() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    c.set_aggregation_method(&admin, &wt(), &AggregationMethod::Mean);
+    c.set_outlier_config(&admin, &wt(), &true, &DEFAULT_OUTLIER_THRESHOLD_BPS, &DEFAULT_OUTLIER_MIN_SAMPLE_SIZE);
+
+    let oracles: std::vec::Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
+    for o in oracles.iter() {
+        c.add_oracle(&admin, o, &wt(), &50u32);
+    }
+
+    env.ledger().set_timestamp(1);
+    let good = 100_0000000i128;
+    let bad = 100_000_0000000i128;
+    for o in oracles.iter().take(4) {
+        c.submit_data(o, &wt(), &kk(), &good, &90u32, &1u64);
+    }
+    c.submit_data(&oracles[4], &wt(), &kk(), &bad, &90u32, &1u64);
+
+    let agg = c.get_aggregated(&wt(), &kk());
+    assert_eq!(agg.median_value, good);
+}
+
+/// Outlier detection never removes enough entries to drop below
+/// `min_sample_size` — with exactly four submissions and a `min_sample_size`
+/// of 4, the arrangement has no slack to trim, so even a wild outlier
+/// survives into the aggregate untouched.
+#[test]
+fn outlier_filtering_never_drops_below_min_sample_size() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    c.set_aggregation_method(&admin, &wt(), &AggregationMethod::Mean);
+    c.set_outlier_config(&admin, &wt(), &true, &DEFAULT_OUTLIER_THRESHOLD_BPS, &4u32);
+
+    let oracles: std::vec::Vec<Address> = (0..4).map(|_| Address::generate(&env)).collect();
+    for o in oracles.iter() {
+        c.add_oracle(&admin, o, &wt(), &50u32);
+    }
+
+    env.ledger().set_timestamp(1);
+    let good = 100_0000000i128;
+    let bad = 100_000_0000000i128;
+    for o in oracles.iter().take(3) {
+        c.submit_data(o, &wt(), &kk(), &good, &90u32, &1u64);
+    }
+    c.submit_data(&oracles[3], &wt(), &kk(), &bad, &90u32, &1u64);
+
+    let agg = c.get_aggregated(&wt(), &kk());
+    // All 4 submissions survive (below the slack needed to trim), so the
+    // outlier still drags the mean up.
+    assert!(agg.median_value > good * 100);
+}

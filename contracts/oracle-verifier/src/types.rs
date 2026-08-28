@@ -421,3 +421,33 @@ pub struct OracleEncryptedDataSubmitted {
 pub struct TimestampFutureBufferUpdated {
     pub seconds: u64,
 }
+
+/// Outlier-rejection settings applied before aggregation for a data type.
+///
+/// Filtering uses a MAD-based (median absolute deviation) modified
+/// z-score: robust to the same kind of extreme-minority manipulation the
+/// submissions themselves represent, unlike a mean/standard-deviation
+/// approach whose own spread is skewed by the very outlier it is trying to
+/// catch.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutlierConfig {
+    /// Off by default — an existing data type's aggregation does not
+    /// change until an admin opts it in.
+    pub enabled: bool,
+    /// Rejection threshold in basis points of the MAD: a submission is
+    /// flagged once `|value - median| * 10_000 > threshold_bps * MAD`.
+    pub threshold_bps: u32,
+    /// Filtering is skipped below this many eligible submissions, and never
+    /// removes enough points to leave fewer than this many behind.
+    pub min_sample_size: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutlierConfigUpdated {
+    pub data_type: Symbol,
+    pub enabled: bool,
+    pub threshold_bps: u32,
+    pub min_sample_size: u32,
+}

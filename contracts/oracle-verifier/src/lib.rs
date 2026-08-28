@@ -51,6 +51,20 @@ const MAX_ORACLES: u32 = 100;
 /// Maximum number of data points stored per (data_type, key).
 const MAX_DATA_POINTS: u32 = 100;
 
+/// Default outlier-rejection threshold, in basis points of the median
+/// absolute deviation (MAD): a submission is flagged once its distance from
+/// the median exceeds 5.0x the MAD. This approximates the standard
+/// Iglewicz-Hoaglin modified z-score cutoff of 3.5 (which is expressed in
+/// MAD-equivalent standard-deviation units via a 0.6745 consistency
+/// constant: 3.5 / 0.6745 ≈ 5.19, rounded down for a slightly more
+/// conservative default that keeps borderline genuine variation in).
+const DEFAULT_OUTLIER_THRESHOLD_BPS: u32 = 50_000;
+/// Outlier filtering is skipped below this many eligible submissions —
+/// with too few points neither the median nor the MAD used to judge
+/// deviation is a meaningful reference, so filtering would be as likely to
+/// discard a legitimate value as a bad one.
+const DEFAULT_OUTLIER_MIN_SAMPLE_SIZE: u32 = 4;
+
 /// Default minimum number of seconds a single oracle must wait between
 /// submissions for the same data_type, used when no admin override has been
 /// set via `set_min_submit_interval`. Chosen well below any realistic
@@ -138,6 +152,10 @@ enum StorageKey {
     /// Per-product consensus threshold configuration (ConsensusThreshold).
     /// Specifies different oracle agreement levels for different data types/products.
     ConsensusThreshold(Symbol),
+    /// Per-data-type outlier-detection configuration (OutlierConfig). Falls
+    /// back to disabled when unset, so an existing data type's aggregation
+    /// does not change until an admin opts it in.
+    OutlierConfig(Symbol),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -172,6 +190,8 @@ pub enum Error {
     InvalidMaxAge = 24,
     EncryptionRequiredForType = 25,
     TimestampOutOfRange = 26,
+    InvalidOutlierConfig = 27,
+    InvalidInput = 28,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -618,6 +638,50 @@ impl OracleVerifier {
     /// The aggregation method applied to a data type (default: weighted median).
     pub fn get_aggregation_method(env: Env, data_type: Symbol) -> AggregationMethod {
         Self::effective_aggregation_method(&env, &data_type)
+    }
+
+    /// Configure outlier rejection for a data type, applied before
+    /// aggregation regardless of `AggregationMethod` (issue #383).
+    ///
+    /// `WeightedMedian` already resists a minority of outliers by
+    /// construction, but `Mean`/`WeightedAverage`/`TimeWeightedAverage`
+    /// have no such protection, and even a median can still be dragged if
+    /// close to half the submissions for a key are bad. This runs as a
+    /// preprocessing step ahead of whichever method is configured.
+    ///
+    /// `threshold_bps` is basis points of the median absolute deviation
+    /// (MAD) — see [`OutlierConfig`]. `min_sample_size` must be at least 3;
+    /// below that, neither a median nor a MAD is a meaningful reference to
+    /// judge deviation against.
+    pub fn set_outlier_config(
+        env: Env,
+        admin: Address,
+        data_type: Symbol,
+        enabled: bool,
+        threshold_bps: u32,
+        min_sample_size: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+        if threshold_bps == 0 || min_sample_size < 3 {
+            panic_with_error!(&env, Error::InvalidOutlierConfig);
+        }
+
+        env.storage().instance().set(
+            &StorageKey::OutlierConfig(data_type.clone()),
+            &OutlierConfig { enabled, threshold_bps, min_sample_size },
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "outlier_config_updated"),),
+            OutlierConfigUpdated { data_type, enabled, threshold_bps, min_sample_size },
+        );
+    }
+
+    /// The outlier-rejection configuration applied to a data type. Disabled
+    /// with the compiled-in defaults until an admin calls
+    /// `set_outlier_config`.
+    pub fn get_outlier_config(env: Env, data_type: Symbol) -> OutlierConfig {
+        Self::effective_outlier_config(&env, &data_type)
     }
 
     /// Report whether the data for `(data_type, key)` is fresh enough to use,
@@ -1635,6 +1699,9 @@ impl OracleVerifier {
             }
         }
 
+        n = Self::filter_outliers(&env, &data_type, &mut values, &mut timestamps, n);
+        total_weight = values[0..n].iter().map(|&(_, wt)| wt).sum();
+
         let min_oracle_count: u32 = env
             .storage()
             .instance()
@@ -2165,6 +2232,120 @@ impl OracleVerifier {
             .unwrap_or(AggregationMethod::WeightedMedian)
     }
 
+    /// The outlier-rejection config for a data type, or disabled with the
+    /// compiled-in defaults if never configured.
+    fn effective_outlier_config(env: &Env, data_type: &Symbol) -> OutlierConfig {
+        env.storage()
+            .instance()
+            .get(&StorageKey::OutlierConfig(data_type.clone()))
+            .unwrap_or(OutlierConfig {
+                enabled: false,
+                threshold_bps: DEFAULT_OUTLIER_THRESHOLD_BPS,
+                min_sample_size: DEFAULT_OUTLIER_MIN_SAMPLE_SIZE,
+            })
+    }
+
+    /// Drop statistical outliers from a batch of collected oracle values
+    /// ahead of aggregation, using a MAD-based (median absolute deviation)
+    /// modified z-score (issue #383). `values`/`timestamps` are the same
+    /// parallel, stack-allocated buffers the aggregation methods consume;
+    /// only the first `n` entries of each are live.
+    ///
+    /// A no-op when outlier detection is disabled for `data_type` or below
+    /// `min_sample_size` live entries. Never drops enough points to leave
+    /// fewer than `min_sample_size` behind — the worst offenders are
+    /// removed first, so a data type in genuine turmoil still yields some
+    /// aggregate rather than an empty set.
+    ///
+    /// Returns the number of live entries remaining at the front of each
+    /// buffer; relative order among the survivors is otherwise preserved,
+    /// which does not matter since every aggregation method sorts (or sums
+    /// order-independently) afterward.
+    fn filter_outliers(
+        env: &Env,
+        data_type: &Symbol,
+        values: &mut [(i128, u32)],
+        timestamps: &mut [u64],
+        n: usize,
+    ) -> usize {
+        let config = Self::effective_outlier_config(env, data_type);
+        if !config.enabled || n < 3 || n < config.min_sample_size as usize {
+            return n;
+        }
+
+        let mut sorted_vals = [0i128; 100];
+        for i in 0..n {
+            sorted_vals[i] = values[i].0;
+        }
+        let sorted_vals = &mut sorted_vals[0..n];
+        sorted_vals.sort_unstable();
+        let median = if n % 2 == 1 {
+            sorted_vals[n / 2]
+        } else {
+            (sorted_vals[n / 2 - 1] + sorted_vals[n / 2]) / 2
+        };
+
+        let mut deviations = [0i128; 100];
+        for i in 0..n {
+            deviations[i] = (values[i].0 - median).abs();
+        }
+        let dev_slice = &mut deviations[0..n];
+        dev_slice.sort_unstable();
+        let mad = if n % 2 == 1 {
+            dev_slice[n / 2]
+        } else {
+            (dev_slice[n / 2 - 1] + dev_slice[n / 2]) / 2
+        };
+        // Deliberately no `mad == 0` short-circuit: a MAD of 0 means at
+        // least half the live submissions agree exactly, which is the
+        // clearest possible signal, not a reason to abstain. With
+        // threshold * mad == 0, any submission that differs from the
+        // median at all is flagged below — exactly right when the
+        // majority is unanimous and one value is clearly not.
+
+        let threshold = config.threshold_bps as i128;
+        let min_keep = (config.min_sample_size as usize).max(1);
+
+        // Rank live entries by deviation, worst first, so trimming toward
+        // `min_keep` always drops the most extreme values.
+        let mut order = [0usize; 100];
+        for i in 0..n {
+            order[i] = i;
+        }
+        let order_slice = &mut order[0..n];
+        order_slice.sort_unstable_by_key(|&i| core::cmp::Reverse((values[i].0 - median).abs()));
+
+        let mut is_outlier = [false; 100];
+        let mut flagged = 0usize;
+        for &i in order_slice.iter() {
+            if n - flagged <= min_keep {
+                break;
+            }
+            let deviation = (values[i].0 - median).abs();
+            if deviation.saturating_mul(10_000) > threshold.saturating_mul(mad) {
+                is_outlier[i] = true;
+                flagged += 1;
+            } else {
+                // Sorted by deviation descending — once one entry is inside
+                // the threshold, every entry after it is too.
+                break;
+            }
+        }
+        if flagged == 0 {
+            return n;
+        }
+
+        let mut write = 0usize;
+        for read in 0..n {
+            if !is_outlier[read] {
+                values[write] = values[read];
+                timestamps[write] = timestamps[read];
+                write += 1;
+            }
+        }
+        write
+    }
+
     /// The effective minimum oracle count for a data type: the per-type
     /// override when set, otherwise the global value (default 1).
     fn effective_min_oracle_count(env: &Env, data_type: &Symbol) -> u32 {
@@ -2226,6 +2407,9 @@ impl OracleVerifier {
                 }
             }
         }
+
+        n = Self::filter_outliers(env, data_type, &mut values, &mut timestamps, n);
+        total_weight = values[0..n].iter().map(|&(_, wt)| wt).sum();
 
         let min_oracle_count: u32 = env
             .storage()
