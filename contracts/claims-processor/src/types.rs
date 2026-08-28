@@ -58,6 +58,9 @@ pub struct Claim {
     pub partial_payout_bps: Option<u32>,
     /// Installment payout configuration for large claims.
     pub installments: Option<InstallmentSchedule>,
+    /// Timestamp at which payout becomes available (issue #432).
+    /// `None` means payout is immediate or not applicable.
+    pub payout_ready_at: Option<u64>,
 }
 
 /// Configuration for installment-based claim payouts.
@@ -289,5 +292,12 @@ pub struct InstallmentPaid {
     pub amount: i128,
     pub paid_count: u32,
     pub total_installments: u32,
+}
+
+/// Emitted when the payout delay configuration is updated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutDelayUpdated {
+    pub delay_seconds: u64,
 }
 

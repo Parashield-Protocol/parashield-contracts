@@ -63,6 +63,8 @@ pub fn setup() -> (
             majority_bps: 5_100u32,                 // 51%
             voting_period: VOTING_PERIOD,
             proposal_timelock: 0,
+            discussion_period: 0,
+            vote_weight_cap: 0,
         },
     );
 
@@ -97,6 +99,8 @@ fn cannot_initialize_twice() {
             majority_bps: 0,
             voting_period: 0,
             proposal_timelock: 0,
+            discussion_period: 0,
+            vote_weight_cap: 0,
         },
     );
 }
@@ -359,6 +363,8 @@ fn test_proposal_timelock_execution() {
             majority_bps: 5_100u32,
             voting_period: 604800,
             proposal_timelock: 604800,
+            discussion_period: 0,
+            vote_weight_cap: 0,
         },
     );
 

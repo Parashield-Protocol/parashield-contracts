@@ -138,8 +138,10 @@ enum StorageKey {
     /// Per-product consensus threshold configuration (ConsensusThreshold).
     /// Specifies different oracle agreement levels for different data types/products.
     ConsensusThreshold(Symbol),
-    /// Geographic weighting (data_type, oracle_address, region) -> geo_weight_bps (u32).
-    GeoWeight(Symbol, Address, Symbol),
+    /// Cross-validation rule between two data types — (source, target) → CrossValidationRule.
+    CrossValidationRule(Symbol, Symbol),
+    /// List of target data types that a source data type has cross-validation rules for.
+    CrossValidationTargets(Symbol),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -174,15 +176,15 @@ pub enum Error {
     InvalidMaxAge = 24,
     EncryptionRequiredForType = 25,
     TimestampOutOfRange = 26,
+    CrossValidationFailed = 27,
+    InvalidInput = 28,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
-#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contract]
 pub struct OracleVerifier;
 
-#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contractimpl]
 impl OracleVerifier {
     // ── Lifecycle ────────────────────────────────────────────────────────────
@@ -676,6 +678,100 @@ impl OracleVerifier {
         }
     }
 
+    /// Check for stale oracle data across all submissions for a key.
+    ///
+    /// Unlike `check_freshness` which counts individual fresh submissions,
+    /// this provides a holistic staleness report that includes the ratio
+    /// of fresh to stale data and the age range of submissions. Useful for
+    /// monitoring dashboards and automated alerts.
+    ///
+    /// Data is considered stale when its age exceeds the effective max_age
+    /// for the data type. If more than half the submissions are stale, the
+    /// entire data set is flagged as stale.
+    pub fn check_staleness(env: Env, data_type: Symbol, key: Symbol) -> StalenessReport {
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let max_age = Self::effective_max_age(&env, &data_type);
+        let now = env.ledger().timestamp();
+
+        let mut stale_count = 0u32;
+        let mut newest_age = u64::MAX;
+        let mut oldest_fresh_age = 0u64;
+        let total_count = points.len();
+
+        for i in 0..points.len() {
+            let p = points.get_unchecked(i);
+            let age = now.saturating_sub(p.timestamp);
+
+            if age < newest_age {
+                newest_age = age;
+            }
+
+            if age > max_age {
+                stale_count += 1;
+            } else {
+                if age > oldest_fresh_age {
+                    oldest_fresh_age = age;
+                }
+            }
+        }
+
+        // If no submissions, report as stale with max ages
+        if total_count == 0 {
+            return StalenessReport {
+                data_type,
+                key,
+                is_stale: true,
+                oldest_fresh_age: 0,
+                newest_age: u64::MAX,
+                stale_count: 0,
+                total_count: 0,
+                max_age,
+                freshness_ratio_bps: 0,
+            };
+        }
+
+        let fresh_count = total_count.saturating_sub(stale_count);
+        let freshness_ratio_bps = if total_count > 0 {
+            (fresh_count as u64 * 10_000 / total_count as u64) as u32
+        } else {
+            0
+        };
+
+        // Data is stale if more than half of submissions are stale
+        let is_stale = stale_count > total_count / 2;
+
+        if is_stale {
+            env.events().publish(
+                (Symbol::new(&env, "stale_data_detected"),),
+                StaleDataDetected {
+                    data_type: data_type.clone(),
+                    key: key.clone(),
+                    stale_count,
+                    total_count,
+                    oldest_age: now.saturating_sub(newest_age),
+                    max_age,
+                },
+            );
+        }
+
+        StalenessReport {
+            data_type,
+            key,
+            is_stale,
+            oldest_fresh_age,
+            newest_age,
+            stale_count,
+            total_count,
+            max_age,
+            freshness_ratio_bps,
+        }
+    }
+
     /// Set the minimum number of oracle submissions required to form a consensus value.
     /// `min_count` must be at least 1; the default is 1.
     pub fn set_min_oracle_count(env: Env, admin: Address, min_count: u32) {
@@ -783,6 +879,180 @@ impl OracleVerifier {
                 data_type,
                 agreement_threshold_bps: 5000, // Default to simple majority
             },
+        }
+    }
+
+    // ── Cross-Validation (issue #430) ────────────────────────────────────────
+
+    /// Add or update a cross-validation rule between two data types.
+    ///
+    /// When data is submitted for `source_type`, the aggregated values for
+    /// `source_type` and `target_type` on the same key must not differ by
+    /// more than `max_variance`. This catches inconsistent oracle data
+    /// across correlated feeds (e.g. rainfall vs. temperature).
+    pub fn set_cross_validation_rule(
+        env: Env,
+        admin: Address,
+        source_type: Symbol,
+        target_type: Symbol,
+        max_variance: i128,
+        description: Bytes,
+    ) {
+        Self::require_admin(&env, &admin);
+        if max_variance < 0 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        if source_type == target_type {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
+        let rule = CrossValidationRule {
+            source_type: source_type.clone(),
+            target_type: target_type.clone(),
+            max_variance,
+            description,
+        };
+        env.storage().instance().set(
+            &StorageKey::CrossValidationRule(source_type.clone(), target_type.clone()),
+            &rule,
+        );
+
+        // Track which targets this source has rules for
+        let mut targets: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::CrossValidationTargets(source_type.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut found = false;
+        for i in 0..targets.len() {
+            if targets.get_unchecked(i) == target_type {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            targets.push_back(target_type.clone());
+            env.storage().instance().set(
+                &StorageKey::CrossValidationTargets(source_type.clone()),
+                &targets,
+            );
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "cross_validation_rule_added"),),
+            CrossValidationRuleAdded {
+                source_type,
+                target_type,
+                max_variance,
+            },
+        );
+    }
+
+    /// Remove a cross-validation rule between two data types.
+    pub fn remove_cross_validation_rule(
+        env: Env,
+        admin: Address,
+        source_type: Symbol,
+        target_type: Symbol,
+    ) {
+        Self::require_admin(&env, &admin);
+        let key = StorageKey::CrossValidationRule(source_type.clone(), target_type.clone());
+        if !env.storage().instance().has(&key) {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        env.storage().instance().remove(&key);
+
+        // Remove from targets list
+        let mut targets: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::CrossValidationTargets(source_type.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut pruned: Vec<Symbol> = Vec::new(&env);
+        for i in 0..targets.len() {
+            if targets.get_unchecked(i) != target_type {
+                pruned.push_back(targets.get_unchecked(i));
+            }
+        }
+        env.storage().instance().set(
+            &StorageKey::CrossValidationTargets(source_type.clone()),
+            &pruned,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "cross_validation_rule_removed"),),
+            CrossValidationRuleRemoved {
+                source_type,
+                target_type,
+            },
+        );
+    }
+
+    /// Get the cross-validation rule between two data types, if one exists.
+    pub fn get_cross_validation_rule(
+        env: Env,
+        source_type: Symbol,
+        target_type: Symbol,
+    ) -> Option<CrossValidationRule> {
+        env.storage().instance().get(
+            &StorageKey::CrossValidationRule(source_type, target_type),
+        )
+    }
+
+    /// Get all cross-validation targets for a given source data type.
+    pub fn get_cross_validation_targets(env: Env, source_type: Symbol) -> Vec<Symbol> {
+        env.storage().instance().get(
+            &StorageKey::CrossValidationTargets(source_type),
+        ).unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Check cross-validation rules between a source data type and all its
+    /// configured targets for a given key. Returns Ok(()) if all rules pass,
+    /// or the first failing rule's details.
+    ///
+    /// Called internally after aggregation to detect inconsistent oracle data
+    /// across correlated feeds. Panics with `CrossValidationFailed` if any
+    /// rule is violated.
+    fn check_cross_validation(env: &Env, source_type: &Symbol, key: &Symbol) {
+        let targets: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::CrossValidationTargets(source_type.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+
+        if targets.is_empty() {
+            return;
+        }
+
+        // Get source aggregated value
+        let source_value = Self::get_median_value(env, source_type, key);
+
+        for i in 0..targets.len() {
+            let target_type = targets.get_unchecked(i);
+            let rule: CrossValidationRule = match env.storage().instance().get(
+                &StorageKey::CrossValidationRule(source_type.clone(), target_type.clone()),
+            ) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            // Try to get target aggregated value — skip if no data available
+            let target_points: Vec<OracleDataPoint> = match env.storage().persistent().get(
+                &StorageKey::DataPoints(target_type.clone(), key.clone()),
+            ) {
+                Some(pts) => pts,
+                None => continue,
+            };
+            if target_points.is_empty() {
+                continue;
+            }
+
+            let target_value = Self::get_median_value(env, &target_type, key);
+            let variance = source_value.saturating_sub(target_value).abs();
+
+            if variance > rule.max_variance {
+                panic_with_error!(env, Error::CrossValidationFailed);
+            }
         }
     }
 
@@ -1405,6 +1675,9 @@ impl OracleVerifier {
 
         env.storage().persistent().set(&dp_key, &pruned_points);
         env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        // Check cross-validation rules after storing new data
+        Self::check_cross_validation(&env, &data_type, &key);
 
         env.events().publish(
             (Symbol::new(&env, "oracle_data_submitted"),),

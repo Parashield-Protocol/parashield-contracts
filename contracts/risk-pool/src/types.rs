@@ -523,3 +523,65 @@ pub struct VotesDelegated {
     pub provider: Address,
     pub delegate: Address,
 }
+
+/// Collateralization ratio for an LP position.
+///
+/// Measures how well-backed an LP's position is by available liquidity
+/// relative to their share of locked capital. A ratio below 10000 (100%)
+/// means the position is undercollateralized and may be subject to
+/// liquidation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollateralizationInfo {
+    pub provider: Address,
+    /// LP's share of available pool liquidity (deposited - locked).
+    pub position_value: i128,
+    /// LP's proportional share of locked capital.
+    pub position_liability: i128,
+    /// Collateralization ratio in basis points (position_value / position_liability * 10000).
+    /// 10000 = 100% collateralized. 0 = no locked liability (fully collateralized).
+    pub collateralization_bps: u32,
+}
+
+/// Result of a liquidation attempt on an undercollateralized LP position.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidationResult {
+    pub provider: Address,
+    pub shares_seized: i128,
+    pub amount_recovered: i128,
+    pub previous_ratio_bps: u32,
+}
+
+/// An LP fee tier based on deposit amount and/or lock duration.
+/// LPs with larger deposits or longer commitment get lower fees.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeTier {
+    /// Minimum deposit amount for this tier (7-decimal stroops). 0 = no minimum.
+    pub min_deposit: i128,
+    /// Minimum lock duration in seconds for this tier. 0 = no lock required.
+    pub min_lock_duration: u64,
+    /// Fee discount in basis points (0-10000). 0 = no discount, 10000 = 100% off.
+    pub discount_bps: u32,
+    /// Human-readable tier name.
+    pub name: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeTierUpdated {
+    pub tier_name: Symbol,
+    pub min_deposit: i128,
+    pub min_lock_duration: u64,
+    pub discount_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PositionLiquidated {
+    pub provider: Address,
+    pub shares_seized: i128,
+    pub amount_recovered: i128,
+    pub collateralization_bps: u32,
+}

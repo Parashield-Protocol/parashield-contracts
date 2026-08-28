@@ -24,6 +24,8 @@ fn base_config(gov_token: Address) -> DaoConfig {
         majority_bps: 5_100u32,
         voting_period: VOTING_PERIOD,
         proposal_timelock: 0,
+        discussion_period: 0,
+        vote_weight_cap: 0,
     }
 }
 
