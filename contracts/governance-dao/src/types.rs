@@ -123,6 +123,10 @@ pub struct DaoConfig {
     /// Mandatory discussion period in seconds before voting opens.
     /// Set to 0 to disable (proposals go straight to Active).
     pub discussion_period: u64,
+    /// Maximum voting weight any single address may cast per proposal (7-decimal).
+    /// 0 = no cap (unlimited whale voting). Capping prevents a single large
+    /// holder from dominating governance outcomes.
+    pub vote_weight_cap: i128,
 }
 
 /// Settings controlling adaptive (decaying) quorum.
@@ -378,4 +382,11 @@ pub struct TemplateRegistered {
 pub struct ProposalCreatedFromTemplate {
     pub proposal_id: u64,
     pub template_name: Symbol,
+}
+
+/// Emitted when the vote weight cap is updated via DAO config.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoteWeightCapUpdated {
+    pub vote_weight_cap: i128,
 }

@@ -1,4 +1,4 @@
-﻿//! Parashield Governance DAO
+//! Parashield Governance DAO
 //!
 //! Token-weighted governance over protocol parameters:
 //!   - Add/remove insurance products
@@ -153,6 +153,7 @@ pub enum Error {
     DiscussionPeriodNotRequired = 39,
     /// `vote_batch` was called with an empty proposal list.
     NoProposals = 40,
+    InvalidInput = 41,
 }
 
 #[contract]
@@ -649,24 +650,31 @@ impl GovernanceDao {
             panic_with_error!(&env, Error::InsufficientWeight);
         }
 
+        // Apply vote weight cap to prevent whale dominance (issue #431).
+        let capped_own_weight = if config.vote_weight_cap > 0 {
+            core::cmp::min(own_weight, config.vote_weight_cap)
+        } else {
+            own_weight
+        };
+
         // 2. Lock tokens in the DAO contract to prevent token cycling / double-voting
         //
         // Only the voter's own tokens are locked. Delegated weight is counted,
         // never custodied — the DAO has no authority to move a delegator's
         // balance, and taking it would turn delegation into a custody decision.
-        gov_token.transfer(&voter, &env.current_contract_address(), &own_weight);
+        gov_token.transfer(&voter, &env.current_contract_address(), &capped_own_weight);
 
         // 3. Add any weight delegated to this voter, recording each delegator
         //    so they cannot also vote this proposal themselves.
         let delegated_weight = Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
-        let weight = own_weight.saturating_add(delegated_weight);
+        let weight = capped_own_weight.saturating_add(delegated_weight);
 
         // Save the tracked locked balance for later retrieval
         // Only the voter's own tokens were transferred in, so only that amount
         // is refundable — refunding `weight` would pay out delegated balances
         // the contract never held.
         let lock_key = StorageKey::LockedBalance(proposal_id, voter.clone());
-        env.storage().persistent().set(&lock_key, &own_weight);
+        env.storage().persistent().set(&lock_key, &capped_own_weight);
 
         match choice {
             VoteChoice::For => proposal.votes_for += weight,
@@ -763,7 +771,14 @@ impl GovernanceDao {
         if own_weight <= 0 {
             panic_with_error!(&env, Error::InsufficientWeight);
         }
-        gov_token.transfer(&voter, &env.current_contract_address(), &own_weight);
+
+        // Apply vote weight cap to prevent whale dominance (issue #431).
+        let capped_own_weight = if config.vote_weight_cap > 0 {
+            core::cmp::min(own_weight, config.vote_weight_cap)
+        } else {
+            own_weight
+        };
+        gov_token.transfer(&voter, &env.current_contract_address(), &capped_own_weight);
 
         for i in 0..proposal_ids.len() {
             let proposal_id = proposal_ids.get_unchecked(i);
@@ -771,7 +786,7 @@ impl GovernanceDao {
 
             let delegated_weight =
                 Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
-            let weight = own_weight.saturating_add(delegated_weight);
+            let weight = capped_own_weight.saturating_add(delegated_weight);
 
             match choice {
                 VoteChoice::For => proposal.votes_for += weight,
@@ -792,7 +807,7 @@ impl GovernanceDao {
             // The tokens were locked once for the whole batch. Attribute the
             // real lock to the first proposal only; `withdraw_tokens` treats the
             // rest as sharing that lock and no-ops for them.
-            let lock_amount = if i == 0 { own_weight } else { 0 };
+            let lock_amount = if i == 0 { capped_own_weight } else { 0 };
             env.storage()
                 .persistent()
                 .set(&StorageKey::LockedBalance(proposal_id, voter.clone()), &lock_amount);

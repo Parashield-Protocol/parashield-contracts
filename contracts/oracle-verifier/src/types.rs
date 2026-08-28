@@ -421,3 +421,45 @@ pub struct OracleEncryptedDataSubmitted {
 pub struct TimestampFutureBufferUpdated {
     pub seconds: u64,
 }
+
+/// A cross-validation rule between two oracle data types.
+///
+/// Ensures that submitted data for `source_type` is consistent with
+/// `target_type` within `max_variance`. For example, rainfall and
+/// temperature data from the same region should not diverge wildly.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossValidationRule {
+    pub source_type: Symbol,
+    pub target_type: Symbol,
+    /// Maximum allowed absolute variance between aggregated values (fixed-point).
+    pub max_variance: i128,
+    /// Description of the rule for auditability.
+    pub description: Bytes,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossValidationRuleAdded {
+    pub source_type: Symbol,
+    pub target_type: Symbol,
+    pub max_variance: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossValidationRuleRemoved {
+    pub source_type: Symbol,
+    pub target_type: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossValidationFailed {
+    pub source_type: Symbol,
+    pub source_value: i128,
+    pub target_type: Symbol,
+    pub target_value: i128,
+    pub variance: i128,
+    pub max_variance: i128,
+}
