@@ -33,6 +33,21 @@ pub enum ProposalStatus {
     Executed,
     /// Cancelled by admin before vote close
     Cancelled,
+    /// Passed but execution deadline expired without execution
+    Expired,
+}
+
+/// On-chain comment on a proposal for discussion and feedback.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalComment {
+    pub id: u128,
+    pub proposal_id: u64,
+    pub author: Address,
+    pub text: Bytes,
+    pub created_at: u64,
+    /// Optional: ID of the comment this replies to, for threaded discussion
+    pub reply_to: Option<u128>,
 }
 
 /// Vote direction cast by a token holder.
@@ -83,6 +98,9 @@ pub struct Proposal {
     pub vote_end: u64,
     /// Timelock expiration timestamp for execution.
     pub execution_time: u64,
+    /// Timestamp after which a passed proposal can no longer be executed.
+    /// Defaults to vote_end + finalize_delay + 7 days. Prevents stale proposals from executing.
+    pub execution_deadline: u64,
     /// Total supply captured at proposal creation time for quorum calculation.
     /// This prevents admin manipulation of total_supply during active votes.
     pub total_supply: i128,
@@ -466,4 +484,15 @@ pub struct ExecutionVerificationFailed {
     pub target: Address,
     pub callback: Symbol,
     pub error: Symbol,
+}
+
+/// Emitted when a comment is posted on a proposal for discussion.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalCommentAdded {
+    pub proposal_id: u64,
+    pub comment_id: u128,
+    pub author: Address,
+    pub reply_to: Option<u128>,
+    pub created_at: u64,
 }

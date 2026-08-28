@@ -110,6 +110,10 @@ enum StorageKey {
     RiskPool,
     /// On-chain audit trail record for executed proposal — proposal_id -> ExecutionAuditRecord.
     ExecutionAudit(u64),
+    /// Proposal comment by ID — comment_id -> ProposalComment.
+    ProposalComment(u128),
+    /// Next comment ID counter for a proposal — proposal_id -> u128.
+    NextCommentId(u64),
 }
 
 
@@ -157,6 +161,8 @@ pub enum Error {
     /// `vote_batch` was called with an empty proposal list.
     NoProposals = 40,
     InvalidInput = 41,
+    /// Proposal passed but execution deadline has expired without execution.
+    ExecutionDeadlineExpired = 42,
 }
 
 #[contract]
@@ -303,6 +309,7 @@ impl GovernanceDao {
             created_at: now,
             vote_end,
             execution_time: 0,
+            execution_deadline: vote_end.saturating_add(config.finalize_delay).saturating_add(7 * 24 * 3600),
             total_supply: config.total_supply,
             kind: ProposalKind::Standard,
             impact_analysis,
@@ -406,6 +413,7 @@ impl GovernanceDao {
             created_at: now,
             vote_end,
             execution_time: 0,
+            execution_deadline: vote_end.saturating_add(config.finalize_delay).saturating_add(7 * 24 * 3600),
             total_supply: config.total_supply,
             kind: ProposalKind::Upgrade,
             impact_analysis,
@@ -1091,6 +1099,14 @@ impl GovernanceDao {
         if env.ledger().timestamp() < proposal.execution_time {
             panic_with_error!(&env, Error::TimelockNotExpired);
         }
+        // Check execution deadline: if passed, prevent execution to keep proposals fresh
+        if env.ledger().timestamp() > proposal.execution_deadline {
+            proposal.status = ProposalStatus::Expired;
+            env.storage()
+                .persistent()
+                .set(&StorageKey::Proposal(proposal_id), &proposal);
+            panic_with_error!(&env, Error::ExecutionDeadlineExpired);
+        }
 
         // Validate target address is a valid Stellar address before execution
         // This is a defense-in-depth check to prevent targeting invalid contracts
@@ -1140,6 +1156,113 @@ impl GovernanceDao {
             .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound))
     }
 
+    // ── On-Chain Discussion ──────────────────────────────────────────────────
+
+    /// Post a comment on a proposal during the Discussion or Active phase.
+    /// Comments are stored on-chain for transparent discussion.
+    /// `reply_to` is optional and allows threading of comments.
+    pub fn add_comment(
+        env: Env,
+        commenter: Address,
+        proposal_id: u64,
+        text: Bytes,
+        reply_to: Option<u128>,
+    ) -> u128 {
+        commenter.require_auth();
+
+        // Validate text length (max 1024 bytes)
+        if text.is_empty() || text.len() > 1024 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
+        // Verify proposal exists
+        let proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        // Only allow comments during Discussion or Active phases
+        if proposal.status != ProposalStatus::Discussion && proposal.status != ProposalStatus::Active {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
+        // If reply_to is specified, verify that comment exists
+        if let Some(reply_id) = reply_to {
+            if !env
+                .storage()
+                .persistent()
+                .has(&StorageKey::ProposalComment(reply_id))
+            {
+                panic_with_error!(&env, Error::ProposalNotFound);
+            }
+        }
+
+        // Generate comment ID
+        let comment_id: u128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::NextCommentId(proposal_id))
+            .unwrap_or(1u128);
+
+        let now = env.ledger().timestamp();
+        let comment = ProposalComment {
+            id: comment_id,
+            proposal_id,
+            author: commenter.clone(),
+            text,
+            created_at: now,
+            reply_to,
+        };
+
+        let comment_key = StorageKey::ProposalComment(comment_id);
+        env.storage().persistent().set(&comment_key, &comment);
+        env.storage()
+            .persistent()
+            .extend_ttl(&comment_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::NextCommentId(proposal_id), &(comment_id.saturating_add(1)));
+
+        env.events().publish(
+            (Symbol::new(&env, "comment_added"),),
+            ProposalCommentAdded {
+                proposal_id,
+                comment_id,
+                author: commenter,
+                reply_to,
+                created_at: now,
+            },
+        );
+
+        comment_id
+    }
+
+    /// Retrieve a comment by its ID.
+    pub fn get_comment(env: Env, comment_id: u128) -> ProposalComment {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::ProposalComment(comment_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound))
+    }
+
+    /// Admin-only: delete a comment (for moderation of spam/abuse).
+    pub fn delete_comment(env: Env, admin: Address, comment_id: u128) {
+        Self::require_admin(&env, &admin);
+
+        let comment_key = StorageKey::ProposalComment(comment_id);
+        if !env.storage().persistent().has(&comment_key) {
+            panic_with_error!(&env, Error::ProposalNotFound);
+        }
+
+        env.storage().persistent().remove(&comment_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "comment_deleted"),),
+            comment_id,
+        );
+    }
 
     /// Admin-only: cancel an Active proposal before voting closes.
     ///
