@@ -473,7 +473,98 @@ impl RiskPool {
         amount
     }
 
+    /// Transfer `shares` from `from` address to `to` address.
+    /// Returns the proportional USDC deposit amount transferred.
+    pub fn transfer_position(env: Env, from: Address, to: Address, shares: i128) -> i128 {
+        from.require_auth();
+        if shares <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
+        if from == to { panic_with_error!(&env, Error::InvalidAddress); }
+        Self::assert_active(&env);
+
+        let from_key = StorageKey::LpPosition(from.clone());
+        let mut from_pos: LpPosition = env.storage().persistent()
+            .get(&from_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
+
+        if from_pos.shares < shares {
+            panic_with_error!(&env, Error::InsufficientShares);
+        }
+
+        let amount = shares.checked_mul(from_pos.deposited)
+            .and_then(|v| v.checked_div(from_pos.shares))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+
+        let pending_yield_from = Self::settle_yield(&env, &mut from_pos);
+        from_pos.deposited = from_pos.deposited.saturating_sub(amount);
+        from_pos.shares -= shares;
+        let acc_per_share: i128 = env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0);
+        from_pos.yield_debt = (acc_per_share * from_pos.shares) / 1_000_000_000_000;
+        env.storage().persistent().set(&from_key, &from_pos);
+        Self::extend_to_max(&env, &from_key);
+
+        Self::update_lp_nft(&env, &from, &from_pos);
+        Self::pay_out_yield(&env, &from, pending_yield_from);
+
+        let now = env.ledger().timestamp();
+        let to_key = StorageKey::LpPosition(to.clone());
+        let mut is_new_lp = false;
+        let mut to_pos: LpPosition = match env.storage().persistent().get::<_, LpPosition>(&to_key) {
+            Some(mut pos) => {
+                let pending_yield_to = Self::settle_yield(&env, &mut pos);
+                pos.deposited += amount;
+                pos.shares += shares;
+                pos.yield_debt = (acc_per_share * pos.shares) / 1_000_000_000_000;
+                env.storage().persistent().set(&to_key, &pos);
+                Self::extend_to_max(&env, &to_key);
+                Self::pay_out_yield(&env, &to, pending_yield_to);
+                pos
+            }
+            None => {
+                is_new_lp = true;
+                let count: u32 = env.storage().instance()
+                    .get(&StorageKey::LpCount).unwrap_or(0);
+                let lp_address_key = StorageKey::LpAddress(count);
+                env.storage().persistent().set(&lp_address_key, &to);
+                Self::extend_to_max(&env, &lp_address_key);
+                env.storage().instance().set(&StorageKey::LpCount, &(count + 1));
+                let pos = LpPosition {
+                    provider: to.clone(),
+                    deposited: amount,
+                    shares,
+                    yield_claimed: 0,
+                    yield_debt: (acc_per_share * shares) / 1_000_000_000_000,
+                    deposited_at: now,
+                    last_yield_claim: now,
+                    compound_enabled: false,
+                };
+                env.storage().persistent().set(&to_key, &pos);
+                Self::extend_to_max(&env, &to_key);
+                pos
+            }
+        };
+
+        let category: Symbol = env.storage().instance().get(&StorageKey::Category).unwrap();
+        if is_new_lp {
+            Self::mint_lp_nft(&env, &to, &category, now, &to_pos);
+        } else {
+            Self::update_lp_nft(&env, &to, &to_pos);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "lp_position_transferred"),),
+            LpPositionTransferred {
+                from,
+                to,
+                shares,
+                amount,
+            },
+        );
+
+        amount
+    }
+
     // ── Premium and yield ─────────────────────────────────────────────────────
+
 
     /// Pull `amount` USDC from `caller` and split it among LPs, treasury, and backstop
     /// according to the protocol fee schedule. No-op if `amount` is zero or negative.

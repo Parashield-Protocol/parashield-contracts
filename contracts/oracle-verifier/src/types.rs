@@ -248,6 +248,15 @@ pub struct MinOracleCountUpdated {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeoWeightUpdated {
+    pub oracle: Address,
+    pub data_type: Symbol,
+    pub region: Symbol,
+    pub geo_weight_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DataTypeMinOracleCountUpdated {
     pub data_type: Symbol,
     pub min_count: u32,

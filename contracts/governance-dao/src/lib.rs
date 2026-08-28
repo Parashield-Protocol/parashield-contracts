@@ -108,7 +108,10 @@ enum StorageKey {
     TemplateList,
     /// Risk pool contract address for querying LP vote delegation.
     RiskPool,
+    /// On-chain audit trail record for executed proposal — proposal_id -> ExecutionAuditRecord.
+    ExecutionAudit(u64),
 }
+
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -1099,11 +1102,40 @@ impl GovernanceDao {
             .persistent()
             .set(&StorageKey::Proposal(proposal_id), &proposal);
 
+        let executed_at = env.ledger().timestamp();
+        let audit = ExecutionAuditRecord {
+            proposal_id,
+            executor: proposal.proposer.clone(),
+            target: proposal.target.clone(),
+            function: proposal.function.clone(),
+            executed_at,
+            votes_for: proposal.votes_for,
+            votes_against: proposal.votes_against,
+        };
+        let audit_key = StorageKey::ExecutionAudit(proposal_id);
+        env.storage().persistent().set(&audit_key, &audit);
+        env.storage().persistent().extend_ttl(&audit_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
         env.events().publish(
             (Symbol::new(&env, "proposal_executed"),),
-            ProposalExecuted { proposal_id },
+            ProposalExecuted {
+                proposal_id,
+                executor: proposal.proposer,
+                target: proposal.target,
+                function: proposal.function,
+                executed_at,
+            },
         );
     }
+
+    /// Return the execution audit trail record for an executed proposal.
+    pub fn get_execution_audit(env: Env, proposal_id: u64) -> ExecutionAuditRecord {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::ExecutionAudit(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound))
+    }
+
 
     /// Admin-only: cancel an Active proposal before voting closes.
     ///

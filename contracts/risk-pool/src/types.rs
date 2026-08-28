@@ -420,6 +420,15 @@ pub struct CompoundYieldToggled {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LpPositionTransferred {
+    pub from:   Address,
+    pub to:     Address,
+    pub shares: i128,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolCapacityUpdated {
     pub max_total_deposited: i128,
     pub max_utilization_bps: u32,

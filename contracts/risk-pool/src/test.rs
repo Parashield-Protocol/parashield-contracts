@@ -1107,3 +1107,73 @@ fn direct_withdraw_still_works_when_no_delay_is_set() {
 
     assert_eq!(amount, 10_000_0000000i128);
 }
+
+// ── position transfer (Issue #425) ──────────────────────────────────────────────
+
+#[test]
+fn test_transfer_position_full() {
+    let (env, pool, _usdc, _admin, _t, lp1) = setup();
+    let lp2 = Address::generate(&env);
+
+    let amount = 1000_0000000i128;
+    let shares = pool.deposit(&lp1, &amount, &0i128, &false);
+
+    let transferred_amount = pool.transfer_position(&lp1, &lp2, &shares);
+    assert_eq!(transferred_amount, amount);
+
+    let pos1 = pool.get_position(&lp1).unwrap();
+    assert_eq!(pos1.shares, 0);
+    assert_eq!(pos1.deposited, 0);
+
+    let pos2 = pool.get_position(&lp2).unwrap();
+    assert_eq!(pos2.shares, shares);
+    assert_eq!(pos2.deposited, amount);
+}
+
+#[test]
+fn test_transfer_position_partial() {
+    let (env, pool, _usdc, _admin, _t, lp1) = setup();
+    let lp2 = Address::generate(&env);
+
+    let amount = 1000_0000000i128;
+    let shares = pool.deposit(&lp1, &amount, &0i128, &false);
+
+    let half_shares = shares / 2;
+    let transferred_amount = pool.transfer_position(&lp1, &lp2, &half_shares);
+    assert_eq!(transferred_amount, amount / 2);
+
+    let pos1 = pool.get_position(&lp1).unwrap();
+    assert_eq!(pos1.shares, shares - half_shares);
+    assert_eq!(pos1.deposited, amount - transferred_amount);
+
+    let pos2 = pool.get_position(&lp2).unwrap();
+    assert_eq!(pos2.shares, half_shares);
+    assert_eq!(pos2.deposited, transferred_amount);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_transfer_position_self_fails() {
+    let (_env, pool, _usdc, _admin, _t, lp1) = setup();
+    let shares = pool.deposit(&lp1, &1000_0000000i128, &0i128, &false);
+    pool.transfer_position(&lp1, &lp1, &shares);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_transfer_position_zero_shares_fails() {
+    let (env, pool, _usdc, _admin, _t, lp1) = setup();
+    let lp2 = Address::generate(&env);
+    pool.deposit(&lp1, &1000_0000000i128, &0i128, &false);
+    pool.transfer_position(&lp1, &lp2, &0i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_transfer_position_insufficient_shares_fails() {
+    let (env, pool, _usdc, _admin, _t, lp1) = setup();
+    let lp2 = Address::generate(&env);
+    let shares = pool.deposit(&lp1, &1000_0000000i128, &0i128, &false);
+    pool.transfer_position(&lp1, &lp2, &(shares + 1));
+}
+
