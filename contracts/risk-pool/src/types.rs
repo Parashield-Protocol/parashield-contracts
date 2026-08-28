@@ -514,3 +514,69 @@ pub struct VotesDelegated {
     pub provider: Address,
     pub delegate: Address,
 }
+
+/// An external reinsurance arrangement that backstops this pool against
+/// catastrophic (large single-claim) losses.
+///
+/// The pool retains every loss up to `attachment_point` itself; only the
+/// portion of a claim above that point is eligible for recovery from
+/// `reinsurer`, capped over the arrangement's lifetime by `coverage_limit`.
+/// This is a per-claim ("excess of loss") layer, not aggregate stop-loss —
+/// each claim is evaluated against `attachment_point` independently.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReinsuranceConfig {
+    /// Contract this pool cedes premium to and recovers claims from.
+    pub reinsurer: Address,
+    /// Per-claim loss threshold below which the pool bears the loss alone.
+    pub attachment_point: i128,
+    /// Cumulative lifetime cap on reinsurance recoveries this pool can draw.
+    pub coverage_limit: i128,
+    /// Whether recovery requests are currently honored. Config (and prior
+    /// usage) is preserved when set to `false` — this pauses the
+    /// arrangement without discarding it.
+    pub active: bool,
+}
+
+/// Running totals for the pool's reinsurance arrangement.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReinsuranceStats {
+    /// Total premium ceded to the reinsurer so far.
+    pub total_premium_paid: i128,
+    /// Total claims recovered from the reinsurer so far.
+    pub total_recovered: i128,
+    /// `coverage_limit - total_recovered`, floored at 0.
+    pub coverage_remaining: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReinsuranceConfigured {
+    pub reinsurer: Address,
+    pub attachment_point: i128,
+    pub coverage_limit: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReinsuranceActiveSet {
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReinsurancePremiumPaid {
+    pub reinsurer: Address,
+    pub amount: i128,
+    pub total_premium_paid: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReinsuranceRecovered {
+    pub policy_id: u128,
+    pub loss_amount: i128,
+    pub recovered_amount: i128,
+    pub coverage_remaining: i128,
+}

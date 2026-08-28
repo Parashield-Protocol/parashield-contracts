@@ -23,6 +23,19 @@ use soroban_sdk::{
 pub mod types;
 pub use types::*;
 
+/// Cross-contract interface for an external reinsurer this pool cedes
+/// catastrophic risk to. The reinsurer is any contract implementing this
+/// single entry point — how it sources the payout (its own reserves,
+/// retrocession, etc.) is entirely its own concern.
+#[soroban_sdk::contractclient(name = "ReinsurerClient")]
+trait IReinsurer {
+    /// Pay out up to `amount` of the pool's USDC to `caller` (the ceding
+    /// pool), attributed to `policy_id`. Returns the amount actually paid,
+    /// which may be less than requested if the reinsurer's own capacity is
+    /// exhausted.
+    fn recover(env: Env, caller: Address, policy_id: u128, amount: i128) -> i128;
+}
+
 /// Default premium split, in effect until the admin calls `update_premium_split`.
 const DEFAULT_PREMIUM_LP_BPS:       i128 = 8_000;  // 80% of premium to LP pool
 const DEFAULT_PREMIUM_TREAS_BPS:    i128 = 1_000;  // 10% to treasury
@@ -137,6 +150,12 @@ enum StorageKey {
     /// Dynamic fee adjustment configuration (DynamicFeeConfig).
     /// Allows pool fees to automatically adjust based on market conditions and utilization.
     DynamicFeeConfig,
+    /// Reinsurance arrangement backstopping this pool (`ReinsuranceConfig`).
+    Reinsurance,
+    /// Cumulative premium ceded to the reinsurer so far (i128).
+    ReinsurancePremiumPaid,
+    /// Cumulative claims recovered from the reinsurer so far (i128).
+    ReinsuranceRecovered,
 }
 
 #[contracterror]
@@ -178,6 +197,9 @@ pub enum Error {
     ExitAlreadyQueued         = 33,
     NoExitRequest             = 34,
     ExitDelayNotElapsed       = 35,
+    ReinsuranceNotConfigured  = 36,
+    InvalidReinsuranceConfig  = 37,
+    InvalidParameter          = 38,
 }
 
 #[contract]
@@ -1014,6 +1036,180 @@ impl RiskPool {
         env.storage().instance().set(&StorageKey::TotalLocked, &(total_locked.saturating_sub(lock.amount)));
     }
 
+    // ── Reinsurance ──────────────────────────────────────────────────────────
+
+    /// Configure (or replace) the pool's reinsurance arrangement.
+    ///
+    /// `attachment_point` and `coverage_limit` are per-claim and lifetime
+    /// caps respectively — see [`ReinsuranceConfig`]. Replacing an existing
+    /// arrangement does not reset `ReinsuranceStats`: prior premium paid and
+    /// claims recovered still count against the new `coverage_limit`, since
+    /// a re-negotiated arrangement with the same or a new reinsurer is a
+    /// continuation, not a fresh start.
+    pub fn set_reinsurance(
+        env: Env,
+        admin: Address,
+        reinsurer: Address,
+        attachment_point: i128,
+        coverage_limit: i128,
+    ) {
+        Self::require_admin(&env, &admin);
+        if attachment_point < 0 || coverage_limit < 0 {
+            panic_with_error!(&env, Error::InvalidReinsuranceConfig);
+        }
+        let config = ReinsuranceConfig {
+            reinsurer: reinsurer.clone(),
+            attachment_point,
+            coverage_limit,
+            active: true,
+        };
+        env.storage().instance().set(&StorageKey::Reinsurance, &config);
+        env.events().publish(
+            (Symbol::new(&env, "reinsurance_configured"),),
+            ReinsuranceConfigured { reinsurer, attachment_point, coverage_limit },
+        );
+    }
+
+    /// Pause or resume the reinsurance arrangement without discarding its
+    /// configuration or accumulated stats. While inactive,
+    /// `request_reinsurance_recovery` always returns 0.
+    pub fn set_reinsurance_active(env: Env, admin: Address, active: bool) {
+        Self::require_admin(&env, &admin);
+        let mut config: ReinsuranceConfig = env.storage().instance()
+            .get(&StorageKey::Reinsurance)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ReinsuranceNotConfigured));
+        config.active = active;
+        env.storage().instance().set(&StorageKey::Reinsurance, &config);
+        env.events().publish(
+            (Symbol::new(&env, "reinsurance_active_set"),),
+            ReinsuranceActiveSet { active },
+        );
+    }
+
+    /// Cede `amount` of USDC from the pool's own balance to the reinsurer as
+    /// reinsurance premium. Mirrors `send_premium_to_treasury`/
+    /// `send_premium_to_backstop` — called by the admin (typically from an
+    /// off-chain job) after premium income has accrued in the pool.
+    pub fn send_premium_to_reinsurer(env: Env, caller: Address, amount: i128) {
+        Self::require_admin(&env, &caller);
+        if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
+        let config: ReinsuranceConfig = env.storage().instance()
+            .get(&StorageKey::Reinsurance)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ReinsuranceNotConfigured));
+
+        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+        token::Client::new(&env, &usdc)
+            .transfer(&env.current_contract_address(), &config.reinsurer, &amount);
+
+        let paid: i128 = env.storage().instance()
+            .get(&StorageKey::ReinsurancePremiumPaid).unwrap_or(0);
+        let total_premium_paid = paid.saturating_add(amount);
+        env.storage().instance().set(&StorageKey::ReinsurancePremiumPaid, &total_premium_paid);
+
+        env.events().publish(
+            (Symbol::new(&env, "reinsurance_premium_paid"),),
+            ReinsurancePremiumPaid { reinsurer: config.reinsurer, amount, total_premium_paid },
+        );
+    }
+
+    /// Request recovery of a catastrophic claim loss from the reinsurer.
+    ///
+    /// Callable only by the admin, policy engine, or claims processor (the
+    /// same gate as `release_for_claim`), so it slots directly into the
+    /// existing claim-settlement flow. `loss_amount` is the size of the
+    /// claim payout being recovered against; only the portion above
+    /// `attachment_point` is eligible, and the total ever recovered is
+    /// capped at `coverage_limit`.
+    ///
+    /// This never panics on "no coverage available" — an unconfigured,
+    /// inactive, or exhausted arrangement simply recovers nothing (returns
+    /// 0), so a claim payout is never blocked by the state of a reinsurance
+    /// side-arrangement. Returns the amount actually recovered, which is
+    /// credited to `total_deposited` (replenishing pool capital) and may be
+    /// less than the eligible excess if the reinsurer's own capacity is
+    /// exhausted.
+    pub fn request_reinsurance_recovery(
+        env: Env,
+        caller: Address,
+        policy_id: u128,
+        loss_amount: i128,
+    ) -> i128 {
+        Self::require_protocol_caller(&env, &caller);
+        if loss_amount <= 0 { return 0; }
+
+        let config: ReinsuranceConfig = match env.storage().instance().get(&StorageKey::Reinsurance) {
+            Some(c) => c,
+            None => return 0,
+        };
+        if !config.active || loss_amount <= config.attachment_point {
+            return 0;
+        }
+
+        let excess = loss_amount - config.attachment_point;
+        let already_recovered: i128 = env.storage().instance()
+            .get(&StorageKey::ReinsuranceRecovered).unwrap_or(0);
+        let coverage_remaining = config.coverage_limit.saturating_sub(already_recovered).max(0);
+        if coverage_remaining <= 0 { return 0; }
+
+        let requested = excess.min(coverage_remaining);
+
+        let recovered = ReinsurerClient::new(&env, &config.reinsurer)
+            .recover(&env.current_contract_address(), &policy_id, &requested)
+            // The reinsurer's own report is trusted for *what* it paid, but
+            // never for *how much* — clamp to what was actually requested so
+            // a misbehaving or buggy reinsurer cannot inflate this pool's
+            // coverage accounting past what it asked for.
+            .clamp(0, requested);
+
+        if recovered > 0 {
+            let total_deposited: i128 = env.storage().instance()
+                .get(&StorageKey::TotalDeposited).unwrap_or(0);
+            env.storage().instance().set(
+                &StorageKey::TotalDeposited,
+                &total_deposited.checked_add(recovered).unwrap_or_else(|| panic_with_error!(&env, Error::Overflow)),
+            );
+
+            let total_recovered = already_recovered.saturating_add(recovered);
+            env.storage().instance().set(&StorageKey::ReinsuranceRecovered, &total_recovered);
+
+            env.events().publish(
+                (Symbol::new(&env, "reinsurance_recovered"),),
+                ReinsuranceRecovered {
+                    policy_id,
+                    loss_amount,
+                    recovered_amount: recovered,
+                    coverage_remaining: config.coverage_limit.saturating_sub(total_recovered).max(0),
+                },
+            );
+        }
+
+        recovered
+    }
+
+    /// Returns the pool's reinsurance configuration, or `None` if never set.
+    pub fn get_reinsurance(env: Env) -> Option<ReinsuranceConfig> {
+        env.storage().instance().get(&StorageKey::Reinsurance)
+    }
+
+    /// Returns cumulative reinsurance premium paid, claims recovered, and
+    /// remaining coverage. Coverage remaining is 0 (not an error) when no
+    /// arrangement has ever been configured.
+    pub fn get_reinsurance_stats(env: Env) -> ReinsuranceStats {
+        let total_premium_paid: i128 = env.storage().instance()
+            .get(&StorageKey::ReinsurancePremiumPaid).unwrap_or(0);
+        let total_recovered: i128 = env.storage().instance()
+            .get(&StorageKey::ReinsuranceRecovered).unwrap_or(0);
+        let coverage_limit = env.storage().instance()
+            .get::<_, ReinsuranceConfig>(&StorageKey::Reinsurance)
+            .map(|c| c.coverage_limit)
+            .unwrap_or(0);
+        ReinsuranceStats {
+            total_premium_paid,
+            total_recovered,
+            coverage_remaining: coverage_limit.saturating_sub(total_recovered).max(0),
+        }
+    }
+
     // ── Queries ───────────────────────────────────────────────────────────────
 
     /// Return aggregate pool statistics: total deposited, locked, shares, and premium accumulators.
@@ -1153,12 +1349,12 @@ impl RiskPool {
     /// Calculate the current dynamic fee based on pool utilization.
     /// Returns adjusted fee in basis points within the configured min/max bounds.
     pub fn calculate_dynamic_fee(env: Env) -> u32 {
-        let config = Self::get_dynamic_fee_config(&env);
+        let config = Self::get_dynamic_fee_config(env.clone());
         if !config.enabled {
             return config.base_fee_bps;
         }
 
-        let status = Self::get_capacity_status(&env);
+        let status = Self::get_capacity_status(env);
         let util_bps = status.utilization_bps;
 
         // If below threshold, use base fee
@@ -2104,3 +2300,5 @@ mod test;
 mod test_advanced;
 #[cfg(test)]
 mod test_edge;
+#[cfg(test)]
+mod test_reinsurance;
