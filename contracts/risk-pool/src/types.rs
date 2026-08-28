@@ -568,6 +568,38 @@ pub struct FeeTier {
     pub name: Symbol,
 }
 
+/// Optional vesting schedule for LP deposits to prevent large LPs from exiting immediately.
+/// Vesting ensures LPs gradually unlock their shares over time, reducing exit risk.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestingSchedule {
+    /// Total number of vesting periods.
+    pub total_periods: u32,
+    /// Duration of each vesting period in seconds.
+    pub period_duration: u64,
+    /// Shares that vest per period (can be 0 for cliff vesting).
+    pub amount_per_period: i128,
+    /// Cliff period (shares locked until this many periods have passed).
+    /// 0 = no cliff, vesting starts immediately.
+    pub cliff_periods: u32,
+    /// Absolute timestamp when vesting started.
+    pub vesting_start: u64,
+    /// Shares already vested and available for withdrawal.
+    pub vested_amount: i128,
+    /// Total shares subject to this vesting schedule.
+    pub total_amount: i128,
+}
+
+/// LP position with optional vesting constraint.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestedLpPosition {
+    pub provider: Address,
+    pub position: LpPosition,
+    /// Optional vesting schedule. If present, constrains withdrawals.
+    pub vesting: Option<VestingSchedule>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeTierUpdated {
@@ -584,4 +616,33 @@ pub struct PositionLiquidated {
     pub shares_seized: i128,
     pub amount_recovered: i128,
     pub collateralization_bps: u32,
+}
+
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestingScheduleCreated {
+    pub provider: Address,
+    pub total_periods: u32,
+    pub period_duration: u64,
+    pub cliff_periods: u32,
+    pub vesting_start: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestingSharesReleased {
+    pub provider: Address,
+    pub newly_vested_amount: i128,
+    pub total_vested: i128,
+    pub vesting_period: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawalBlockedByVesting {
+    pub provider: Address,
+    pub requested_shares: i128,
+    pub available_shares: i128,
+    pub vesting_period: u32,
 }

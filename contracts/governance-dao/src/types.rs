@@ -91,6 +91,13 @@ pub struct Proposal {
     /// Mandatory impact analysis describing potential consequences of this proposal.
     /// Max 4096 bytes to provide comprehensive risk assessment.
     pub impact_analysis: Bytes,
+    /// Optional verification callback function on the target contract to confirm
+    /// execution produced the intended state change. Called as `target::verify_proposal_execution(proposal_id)`.
+    /// If specified and fails, execution is marked as failed with audit trail.
+    /// Signature: fn verify_proposal_execution(env: Env, proposal_id: u64) -> Result<bool, Symbol>
+    pub verification_callback: Option<Symbol>,
+    /// Whether execution has been verified (callback succeeded or not required).
+    pub execution_verified: bool,
 }
 
 /// A single vote record stored per (proposal_id, voter) key.
@@ -431,4 +438,24 @@ pub struct DelegationRecorded {
     pub delegate: Address,
     pub action: Symbol,
     pub recorded_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionVerified {
+    pub proposal_id: u64,
+    pub executor: Address,
+    pub target: Address,
+    pub verification_callback: Symbol,
+    pub verified_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionVerificationFailed {
+    pub proposal_id: u64,
+    pub executor: Address,
+    pub target: Address,
+    pub callback: Symbol,
+    pub error: Symbol,
 }
