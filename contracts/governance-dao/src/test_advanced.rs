@@ -25,6 +25,7 @@ fn base_config(gov_token: Address) -> DaoConfig {
         voting_period: VOTING_PERIOD,
         proposal_timelock: 0,
         discussion_period: 0,
+        vote_weight_cap: 0,
     }
 }
 

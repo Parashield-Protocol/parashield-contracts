@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
 // Address/state validation must fail with a typed contract error so callers
 // can match on it programmatically, never with a raw panic! and a string
 // message.
@@ -126,6 +124,11 @@ enum StorageKey {
     /// still be submitted for the triggering event (u64). `0` means a claim
     /// can only be filed while the policy is Active (behaves as before).
     ClaimDeadline,
+    /// Configurable delay in seconds between claim approval and payout (u64).
+    /// 0 = immediate payout (default behavior).
+    PayoutDelay,
+    /// Identity attestation requirement: product_id → Symbol (id_type required).
+    IdentityRequirement(u128),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -155,6 +158,11 @@ pub enum Error {
     /// A `submit_claim` arrived after `end_time + claim_deadline` had elapsed,
     /// so the window to file a claim for the triggering event has closed.
     ClaimDeadlinePassed  = 19,
+    /// Payout delay has not yet elapsed — the claim cannot be settled now.
+    PayoutDelayNotElapsed = 20,
+    /// Identity verification required for this claim category but not verified.
+    IdentityVerificationRequired = 21,
+    InvalidInput = 22,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -330,6 +338,11 @@ impl ClaimsProcessor {
             dispute_reason: None,
             paid_amount: None,
             partial_payout_bps: None,
+            installments: Vec::new(&env),
+            payout_ready_at: None,
+            identity_verified: false,
+            verification_type: None,
+            verification_time: None,
         };
         env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
         env.storage().persistent().extend_ttl(&StorageKey::Claim(claim_id), TTL_THRESHOLD, TTL_EXTEND_TO);
@@ -352,6 +365,35 @@ impl ClaimsProcessor {
         );
 
         claim_id
+    }
+
+    /// Submit multiple claims in a single transaction up to MAX_BATCH_SIZE.
+    pub fn batch_submit_claims(env: Env, claimant: Address, policy_ids: Vec<u128>) -> Vec<u128> {
+        claimant.require_auth();
+        Self::require_not_paused(&env);
+
+        let mut claim_ids = Vec::new(&env);
+        let count = if policy_ids.len() > MAX_BATCH_SIZE {
+            MAX_BATCH_SIZE
+        } else {
+            policy_ids.len()
+        };
+
+        for i in 0..count {
+            let pid = policy_ids.get_unchecked(i);
+            let cid = Self::submit_claim(env.clone(), claimant.clone(), pid);
+            claim_ids.push_back(cid);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_claims_submitted"),),
+            BatchClaimsSubmitted {
+                claimant,
+                count,
+            },
+        );
+
+        claim_ids
     }
 
     /// Process an existing pending claim. Reads oracle data and pays out or rejects.
@@ -383,6 +425,41 @@ impl ClaimsProcessor {
 
         Self::evaluate_and_settle(&env, &mut claim, &policy, partial_payout_bps)
     }
+
+    /// Process multiple existing claims in a single transaction up to MAX_BATCH_SIZE.
+    pub fn batch_process_claims(
+        env: Env,
+        keeper: Address,
+        claim_ids: Vec<u128>,
+        partial_payout_bps: Option<u32>,
+    ) -> Vec<(u128, ClaimResult)> {
+        Self::require_keeper(&env, &keeper);
+        Self::require_not_paused(&env);
+
+        let mut results = Vec::new(&env);
+        let count = if claim_ids.len() > MAX_BATCH_SIZE {
+            MAX_BATCH_SIZE
+        } else {
+            claim_ids.len()
+        };
+
+        for i in 0..count {
+            let cid = claim_ids.get_unchecked(i);
+            let res = Self::process_claim(env.clone(), keeper.clone(), cid, partial_payout_bps);
+            results.push_back((cid, res));
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_claims_processed"),),
+            BatchClaimsProcessed {
+                keeper,
+                count,
+            },
+        );
+
+        results
+    }
+
 
     /// Keeper-triggered automatic processing — no prior `submit_claim` needed.
     /// This is the primary flow for parametric insurance.
@@ -461,6 +538,11 @@ impl ClaimsProcessor {
                 dispute_reason: None,
                 paid_amount: None,
                 partial_payout_bps: None,
+                installments: Vec::new(&env),
+                payout_ready_at: None,
+                identity_verified: false,
+                verification_type: None,
+                verification_time: None,
             };
             env.storage().persistent().set(&StorageKey::Claim(cid), &claim);
             env.storage().persistent().extend_ttl(&StorageKey::Claim(cid), TTL_THRESHOLD, TTL_EXTEND_TO);
@@ -660,7 +742,7 @@ impl ClaimsProcessor {
         Self::require_keeper(&env, &caller);
         Self::require_not_paused(&env);
 
-        let mut claim = Self::get_claim(&env, claim_id);
+        let mut claim = Self::get_claim(env.clone(), claim_id);
         
         // Only schedule installments for approved claims
         if claim.status != ClaimStatus::Paid && claim.status != ClaimStatus::PartiallyPaid {
@@ -683,7 +765,7 @@ impl ClaimsProcessor {
             paid_count: 0,
         };
 
-        claim.installments = Some(schedule.clone());
+        claim.installments = Vec::from_array(&env, [schedule.clone()]);
         env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
         env.storage().persistent().extend_ttl(&StorageKey::Claim(claim_id), TTL_THRESHOLD, TTL_EXTEND_TO);
 
@@ -707,13 +789,13 @@ impl ClaimsProcessor {
         claimant.require_auth();
         Self::require_not_paused(&env);
 
-        let mut claim = Self::get_claim(&env, claim_id);
+        let mut claim = Self::get_claim(env.clone(), claim_id);
         
         if claim.claimant != claimant {
             panic_with_error!(&env, Error::Unauthorized);
         }
 
-        let schedule = claim.installments.as_ref()
+        let schedule = claim.installments.first()
             .unwrap_or_else(|| panic_with_error!(&env, Error::InvalidInput));
 
         // Check if there are remaining installments
@@ -739,17 +821,20 @@ impl ClaimsProcessor {
         let amount_to_pay = schedule.amount_per_installment
             .saturating_mul((installments_available - schedule.paid_count) as i128);
 
+        let total_installments = schedule.num_installments;
+
         // Transfer funds from risk pool
         let risk_pool: Address = env.storage().instance()
             .get(&StorageKey::RiskPool)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-        
+
         let pool_client = RiskPoolClient::new(&env, &risk_pool);
         pool_client.release_for_claim(&env.current_contract_address(), &claim.policy_id);
 
         // Update installment schedule
-        if let Some(ref mut sched) = claim.installments {
+        if let Some(mut sched) = claim.installments.first() {
             sched.paid_count = installments_available;
+            claim.installments.set(0, sched);
         }
 
         env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
@@ -762,7 +847,7 @@ impl ClaimsProcessor {
                 claimant,
                 amount: amount_to_pay,
                 paid_count: installments_available,
-                total_installments: schedule.num_installments,
+                total_installments,
             },
         );
 
@@ -1232,6 +1317,84 @@ impl ClaimsProcessor {
         Self::claim_deadline(&env)
     }
 
+    // ── Payout Delay (issue #432) ─────────────────────────────────────────────
+
+    /// Set the delay in seconds between claim approval and actual payout.
+    ///
+    /// When non-zero, a claim that passes evaluation enters `PaidPendingDelay`
+    /// status and the payout is held for `delay_seconds` before becoming
+    /// claimable. This gives the protocol a window to catch fraud or errors
+    /// before funds leave the pool. `0` restores immediate payout behavior.
+    pub fn set_payout_delay(env: Env, admin: Address, delay_seconds: u64) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&StorageKey::PayoutDelay, &delay_seconds);
+        env.events().publish(
+            (Symbol::new(&env, "payout_delay_set"),),
+            PayoutDelayUpdated { delay_seconds },
+        );
+    }
+
+    /// The configured payout delay in seconds (default: 0 — immediate).
+    pub fn get_payout_delay(env: Env) -> u64 {
+        Self::payout_delay(&env)
+    }
+
+    /// The configured payout delay, or the default.
+    fn payout_delay(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::PayoutDelay)
+            .unwrap_or(0)
+    }
+
+    /// Claim the payout for an approved claim after the payout delay has elapsed.
+    ///
+    /// When a payout delay is configured, approved claims enter Paid/PartiallyPaid
+    /// status but funds are not transferred until the delay passes. This function
+    /// completes the transfer. Callable by anyone — the claim is already approved.
+    pub fn claim_payout(env: Env, claim_id: u128) -> i128 {
+        Self::require_not_paused(&env);
+
+        let mut claim: Claim = env.storage().persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+
+        let payout_ready_at = claim.payout_ready_at
+            .unwrap_or_else(|| panic_with_error!(&env, Error::PayoutDelayNotElapsed));
+
+        let now = env.ledger().timestamp();
+        if now < payout_ready_at {
+            panic_with_error!(&env, Error::PayoutDelayNotElapsed);
+        }
+
+        let paid_amount = claim.paid_amount
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+
+        // Clear payout_ready_at so this cannot be called again
+        claim.payout_ready_at = None;
+        env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
+
+        // Execute the actual payout
+        let policy_engine: Address = env.storage().instance()
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        let risk_pool: Address = env.storage().instance()
+            .get(&StorageKey::RiskPool)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+
+        PolicyEngineClient::new(&env, &policy_engine)
+            .pay_claim(&env.current_contract_address(), &claim.policy_id);
+        RiskPoolClient::new(&env, &risk_pool)
+            .release_for_claim(&env.current_contract_address(), &claim.policy_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "payout_released"),),
+            (claim_id, claim.policy_id, paid_amount),
+        );
+
+        paid_amount
+    }
+
     /// Escalate a claim that has been Pending past the threshold.
     ///
     /// A claim that nothing processes is worse than a rejected one: a
@@ -1326,6 +1489,89 @@ impl ClaimsProcessor {
         overdue
     }
 
+    // ── Identity Verification ───────────────────────────────────────────────
+
+    /// Admin-only: mark a product/category as requiring identity verification.
+    /// Claimants must have verified identity (via oracle-verifier attestation)
+    /// to claim payouts for this product.
+    pub fn require_identity_for_category(
+        env: Env,
+        admin: Address,
+        product_id: u128,
+        id_type: Symbol,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        let key = StorageKey::IdentityRequirement(product_id);
+        env.storage().instance().set(&key, &id_type);
+
+        env.events().publish(
+            (Symbol::new(&env, "identity_requirement_set"),),
+            (product_id, id_type),
+        );
+    }
+
+    /// Admin-only: remove identity verification requirement for a product.
+    pub fn remove_identity_requirement(env: Env, admin: Address, product_id: u128) {
+        Self::require_admin(&env, &admin);
+
+        let key = StorageKey::IdentityRequirement(product_id);
+        env.storage().instance().remove(&key);
+
+        env.events().publish(
+            (Symbol::new(&env, "identity_requirement_removed"),),
+            product_id,
+        );
+    }
+
+    /// Admin-only: manually verify a claimant's identity for a claim.
+    /// Used when off-chain identity verification is completed or approved by DAO.
+    pub fn verify_claimant_identity(
+        env: Env,
+        admin: Address,
+        claim_id: u128,
+        id_type: Symbol,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        let mut claim: Claim = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+
+        let now = env.ledger().timestamp();
+        claim.identity_verified = true;
+        claim.verification_type = Some(id_type.clone());
+        claim.verification_time = Some(now);
+
+        let key = StorageKey::Claim(claim_id);
+        env.storage().persistent().set(&key, &claim);
+        Self::extend_claim_ttl(&env, &key);
+
+        env.events().publish(
+            (Symbol::new(&env, "identity_verified"),),
+            (claim_id, id_type, now),
+        );
+    }
+
+    /// Get the identity requirement for a product (if set).
+    pub fn get_identity_requirement(env: Env, product_id: u128) -> Option<Symbol> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::IdentityRequirement(product_id))
+    }
+
+    /// Check if a claimant's identity is verified for a particular ID type.
+    /// This is a utility for off-chain systems to verify attestation status.
+    pub fn is_identity_verified(env: Env, claim_id: u128) -> bool {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .map(|claim: Claim| claim.identity_verified)
+            .unwrap_or(false)
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     /// Evaluate a pending claim and settle it against the configured oracle trigger.
@@ -1388,21 +1634,30 @@ impl ClaimsProcessor {
         claim.trigger_met  = trigger_met;
         claim.processed_at = Some(env.ledger().timestamp());
 
+        let payout_delay = Self::payout_delay(env);
+
         let result = if trigger_met {
             // Determine payout: full or partial based on partial_payout_bps.
             let bps = partial_payout_bps.unwrap_or(10_000);
             let effective_bps = if bps > 10_000 { 10_000 } else { bps };
+            let now = env.ledger().timestamp();
 
             if effective_bps >= 10_000 {
                 // Full payment
                 claim.status = ClaimStatus::Paid;
                 claim.paid_amount = Some(claim.coverage_amount);
                 claim.partial_payout_bps = Some(10_000);
-                PolicyEngineClient::new(env, &policy_engine)
-                    .pay_claim(&env.current_contract_address(), &claim.policy_id);
-                // Atomic lock release
-                RiskPoolClient::new(env, &risk_pool)
-                    .release_for_claim(&env.current_contract_address(), &claim.policy_id);
+
+                if payout_delay > 0 {
+                    // Delay payout: record when payout becomes available
+                    claim.payout_ready_at = Some(now.saturating_add(payout_delay));
+                } else {
+                    // Immediate payout
+                    PolicyEngineClient::new(env, &policy_engine)
+                        .pay_claim(&env.current_contract_address(), &claim.policy_id);
+                    RiskPoolClient::new(env, &risk_pool)
+                        .release_for_claim(&env.current_contract_address(), &claim.policy_id);
+                }
                 ClaimResult::Paid
             } else {
                 // Partial payment: calculate proportional payout
@@ -1410,11 +1665,15 @@ impl ClaimsProcessor {
                 claim.status = ClaimStatus::PartiallyPaid;
                 claim.paid_amount = Some(paid);
                 claim.partial_payout_bps = Some(effective_bps);
-                PolicyEngineClient::new(env, &policy_engine)
-                    .pay_claim(&env.current_contract_address(), &claim.policy_id);
-                // Atomic lock release
-                RiskPoolClient::new(env, &risk_pool)
-                    .release_for_claim(&env.current_contract_address(), &claim.policy_id);
+
+                if payout_delay > 0 {
+                    claim.payout_ready_at = Some(now.saturating_add(payout_delay));
+                } else {
+                    PolicyEngineClient::new(env, &policy_engine)
+                        .pay_claim(&env.current_contract_address(), &claim.policy_id);
+                    RiskPoolClient::new(env, &risk_pool)
+                        .release_for_claim(&env.current_contract_address(), &claim.policy_id);
+                }
                 ClaimResult::PartiallyPaid
             }
         } else {

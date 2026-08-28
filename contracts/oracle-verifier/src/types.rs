@@ -141,6 +141,12 @@ pub struct AggregatedData {
     pub confidence: u32,
     pub min_confidence: u32,
     pub last_updated: u64,
+    /// Lower bound of the 95% confidence interval (in 7-decimal fixed point).
+    /// Helps users assess result reliability. Calculated from value spread and oracle count.
+    pub confidence_interval_lower: i128,
+    /// Upper bound of the 95% confidence interval (in 7-decimal fixed point).
+    /// Helps users assess result reliability. Calculated from value spread and oracle count.
+    pub confidence_interval_upper: i128,
 }
 
 /// Registered oracle record.
@@ -244,6 +250,15 @@ pub struct FreshnessReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MinOracleCountUpdated {
     pub min_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeoWeightUpdated {
+    pub oracle: Address,
+    pub data_type: Symbol,
+    pub region: Symbol,
+    pub geo_weight_bps: u32,
 }
 
 #[contracttype]
@@ -443,6 +458,22 @@ pub struct OutlierConfig {
     pub min_sample_size: u32,
 }
 
+/// A cross-validation rule between two oracle data types.
+///
+/// Ensures that submitted data for `source_type` is consistent with
+/// `target_type` within `max_variance`. For example, rainfall and
+/// temperature data from the same region should not diverge wildly.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossValidationRule {
+    pub source_type: Symbol,
+    pub target_type: Symbol,
+    /// Maximum allowed absolute variance between aggregated values (fixed-point).
+    pub max_variance: i128,
+    /// Description of the rule for auditability.
+    pub description: Bytes,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutlierConfigUpdated {
@@ -450,4 +481,113 @@ pub struct OutlierConfigUpdated {
     pub enabled: bool,
     pub threshold_bps: u32,
     pub min_sample_size: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossValidationRuleAdded {
+    pub source_type: Symbol,
+    pub target_type: Symbol,
+    pub max_variance: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossValidationRuleRemoved {
+    pub source_type: Symbol,
+    pub target_type: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossValidationFailed {
+    pub source_type: Symbol,
+    pub source_value: i128,
+    pub target_type: Symbol,
+    pub target_value: i128,
+    pub variance: i128,
+    pub max_variance: i128,
+}
+
+/// Staleness report for oracle data across all submissions for a key.
+///
+/// Unlike `FreshnessReport` which checks individual submissions, this
+/// aggregates staleness across the entire data set to give a holistic
+/// view of whether the data is safe to use for decision-making.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StalenessReport {
+    pub data_type: Symbol,
+    pub key: Symbol,
+    /// Whether the data is considered stale overall.
+    pub is_stale: bool,
+    /// Age in seconds of the oldest fresh submission.
+    pub oldest_fresh_age: u64,
+    /// Age in seconds of the newest submission.
+    pub newest_age: u64,
+    /// Number of submissions that are stale (older than max_age).
+    pub stale_count: u32,
+    /// Total submissions for this key.
+    pub total_count: u32,
+    /// The max age threshold used (per-type or global).
+    pub max_age: u64,
+    /// Percentage of submissions that are fresh (0-10000 basis points).
+    pub freshness_ratio_bps: u32,
+}
+
+/// Temporal decay configuration for oracle submissions.
+/// Applies exponential decay to older submissions, giving more weight to recent data.
+/// Prevents stale oracles from permanently distorting aggregation as data ages.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TemporalDecayConfig {
+    pub data_type: Symbol,
+    /// Whether temporal decay weighting is enabled for this data type.
+    pub enabled: bool,
+    /// Half-life in seconds: age at which submission weight drops to 50%.
+    /// For example: 86400 = 1 day, 3600 = 1 hour.
+    pub half_life_seconds: u64,
+    /// Minimum weight floor (basis points). Submissions never drop below this.
+    /// 0 = no floor, 1000 = 10% minimum weight.
+    pub min_weight_bps: u32,
+    /// Maximum weight ceiling (basis points) for the newest submissions.
+    /// 10000 = no ceiling, newest always get full weight.
+    pub max_weight_bps: u32,
+}
+
+/// Emitted when stale oracle data is detected during submission or verification.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StaleDataDetected {
+    pub data_type: Symbol,
+    pub key: Symbol,
+    pub stale_count: u32,
+    pub total_count: u32,
+    pub oldest_age: u64,
+    pub max_age: u64,
+}
+
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TemporalDecayConfigUpdated {
+    pub data_type: Symbol,
+    pub enabled: bool,
+    pub half_life_seconds: u64,
+    pub min_weight_bps: u32,
+    pub max_weight_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregatedDataWeighted {
+    pub data_type: Symbol,
+    pub key: Symbol,
+    pub median_value: i128,
+    /// Whether temporal decay weighting was applied.
+    pub temporal_decay_applied: bool,
+    /// Average age in seconds of submissions included in aggregation.
+    pub average_submission_age: u64,
+    /// Total decay factor applied (0-10000 basis points).
+    pub decay_factor_bps: u32,
 }

@@ -64,6 +64,7 @@ pub fn setup() -> (
             voting_period: VOTING_PERIOD,
             proposal_timelock: 0,
             discussion_period: 0,
+            vote_weight_cap: 0,
         },
     );
 
@@ -99,6 +100,7 @@ fn cannot_initialize_twice() {
             voting_period: 0,
             proposal_timelock: 0,
             discussion_period: 0,
+            vote_weight_cap: 0,
         },
     );
 }
@@ -374,6 +376,7 @@ fn test_proposal_timelock_execution() {
             voting_period: 604800,
             proposal_timelock: 604800,
             discussion_period: 0,
+            vote_weight_cap: 0,
         },
     );
 
@@ -1324,3 +1327,51 @@ fn deactivated_template_cannot_be_used() {
     );
     assert!(result.is_err());
 }
+
+// ── Governance Execution Audit Trail (Issue #428) ─────────────────────────────
+
+#[test]
+fn test_get_execution_audit_records_data() {
+    let (env, dao, _, voter1, voter2, target) = setup();
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Execute and audit me"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+
+    dao.finalize(&pid);
+    dao.execute(&pid);
+
+    let audit = dao.get_execution_audit(&pid);
+    assert_eq!(audit.proposal_id, pid);
+    assert_eq!(audit.target, target);
+    assert_eq!(audit.function, Symbol::new(&env, "update"));
+    assert_eq!(audit.executed_at, env.ledger().timestamp());
+    assert!(audit.votes_for > 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_get_execution_audit_unexecuted_panics() {
+    let (env, dao, _, voter1, _, target) = setup();
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Unexecuted"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+    dao.get_execution_audit(&pid);
+}
+

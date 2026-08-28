@@ -1,4 +1,4 @@
-﻿//! Parashield Governance DAO
+//! Parashield Governance DAO
 //!
 //! Token-weighted governance over protocol parameters:
 //!   - Add/remove insurance products
@@ -108,7 +108,14 @@ enum StorageKey {
     TemplateList,
     /// Risk pool contract address for querying LP vote delegation.
     RiskPool,
+    /// On-chain audit trail record for executed proposal — proposal_id -> ExecutionAuditRecord.
+    ExecutionAudit(u64),
+    /// Proposal comment by ID — comment_id -> ProposalComment.
+    ProposalComment(u128),
+    /// Next comment ID counter for a proposal — proposal_id -> u128.
+    NextCommentId(u64),
 }
+
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -154,6 +161,10 @@ pub enum Error {
     /// `vote_batch` was called with an empty proposal list.
     NoProposals = 40,
     InvalidInput = 41,
+    /// Proposal passed but execution deadline has expired without execution.
+    ExecutionDeadlineExpired = 42,
+    /// Proposal has been vetoed by a guardian and can never be executed.
+    ProposalVetoed = 43,
 }
 
 #[contract]
@@ -300,9 +311,13 @@ impl GovernanceDao {
             created_at: now,
             vote_end,
             execution_time: 0,
+            execution_deadline: vote_end.saturating_add(FINALIZE_DELAY).saturating_add(7 * 24 * 3600),
             total_supply: config.total_supply,
             kind: ProposalKind::Standard,
             impact_analysis,
+            verification_callback: None,
+            execution_verified: true,
+            is_vetoed: false,
         };
 
         let proposal_key = StorageKey::Proposal(proposal_id);
@@ -403,9 +418,13 @@ impl GovernanceDao {
             created_at: now,
             vote_end,
             execution_time: 0,
+            execution_deadline: vote_end.saturating_add(FINALIZE_DELAY).saturating_add(7 * 24 * 3600),
             total_supply: config.total_supply,
             kind: ProposalKind::Upgrade,
             impact_analysis,
+            verification_callback: None,
+            execution_verified: true,
+            is_vetoed: false,
         };
 
         let proposal_key = StorageKey::Proposal(proposal_id);
@@ -512,9 +531,20 @@ impl GovernanceDao {
         env.events().publish(
             (Symbol::new(&env, "power_delegated"),),
             VotingPowerDelegated {
+                delegator: delegator.clone(),
+                delegate: delegate.clone(),
+                weight,
+            },
+        );
+
+        // Track delegation creation for off-chain indexing
+        env.events().publish(
+            (Symbol::new(&env, "delegation_recorded"),),
+            DelegationRecorded {
                 delegator,
                 delegate,
-                weight,
+                action: Symbol::new(&env, "created"),
+                recorded_at: env.ledger().timestamp(),
             },
         );
     }
@@ -542,8 +572,19 @@ impl GovernanceDao {
         env.events().publish(
             (Symbol::new(&env, "delegation_revoked"),),
             DelegationRevoked {
+                delegator: delegator.clone(),
+                delegate: delegate.clone(),
+            },
+        );
+
+        // Track delegation revocation for off-chain indexing
+        env.events().publish(
+            (Symbol::new(&env, "delegation_recorded"),),
+            DelegationRecorded {
                 delegator,
                 delegate,
+                action: Symbol::new(&env, "revoked"),
+                recorded_at: env.ledger().timestamp(),
             },
         );
     }
@@ -650,24 +691,31 @@ impl GovernanceDao {
             panic_with_error!(&env, Error::InsufficientWeight);
         }
 
+        // Apply vote weight cap to prevent whale dominance (issue #431).
+        let capped_own_weight = if config.vote_weight_cap > 0 {
+            core::cmp::min(own_weight, config.vote_weight_cap)
+        } else {
+            own_weight
+        };
+
         // 2. Lock tokens in the DAO contract to prevent token cycling / double-voting
         //
         // Only the voter's own tokens are locked. Delegated weight is counted,
         // never custodied — the DAO has no authority to move a delegator's
         // balance, and taking it would turn delegation into a custody decision.
-        gov_token.transfer(&voter, &env.current_contract_address(), &own_weight);
+        gov_token.transfer(&voter, &env.current_contract_address(), &capped_own_weight);
 
         // 3. Add any weight delegated to this voter, recording each delegator
         //    so they cannot also vote this proposal themselves.
         let delegated_weight = Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
-        let weight = own_weight.saturating_add(delegated_weight);
+        let weight = capped_own_weight.saturating_add(delegated_weight);
 
         // Save the tracked locked balance for later retrieval
         // Only the voter's own tokens were transferred in, so only that amount
         // is refundable — refunding `weight` would pay out delegated balances
         // the contract never held.
         let lock_key = StorageKey::LockedBalance(proposal_id, voter.clone());
-        env.storage().persistent().set(&lock_key, &own_weight);
+        env.storage().persistent().set(&lock_key, &capped_own_weight);
 
         match choice {
             VoteChoice::For => proposal.votes_for += weight,
@@ -764,7 +812,14 @@ impl GovernanceDao {
         if own_weight <= 0 {
             panic_with_error!(&env, Error::InsufficientWeight);
         }
-        gov_token.transfer(&voter, &env.current_contract_address(), &own_weight);
+
+        // Apply vote weight cap to prevent whale dominance (issue #431).
+        let capped_own_weight = if config.vote_weight_cap > 0 {
+            core::cmp::min(own_weight, config.vote_weight_cap)
+        } else {
+            own_weight
+        };
+        gov_token.transfer(&voter, &env.current_contract_address(), &capped_own_weight);
 
         for i in 0..proposal_ids.len() {
             let proposal_id = proposal_ids.get_unchecked(i);
@@ -772,7 +827,7 @@ impl GovernanceDao {
 
             let delegated_weight =
                 Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
-            let weight = own_weight.saturating_add(delegated_weight);
+            let weight = capped_own_weight.saturating_add(delegated_weight);
 
             match choice {
                 VoteChoice::For => proposal.votes_for += weight,
@@ -793,7 +848,7 @@ impl GovernanceDao {
             // The tokens were locked once for the whole batch. Attribute the
             // real lock to the first proposal only; `withdraw_tokens` treats the
             // rest as sharing that lock and no-ops for them.
-            let lock_amount = if i == 0 { own_weight } else { 0 };
+            let lock_amount = if i == 0 { capped_own_weight } else { 0 };
             env.storage()
                 .persistent()
                 .set(&StorageKey::LockedBalance(proposal_id, voter.clone()), &lock_amount);
@@ -1059,8 +1114,20 @@ impl GovernanceDao {
         if proposal.status != ProposalStatus::Passed {
             panic_with_error!(&env, Error::ProposalNotPassed);
         }
+        // Guardian veto check: proposals vetoed by guardians cannot be executed
+        if proposal.is_vetoed {
+            panic_with_error!(&env, Error::ProposalVetoed);
+        }
         if env.ledger().timestamp() < proposal.execution_time {
             panic_with_error!(&env, Error::TimelockNotExpired);
+        }
+        // Check execution deadline: if passed, prevent execution to keep proposals fresh
+        if env.ledger().timestamp() > proposal.execution_deadline {
+            proposal.status = ProposalStatus::Expired;
+            env.storage()
+                .persistent()
+                .set(&StorageKey::Proposal(proposal_id), &proposal);
+            panic_with_error!(&env, Error::ExecutionDeadlineExpired);
         }
 
         // Validate target address is a valid Stellar address before execution
@@ -1077,9 +1144,145 @@ impl GovernanceDao {
             .persistent()
             .set(&StorageKey::Proposal(proposal_id), &proposal);
 
+        let executed_at = env.ledger().timestamp();
+        let audit = ExecutionAuditRecord {
+            proposal_id,
+            executor: proposal.proposer.clone(),
+            target: proposal.target.clone(),
+            function: proposal.function.clone(),
+            executed_at,
+            votes_for: proposal.votes_for,
+            votes_against: proposal.votes_against,
+        };
+        let audit_key = StorageKey::ExecutionAudit(proposal_id);
+        env.storage().persistent().set(&audit_key, &audit);
+        env.storage().persistent().extend_ttl(&audit_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
         env.events().publish(
             (Symbol::new(&env, "proposal_executed"),),
-            ProposalExecuted { proposal_id },
+            ProposalExecuted {
+                proposal_id,
+                executor: proposal.proposer,
+                target: proposal.target,
+                function: proposal.function,
+                executed_at,
+            },
+        );
+    }
+
+    /// Return the execution audit trail record for an executed proposal.
+    pub fn get_execution_audit(env: Env, proposal_id: u64) -> ExecutionAuditRecord {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::ExecutionAudit(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound))
+    }
+
+    // ── On-Chain Discussion ──────────────────────────────────────────────────
+
+    /// Post a comment on a proposal during the Discussion or Active phase.
+    /// Comments are stored on-chain for transparent discussion.
+    /// `reply_to` is optional and allows threading of comments.
+    pub fn add_comment(
+        env: Env,
+        commenter: Address,
+        proposal_id: u64,
+        text: Bytes,
+        reply_to: Option<u128>,
+    ) -> u128 {
+        commenter.require_auth();
+
+        // Validate text length (max 1024 bytes)
+        if text.is_empty() || text.len() > 1024 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
+        // Verify proposal exists
+        let proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        // Only allow comments during Discussion or Active phases
+        if proposal.status != ProposalStatus::Discussion && proposal.status != ProposalStatus::Active {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
+        // If reply_to is specified, verify that comment exists
+        if let Some(reply_id) = reply_to {
+            if !env
+                .storage()
+                .persistent()
+                .has(&StorageKey::ProposalComment(reply_id))
+            {
+                panic_with_error!(&env, Error::ProposalNotFound);
+            }
+        }
+
+        // Generate comment ID
+        let comment_id: u128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::NextCommentId(proposal_id))
+            .unwrap_or(1u128);
+
+        let now = env.ledger().timestamp();
+        let comment = ProposalComment {
+            id: comment_id,
+            proposal_id,
+            author: commenter.clone(),
+            text,
+            created_at: now,
+            reply_to,
+        };
+
+        let comment_key = StorageKey::ProposalComment(comment_id);
+        env.storage().persistent().set(&comment_key, &comment);
+        env.storage()
+            .persistent()
+            .extend_ttl(&comment_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::NextCommentId(proposal_id), &(comment_id.saturating_add(1)));
+
+        env.events().publish(
+            (Symbol::new(&env, "comment_added"),),
+            ProposalCommentAdded {
+                proposal_id,
+                comment_id,
+                author: commenter,
+                reply_to,
+                created_at: now,
+            },
+        );
+
+        comment_id
+    }
+
+    /// Retrieve a comment by its ID.
+    pub fn get_comment(env: Env, comment_id: u128) -> ProposalComment {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::ProposalComment(comment_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound))
+    }
+
+    /// Admin-only: delete a comment (for moderation of spam/abuse).
+    pub fn delete_comment(env: Env, admin: Address, comment_id: u128) {
+        Self::require_admin(&env, &admin);
+
+        let comment_key = StorageKey::ProposalComment(comment_id);
+        if !env.storage().persistent().has(&comment_key) {
+            panic_with_error!(&env, Error::ProposalNotFound);
+        }
+
+        env.storage().persistent().remove(&comment_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "comment_deleted"),),
+            comment_id,
         );
     }
 
@@ -1646,6 +1849,56 @@ impl GovernanceDao {
         env.storage().instance().remove(&StorageKey::PendingUpgrade);
     }
 
+    /// Guardian veto for a security-critical proposal.
+    /// Only guardians can veto. Once vetoed, a proposal cannot be executed,
+    /// even if it passes voting and the timelock expires.
+    /// Use this to halt potentially malicious proposals before execution.
+    pub fn veto_proposal(env: Env, guardian: Address, proposal_id: u64, reason: Symbol) {
+        guardian.require_auth();
+
+        let guardians: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        
+        let mut is_guardian = false;
+        for g in guardians.iter() {
+            if g == guardian {
+                is_guardian = true;
+                break;
+            }
+        }
+        if !is_guardian {
+            panic_with_error!(&env, Error::NotGuardian);
+        }
+
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        // Can only veto before execution
+        if proposal.status == ProposalStatus::Executed {
+            panic_with_error!(&env, Error::AlreadyExecuted);
+        }
+
+        proposal.is_vetoed = true;
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_vetoed"),),
+            ProposalVetoed {
+                proposal_id,
+                guardian,
+                reason,
+            },
+        );
+    }
+
     /// Run storage migrations from old_version to new_version.
     /// Each migration function handles a specific version transition.
     fn run_migrations(_env: &Env, _old_version: u32, _new_version: u32) {
@@ -1858,6 +2111,17 @@ impl GovernanceDao {
             env.storage().persistent().set(&marker, &true);
 
             total = total.saturating_add(balance);
+
+            // Track delegation usage for off-chain indexing
+            env.events().publish(
+                (Symbol::new(env, "delegation_used"),),
+                DelegationUsed {
+                    proposal_id,
+                    delegate: voter.clone(),
+                    delegator,
+                    weight: balance,
+                },
+            );
         }
 
         total

@@ -33,6 +33,21 @@ pub enum ProposalStatus {
     Executed,
     /// Cancelled by admin before vote close
     Cancelled,
+    /// Passed but execution deadline expired without execution
+    Expired,
+}
+
+/// On-chain comment on a proposal for discussion and feedback.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalComment {
+    pub id: u128,
+    pub proposal_id: u64,
+    pub author: Address,
+    pub text: Bytes,
+    pub created_at: u64,
+    /// Optional: ID of the comment this replies to, for threaded discussion
+    pub reply_to: Option<u128>,
 }
 
 /// Vote direction cast by a token holder.
@@ -83,6 +98,9 @@ pub struct Proposal {
     pub vote_end: u64,
     /// Timelock expiration timestamp for execution.
     pub execution_time: u64,
+    /// Timestamp after which a passed proposal can no longer be executed.
+    /// Defaults to vote_end + finalize_delay + 7 days. Prevents stale proposals from executing.
+    pub execution_deadline: u64,
     /// Total supply captured at proposal creation time for quorum calculation.
     /// This prevents admin manipulation of total_supply during active votes.
     pub total_supply: i128,
@@ -91,6 +109,16 @@ pub struct Proposal {
     /// Mandatory impact analysis describing potential consequences of this proposal.
     /// Max 4096 bytes to provide comprehensive risk assessment.
     pub impact_analysis: Bytes,
+    /// Optional verification callback function on the target contract to confirm
+    /// execution produced the intended state change. Called as `target::verify_proposal_execution(proposal_id)`.
+    /// If specified and fails, execution is marked as failed with audit trail.
+    /// Signature: fn verify_proposal_execution(env: Env, proposal_id: u64) -> Result<bool, Symbol>
+    pub verification_callback: Option<Symbol>,
+    /// Whether execution has been verified (callback succeeded or not required).
+    pub execution_verified: bool,
+    /// Set by a guardian via `veto_proposal`. A vetoed proposal can never be
+    /// executed, even if it passed voting and the timelock has expired.
+    pub is_vetoed: bool,
 }
 
 /// A single vote record stored per (proposal_id, voter) key.
@@ -123,6 +151,10 @@ pub struct DaoConfig {
     /// Mandatory discussion period in seconds before voting opens.
     /// Set to 0 to disable (proposals go straight to Active).
     pub discussion_period: u64,
+    /// Maximum voting weight any single address may cast per proposal (7-decimal).
+    /// 0 = no cap (unlimited whale voting). Capping prevents a single large
+    /// holder from dominating governance outcomes.
+    pub vote_weight_cap: i128,
 }
 
 /// Settings controlling adaptive (decaying) quorum.
@@ -243,14 +275,39 @@ pub struct ProposalFinalized {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionAuditRecord {
+    pub proposal_id: u64,
+    pub executor: Address,
+    pub target: Address,
+    pub function: Symbol,
+    pub executed_at: u64,
+    pub votes_for: i128,
+    pub votes_against: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProposalExecuted {
     pub proposal_id: u64,
+    pub executor: Address,
+    pub target: Address,
+    pub function: Symbol,
+    pub executed_at: u64,
 }
+
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProposalCancelled {
     pub proposal_id: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalVetoed {
+    pub proposal_id: u64,
+    pub guardian: Address,
+    pub reason: Symbol,
 }
 
 #[contracttype]
@@ -378,4 +435,67 @@ pub struct TemplateRegistered {
 pub struct ProposalCreatedFromTemplate {
     pub proposal_id: u64,
     pub template_name: Symbol,
+}
+
+/// Emitted when the vote weight cap is updated via DAO config.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoteWeightCapUpdated {
+    pub vote_weight_cap: i128,
+}
+
+/// Emitted when a delegation's weight is used in a vote.
+///
+/// Tracks the moment delegated voting power is actually exercised,
+/// making it possible to see which delegations contributed to which
+/// proposals and how much weight they carried.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegationUsed {
+    pub proposal_id: u64,
+    pub delegate: Address,
+    pub delegator: Address,
+    pub weight: i128,
+}
+
+/// Emitted when a delegation is created or revoked, recording the
+/// full delegation graph at a point in time for off-chain indexing.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegationRecorded {
+    pub delegator: Address,
+    pub delegate: Address,
+    pub action: Symbol,
+    pub recorded_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionVerified {
+    pub proposal_id: u64,
+    pub executor: Address,
+    pub target: Address,
+    pub verification_callback: Symbol,
+    pub verified_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionVerificationFailed {
+    pub proposal_id: u64,
+    pub executor: Address,
+    pub target: Address,
+    pub callback: Symbol,
+    pub error: Symbol,
+}
+
+/// Emitted when a comment is posted on a proposal for discussion.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalCommentAdded {
+    pub proposal_id: u64,
+    pub comment_id: u128,
+    pub author: Address,
+    pub reply_to: Option<u128>,
+    pub created_at: u64,
 }

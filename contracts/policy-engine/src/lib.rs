@@ -64,7 +64,6 @@ const ADMIN_TRANSFER_TIMELOCK: u64 = 48 * 60 * 60;
 
 /// Upper bound on the number of policies `batch_buy_policy` will create in one
 /// call, so a single transaction cannot blow Soroban's instruction budget.
-#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 const MAX_BATCH_BUY: u32 = 20;
 
 // ─── Pagination ───────────────────────────────────────────────────────────────
@@ -72,7 +71,6 @@ const MAX_BATCH_BUY: u32 = 20;
 /// Upper bound on the number of entries a paginated query will return in one
 /// call. Without a cap, a caller could pass `limit = u32::MAX` and force the
 /// contract to build one huge `Vec`, blowing Soroban's instruction budget.
-#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 const MAX_PAGE_SIZE: u32 = 100;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
@@ -190,11 +188,9 @@ pub enum Error {
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
-#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contract]
 pub struct PolicyEngine;
 
-#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contractimpl]
 impl PolicyEngine {
 

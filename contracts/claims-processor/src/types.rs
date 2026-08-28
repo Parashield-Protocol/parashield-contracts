@@ -56,8 +56,22 @@ pub struct Claim {
     /// For PartiallyPaid claims: payout ratio in basis points (0-10000).
     /// 10000 = full coverage; lower = proportional partial payment.
     pub partial_payout_bps: Option<u32>,
-    /// Installment payout configuration for large claims.
-    pub installments: Option<InstallmentSchedule>,
+    /// Installment payout configuration for large claims. `Vec` instead of
+    /// `Option<InstallmentSchedule>` because the soroban-sdk XDR (`ScVal`)
+    /// conversion generated for a contracttype struct does not support
+    /// `Option<CustomStruct>` fields — only `Vec<T>` round-trips a custom
+    /// struct through both the WASM `Val` path and the host-side `ScVal`
+    /// path used by test tooling. Empty = no installment schedule.
+    pub installments: Vec<InstallmentSchedule>,
+    /// Whether the claimant's identity was verified (optional, for Sybil protection).
+    pub identity_verified: bool,
+    /// Type of identity verification performed (e.g., "kyc", "accreditation").
+    pub verification_type: Option<Symbol>,
+    /// Timestamp when identity verification occurred.
+    pub verification_time: Option<u64>,
+    /// Timestamp at which payout becomes available (issue #432).
+    /// `None` means payout is immediate or not applicable.
+    pub payout_ready_at: Option<u64>,
 }
 
 /// Configuration for installment-based claim payouts.
@@ -115,6 +129,21 @@ pub struct ClaimSubmitted {
     pub claimant: Address,
     pub coverage_amount: i128,
 }
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchClaimsSubmitted {
+    pub claimant: Address,
+    pub count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchClaimsProcessed {
+    pub keeper: Address,
+    pub count: u32,
+}
+
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -276,3 +305,73 @@ pub struct InstallmentPaid {
     pub total_installments: u32,
 }
 
+/// Emitted when the payout delay configuration is updated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutDelayUpdated {
+    pub delay_seconds: u64,
+}
+
+/// Supported payout currencies for claim settlements.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PayoutCurrency {
+    /// Default USDC (7-decimal)
+    USDC,
+    /// Alternative stablecoin (address stored separately)
+    Custom(Address),
+}
+
+/// Multi-currency payout configuration for a claim.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutOption {
+    /// Currency to pay out in.
+    pub currency: PayoutCurrency,
+    /// Exchange rate (basis points) relative to USDC. 10000 = 1:1 parity.
+    /// Used to convert USDC coverage amounts to equivalent other-currency amounts.
+    pub exchange_rate_bps: u32,
+    /// Whether this payout option is currently enabled.
+    pub enabled: bool,
+}
+
+/// Record of available payout currencies and their exchange rates.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutCurrencyRegistry {
+    /// Address of the USDC token contract (default payout currency).
+    pub usdc_token: Address,
+    /// Optional alternative payout currencies with their exchange rates.
+    pub alt_currencies: Vec<Address>,
+    /// Exchange rates for alt currencies (index matches alt_currencies).
+    pub exchange_rates_bps: Vec<u32>,
+}
+
+/// Emitted when a new payout currency is registered.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutCurrencyAdded {
+    pub token: Address,
+    pub exchange_rate_bps: u32,
+}
+
+/// Emitted when a payout currency's exchange rate is updated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutCurrencyRateUpdated {
+    pub token: Address,
+    pub old_rate_bps: u32,
+    pub new_rate_bps: u32,
+}
+
+/// Emitted when a claim is paid out in an alternate currency.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimPaidInAlternativeCurrency {
+    pub claim_id: u128,
+    pub claimant: Address,
+    pub usdc_equivalent: i128,
+    pub token: Address,
+    pub actual_amount: i128,
+    pub exchange_rate_bps: u32,
+}

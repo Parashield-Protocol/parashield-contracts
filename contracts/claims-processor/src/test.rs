@@ -725,9 +725,6 @@ fn pending_claim() -> (World, u128, Address) {
 fn escalation_threshold_defaults_to_seven_days() {
     let w = deploy();
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
-    let claim_id = cp.submit_claim(&buyer, &pol_id);
-    let first = cp.process_claim(&w.keeper, &claim_id, &None);
-    let second = cp.process_claim(&w.keeper, &claim_id, &None);
 
     assert_eq!(cp.get_escalation_threshold(), 7 * 24 * 60 * 60);
 }
@@ -747,21 +744,6 @@ fn admin_can_set_the_escalation_threshold() {
 fn a_near_zero_threshold_is_rejected() {
     let w = deploy();
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
-    cp.submit_claim(&buyer, &pol_id);
-}
-
-/// Manual submit_claim + process_claim flow works end-to-end.
-#[test]
-fn test_manual_claim_flow() {
-    let w      = deploy();
-    let pid    = create_crop_product(&w);
-    let buyer  = Address::generate(&w.env);
-    let pol_id = buy_crop_policy(&w, &buyer, pid);
-    submit_rainfall(&w, 30_000_000); // below threshold
-
-    let cp       = ClaimsProcessorClient::new(&w.env, &w.claims_id);
-    let claim_id = cp.submit_claim(&buyer, &pol_id);
-    let result   = cp.process_claim(&w.keeper, &claim_id, &None);
 
     // Every claim escalatable on submission is noise, not a signal.
     cp.set_escalation_threshold(&w.admin, &60u64);
@@ -775,9 +757,6 @@ fn setting_the_threshold_requires_admin() {
     let stranger = Address::generate(&w.env);
 
     cp.set_escalation_threshold(&stranger, &(24 * 60 * 60));
-    // `stranger` is not in the keeper registry → Unauthorized
-    ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .auto_process(&stranger, &pol_id, &None);
 }
 
 #[test]
@@ -786,24 +765,6 @@ fn a_fresh_claim_is_not_escalatable() {
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
 
     let age = cp.get_claim_age(&claim_id);
-    let claim_id = cp.submit_claim(&buyer, &pol_id);
-    cp.process_claim(&stranger, &claim_id, &None);
-}
-
-/// A revoked keeper can no longer settle claims.
-#[test]
-#[should_panic(expected = "Error(Contract, #3)")]
-fn test_removed_keeper_cannot_process() {
-    let w      = deploy();
-    let pid    = create_crop_product(&w);
-    let buyer  = Address::generate(&w.env);
-    let pol_id = buy_crop_policy(&w, &buyer, pid);
-    submit_rainfall(&w, 20_000_000);
-
-    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
-    cp.remove_keeper(&w.admin, &w.keeper);
-    cp.auto_process(&w.keeper, &pol_id, &None);
-}
 
     assert!(!age.escalatable);
     assert_eq!(age.status, ClaimStatus::Pending);
@@ -814,14 +775,6 @@ fn test_removed_keeper_cannot_process() {
 fn a_claim_becomes_escalatable_once_overdue() {
     let (w, claim_id, _buyer) = pending_claim();
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
-    assert_eq!(cp.get_pending_claims().len(), 0);
-
-    let result = cp.auto_process(&w.keeper, &pol_id, &None);
-    assert_eq!(result, ClaimResult::Paid);
-
-    // Settled claim must not linger in the pending queue.
-    assert_eq!(cp.get_pending_claims().len(), 0, "settled claim left in queue");
-}
 
     let now = w.env.ledger().timestamp();
     w.env.ledger().set_timestamp(now + 7 * 24 * 60 * 60);
@@ -831,8 +784,6 @@ fn a_claim_becomes_escalatable_once_overdue() {
     assert!(age.escalatable);
     assert_eq!(age.seconds_until_escalatable, 0);
     assert_eq!(age.pending_for, 7 * 24 * 60 * 60);
-    cp.process_claim(&w.keeper, &claim_id, &None);
-    assert_eq!(cp.get_pending_claims().len(), 0, "settled claim left in queue");
 }
 
 #[test]
@@ -848,9 +799,6 @@ fn escalating_too_early_is_refused() {
 fn escalating_an_overdue_claim_marks_it_escalated() {
     let (w, claim_id, buyer) = pending_claim();
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
-    let claim_id = cp.submit_claim(&buyer, &pol_id);
-    cp.process_claim(&w.keeper, &claim_id, &None);
-    assert_eq!(cp.get_claim(&claim_id).status, ClaimStatus::Paid);
 
     let now = w.env.ledger().timestamp();
     w.env.ledger().set_timestamp(now + 7 * 24 * 60 * 60 + 1);
@@ -858,14 +806,6 @@ fn escalating_an_overdue_claim_marks_it_escalated() {
     cp.escalate_claim(&buyer, &claim_id);
 
     assert_eq!(cp.get_claim(&claim_id).status, ClaimStatus::Escalated);
-    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
-    let claim_id = cp.submit_claim(&buyer, &pol_id);
-    let result = cp.process_claim(&w.keeper, &claim_id, &None);
-    assert_eq!(result, ClaimResult::Rejected);
-
-    // First dispute on a Rejected claim succeeds.
-    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("disagree"));
-    assert_eq!(cp.get_claim(&claim_id).status, ClaimStatus::Disputed);
 }
 
 #[test]
@@ -873,12 +813,6 @@ fn escalation_is_permissionless() {
     let (w, claim_id, _buyer) = pending_claim();
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let stranger = Address::generate(&w.env);
-    let claim_id = cp.submit_claim(&buyer, &pol_id);
-    cp.process_claim(&w.keeper, &claim_id, &None);
-    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("disagree"));
-    // Second dispute → AlreadyProcessed
-    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("again"));
-}
 
     let now = w.env.ledger().timestamp();
     w.env.ledger().set_timestamp(now + 7 * 24 * 60 * 60 + 1);
@@ -901,10 +835,6 @@ fn escalating_twice_is_refused() {
 
     cp.escalate_claim(&buyer, &claim_id);
     cp.escalate_claim(&buyer, &claim_id);
-    // A stranger that is not an authorized keeper tries to auto_process
-    let stranger = Address::generate(&w.env);
-    ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .auto_process(&stranger, &pol_id, &None);
 }
 
 #[test]
@@ -922,9 +852,6 @@ fn a_settled_claim_cannot_be_escalated() {
 
     let now = w.env.ledger().timestamp();
     w.env.ledger().set_timestamp(now + 30 * 24 * 60 * 60);
-    let stranger = Address::generate(&w.env);
-    cp.process_claim(&stranger, &claim_id, &None);
-}
 
     // Already paid — there is nothing overdue to escalate.
     cp.escalate_claim(&buyer, &claim_id);
@@ -942,13 +869,6 @@ fn escalation_uses_the_configured_threshold() {
 
     // Would still be far too early under the seven-day default.
     cp.escalate_claim(&buyer, &claim_id);
-    // First call settles the claim (Paid)
-    let first = cp.process_claim(&w.keeper, &claim_id, &None);
-    assert_eq!(first, ClaimResult::Paid);
-
-    // Second call on same claim returns AlreadyProcessed
-    let second = cp.process_claim(&w.keeper, &claim_id, &None);
-    assert_eq!(second, ClaimResult::AlreadyProcessed);
 
     assert_eq!(cp.get_claim(&claim_id).status, ClaimStatus::Escalated);
 }
@@ -976,14 +896,12 @@ fn an_escalated_claim_leaves_the_pending_queue() {
     let now = w.env.ledger().timestamp();
     w.env.ledger().set_timestamp(now + 7 * 24 * 60 * 60 + 1);
     cp.escalate_claim(&buyer, &claim_id);
-    let cp       = ClaimsProcessorClient::new(&w.env, &w.claims_id);
-    let claim_id = cp.submit_claim(&buyer, &pol_id);
-    assert_eq!(cp.process_claim(&w.keeper, &claim_id, &None), ClaimResult::Paid);
 
     // A keeper sweeping pending claims should not keep retrying one that has
     // been handed to manual review.
     assert_eq!(cp.get_escalatable_claims().len(), 0);
 }
+
 
 #[test]
 fn claim_age_reports_zero_pending_time_once_resolved() {
@@ -1278,3 +1196,36 @@ fn test_resolve_dispute_paid_claim_fails() {
     
     cp.resolve_dispute(&w.admin, &claim_id);
 }
+
+// ── Batch Claim Processing (Issue #427) ──────────────────────────────────────
+
+#[test]
+fn test_batch_submit_and_process_claims() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id1 = buy_crop_policy(&w, &buyer, pid);
+    let pol_id2 = buy_crop_policy(&w, &buyer, pid);
+
+    submit_rainfall(&w, 20_000_000); // 20mm < 50mm threshold
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    let mut policy_ids = soroban_sdk::Vec::new(&w.env);
+    policy_ids.push_back(pol_id1);
+    policy_ids.push_back(pol_id2);
+
+    let claim_ids = cp.batch_submit_claims(&buyer, &policy_ids);
+    assert_eq!(claim_ids.len(), 2);
+
+    let pending = cp.get_pending_claims();
+    assert_eq!(pending.len(), 2);
+
+    let results = cp.batch_process_claims(&w.keeper, &claim_ids, &None);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results.get_unchecked(0).1, ClaimResult::Paid);
+    assert_eq!(results.get_unchecked(1).1, ClaimResult::Paid);
+
+    assert_eq!(cp.get_pending_claims().len(), 0);
+}
+

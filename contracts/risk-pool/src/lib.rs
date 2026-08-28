@@ -1,4 +1,4 @@
-﻿//! Parashield Risk Pool
+//! Parashield Risk Pool
 //!
 //! Liquidity providers deposit USDC into category-specific risk pools.
 //! Pool-share tokens represent proportional ownership.
@@ -156,6 +156,10 @@ enum StorageKey {
     ReinsurancePremiumPaid,
     /// Cumulative claims recovered from the reinsurer so far (i128).
     ReinsuranceRecovered,
+    /// Fee tier configuration — Symbol (tier name) → FeeTier.
+    FeeTier(Symbol),
+    /// Names of all registered fee tiers (Vec<Symbol>).
+    FeeTierList,
 }
 
 #[contracterror]
@@ -200,6 +204,7 @@ pub enum Error {
     ReinsuranceNotConfigured  = 36,
     InvalidReinsuranceConfig  = 37,
     InvalidParameter          = 38,
+    InvalidFeeTier            = 39,
 }
 
 #[contract]
@@ -381,6 +386,8 @@ impl RiskPool {
                     deposited_at:     now,
                     last_yield_claim: now,
                     compound_enabled,
+                    insurance_enabled: false,
+                    insurance_paid:    0,
                 }
             }
         };
@@ -489,7 +496,100 @@ impl RiskPool {
         amount
     }
 
+    /// Transfer `shares` from `from` address to `to` address.
+    /// Returns the proportional USDC deposit amount transferred.
+    pub fn transfer_position(env: Env, from: Address, to: Address, shares: i128) -> i128 {
+        from.require_auth();
+        if shares <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
+        if from == to { panic_with_error!(&env, Error::InvalidAddress); }
+        Self::assert_active(&env);
+
+        let from_key = StorageKey::LpPosition(from.clone());
+        let mut from_pos: LpPosition = env.storage().persistent()
+            .get(&from_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
+
+        if from_pos.shares < shares {
+            panic_with_error!(&env, Error::InsufficientShares);
+        }
+
+        let amount = shares.checked_mul(from_pos.deposited)
+            .and_then(|v| v.checked_div(from_pos.shares))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+
+        let pending_yield_from = Self::settle_yield(&env, &mut from_pos);
+        from_pos.deposited = from_pos.deposited.saturating_sub(amount);
+        from_pos.shares -= shares;
+        let acc_per_share: i128 = env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0);
+        from_pos.yield_debt = (acc_per_share * from_pos.shares) / 1_000_000_000_000;
+        env.storage().persistent().set(&from_key, &from_pos);
+        Self::extend_to_max(&env, &from_key);
+
+        Self::update_lp_nft(&env, &from, &from_pos);
+        Self::pay_out_yield(&env, &from, pending_yield_from);
+
+        let now = env.ledger().timestamp();
+        let to_key = StorageKey::LpPosition(to.clone());
+        let mut is_new_lp = false;
+        let mut to_pos: LpPosition = match env.storage().persistent().get::<_, LpPosition>(&to_key) {
+            Some(mut pos) => {
+                let pending_yield_to = Self::settle_yield(&env, &mut pos);
+                pos.deposited += amount;
+                pos.shares += shares;
+                pos.yield_debt = (acc_per_share * pos.shares) / 1_000_000_000_000;
+                env.storage().persistent().set(&to_key, &pos);
+                Self::extend_to_max(&env, &to_key);
+                Self::pay_out_yield(&env, &to, pending_yield_to);
+                pos
+            }
+            None => {
+                is_new_lp = true;
+                let count: u32 = env.storage().instance()
+                    .get(&StorageKey::LpCount).unwrap_or(0);
+                let lp_address_key = StorageKey::LpAddress(count);
+                env.storage().persistent().set(&lp_address_key, &to);
+                Self::extend_to_max(&env, &lp_address_key);
+                env.storage().instance().set(&StorageKey::LpCount, &(count + 1));
+                let pos = LpPosition {
+                    provider: to.clone(),
+                    deposited: amount,
+                    shares,
+                    yield_claimed: 0,
+                    yield_debt: (acc_per_share * shares) / 1_000_000_000_000,
+                    deposited_at: now,
+                    last_yield_claim: now,
+                    compound_enabled: false,
+                    insurance_enabled: false,
+                    insurance_paid: 0,
+                };
+                env.storage().persistent().set(&to_key, &pos);
+                Self::extend_to_max(&env, &to_key);
+                pos
+            }
+        };
+
+        let category: Symbol = env.storage().instance().get(&StorageKey::Category).unwrap();
+        if is_new_lp {
+            Self::mint_lp_nft(&env, &to, &category, now, &to_pos);
+        } else {
+            Self::update_lp_nft(&env, &to, &to_pos);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "lp_position_transferred"),),
+            LpPositionTransferred {
+                from,
+                to,
+                shares,
+                amount,
+            },
+        );
+
+        amount
+    }
+
     // ── Premium and yield ─────────────────────────────────────────────────────
+
 
     /// Pull `amount` USDC from `caller` and split it among LPs, treasury, and backstop
     /// according to the protocol fee schedule. No-op if `amount` is zero or negative.
@@ -1372,6 +1472,136 @@ impl RiskPool {
         adjusted_fee.min(config.max_fee_bps).max(config.min_fee_bps)
     }
 
+    // ── Fee Tiers (issue #429) ────────────────────────────────────────────────
+
+    /// Add or update an LP fee tier. LPs meeting the tier's requirements
+    /// (minimum deposit and/or minimum lock duration) receive the discount
+    /// on protocol fees.
+    ///
+    /// `discount_bps` is in basis points: 500 = 5% discount, 1000 = 10%, etc.
+    /// Maximum 10000 (100% discount, i.e. zero fees).
+    pub fn set_fee_tier(
+        env: Env,
+        admin: Address,
+        name: Symbol,
+        min_deposit: i128,
+        min_lock_duration: u64,
+        discount_bps: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+        if discount_bps > 10_000 {
+            panic_with_error!(&env, Error::InvalidFeeTier);
+        }
+        if min_deposit < 0 {
+            panic_with_error!(&env, Error::InvalidFeeTier);
+        }
+
+        let tier = FeeTier {
+            min_deposit,
+            min_lock_duration,
+            discount_bps,
+            name: name.clone(),
+        };
+        env.storage().instance().set(&StorageKey::FeeTier(name.clone()), &tier);
+
+        // Track tier names
+        let mut names: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::FeeTierList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut found = false;
+        for i in 0..names.len() {
+            if names.get_unchecked(i) == name {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            names.push_back(name.clone());
+            env.storage().instance().set(&StorageKey::FeeTierList, &names);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "fee_tier_updated"),),
+            FeeTierUpdated {
+                tier_name: name,
+                min_deposit,
+                min_lock_duration,
+                discount_bps,
+            },
+        );
+    }
+
+    /// Remove an LP fee tier by name.
+    pub fn remove_fee_tier(env: Env, admin: Address, name: Symbol) {
+        Self::require_admin(&env, &admin);
+        let key = StorageKey::FeeTier(name.clone());
+        if !env.storage().instance().has(&key) {
+            panic_with_error!(&env, Error::InvalidFeeTier);
+        }
+        env.storage().instance().remove(&key);
+
+        let mut names: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::FeeTierList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut pruned: Vec<Symbol> = Vec::new(&env);
+        for i in 0..names.len() {
+            if names.get_unchecked(i) != name {
+                pruned.push_back(names.get_unchecked(i));
+            }
+        }
+        env.storage().instance().set(&StorageKey::FeeTierList, &pruned);
+    }
+
+    /// Get a specific fee tier by name.
+    pub fn get_fee_tier(env: Env, name: Symbol) -> Option<FeeTier> {
+        env.storage().instance().get(&StorageKey::FeeTier(name))
+    }
+
+    /// List all registered fee tier names.
+    pub fn get_fee_tier_names(env: Env) -> Vec<Symbol> {
+        env.storage().instance()
+            .get(&StorageKey::FeeTierList)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Get the effective fee discount for a provider based on their deposit
+    /// amount and lock duration. Returns the highest applicable discount.
+    pub fn get_lp_fee_discount(env: Env, provider: Address) -> u32 {
+        let position: LpPosition = match env.storage().persistent()
+            .get(&StorageKey::LpPosition(provider.clone()))
+        {
+            Some(p) => p,
+            None => return 0,
+        };
+
+        let names: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::FeeTierList)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let now = env.ledger().timestamp();
+        let mut best_discount: u32 = 0;
+
+        for i in 0..names.len() {
+            let tier_name = names.get_unchecked(i);
+            if let Some(tier) = env.storage().instance().get::<_, FeeTier>(&StorageKey::FeeTier(tier_name.clone())) {
+                let deposit_met = position.deposited >= tier.min_deposit;
+                let lock_duration = now.saturating_sub(position.deposited_at);
+                let lock_met = tier.min_lock_duration == 0 || lock_duration >= tier.min_lock_duration;
+                if deposit_met && lock_met && tier.discount_bps > best_discount {
+                    best_discount = tier.discount_bps;
+                }
+            }
+        }
+
+        best_discount
+    }
+
     /// Return the current admin address. Panics with `NotInitialized` if not set up.
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&StorageKey::Admin)
@@ -2192,6 +2422,175 @@ impl RiskPool {
                 enabled,
             },
         );
+    }
+
+    /// Return the collateralization ratio for an LP position.
+    ///
+    /// The ratio measures how well-backed the LP's position is by available
+    /// liquidity relative to their share of locked capital. A ratio below
+    /// 10000 (100%) indicates the position is undercollateralized.
+    ///
+    /// - `position_value` = LP's proportional share of available liquidity
+    ///   (total_deposited - total_locked) based on their share ratio.
+    /// - `position_liability` = LP's proportional share of locked capital.
+    /// - `collateralization_bps` = (position_value / position_liability) * 10000,
+    ///   or u32::MAX if there is no locked liability.
+    pub fn get_collateralization_ratio(env: Env, provider: Address) -> CollateralizationInfo {
+        let position: LpPosition = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::LpPosition(provider.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
+
+        let total_deposited: i128 = env
+            .storage().instance().get(&StorageKey::TotalDeposited).unwrap_or(0);
+        let total_locked: i128 = env
+            .storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
+        let total_shares: i128 = env
+            .storage().instance().get(&StorageKey::TotalShares).unwrap_or(0);
+
+        if total_shares == 0 || position.shares == 0 {
+            return CollateralizationInfo {
+                provider,
+                position_value: 0,
+                position_liability: 0,
+                collateralization_bps: u32::MAX,
+            };
+        }
+
+        // LP's proportional share of available liquidity (deposited - locked)
+        let available = total_deposited.saturating_sub(total_locked);
+        let position_value = position.shares
+            .checked_mul(available)
+            .and_then(|v| v.checked_div(total_shares))
+            .unwrap_or(0);
+
+        // LP's proportional share of locked capital
+        let position_liability = position.shares
+            .checked_mul(total_locked)
+            .and_then(|v| v.checked_div(total_shares))
+            .unwrap_or(0);
+
+        // Calculate collateralization ratio in basis points
+        let collateralization_bps = if position_liability <= 0 {
+            u32::MAX // No liability = fully collateralized
+        } else {
+            let ratio = position_value
+                .checked_mul(10_000)
+                .and_then(|v| v.checked_div(position_liability))
+                .unwrap_or(0);
+            if ratio > u32::MAX as i128 { u32::MAX } else { ratio as u32 }
+        };
+
+        CollateralizationInfo {
+            provider,
+            position_value,
+            position_liability,
+            collateralization_bps,
+        }
+    }
+
+    /// Liquidate an undercollateralized LP position.
+    ///
+    /// When an LP's collateralization ratio falls below 100% (10000 bps),
+    /// their position poses a risk to other LPs. This function seizes a
+    /// portion of their shares to restore pool health.
+    ///
+    /// The seizure is proportional to the undercollateralization程度:
+    /// - At 50% collateralization, ~50% of shares are seized.
+    /// - At 0% collateralization, all shares are seized.
+    ///
+    /// Only callable by the admin or the claims processor.
+    pub fn liquidate_position(env: Env, caller: Address, provider: Address) -> LiquidationResult {
+        Self::require_protocol_caller(&env, &caller);
+
+        let position: LpPosition = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::LpPosition(provider.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
+
+        let info = Self::get_collateralization_ratio(env.clone(), provider.clone());
+
+        // Cannot liquidate if fully collateralized or no liability
+        if info.collateralization_bps >= 10_000 || info.position_liability <= 0 {
+            panic_with_error!(&env, Error::Undercollateralized);
+        }
+
+        // Calculate shares to seize: proportional to undercollateralization
+        // At 0 bps ratio, seize all shares. At 5000 bps (50%), seize ~50%.
+        let undercollateral_bps = 10_000u32.saturating_sub(info.collateralization_bps);
+        let shares_seized = position.shares
+            .checked_mul(undercollateral_bps as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .unwrap_or(0);
+
+        if shares_seized <= 0 {
+            panic_with_error!(&env, Error::Undercollateralized);
+        }
+
+        // Calculate amount recovered (proportional to shares seized)
+        let total_shares: i128 = env
+            .storage().instance().get(&StorageKey::TotalShares).unwrap_or(0);
+        let total_deposited: i128 = env
+            .storage().instance().get(&StorageKey::TotalDeposited).unwrap_or(0);
+
+        let amount_recovered = if total_shares > 0 {
+            shares_seized
+                .checked_mul(total_deposited)
+                .and_then(|v| v.checked_div(total_shares))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Update position
+        let mut new_position = position.clone();
+        new_position.shares = new_position.shares.saturating_sub(shares_seized);
+        new_position.deposited = new_position.deposited.saturating_sub(amount_recovered);
+
+        if new_position.shares <= 0 {
+            env.storage().persistent().remove(&StorageKey::LpPosition(provider.clone()));
+        } else {
+            env.storage().persistent().set(
+                &StorageKey::LpPosition(provider.clone()),
+                &new_position,
+            );
+        }
+
+        // Update pool totals
+        let current_total_shares: i128 = env
+            .storage().instance().get(&StorageKey::TotalShares).unwrap_or(0);
+        let current_total_deposited: i128 = env
+            .storage().instance().get(&StorageKey::TotalDeposited).unwrap_or(0);
+        env.storage().instance().set(
+            &StorageKey::TotalShares,
+            &current_total_shares.saturating_sub(shares_seized),
+        );
+        env.storage().instance().set(
+            &StorageKey::TotalDeposited,
+            &current_total_deposited.saturating_sub(amount_recovered),
+        );
+
+        // Return seized funds to pool (they stay as available liquidity)
+        // The recovered amount stays in the contract as pool liquidity
+
+        env.events().publish(
+            (Symbol::new(&env, "position_liquidated"),),
+            PositionLiquidated {
+                provider: provider.clone(),
+                shares_seized,
+                amount_recovered,
+                collateralization_bps: info.collateralization_bps,
+            },
+        );
+
+        LiquidationResult {
+            provider,
+            shares_seized,
+            amount_recovered,
+            previous_ratio_bps: info.collateralization_bps,
+        }
     }
 
     /// Return the LP NFT for a given token ID, if it exists.

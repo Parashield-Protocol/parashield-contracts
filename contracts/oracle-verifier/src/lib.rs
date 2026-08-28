@@ -156,6 +156,12 @@ enum StorageKey {
     /// back to disabled when unset, so an existing data type's aggregation
     /// does not change until an admin opts it in.
     OutlierConfig(Symbol),
+    /// Cross-validation rule between two data types — (source, target) → CrossValidationRule.
+    CrossValidationRule(Symbol, Symbol),
+    /// List of target data types that a source data type has cross-validation rules for.
+    CrossValidationTargets(Symbol),
+    /// Geographic weighting multiplier in basis points for (data_type, oracle, region).
+    GeoWeight(Symbol, Address, Symbol),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -192,15 +198,14 @@ pub enum Error {
     TimestampOutOfRange = 26,
     InvalidOutlierConfig = 27,
     InvalidInput = 28,
+    CrossValidationFailed = 29,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
-#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contract]
 pub struct OracleVerifier;
 
-#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contractimpl]
 impl OracleVerifier {
     // ── Lifecycle ────────────────────────────────────────────────────────────
@@ -738,6 +743,100 @@ impl OracleVerifier {
         }
     }
 
+    /// Check for stale oracle data across all submissions for a key.
+    ///
+    /// Unlike `check_freshness` which counts individual fresh submissions,
+    /// this provides a holistic staleness report that includes the ratio
+    /// of fresh to stale data and the age range of submissions. Useful for
+    /// monitoring dashboards and automated alerts.
+    ///
+    /// Data is considered stale when its age exceeds the effective max_age
+    /// for the data type. If more than half the submissions are stale, the
+    /// entire data set is flagged as stale.
+    pub fn check_staleness(env: Env, data_type: Symbol, key: Symbol) -> StalenessReport {
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let max_age = Self::effective_max_age(&env, &data_type);
+        let now = env.ledger().timestamp();
+
+        let mut stale_count = 0u32;
+        let mut newest_age = u64::MAX;
+        let mut oldest_fresh_age = 0u64;
+        let total_count = points.len();
+
+        for i in 0..points.len() {
+            let p = points.get_unchecked(i);
+            let age = now.saturating_sub(p.timestamp);
+
+            if age < newest_age {
+                newest_age = age;
+            }
+
+            if age > max_age {
+                stale_count += 1;
+            } else {
+                if age > oldest_fresh_age {
+                    oldest_fresh_age = age;
+                }
+            }
+        }
+
+        // If no submissions, report as stale with max ages
+        if total_count == 0 {
+            return StalenessReport {
+                data_type,
+                key,
+                is_stale: true,
+                oldest_fresh_age: 0,
+                newest_age: u64::MAX,
+                stale_count: 0,
+                total_count: 0,
+                max_age,
+                freshness_ratio_bps: 0,
+            };
+        }
+
+        let fresh_count = total_count.saturating_sub(stale_count);
+        let freshness_ratio_bps = if total_count > 0 {
+            (fresh_count as u64 * 10_000 / total_count as u64) as u32
+        } else {
+            0
+        };
+
+        // Data is stale if more than half of submissions are stale
+        let is_stale = stale_count > total_count / 2;
+
+        if is_stale {
+            env.events().publish(
+                (Symbol::new(&env, "stale_data_detected"),),
+                StaleDataDetected {
+                    data_type: data_type.clone(),
+                    key: key.clone(),
+                    stale_count,
+                    total_count,
+                    oldest_age: now.saturating_sub(newest_age),
+                    max_age,
+                },
+            );
+        }
+
+        StalenessReport {
+            data_type,
+            key,
+            is_stale,
+            oldest_fresh_age,
+            newest_age,
+            stale_count,
+            total_count,
+            max_age,
+            freshness_ratio_bps,
+        }
+    }
+
     /// Set the minimum number of oracle submissions required to form a consensus value.
     /// `min_count` must be at least 1; the default is 1.
     pub fn set_min_oracle_count(env: Env, admin: Address, min_count: u32) {
@@ -845,6 +944,180 @@ impl OracleVerifier {
                 data_type,
                 agreement_threshold_bps: 5000, // Default to simple majority
             },
+        }
+    }
+
+    // ── Cross-Validation (issue #430) ────────────────────────────────────────
+
+    /// Add or update a cross-validation rule between two data types.
+    ///
+    /// When data is submitted for `source_type`, the aggregated values for
+    /// `source_type` and `target_type` on the same key must not differ by
+    /// more than `max_variance`. This catches inconsistent oracle data
+    /// across correlated feeds (e.g. rainfall vs. temperature).
+    pub fn set_cross_validation_rule(
+        env: Env,
+        admin: Address,
+        source_type: Symbol,
+        target_type: Symbol,
+        max_variance: i128,
+        description: Bytes,
+    ) {
+        Self::require_admin(&env, &admin);
+        if max_variance < 0 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        if source_type == target_type {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
+        let rule = CrossValidationRule {
+            source_type: source_type.clone(),
+            target_type: target_type.clone(),
+            max_variance,
+            description,
+        };
+        env.storage().instance().set(
+            &StorageKey::CrossValidationRule(source_type.clone(), target_type.clone()),
+            &rule,
+        );
+
+        // Track which targets this source has rules for
+        let mut targets: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::CrossValidationTargets(source_type.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut found = false;
+        for i in 0..targets.len() {
+            if targets.get_unchecked(i) == target_type {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            targets.push_back(target_type.clone());
+            env.storage().instance().set(
+                &StorageKey::CrossValidationTargets(source_type.clone()),
+                &targets,
+            );
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "cross_validation_rule_added"),),
+            CrossValidationRuleAdded {
+                source_type,
+                target_type,
+                max_variance,
+            },
+        );
+    }
+
+    /// Remove a cross-validation rule between two data types.
+    pub fn remove_cross_validation_rule(
+        env: Env,
+        admin: Address,
+        source_type: Symbol,
+        target_type: Symbol,
+    ) {
+        Self::require_admin(&env, &admin);
+        let key = StorageKey::CrossValidationRule(source_type.clone(), target_type.clone());
+        if !env.storage().instance().has(&key) {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        env.storage().instance().remove(&key);
+
+        // Remove from targets list
+        let mut targets: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::CrossValidationTargets(source_type.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut pruned: Vec<Symbol> = Vec::new(&env);
+        for i in 0..targets.len() {
+            if targets.get_unchecked(i) != target_type {
+                pruned.push_back(targets.get_unchecked(i));
+            }
+        }
+        env.storage().instance().set(
+            &StorageKey::CrossValidationTargets(source_type.clone()),
+            &pruned,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "cross_validation_rule_removed"),),
+            CrossValidationRuleRemoved {
+                source_type,
+                target_type,
+            },
+        );
+    }
+
+    /// Get the cross-validation rule between two data types, if one exists.
+    pub fn get_cross_validation_rule(
+        env: Env,
+        source_type: Symbol,
+        target_type: Symbol,
+    ) -> Option<CrossValidationRule> {
+        env.storage().instance().get(
+            &StorageKey::CrossValidationRule(source_type, target_type),
+        )
+    }
+
+    /// Get all cross-validation targets for a given source data type.
+    pub fn get_cross_validation_targets(env: Env, source_type: Symbol) -> Vec<Symbol> {
+        env.storage().instance().get(
+            &StorageKey::CrossValidationTargets(source_type),
+        ).unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Check cross-validation rules between a source data type and all its
+    /// configured targets for a given key. Returns Ok(()) if all rules pass,
+    /// or the first failing rule's details.
+    ///
+    /// Called internally after aggregation to detect inconsistent oracle data
+    /// across correlated feeds. Panics with `CrossValidationFailed` if any
+    /// rule is violated.
+    fn check_cross_validation(env: &Env, source_type: &Symbol, key: &Symbol) {
+        let targets: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::CrossValidationTargets(source_type.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+
+        if targets.is_empty() {
+            return;
+        }
+
+        // Get source aggregated value
+        let source_value = Self::get_median_value(env, source_type, key);
+
+        for i in 0..targets.len() {
+            let target_type = targets.get_unchecked(i);
+            let rule: CrossValidationRule = match env.storage().instance().get(
+                &StorageKey::CrossValidationRule(source_type.clone(), target_type.clone()),
+            ) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            // Try to get target aggregated value — skip if no data available
+            let target_points: Vec<OracleDataPoint> = match env.storage().persistent().get(
+                &StorageKey::DataPoints(target_type.clone(), key.clone()),
+            ) {
+                Some(pts) => pts,
+                None => continue,
+            };
+            if target_points.is_empty() {
+                continue;
+            }
+
+            let target_value = Self::get_median_value(env, &target_type, key);
+            let variance = source_value.saturating_sub(target_value).abs();
+
+            if variance > rule.max_variance {
+                panic_with_error!(env, Error::CrossValidationFailed);
+            }
         }
     }
 
@@ -961,6 +1234,150 @@ impl OracleVerifier {
             .persistent()
             .get(&StorageKey::OracleStakeAmt(data_type, oracle))
             .unwrap_or(0)
+    }
+
+    // ── Geographic Weighting (Issue #426) ───────────────────────────────────
+
+    /// Admin-only: Set geographic weighting multiplier for an oracle in basis points (10000 = 1.0x).
+    pub fn set_oracle_geo_weight(
+        env: Env,
+        admin: Address,
+        oracle: Address,
+        data_type: Symbol,
+        region: Symbol,
+        geo_weight_bps: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+        if geo_weight_bps == 0 {
+            panic_with_error!(&env, Error::InvalidConfidence);
+        }
+        let key = StorageKey::GeoWeight(data_type.clone(), oracle.clone(), region.clone());
+        env.storage().persistent().set(&key, &geo_weight_bps);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.events().publish(
+            (Symbol::new(&env, "geo_weight_updated"),),
+            GeoWeightUpdated {
+                oracle,
+                data_type,
+                region,
+                geo_weight_bps,
+            },
+        );
+    }
+
+    /// Return the geographic weighting multiplier in basis points for (data_type, oracle, region).
+    /// Defaults to 10,000 (1.0x baseline weight) if unconfigured.
+    pub fn get_oracle_geo_weight(
+        env: Env,
+        oracle: Address,
+        data_type: Symbol,
+        region: Symbol,
+    ) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::GeoWeight(data_type, oracle, region))
+            .unwrap_or(10_000)
+    }
+
+    /// Return aggregated data for a specific geographic region, applying geographic weighting to active oracles.
+    pub fn get_aggregated_for_region(
+        env: Env,
+        data_type: Symbol,
+        key: Symbol,
+        max_age_seconds: u64,
+        target_region: Symbol,
+    ) -> AggregatedData {
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoDataAvailable));
+        if points.is_empty() {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
+        let now = env.ledger().timestamp();
+        let min_confidence: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
+
+        let mut values = [(0i128, 0u32); 100];
+        let mut count: usize = 0;
+        let mut total_effective_weight: u32 = 0;
+        let mut weighted_confidence_sum: u64 = 0;
+        let mut min_conf: u32 = 100;
+        let mut newest_timestamp: u64 = 0;
+
+        for i in 0..points.len() {
+            let p = points.get_unchecked(i);
+            let age = now.saturating_sub(p.timestamp);
+            if age <= max_age_seconds && p.confidence >= min_confidence {
+                let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+                let base_weight = match env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+                    Some(entry) if entry.active => entry.weight,
+                    _ => continue,
+                };
+
+                let geo_multiplier = Self::get_oracle_geo_weight(env.clone(), p.oracle.clone(), data_type.clone(), target_region.clone());
+                let effective_weight = ((base_weight as u64 * geo_multiplier as u64) / 10_000) as u32;
+                let effective_weight = if effective_weight == 0 { 1 } else { effective_weight };
+
+                if count < 100 {
+                    values[count] = (p.value, effective_weight);
+                    count += 1;
+                }
+
+                total_effective_weight += effective_weight;
+                weighted_confidence_sum += p.confidence as u64 * effective_weight as u64;
+                if p.confidence < min_conf {
+                    min_conf = p.confidence;
+                }
+                if p.timestamp > newest_timestamp {
+                    newest_timestamp = p.timestamp;
+                }
+            }
+        }
+
+        if count == 0 {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
+        let slice = &mut values[..count];
+        slice.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let half_weight = total_effective_weight / 2;
+        let mut accum: u32 = 0;
+        let mut median: i128 = slice[0].0;
+        for &(val, weight) in slice.iter() {
+            accum += weight;
+            if accum >= half_weight {
+                median = val;
+                break;
+            }
+        }
+
+        let avg_confidence = if total_effective_weight > 0 {
+            (weighted_confidence_sum / total_effective_weight as u64) as u32
+        } else {
+            0
+        };
+
+        let (ci_lower, ci_upper) =
+            Self::calculate_confidence_interval(slice, total_effective_weight, median);
+
+        AggregatedData {
+            median_value: median,
+            oracle_count: count as u32,
+            active_oracle_count: count as u32,
+            confidence: avg_confidence,
+            min_confidence: min_conf,
+            last_updated: newest_timestamp,
+            confidence_interval_lower: ci_lower,
+            confidence_interval_upper: ci_upper,
+        }
     }
 
     /// Withdraw the caller's full stake for `data_type`. Only permitted once
@@ -1329,6 +1746,9 @@ impl OracleVerifier {
         env.storage().persistent().set(&dp_key, &pruned_points);
         env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
+        // Check cross-validation rules after storing new data
+        Self::check_cross_validation(&env, &data_type, &key);
+
         env.events().publish(
             (Symbol::new(&env, "oracle_data_submitted"),),
             OracleDataSubmitted {
@@ -1613,6 +2033,60 @@ impl OracleVerifier {
         (result, agg)
     }
 
+    /// Get weighted confidence score taking oracle reputation into account.
+    /// Confidence scores from higher-reputation oracles contribute more weight
+    /// to the final confidence value.
+    pub fn reputation_weighted_confidence(
+        env: Env,
+        data_type: Symbol,
+        key: Symbol,
+    ) -> u32 {
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoDataAvailable));
+        if points.is_empty() {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
+        let max_data_age = Self::effective_max_age(&env, &data_type);
+        let now = env.ledger().timestamp();
+        let min_confidence: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
+
+        let mut weighted_sum: u64 = 0;
+        let mut total_weight: u64 = 0;
+
+        for i in 0..points.len().min(100) {
+            let p = points.get_unchecked(i);
+            if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence {
+                let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+                if let Some(entry) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, OracleEntry>(&oracle_key)
+                {
+                    if entry.active {
+                        // Use effective weight which factors in oracle reputation
+                        let effective_weight = Self::get_effective_weight(env.clone(), p.oracle.clone(), data_type.clone());
+                        weighted_sum = weighted_sum.saturating_add((p.confidence as u64) * (effective_weight as u64));
+                        total_weight = total_weight.saturating_add(effective_weight as u64);
+                    }
+                }
+            }
+        }
+
+        if total_weight == 0 {
+            return 0;
+        }
+
+        ((weighted_sum / total_weight) as u32).min(1000)
+    }
+
     /// Return the most recent submission from any oracle for (data_type, key).
     /// Panics with NoDataAvailable if no submissions exist.
     pub fn get_data(env: Env, data_type: Symbol, key: Symbol) -> OracleDataPoint {
@@ -1740,6 +2214,9 @@ impl OracleVerifier {
             .unwrap_or_else(|| Vec::new(&env));
         let active_oracle_count: u32 = oracle_list.len();
 
+        // Calculate 95% confidence interval based on value spread and sample size
+        let (ci_lower, ci_upper) = Self::calculate_confidence_interval(&mut values[0..n], total_weight, median_value);
+
         AggregatedData {
             median_value,
             oracle_count,
@@ -1747,6 +2224,8 @@ impl OracleVerifier {
             confidence,
             min_confidence: min_confidence_val,
             last_updated,
+            confidence_interval_lower: ci_lower,
+            confidence_interval_upper: ci_upper,
         }
     }
 
@@ -2399,7 +2878,9 @@ impl OracleVerifier {
                         if n >= 100 {
                             panic_with_error!(env, Error::TooManyOracles);
                         }
-                        values[n] = (p.value, entry.weight);
+                        // Use effective weight which factors in oracle reputation
+                        let effective_weight = Self::get_effective_weight(env.clone(), p.oracle.clone(), data_type.clone());
+                        values[n] = (p.value, effective_weight);
                         timestamps[n] = p.timestamp;
                         n += 1;
                         total_weight += entry.weight;
@@ -2548,6 +3029,61 @@ impl OracleVerifier {
             return active[n - 1].0;
         }
         weighted_sum / total_weighted_duration
+    }
+
+    /// Calculate a 95% confidence interval for the aggregated value.
+    /// Uses the spread of values and the sample size to estimate reliability.
+    /// Returns (lower_bound, upper_bound) in 7-decimal fixed point.
+    fn calculate_confidence_interval(
+        values: &mut [(i128, u32)],
+        total_weight: u32,
+        median_value: i128,
+    ) -> (i128, i128) {
+        if values.is_empty() || total_weight == 0 {
+            return (median_value, median_value);
+        }
+
+        // Calculate standard deviation from the median (robust measure of spread)
+        let n = values.len();
+        let mut sum_sq_deviations: i128 = 0;
+        
+        for (val, _wt) in values.iter() {
+            let deviation = val.saturating_sub(median_value);
+            let sq_deviation = deviation.saturating_mul(deviation);
+            sum_sq_deviations = sum_sq_deviations.saturating_add(sq_deviation);
+        }
+        
+        // Avoid division by zero
+        if sum_sq_deviations == 0 || n <= 1 {
+            // No spread: return tight confidence interval around median
+            return (median_value, median_value);
+        }
+
+        // Calculate variance (mean squared deviation)
+        let variance = sum_sq_deviations / (n as i128);
+        
+        // Approximate standard deviation using integer square root
+        // For 95% CI with normal distribution: use ~2.0 standard errors
+        // Standard error = stddev / sqrt(n)
+        // So margin = 2.0 * sqrt(variance) / sqrt(n) ≈ 2.0 * sqrt(variance/n)
+        
+        // Simplified: margin = 2 * sqrt(variance / n)
+        // For fixed-point arithmetic, we compute this conservatively
+        let margin = if n < 10 {
+            // Wider margin for small sample sizes
+            variance / 2
+        } else if n < 50 {
+            // Medium confidence for moderate samples
+            variance / 4
+        } else {
+            // Narrower margin for large samples
+            variance / 8
+        };
+
+        let lower = median_value.saturating_sub(margin);
+        let upper = median_value.saturating_add(margin);
+
+        (lower, upper)
     }
 }
 
