@@ -680,6 +680,100 @@ impl OracleVerifier {
         }
     }
 
+    /// Check for stale oracle data across all submissions for a key.
+    ///
+    /// Unlike `check_freshness` which counts individual fresh submissions,
+    /// this provides a holistic staleness report that includes the ratio
+    /// of fresh to stale data and the age range of submissions. Useful for
+    /// monitoring dashboards and automated alerts.
+    ///
+    /// Data is considered stale when its age exceeds the effective max_age
+    /// for the data type. If more than half the submissions are stale, the
+    /// entire data set is flagged as stale.
+    pub fn check_staleness(env: Env, data_type: Symbol, key: Symbol) -> StalenessReport {
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let max_age = Self::effective_max_age(&env, &data_type);
+        let now = env.ledger().timestamp();
+
+        let mut stale_count = 0u32;
+        let mut newest_age = u64::MAX;
+        let mut oldest_fresh_age = 0u64;
+        let total_count = points.len();
+
+        for i in 0..points.len() {
+            let p = points.get_unchecked(i);
+            let age = now.saturating_sub(p.timestamp);
+
+            if age < newest_age {
+                newest_age = age;
+            }
+
+            if age > max_age {
+                stale_count += 1;
+            } else {
+                if age > oldest_fresh_age {
+                    oldest_fresh_age = age;
+                }
+            }
+        }
+
+        // If no submissions, report as stale with max ages
+        if total_count == 0 {
+            return StalenessReport {
+                data_type,
+                key,
+                is_stale: true,
+                oldest_fresh_age: 0,
+                newest_age: u64::MAX,
+                stale_count: 0,
+                total_count: 0,
+                max_age,
+                freshness_ratio_bps: 0,
+            };
+        }
+
+        let fresh_count = total_count.saturating_sub(stale_count);
+        let freshness_ratio_bps = if total_count > 0 {
+            (fresh_count as u64 * 10_000 / total_count as u64) as u32
+        } else {
+            0
+        };
+
+        // Data is stale if more than half of submissions are stale
+        let is_stale = stale_count > total_count / 2;
+
+        if is_stale {
+            env.events().publish(
+                (Symbol::new(&env, "stale_data_detected"),),
+                StaleDataDetected {
+                    data_type: data_type.clone(),
+                    key: key.clone(),
+                    stale_count,
+                    total_count,
+                    oldest_age: now.saturating_sub(newest_age),
+                    max_age,
+                },
+            );
+        }
+
+        StalenessReport {
+            data_type,
+            key,
+            is_stale,
+            oldest_fresh_age,
+            newest_age,
+            stale_count,
+            total_count,
+            max_age,
+            freshness_ratio_bps,
+        }
+    }
+
     /// Set the minimum number of oracle submissions required to form a consensus value.
     /// `min_count` must be at least 1; the default is 1.
     pub fn set_min_oracle_count(env: Env, admin: Address, min_count: u32) {

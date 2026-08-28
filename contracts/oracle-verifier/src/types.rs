@@ -463,3 +463,41 @@ pub struct CrossValidationFailed {
     pub variance: i128,
     pub max_variance: i128,
 }
+
+/// Staleness report for oracle data across all submissions for a key.
+///
+/// Unlike `FreshnessReport` which checks individual submissions, this
+/// aggregates staleness across the entire data set to give a holistic
+/// view of whether the data is safe to use for decision-making.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StalenessReport {
+    pub data_type: Symbol,
+    pub key: Symbol,
+    /// Whether the data is considered stale overall.
+    pub is_stale: bool,
+    /// Age in seconds of the oldest fresh submission.
+    pub oldest_fresh_age: u64,
+    /// Age in seconds of the newest submission.
+    pub newest_age: u64,
+    /// Number of submissions that are stale (older than max_age).
+    pub stale_count: u32,
+    /// Total submissions for this key.
+    pub total_count: u32,
+    /// The max age threshold used (per-type or global).
+    pub max_age: u64,
+    /// Percentage of submissions that are fresh (0-10000 basis points).
+    pub freshness_ratio_bps: u32,
+}
+
+/// Emitted when stale oracle data is detected during submission or verification.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StaleDataDetected {
+    pub data_type: Symbol,
+    pub key: Symbol,
+    pub stale_count: u32,
+    pub total_count: u32,
+    pub oldest_age: u64,
+    pub max_age: u64,
+}
