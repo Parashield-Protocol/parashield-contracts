@@ -182,11 +182,9 @@ pub enum Error {
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
-#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contract]
 pub struct OracleVerifier;
 
-#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contractimpl]
 impl OracleVerifier {
     // ── Lifecycle ────────────────────────────────────────────────────────────
