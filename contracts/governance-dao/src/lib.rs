@@ -153,6 +153,7 @@ pub enum Error {
     DiscussionPeriodNotRequired = 39,
     /// `vote_batch` was called with an empty proposal list.
     NoProposals = 40,
+    InvalidInput = 41,
 }
 
 #[contract]
@@ -871,12 +872,19 @@ impl GovernanceDao {
     /// Callable by anyone once `vote_end + FINALIZE_DELAY` has passed (the
     /// delay buffer prevents finalize being raced at the exact close of
     /// voting). Quorum is `total_votes >= total_supply * quorum_bps /
-    /// 10_000`, using the `total_supply` snapshotted at proposal creation.
-    /// If quorum is met, the proposal Passes only when `votes_for * 10_000 /
-    /// total_votes >= majority_bps`; otherwise (including the exact-tie
-    /// case, which lands at 50%) it Fails. Passing also starts the
-    /// execution timelock (`execution_time = now + proposal_timelock`).
-    /// The proposer's original deposit is refunded in both outcomes.
+    /// 10_000`, using the `total_supply` snapshotted at proposal creation,
+    /// where `total_votes` includes For, Against, *and* Abstain — an
+    /// abstaining holder still shows up for participation purposes. If
+    /// quorum is met, the proposal Passes only when `votes_for * 10_000 /
+    /// (votes_for + votes_against) >= majority_bps`; Abstain is excluded
+    /// from this ratio entirely, so it counts toward quorum but never
+    /// drags down (or props up) the For/Against split (issue #385). A
+    /// proposal with no partisan (For/Against) votes at all — e.g.
+    /// everyone abstained — has no majority to speak of and Fails, as does
+    /// the exact-tie case (which lands at exactly 50%). Passing also
+    /// starts the execution timelock (`execution_time = now +
+    /// proposal_timelock`). The proposer's original deposit is refunded in
+    /// both outcomes.
     pub fn finalize(env: Env, proposal_id: u64) {
         let mut proposal: Proposal = env
             .storage()
@@ -926,10 +934,17 @@ impl GovernanceDao {
         } else if total_votes < quorum_needed {
             proposal.status = ProposalStatus::Failed;
         } else {
-            // Guard: prevent division by zero if total_votes == 0
-            let for_bps = if total_votes > 0 {
-                proposal.votes_for.checked_mul(10_000).map(|v| v / total_votes).unwrap_or(0)
+            // Majority is decided by the partisan (For/Against) split only —
+            // Abstain already did its job by counting toward quorum above and
+            // must not also dilute the For share here, otherwise a large
+            // abstaining bloc could sink a proposal that every partisan voter
+            // supported (issue #385).
+            let partisan_votes = proposal.votes_for + proposal.votes_against;
+            let for_bps = if partisan_votes > 0 {
+                proposal.votes_for.checked_mul(10_000).map(|v| v / partisan_votes).unwrap_or(0)
             } else {
+                // Nobody voted For or Against — an all-Abstain proposal has no
+                // majority to speak of, regardless of quorum.
                 0
             };
             if for_bps >= config.majority_bps as i128 {
@@ -1333,6 +1348,7 @@ impl GovernanceDao {
         target: Address,
         function: Symbol,
         args: Vec<Val>,
+        impact_analysis: Bytes,
     ) -> u64 {
         let template: ProposalTemplate = env
             .storage()
@@ -1349,7 +1365,7 @@ impl GovernanceDao {
             panic_with_error!(&env, Error::ArgCountMismatch);
         }
 
-        let proposal_id = Self::create_proposal(env.clone(), proposer, title, target, function, args);
+        let proposal_id = Self::create_proposal(env.clone(), proposer, title, target, function, args, impact_analysis);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_created_from_template"),),
