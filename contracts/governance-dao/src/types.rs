@@ -88,9 +88,16 @@ pub struct Proposal {
     pub total_supply: i128,
     /// Whether this is a generic call or a contract-upgrade proposal.
     pub kind: ProposalKind,
-    /// Whether a guardian has vetoed this proposal (security-critical proposals only).
-    /// When true, the proposal cannot be executed even if it passes voting.
-    pub is_vetoed: bool,
+    /// Mandatory impact analysis describing potential consequences of this proposal.
+    /// Max 4096 bytes to provide comprehensive risk assessment.
+    pub impact_analysis: Bytes,
+    /// Optional verification callback function on the target contract to confirm
+    /// execution produced the intended state change. Called as `target::verify_proposal_execution(proposal_id)`.
+    /// If specified and fails, execution is marked as failed with audit trail.
+    /// Signature: fn verify_proposal_execution(env: Env, proposal_id: u64) -> Result<bool, Symbol>
+    pub verification_callback: Option<Symbol>,
+    /// Whether execution has been verified (callback succeeded or not required).
+    pub execution_verified: bool,
 }
 
 /// A single vote record stored per (proposal_id, voter) key.
@@ -123,6 +130,10 @@ pub struct DaoConfig {
     /// Mandatory discussion period in seconds before voting opens.
     /// Set to 0 to disable (proposals go straight to Active).
     pub discussion_period: u64,
+    /// Maximum voting weight any single address may cast per proposal (7-decimal).
+    /// 0 = no cap (unlimited whale voting). Capping prevents a single large
+    /// holder from dominating governance outcomes.
+    pub vote_weight_cap: i128,
 }
 
 /// Settings controlling adaptive (decaying) quorum.
@@ -243,9 +254,26 @@ pub struct ProposalFinalized {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionAuditRecord {
+    pub proposal_id: u64,
+    pub executor: Address,
+    pub target: Address,
+    pub function: Symbol,
+    pub executed_at: u64,
+    pub votes_for: i128,
+    pub votes_against: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProposalExecuted {
     pub proposal_id: u64,
+    pub executor: Address,
+    pub target: Address,
+    pub function: Symbol,
+    pub executed_at: u64,
 }
+
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -386,4 +414,56 @@ pub struct TemplateRegistered {
 pub struct ProposalCreatedFromTemplate {
     pub proposal_id: u64,
     pub template_name: Symbol,
+}
+
+/// Emitted when the vote weight cap is updated via DAO config.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoteWeightCapUpdated {
+    pub vote_weight_cap: i128,
+}
+
+/// Emitted when a delegation's weight is used in a vote.
+///
+/// Tracks the moment delegated voting power is actually exercised,
+/// making it possible to see which delegations contributed to which
+/// proposals and how much weight they carried.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegationUsed {
+    pub proposal_id: u64,
+    pub delegate: Address,
+    pub delegator: Address,
+    pub weight: i128,
+}
+
+/// Emitted when a delegation is created or revoked, recording the
+/// full delegation graph at a point in time for off-chain indexing.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegationRecorded {
+    pub delegator: Address,
+    pub delegate: Address,
+    pub action: Symbol,
+    pub recorded_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionVerified {
+    pub proposal_id: u64,
+    pub executor: Address,
+    pub target: Address,
+    pub verification_callback: Symbol,
+    pub verified_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionVerificationFailed {
+    pub proposal_id: u64,
+    pub executor: Address,
+    pub target: Address,
+    pub callback: Symbol,
+    pub error: Symbol,
 }

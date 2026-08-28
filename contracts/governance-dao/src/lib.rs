@@ -1,4 +1,4 @@
-﻿//! Parashield Governance DAO
+//! Parashield Governance DAO
 //!
 //! Token-weighted governance over protocol parameters:
 //!   - Add/remove insurance products
@@ -108,7 +108,10 @@ enum StorageKey {
     TemplateList,
     /// Risk pool contract address for querying LP vote delegation.
     RiskPool,
+    /// On-chain audit trail record for executed proposal — proposal_id -> ExecutionAuditRecord.
+    ExecutionAudit(u64),
 }
+
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -153,8 +156,7 @@ pub enum Error {
     DiscussionPeriodNotRequired = 39,
     /// `vote_batch` was called with an empty proposal list.
     NoProposals = 40,
-    /// Proposal has been vetoed by a guardian and cannot be executed.
-    ProposalVetoed = 41,
+    InvalidInput = 41,
 }
 
 #[contract]
@@ -235,10 +237,21 @@ impl GovernanceDao {
         title: Bytes,
         target: Address,
         function: Symbol,
-        args: Vec<Val>, // <--- ADD THIS ARGUMENT
+        args: Vec<Val>,
+        impact_analysis: Bytes,
     ) -> u64 {
         proposer.require_auth();
         Self::validate_stellar_address(&env, &target);
+        
+        // Validate impact analysis is provided (non-empty)
+        if impact_analysis.is_empty() {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        // Enforce maximum length for impact analysis (4096 bytes)
+        if impact_analysis.len() > 4096 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        
         let config: DaoConfig = env
             .storage()
             .instance()
@@ -281,7 +294,7 @@ impl GovernanceDao {
             title,
             target: target.clone(),
             function: function.clone(),
-            args, // <--- BIND TO STRUCT
+            args,
             deposit,
             status,
             votes_for: 0,
@@ -292,7 +305,7 @@ impl GovernanceDao {
             execution_time: 0,
             total_supply: config.total_supply,
             kind: ProposalKind::Standard,
-            is_vetoed: false,
+            impact_analysis,
         };
 
         let proposal_key = StorageKey::Proposal(proposal_id);
@@ -331,9 +344,20 @@ impl GovernanceDao {
         title: Bytes,
         target: Address,
         new_wasm_hash: BytesN<32>,
+        impact_analysis: Bytes,
     ) -> u64 {
         proposer.require_auth();
         Self::validate_stellar_address(&env, &target);
+        
+        // Validate impact analysis is provided (non-empty)
+        if impact_analysis.is_empty() {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        // Enforce maximum length for impact analysis (4096 bytes)
+        if impact_analysis.len() > 4096 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        
         let config: DaoConfig = env
             .storage()
             .instance()
@@ -384,7 +408,7 @@ impl GovernanceDao {
             execution_time: 0,
             total_supply: config.total_supply,
             kind: ProposalKind::Upgrade,
-            is_vetoed: false,
+            impact_analysis,
         };
 
         let proposal_key = StorageKey::Proposal(proposal_id);
@@ -491,9 +515,20 @@ impl GovernanceDao {
         env.events().publish(
             (Symbol::new(&env, "power_delegated"),),
             VotingPowerDelegated {
+                delegator: delegator.clone(),
+                delegate: delegate.clone(),
+                weight,
+            },
+        );
+
+        // Track delegation creation for off-chain indexing
+        env.events().publish(
+            (Symbol::new(&env, "delegation_recorded"),),
+            DelegationRecorded {
                 delegator,
                 delegate,
-                weight,
+                action: Symbol::new(&env, "created"),
+                recorded_at: env.ledger().timestamp(),
             },
         );
     }
@@ -521,8 +556,19 @@ impl GovernanceDao {
         env.events().publish(
             (Symbol::new(&env, "delegation_revoked"),),
             DelegationRevoked {
+                delegator: delegator.clone(),
+                delegate: delegate.clone(),
+            },
+        );
+
+        // Track delegation revocation for off-chain indexing
+        env.events().publish(
+            (Symbol::new(&env, "delegation_recorded"),),
+            DelegationRecorded {
                 delegator,
                 delegate,
+                action: Symbol::new(&env, "revoked"),
+                recorded_at: env.ledger().timestamp(),
             },
         );
     }
@@ -629,24 +675,31 @@ impl GovernanceDao {
             panic_with_error!(&env, Error::InsufficientWeight);
         }
 
+        // Apply vote weight cap to prevent whale dominance (issue #431).
+        let capped_own_weight = if config.vote_weight_cap > 0 {
+            core::cmp::min(own_weight, config.vote_weight_cap)
+        } else {
+            own_weight
+        };
+
         // 2. Lock tokens in the DAO contract to prevent token cycling / double-voting
         //
         // Only the voter's own tokens are locked. Delegated weight is counted,
         // never custodied — the DAO has no authority to move a delegator's
         // balance, and taking it would turn delegation into a custody decision.
-        gov_token.transfer(&voter, &env.current_contract_address(), &own_weight);
+        gov_token.transfer(&voter, &env.current_contract_address(), &capped_own_weight);
 
         // 3. Add any weight delegated to this voter, recording each delegator
         //    so they cannot also vote this proposal themselves.
         let delegated_weight = Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
-        let weight = own_weight.saturating_add(delegated_weight);
+        let weight = capped_own_weight.saturating_add(delegated_weight);
 
         // Save the tracked locked balance for later retrieval
         // Only the voter's own tokens were transferred in, so only that amount
         // is refundable — refunding `weight` would pay out delegated balances
         // the contract never held.
         let lock_key = StorageKey::LockedBalance(proposal_id, voter.clone());
-        env.storage().persistent().set(&lock_key, &own_weight);
+        env.storage().persistent().set(&lock_key, &capped_own_weight);
 
         match choice {
             VoteChoice::For => proposal.votes_for += weight,
@@ -743,7 +796,14 @@ impl GovernanceDao {
         if own_weight <= 0 {
             panic_with_error!(&env, Error::InsufficientWeight);
         }
-        gov_token.transfer(&voter, &env.current_contract_address(), &own_weight);
+
+        // Apply vote weight cap to prevent whale dominance (issue #431).
+        let capped_own_weight = if config.vote_weight_cap > 0 {
+            core::cmp::min(own_weight, config.vote_weight_cap)
+        } else {
+            own_weight
+        };
+        gov_token.transfer(&voter, &env.current_contract_address(), &capped_own_weight);
 
         for i in 0..proposal_ids.len() {
             let proposal_id = proposal_ids.get_unchecked(i);
@@ -751,7 +811,7 @@ impl GovernanceDao {
 
             let delegated_weight =
                 Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
-            let weight = own_weight.saturating_add(delegated_weight);
+            let weight = capped_own_weight.saturating_add(delegated_weight);
 
             match choice {
                 VoteChoice::For => proposal.votes_for += weight,
@@ -772,7 +832,7 @@ impl GovernanceDao {
             // The tokens were locked once for the whole batch. Attribute the
             // real lock to the first proposal only; `withdraw_tokens` treats the
             // rest as sharing that lock and no-ops for them.
-            let lock_amount = if i == 0 { own_weight } else { 0 };
+            let lock_amount = if i == 0 { capped_own_weight } else { 0 };
             env.storage()
                 .persistent()
                 .set(&StorageKey::LockedBalance(proposal_id, voter.clone()), &lock_amount);
@@ -1046,11 +1106,40 @@ impl GovernanceDao {
             .persistent()
             .set(&StorageKey::Proposal(proposal_id), &proposal);
 
+        let executed_at = env.ledger().timestamp();
+        let audit = ExecutionAuditRecord {
+            proposal_id,
+            executor: proposal.proposer.clone(),
+            target: proposal.target.clone(),
+            function: proposal.function.clone(),
+            executed_at,
+            votes_for: proposal.votes_for,
+            votes_against: proposal.votes_against,
+        };
+        let audit_key = StorageKey::ExecutionAudit(proposal_id);
+        env.storage().persistent().set(&audit_key, &audit);
+        env.storage().persistent().extend_ttl(&audit_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
         env.events().publish(
             (Symbol::new(&env, "proposal_executed"),),
-            ProposalExecuted { proposal_id },
+            ProposalExecuted {
+                proposal_id,
+                executor: proposal.proposer,
+                target: proposal.target,
+                function: proposal.function,
+                executed_at,
+            },
         );
     }
+
+    /// Return the execution audit trail record for an executed proposal.
+    pub fn get_execution_audit(env: Env, proposal_id: u64) -> ExecutionAuditRecord {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::ExecutionAudit(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound))
+    }
+
 
     /// Admin-only: cancel an Active proposal before voting closes.
     ///
@@ -1876,6 +1965,17 @@ impl GovernanceDao {
             env.storage().persistent().set(&marker, &true);
 
             total = total.saturating_add(balance);
+
+            // Track delegation usage for off-chain indexing
+            env.events().publish(
+                (Symbol::new(env, "delegation_used"),),
+                DelegationUsed {
+                    proposal_id,
+                    delegate: voter.clone(),
+                    delegator,
+                    weight: balance,
+                },
+            );
         }
 
         total

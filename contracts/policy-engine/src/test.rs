@@ -1233,3 +1233,149 @@ fn test_expired_policy_reports_not_active() {
         ExpiryState::NotActive
     );
 }
+
+
+// ── Product statistics (get_product_stats) ────────────────────────────────────
+
+/// get_product_stats returns aggregated statistics for a product.
+#[test]
+fn test_get_product_stats_returns_zeros_for_nonexistent_product() {
+    let (env, _admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    
+    let stats = client.get_product_stats(&999_u128);
+    assert_eq!(stats.product_id, 999);
+    assert_eq!(stats.total_policies, 0);
+    assert_eq!(stats.active_policies, 0);
+    assert_eq!(stats.total_coverage, 0);
+    assert_eq!(stats.total_premium_collected, 0);
+}
+
+/// get_product_stats aggregates across multiple policies for a product.
+#[test]
+fn test_get_product_stats_aggregates_policies() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    
+    let pid = create_crop_product(&env, &client, &admin);
+    
+    // Mint and fund USDC for multiple buyers
+    let buyer1 = Address::generate(&env);
+    let buyer2 = Address::generate(&env);
+    
+    StellarAssetClient::new(&env, &usdc).mint(&buyer1, &2_000_000_000i128);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer2, &2_000_000_000i128);
+    
+    // Fund policy engine with coverage capital
+    StellarAssetClient::new(&env, &usdc).mint(&contract_id, &5_000_000_000i128);
+    
+    // Buy two policies
+    let pol1 = client.buy_policy(&buyer1, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+    let pol2 = client.buy_policy(&buyer2, &pid, &(2_000_000_000i128), &60u32, &symbol_short!("kis2606"));
+    
+    // Get stats
+    let stats = client.get_product_stats(&pid);
+    
+    assert_eq!(stats.product_id, pid);
+    assert_eq!(stats.total_policies, 2, "should have 2 policies");
+    assert_eq!(stats.active_policies, 2, "both policies should be active");
+    assert_eq!(stats.total_coverage, COVERAGE + 2_000_000_000i128);
+    assert!(stats.total_premium_collected > 0, "premiums should be collected");
+}
+
+/// get_product_stats counts only Active policies as active.
+#[test]
+fn test_get_product_stats_counts_by_status() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    
+    let pid = create_crop_product(&env, &client, &admin);
+    
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &2_000_000_000i128);
+    StellarAssetClient::new(&env, &usdc).mint(&contract_id, &5_000_000_000i128);
+    
+    let _pol_id = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+    
+    // Check stats immediately after purchase
+    let stats = client.get_product_stats(&pid);
+    
+    assert_eq!(stats.total_policies, 1, "total count should be 1");
+    assert_eq!(stats.active_policies, 1, "newly purchased policy is active");
+    assert_eq!(stats.total_coverage, COVERAGE);
+    assert!(stats.total_premium_collected > 0);
+}
+
+
+// ── Emergency pause/resume (event emission) ──────────────────────────────────
+
+/// Admin can call emergency_pause and it blocks buy_policy.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_emergency_pause_blocks_buy_policy() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    
+    let pid = create_crop_product(&env, &client, &admin);
+    
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &2_000_000_000i128);
+    StellarAssetClient::new(&env, &usdc).mint(&contract_id, &5_000_000_000i128);
+    
+    // Buy policy succeeds before pause
+    let _pol1 = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+    
+    // Pause the contract
+    client.emergency_pause(&admin);
+    assert!(client.is_paused());
+    
+    // Buy policy fails after pause (panics with Unauthorized = error 3)
+    client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+}
+
+/// Admin can call emergency_resume to re-enable buy_policy.
+#[test]
+fn test_emergency_resume_enables_buy_policy() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    
+    let pid = create_crop_product(&env, &client, &admin);
+    
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &2_000_000_000i128);
+    StellarAssetClient::new(&env, &usdc).mint(&contract_id, &5_000_000_000i128);
+    
+    // Pause then resume
+    client.emergency_pause(&admin);
+    assert!(client.is_paused());
+    
+    client.emergency_resume(&admin);
+    assert!(!client.is_paused());
+    
+    // Buy policy succeeds after resume
+    let _pol = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+}
+
+/// Non-admin cannot pause contract.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_non_admin_cannot_pause() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    
+    let stranger = Address::generate(&env);
+    client.emergency_pause(&stranger);
+}
+
+/// Non-admin cannot resume contract.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_non_admin_cannot_resume() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    
+    client.emergency_pause(&admin);
+    
+    let stranger = Address::generate(&env);
+    client.emergency_resume(&stranger);
+}

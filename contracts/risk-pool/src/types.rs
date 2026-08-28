@@ -426,6 +426,15 @@ pub struct CompoundYieldToggled {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LpPositionTransferred {
+    pub from:   Address,
+    pub to:     Address,
+    pub shares: i128,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolCapacityUpdated {
     pub max_total_deposited: i128,
     pub max_utilization_bps: u32,
@@ -435,6 +444,26 @@ pub struct PoolCapacityUpdated {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExitDelayUpdated {
     pub delay_seconds: u64,
+}
+
+/// Dynamic fee adjustment configuration based on market conditions.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicFeeConfig {
+    /// Base fee in basis points (0-10000).
+    pub base_fee_bps: u32,
+    /// Maximum fee in basis points (0-10000).
+    pub max_fee_bps: u32,
+    /// Minimum fee in basis points (0-10000).
+    pub min_fee_bps: u32,
+    /// Utilization threshold at which fees start increasing (basis points).
+    pub utilization_threshold_bps: u32,
+    /// Fee adjustment per 1% increase in utilization above threshold (basis points).
+    pub fee_adjustment_per_1pct_bps: u32,
+    /// Whether dynamic fee adjustment is enabled.
+    pub enabled: bool,
+    /// Last time the dynamic fee was updated.
+    pub last_updated: u64,
 }
 
 #[contracttype]
@@ -476,25 +505,22 @@ pub struct ReserveFundUpdated {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InsuranceEnabled {
-    pub provider: Address,
-    pub shares: i128,
-    pub insurance_premium_rate_bps: u32,
+pub struct DynamicFeeAdjusted {
+    pub previous_fee_bps: u32,
+    pub new_fee_bps: u32,
+    pub utilization_bps: u32,
+    pub adjusted_at: u64,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InsuranceDisabled {
-    pub provider: Address,
-    pub shares: i128,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InsuranceClaimed {
-    pub provider: Address,
-    pub loss_amount: i128,
-    pub coverage_payout: i128,
+pub struct DynamicFeeConfigUpdated {
+    pub base_fee_bps: u32,
+    pub max_fee_bps: u32,
+    pub min_fee_bps: u32,
+    pub utilization_threshold_bps: u32,
+    pub fee_adjustment_per_1pct_bps: u32,
+    pub enabled: bool,
 }
 
 #[contracttype]
@@ -502,4 +528,127 @@ pub struct InsuranceClaimed {
 pub struct VotesDelegated {
     pub provider: Address,
     pub delegate: Address,
+}
+
+/// Collateralization ratio for an LP position.
+///
+/// Measures how well-backed an LP's position is by available liquidity
+/// relative to their share of locked capital. A ratio below 10000 (100%)
+/// means the position is undercollateralized and may be subject to
+/// liquidation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollateralizationInfo {
+    pub provider: Address,
+    /// LP's share of available pool liquidity (deposited - locked).
+    pub position_value: i128,
+    /// LP's proportional share of locked capital.
+    pub position_liability: i128,
+    /// Collateralization ratio in basis points (position_value / position_liability * 10000).
+    /// 10000 = 100% collateralized. 0 = no locked liability (fully collateralized).
+    pub collateralization_bps: u32,
+}
+
+/// Result of a liquidation attempt on an undercollateralized LP position.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidationResult {
+    pub provider: Address,
+    pub shares_seized: i128,
+    pub amount_recovered: i128,
+    pub previous_ratio_bps: u32,
+}
+
+/// An LP fee tier based on deposit amount and/or lock duration.
+/// LPs with larger deposits or longer commitment get lower fees.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeTier {
+    /// Minimum deposit amount for this tier (7-decimal stroops). 0 = no minimum.
+    pub min_deposit: i128,
+    /// Minimum lock duration in seconds for this tier. 0 = no lock required.
+    pub min_lock_duration: u64,
+    /// Fee discount in basis points (0-10000). 0 = no discount, 10000 = 100% off.
+    pub discount_bps: u32,
+    /// Human-readable tier name.
+    pub name: Symbol,
+}
+
+/// Optional vesting schedule for LP deposits to prevent large LPs from exiting immediately.
+/// Vesting ensures LPs gradually unlock their shares over time, reducing exit risk.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestingSchedule {
+    /// Total number of vesting periods.
+    pub total_periods: u32,
+    /// Duration of each vesting period in seconds.
+    pub period_duration: u64,
+    /// Shares that vest per period (can be 0 for cliff vesting).
+    pub amount_per_period: i128,
+    /// Cliff period (shares locked until this many periods have passed).
+    /// 0 = no cliff, vesting starts immediately.
+    pub cliff_periods: u32,
+    /// Absolute timestamp when vesting started.
+    pub vesting_start: u64,
+    /// Shares already vested and available for withdrawal.
+    pub vested_amount: i128,
+    /// Total shares subject to this vesting schedule.
+    pub total_amount: i128,
+}
+
+/// LP position with optional vesting constraint.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestedLpPosition {
+    pub provider: Address,
+    pub position: LpPosition,
+    /// Optional vesting schedule. If present, constrains withdrawals.
+    pub vesting: Option<VestingSchedule>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeTierUpdated {
+    pub tier_name: Symbol,
+    pub min_deposit: i128,
+    pub min_lock_duration: u64,
+    pub discount_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PositionLiquidated {
+    pub provider: Address,
+    pub shares_seized: i128,
+    pub amount_recovered: i128,
+    pub collateralization_bps: u32,
+}
+
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestingScheduleCreated {
+    pub provider: Address,
+    pub total_periods: u32,
+    pub period_duration: u64,
+    pub cliff_periods: u32,
+    pub vesting_start: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestingSharesReleased {
+    pub provider: Address,
+    pub newly_vested_amount: i128,
+    pub total_vested: i128,
+    pub vesting_period: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawalBlockedByVesting {
+    pub provider: Address,
+    pub requested_shares: i128,
+    pub available_shares: i128,
+    pub vesting_period: u32,
 }
