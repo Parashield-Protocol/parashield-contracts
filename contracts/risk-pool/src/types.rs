@@ -43,6 +43,12 @@ pub struct LpPosition {
     pub last_yield_claim:  u64,
     /// Whether this LP has opted into compound yield (reinvest instead of claim).
     pub compound_enabled:  bool,
+    /// Whether this LP has purchased optional insurance coverage for smart contract risk.
+    /// Insured positions are protected against losses from contract bugs (e.g., infinite mints).
+    /// Insurance premium is paid via reduced yield allocation.
+    pub insurance_enabled: bool,
+    /// Total insurance premium paid by this LP in stroops.
+    pub insurance_paid:    i128,
 }
 
 /// A soulbound NFT representing an LP's position in the pool.

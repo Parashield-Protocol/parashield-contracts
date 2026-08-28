@@ -283,6 +283,14 @@ pub struct ProposalCancelled {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalVetoed {
+    pub proposal_id: u64,
+    pub guardian: Address,
+    pub reason: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscussionPeriodEnded {
     pub proposal_id: u64,
 }

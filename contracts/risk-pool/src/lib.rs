@@ -365,6 +365,8 @@ impl RiskPool {
                     deposited_at:     now,
                     last_yield_claim: now,
                     compound_enabled,
+                    insurance_enabled: false,
+                    insurance_paid:    0,
                 }
             }
         };
