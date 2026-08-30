@@ -22,8 +22,8 @@ extern crate alloc;
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use crate::alloc::string::ToString;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror, panic_with_error,
-    token, Address, BytesN, Env, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, BytesN,
+    Env, Symbol, Vec,
 };
 
 pub mod types;
@@ -39,6 +39,8 @@ const TTL_THRESHOLD: u32 = 518_400;
 /// products and policies don't get evicted from storage before they mature.
 #[cfg(any(test, feature = "testutils", not(feature = "library")))]
 const TTL_EXTEND_TO: u32 = 6_312_000;
+const DEFAULT_MAX_PRODUCTS_PER_POOL: u32 = 100;
+const CURRENT_STORAGE_VERSION: u32 = 3;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -63,6 +65,8 @@ enum StorageKey {
     /// Maps (category, oracle_key) -> product_id for uniqueness constraint
     ProductKey((Symbol, Symbol)),
     PendingAdmin,
+    MaxProductsPerPool,
+    PoolProductCount(Symbol),
     /// Contract version (u32) for storage migration tracking
     Version,
 }
@@ -73,27 +77,29 @@ enum StorageKey {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
-    AlreadyInitialized      = 1,
-    NotInitialized          = 2,
-    Unauthorized            = 3,
-    ProductNotFound         = 4,
-    ProductNotActive        = 5,
-    PolicyNotFound          = 6,
-    PolicyNotActive         = 7,
-    CoverageOutOfRange      = 8,
-    DurationTooLong         = 9,
-    InsufficientPool        = 10,
-    AlreadyClaimed          = 11,
-    AlreadyExpired          = 12,
-    InvalidPremiumRate      = 13,
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    ProductNotFound = 4,
+    ProductNotActive = 5,
+    PolicyNotFound = 6,
+    PolicyNotActive = 7,
+    CoverageOutOfRange = 8,
+    DurationTooLong = 9,
+    InsufficientPool = 10,
+    AlreadyClaimed = 11,
+    AlreadyExpired = 12,
+    InvalidPremiumRate = 13,
     InvalidTriggerThreshold = 14,
-    DuplicateProductKey    = 15,
-    InvalidCoverageRange    = 16,
-    InvalidToken            = 17,
-    ClaimsProcessorNotSet   = 18,
-    InvalidDurationRange    = 19,
-    InvalidOracleKey        = 20,
-    Overflow               = 21,
+    DuplicateProductKey = 15,
+    InvalidCoverageRange = 16,
+    InvalidToken = 17,
+    ClaimsProcessorNotSet = 18,
+    InvalidDurationRange = 19,
+    InvalidOracleKey = 20,
+    Overflow = 21,
+    TooManyProducts = 22,
+    InvalidMaxProducts = 23,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -105,18 +111,12 @@ pub struct PolicyEngine;
 #[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contractimpl]
 impl PolicyEngine {
-
     // ── Lifecycle ────────────────────────────────────────────────────────────
 
     /// One-time initialisation. Wires up the USDC token and oracle contracts.
     /// Panics with `AlreadyInitialized` on a second call, or `InvalidToken` if
     /// `usdc_token` does not expose a `balance` entry-point.
-    pub fn initialize(
-        env: Env,
-        admin: Address,
-        usdc_token: Address,
-        oracle_address: Address,
-    ) {
+    pub fn initialize(env: Env, admin: Address, usdc_token: Address, oracle_address: Address) {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
@@ -161,7 +161,7 @@ impl PolicyEngine {
         if oracle_buf[0] != b'C' {
             panic!("invalid address: oracle_address must be a contract address");
         }
-        
+
         let balance_res = env.try_invoke_contract::<i128, soroban_sdk::Error>(
             &usdc_token,
             &Symbol::new(&env, "balance"),
@@ -172,13 +172,29 @@ impl PolicyEngine {
         }
 
         admin.require_auth();
-        env.storage().instance().set(&StorageKey::Initialized, &true);
+        env.storage()
+            .instance()
+            .set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
-        env.storage().instance().set(&StorageKey::UsdcToken, &usdc_token);
-        env.storage().instance().set(&StorageKey::OracleAddress, &oracle_address);
-        env.storage().instance().set(&StorageKey::NextProductId, &1u128);
-        env.storage().instance().set(&StorageKey::NextPolicyId,  &1u128);
-        env.storage().instance().set(&StorageKey::ActiveProducts, &Vec::<u128>::new(&env));
+        env.storage()
+            .instance()
+            .set(&StorageKey::UsdcToken, &usdc_token);
+        env.storage()
+            .instance()
+            .set(&StorageKey::OracleAddress, &oracle_address);
+        env.storage()
+            .instance()
+            .set(&StorageKey::NextProductId, &1u128);
+        env.storage()
+            .instance()
+            .set(&StorageKey::NextPolicyId, &1u128);
+        env.storage()
+            .instance()
+            .set(&StorageKey::ActiveProducts, &Vec::<u128>::new(&env));
+        env.storage().instance().set(
+            &StorageKey::MaxProductsPerPool,
+            &DEFAULT_MAX_PRODUCTS_PER_POOL,
+        );
         // No pending admin initially
         env.storage().instance().remove(&StorageKey::PendingAdmin);
 
@@ -195,7 +211,9 @@ impl PolicyEngine {
     /// Set the Claims Processor address. Called once after deploying claims contract.
     pub fn set_claims_processor(env: Env, admin: Address, claims_processor: Address) {
         Self::require_admin(&env, &admin);
-        env.storage().instance().set(&StorageKey::ClaimsProcessor, &claims_processor);
+        env.storage()
+            .instance()
+            .set(&StorageKey::ClaimsProcessor, &claims_processor);
         env.events().publish(
             (Symbol::new(&env, "claims_processor_updated"),),
             ClaimsProcessorUpdated {
@@ -244,38 +262,76 @@ impl PolicyEngine {
 
         // Check for duplicate (category, oracle_key) pair
         let key = (params.category.clone(), params.oracle_key.clone());
-        if env.storage().persistent().has(&StorageKey::ProductKey(key.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&StorageKey::ProductKey(key.clone()))
+        {
             panic_with_error!(&env, Error::DuplicateProductKey);
+        }
+
+        let pool_count_key = StorageKey::PoolProductCount(params.category.clone());
+        let pool_count: u32 = env.storage().persistent().get(&pool_count_key).unwrap_or(0);
+        let max_products: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MaxProductsPerPool)
+            .unwrap_or(DEFAULT_MAX_PRODUCTS_PER_POOL);
+        if pool_count >= max_products {
+            panic_with_error!(&env, Error::TooManyProducts);
         }
 
         let id = Self::next_product_id(&env);
         let product = InsuranceProduct {
             id,
-            name:               params.name,
-            category:           params.category,
-            oracle_key:         params.oracle_key,
-            trigger_type:       params.trigger_type,
-            oracle_data_type:   params.oracle_data_type,
-            trigger_threshold:  params.trigger_threshold,
+            name: params.name,
+            category: params.category,
+            oracle_key: params.oracle_key,
+            trigger_type: params.trigger_type,
+            oracle_data_type: params.oracle_data_type,
+            trigger_threshold: params.trigger_threshold,
             trigger_comparison: params.trigger_comparison,
-            coverage_min:       params.coverage_min,
-            coverage_max:       params.coverage_max,
-            premium_rate_bps:   params.premium_rate_bps,
-            max_duration_days:  params.max_duration_days,
-            status:             ProductStatus::Active,
-            created_at:         env.ledger().timestamp(),
+            coverage_min: params.coverage_min,
+            coverage_max: params.coverage_max,
+            premium_rate_bps: params.premium_rate_bps,
+            max_duration_days: params.max_duration_days,
+            status: ProductStatus::Active,
+            created_at: env.ledger().timestamp(),
         };
-        env.storage().persistent().set(&StorageKey::Product(id), &product);
-        env.storage().persistent().extend_ttl(&StorageKey::Product(id), TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Product(id), &product);
+        env.storage().persistent().extend_ttl(
+            &StorageKey::Product(id),
+            TTL_THRESHOLD,
+            TTL_EXTEND_TO,
+        );
 
         // Store the (category, oracle_key) -> product_id mapping for uniqueness
-        env.storage().persistent().set(&StorageKey::ProductKey(key.clone()), &id);
-        env.storage().persistent().extend_ttl(&StorageKey::ProductKey(key), TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::ProductKey(key.clone()), &id);
+        env.storage().persistent().extend_ttl(
+            &StorageKey::ProductKey(key),
+            TTL_THRESHOLD,
+            TTL_EXTEND_TO,
+        );
 
-        let mut products: Vec<u128> = env.storage().instance()
-            .get(&StorageKey::ActiveProducts).unwrap_or_else(|| Vec::new(&env));
+        let mut products: Vec<u128> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::ActiveProducts)
+            .unwrap_or_else(|| Vec::new(&env));
         products.push_back(id);
-        env.storage().instance().set(&StorageKey::ActiveProducts, &products);
+        env.storage()
+            .instance()
+            .set(&StorageKey::ActiveProducts, &products);
+        env.storage()
+            .persistent()
+            .set(&pool_count_key, &(pool_count + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&pool_count_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         env.events().publish(
             (Symbol::new(&env, "product_created"),),
@@ -295,10 +351,15 @@ impl PolicyEngine {
         Self::require_admin(&env, &admin);
         let mut product: InsuranceProduct = Self::load_product(&env, product_id);
         product.status = ProductStatus::Paused;
-        env.storage().persistent().set(&StorageKey::Product(product_id), &product);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Product(product_id), &product);
 
-        let mut products: Vec<u128> = env.storage().instance()
-            .get(&StorageKey::ActiveProducts).unwrap_or_else(|| Vec::new(&env));
+        let mut products: Vec<u128> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::ActiveProducts)
+            .unwrap_or_else(|| Vec::new(&env));
         let mut idx: Option<u32> = None;
         for i in 0..products.len() {
             if products.get_unchecked(i) == product_id {
@@ -308,7 +369,9 @@ impl PolicyEngine {
         }
         if let Some(i) = idx {
             products.remove(i);
-            env.storage().instance().set(&StorageKey::ActiveProducts, &products);
+            env.storage()
+                .instance()
+                .set(&StorageKey::ActiveProducts, &products);
         }
 
         env.events().publish(
@@ -323,11 +386,16 @@ impl PolicyEngine {
         Self::require_admin(&env, &admin);
         let mut product: InsuranceProduct = Self::load_product(&env, product_id);
         product.status = ProductStatus::Deprecated;
-        env.storage().persistent().set(&StorageKey::Product(product_id), &product);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Product(product_id), &product);
 
         // Remove from the ActiveProducts list on deprecation
-        let mut products: Vec<u128> = env.storage().instance()
-            .get(&StorageKey::ActiveProducts).unwrap_or_else(|| Vec::new(&env));
+        let mut products: Vec<u128> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::ActiveProducts)
+            .unwrap_or_else(|| Vec::new(&env));
         let mut idx: Option<u32> = None;
         for i in 0..products.len() {
             if products.get_unchecked(i) == product_id {
@@ -337,12 +405,27 @@ impl PolicyEngine {
         }
         if let Some(i) = idx {
             products.remove(i);
-            env.storage().instance().set(&StorageKey::ActiveProducts, &products);
+            env.storage()
+                .instance()
+                .set(&StorageKey::ActiveProducts, &products);
         }
 
         // Remove the (category, oracle_key) mapping to allow reuse of the key
+        let pool_count_key = StorageKey::PoolProductCount(product.category.clone());
+        let pool_count: u32 = env.storage().persistent().get(&pool_count_key).unwrap_or(0);
+        if pool_count > 0 {
+            env.storage()
+                .persistent()
+                .set(&pool_count_key, &(pool_count - 1));
+            env.storage()
+                .persistent()
+                .extend_ttl(&pool_count_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+
         let key = (product.category, product.oracle_key);
-        env.storage().persistent().remove(&StorageKey::ProductKey(key));
+        env.storage()
+            .persistent()
+            .remove(&StorageKey::ProductKey(key));
     }
 
     // ── Policy Lifecycle ──────────────────────────────────────────────────────
@@ -364,7 +447,12 @@ impl PolicyEngine {
         oracle_key: Symbol,
     ) -> u128 {
         buyer.require_auth();
-        if env.storage().instance().get::<_, bool>(&StorageKey::Paused).unwrap_or(false) {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&StorageKey::Paused)
+            .unwrap_or(false)
+        {
             panic_with_error!(&env, Error::Unauthorized);
         }
         let product = Self::load_product(&env, product_id);
@@ -391,20 +479,23 @@ impl PolicyEngine {
             .and_then(|v| v.checked_div(365))
             .and_then(|v| v.checked_div(10_000))
             .unwrap_or_else(|| panic_with_error!(&env, Error::CoverageOutOfRange));
-        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken)
+        let usdc: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::UsdcToken)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
 
         // Pull premium from buyer into this contract
-        token::Client::new(&env, &usdc)
-            .transfer(&buyer, &env.current_contract_address(), &premium);
+        token::Client::new(&env, &usdc).transfer(&buyer, &env.current_contract_address(), &premium);
 
-        let now        = env.ledger().timestamp();
+        let now = env.ledger().timestamp();
         let duration_secs = (duration_days as u64)
             .checked_mul(86_400)
             .unwrap_or_else(|| panic_with_error!(&env, Error::CoverageOutOfRange));
-        let end_time   = now.checked_add(duration_secs)
+        let end_time = now
+            .checked_add(duration_secs)
             .unwrap_or_else(|| panic_with_error!(&env, Error::CoverageOutOfRange));
-        let policy_id  = Self::next_policy_id(&env);
+        let policy_id = Self::next_policy_id(&env);
 
         let policy = Policy {
             id: policy_id,
@@ -421,16 +512,27 @@ impl PolicyEngine {
             status: PolicyStatus::Active,
             created_at: now,
         };
-        env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
-        env.storage().persistent().extend_ttl(&StorageKey::Policy(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Policy(policy_id), &policy);
+        env.storage().persistent().extend_ttl(
+            &StorageKey::Policy(policy_id),
+            TTL_THRESHOLD,
+            TTL_EXTEND_TO,
+        );
 
         // Append to user's policy list
         let user_key = StorageKey::UserPolicies(buyer.clone());
-        let mut user_policies: Vec<u128> = env.storage().persistent()
-            .get(&user_key).unwrap_or_else(|| Vec::new(&env));
+        let mut user_policies: Vec<u128> = env
+            .storage()
+            .persistent()
+            .get(&user_key)
+            .unwrap_or_else(|| Vec::new(&env));
         user_policies.push_back(policy_id);
         env.storage().persistent().set(&user_key, &user_policies);
-        env.storage().persistent().extend_ttl(&user_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage()
+            .persistent()
+            .extend_ttl(&user_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         env.events().publish(
             (Symbol::new(&env, "buy_policy"), buyer),
@@ -452,7 +554,9 @@ impl PolicyEngine {
             panic_with_error!(&env, Error::PolicyNotActive);
         }
         policy.status = PolicyStatus::Cancelled;
-        env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Policy(policy_id), &policy);
         Self::remove_policy_from_user(&env, &policyholder, policy_id);
 
         // Pro-rate the refund: only return the unearned portion of the premium.
@@ -464,17 +568,25 @@ impl PolicyEngine {
             policy.premium_paid
         } else {
             let elapsed_capped = elapsed.min(total_duration);
-            let earned = policy.premium_paid.checked_mul(elapsed_capped as i128)
+            let earned = policy
+                .premium_paid
+                .checked_mul(elapsed_capped as i128)
                 .and_then(|v| v.checked_div(total_duration as i128))
                 .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
             policy.premium_paid.saturating_sub(earned)
         };
 
-        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken)
+        let usdc: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::UsdcToken)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         if refund > 0 {
-            token::Client::new(&env, &usdc)
-                .transfer(&env.current_contract_address(), &policyholder, &refund);
+            token::Client::new(&env, &usdc).transfer(
+                &env.current_contract_address(),
+                &policyholder,
+                &refund,
+            );
         }
 
         env.events().publish(
@@ -496,15 +608,22 @@ impl PolicyEngine {
         Self::require_claims_processor(&env, &caller);
         let mut policy: Policy = Self::load_policy(&env, policy_id);
         match policy.status {
-            PolicyStatus::Claimed   => panic_with_error!(&env, Error::AlreadyClaimed),
-            PolicyStatus::Expired   => panic_with_error!(&env, Error::AlreadyExpired),
+            PolicyStatus::Claimed => panic_with_error!(&env, Error::AlreadyClaimed),
+            PolicyStatus::Expired => panic_with_error!(&env, Error::AlreadyExpired),
             PolicyStatus::Cancelled => panic_with_error!(&env, Error::PolicyNotActive),
-            PolicyStatus::Active    => {}
+            PolicyStatus::Active => {}
         }
-        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken)
+        let usdc: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::UsdcToken)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         let token_client = token::Client::new(&env, &usdc);
-        match token_client.try_transfer(&env.current_contract_address(), &policy.policyholder, &policy.coverage_amount) {
+        match token_client.try_transfer(
+            &env.current_contract_address(),
+            &policy.policyholder,
+            &policy.coverage_amount,
+        ) {
             Ok(Ok(())) => {}
             _ => {
                 panic_with_error!(&env, Error::InsufficientPool);
@@ -512,7 +631,9 @@ impl PolicyEngine {
         }
 
         policy.status = PolicyStatus::Claimed;
-        env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Policy(policy_id), &policy);
         Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
 
         env.events().publish(
@@ -527,13 +648,15 @@ impl PolicyEngine {
         Self::require_claims_processor(&env, &caller);
         let mut policy: Policy = Self::load_policy(&env, policy_id);
         match policy.status {
-            PolicyStatus::Claimed   => panic_with_error!(&env, Error::AlreadyClaimed),
-            PolicyStatus::Expired   => panic_with_error!(&env, Error::AlreadyExpired),
+            PolicyStatus::Claimed => panic_with_error!(&env, Error::AlreadyClaimed),
+            PolicyStatus::Expired => panic_with_error!(&env, Error::AlreadyExpired),
             PolicyStatus::Cancelled => panic_with_error!(&env, Error::PolicyNotActive),
-            PolicyStatus::Active    => {}
+            PolicyStatus::Active => {}
         }
         policy.status = PolicyStatus::Expired;
-        env.storage().persistent().set(&StorageKey::Policy(policy_id), &policy);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Policy(policy_id), &policy);
         Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
         env.events().publish(
             (Symbol::new(&env, "policy_expired"),),
@@ -556,10 +679,12 @@ impl PolicyEngine {
     /// Return a paginated slice of policy IDs owned by `user`. `offset` is the zero-based
     /// start index; `limit` caps the number of IDs returned.
     pub fn get_user_policies(env: Env, user: Address, offset: u32, limit: u32) -> Vec<u128> {
-        let all: Vec<u128> = env.storage().persistent()
+        let all: Vec<u128> = env
+            .storage()
+            .persistent()
             .get(&StorageKey::UserPolicies(user))
             .unwrap_or_else(|| Vec::new(&env));
-        
+
         let mut paginated = Vec::new(&env);
         let len = all.len();
         if offset >= len {
@@ -574,38 +699,68 @@ impl PolicyEngine {
 
     /// Return the IDs of all products whose status is `Active`.
     pub fn get_active_products(env: Env) -> Vec<u128> {
-        env.storage().instance()
+        env.storage()
+            .instance()
             .get(&StorageKey::ActiveProducts)
             .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Return the USDC balance held by this contract (7-decimal stroops).
     pub fn get_contract_balance(env: Env) -> i128 {
-        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken)
+        let usdc: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::UsdcToken)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         token::Client::new(&env, &usdc).balance(&env.current_contract_address())
     }
 
     /// Return the current admin address. Panics with `NotInitialized` if not set up.
     pub fn get_admin(env: Env) -> Address {
-        env.storage().instance().get(&StorageKey::Admin)
+        env.storage()
+            .instance()
+            .get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
     }
 
     /// Return the configured oracle verifier contract address.
     pub fn get_oracle(env: Env) -> Address {
-        env.storage().instance().get(&StorageKey::OracleAddress)
+        env.storage()
+            .instance()
+            .get(&StorageKey::OracleAddress)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
     }
 
     /// Return `true` if the contract is currently in emergency-pause mode.
     pub fn is_paused(env: Env) -> bool {
-        env.storage().instance().get(&StorageKey::Paused).unwrap_or(false)
+        env.storage()
+            .instance()
+            .get(&StorageKey::Paused)
+            .unwrap_or(false)
     }
 
     /// Return the current storage schema version (defaults to 1 before any migration).
     pub fn get_version(env: Env) -> u32 {
-        env.storage().instance().get(&StorageKey::Version).unwrap_or(1)
+        env.storage()
+            .instance()
+            .get(&StorageKey::Version)
+            .unwrap_or(1)
+    }
+
+    /// Return the configured maximum number of non-deprecated products per risk pool/category.
+    pub fn get_max_products_per_pool(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::MaxProductsPerPool)
+            .unwrap_or(DEFAULT_MAX_PRODUCTS_PER_POOL)
+    }
+
+    /// Return the current non-deprecated product count for a pool/category.
+    pub fn get_pool_product_count(env: Env, category: Symbol) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::PoolProductCount(category))
+            .unwrap_or(0)
     }
 
     // ── Admin: emergency controls ─────────────────────────────────────────────
@@ -616,63 +771,92 @@ impl PolicyEngine {
         env.storage().instance().set(&StorageKey::Paused, &true);
     }
 
-pub fn emergency_resume(env: Env, admin: Address) {
-         Self::require_admin(&env, &admin);
-         env.storage().instance().set(&StorageKey::Paused, &false);
-     }
+    pub fn emergency_resume(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&StorageKey::Paused, &false);
+    }
 
-     /// Propose a new admin. Only the current admin can call this.
-     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
-         Self::require_admin(&env, &admin);
-         // Store the proposed admin
-         env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
-     }
+    /// Propose a new admin. Only the current admin can call this.
+    pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
+        Self::require_admin(&env, &admin);
+        // Store the proposed admin
+        env.storage()
+            .instance()
+            .set(&StorageKey::PendingAdmin, &new_admin);
+    }
 
-     /// Accept the proposed admin. Only the proposed admin can call this.
-     pub fn accept_admin(env: Env, admin: Address) {
-         let pending_admin: Address = env.storage().instance()
-             .get(&StorageKey::PendingAdmin)
-             .unwrap_or_else(|| panic_with_error!(&env, Error::Unauthorized));
-         // Only the pending admin can accept
-         if pending_admin != admin {
-             panic_with_error!(&env, Error::Unauthorized);
-         }
-         admin.require_auth();
-         let _current_admin: Address = env.storage().instance()
-             .get(&StorageKey::Admin)
-             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
-         // Update admin
-         env.storage().instance().set(&StorageKey::Admin, &admin);
-         // Clear the proposal
-         env.storage().instance().remove(&StorageKey::PendingAdmin);
-         // Emit event
-         env.events().publish(
-             (Symbol::new(&env, "admin_updated"),),
-             AdminUpdated {
-                 new_admin: admin,
-             },
-         );
-     }
+    /// Accept the proposed admin. Only the proposed admin can call this.
+    pub fn accept_admin(env: Env, admin: Address) {
+        let pending_admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PendingAdmin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Unauthorized));
+        // Only the pending admin can accept
+        if pending_admin != admin {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        admin.require_auth();
+        let _current_admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        // Update admin
+        env.storage().instance().set(&StorageKey::Admin, &admin);
+        // Clear the proposal
+        env.storage().instance().remove(&StorageKey::PendingAdmin);
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "admin_updated"),),
+            AdminUpdated { new_admin: admin },
+        );
+    }
+
+    /// Admin-only: configure the maximum non-deprecated products per pool/category.
+    pub fn set_max_products_per_pool(env: Env, admin: Address, max_products: u32) {
+        Self::require_admin(&env, &admin);
+        if max_products == 0 {
+            panic_with_error!(&env, Error::InvalidMaxProducts);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::MaxProductsPerPool, &max_products);
+        env.events()
+            .publish((Symbol::new(&env, "max_products_updated"),), max_products);
+    }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     fn require_admin(env: &Env, caller: &Address) {
-        let admin: Address = env.storage().instance().get(&StorageKey::Admin)
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
-        if *caller != admin { panic_with_error!(env, Error::Unauthorized); }
+        if *caller != admin {
+            panic_with_error!(env, Error::Unauthorized);
+        }
         caller.require_auth();
     }
 
     fn require_claims_processor(env: &Env, caller: &Address) {
-        let cp: Address = env.storage().instance().get(&StorageKey::ClaimsProcessor)
+        let cp: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::ClaimsProcessor)
             .unwrap_or_else(|| panic_with_error!(env, Error::ClaimsProcessorNotSet));
-        if *caller != cp { panic_with_error!(env, Error::Unauthorized); }
+        if *caller != cp {
+            panic_with_error!(env, Error::Unauthorized);
+        }
         caller.require_auth();
     }
 
     fn remove_policy_from_user(env: &Env, user: &Address, policy_id: u128) {
         let key = StorageKey::UserPolicies(user.clone());
-        let mut user_policies: Vec<u128> = env.storage().persistent()
+        let mut user_policies: Vec<u128> = env
+            .storage()
+            .persistent()
             .get(&key)
             .unwrap_or_else(|| Vec::new(env));
         let mut pos: Option<u32> = None;
@@ -689,12 +873,16 @@ pub fn emergency_resume(env: Env, admin: Address) {
     }
 
     fn load_product(env: &Env, id: u128) -> InsuranceProduct {
-        env.storage().persistent().get(&StorageKey::Product(id))
+        env.storage()
+            .persistent()
+            .get(&StorageKey::Product(id))
             .unwrap_or_else(|| panic_with_error!(env, Error::ProductNotFound))
     }
 
     fn load_policy(env: &Env, id: u128) -> Policy {
-        env.storage().persistent().get(&StorageKey::Policy(id))
+        env.storage()
+            .persistent()
+            .get(&StorageKey::Policy(id))
             .unwrap_or_else(|| panic_with_error!(env, Error::PolicyNotFound))
     }
 
@@ -703,25 +891,23 @@ pub fn emergency_resume(env: Env, admin: Address) {
     /// preventing two concurrent ledger entries from reading the same value.
     fn next_product_id(env: &Env) -> u128 {
         let mut id = 0u128;
-        env.storage().instance().update(
-            &StorageKey::NextProductId,
-            |v: Option<u128>| {
+        env.storage()
+            .instance()
+            .update(&StorageKey::NextProductId, |v: Option<u128>| {
                 id = v.unwrap_or(1);
                 id + 1
-            },
-        );
+            });
         id
     }
 
     fn next_policy_id(env: &Env) -> u128 {
         let mut id = 0u128;
-        env.storage().instance().update(
-            &StorageKey::NextPolicyId,
-            |v: Option<u128>| {
+        env.storage()
+            .instance()
+            .update(&StorageKey::NextPolicyId, |v: Option<u128>| {
                 id = v.unwrap_or(1);
                 id + 1
-            },
-        );
+            });
         id
     }
 
@@ -730,20 +916,26 @@ pub fn emergency_resume(env: Env, admin: Address) {
     /// Runs storage migrations if the new version requires them.
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>, new_version: u32) {
         Self::require_admin(&env, &admin);
-        let current_version: u32 = env.storage().instance().get(&StorageKey::Version).unwrap_or(1);
+        let current_version: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Version)
+            .unwrap_or(1);
         if new_version <= current_version {
             panic!("new version must be greater than current version");
         }
-        
+
         // Run migrations from current_version to new_version
         Self::run_migrations(&env, current_version, new_version);
-        
+
         // Update the stored version
-        env.storage().instance().set(&StorageKey::Version, &new_version);
-        
+        env.storage()
+            .instance()
+            .set(&StorageKey::Version, &new_version);
+
         // Perform the actual WASM upgrade
         env.deployer().update_current_contract_wasm(new_wasm_hash);
-        
+
         env.events().publish(
             (Symbol::new(&env, "contract_upgraded"),),
             ContractUpgraded {
@@ -755,14 +947,41 @@ pub fn emergency_resume(env: Env, admin: Address) {
 
     /// Run storage migrations from old_version to new_version.
     /// Each migration function handles a specific version transition.
-    fn run_migrations(_env: &Env, _old_version: u32, _new_version: u32) {
-        // Migration from v1 to v2: No storage changes needed yet
-        // This is where you would add migration logic for specific version bumps
-        // Example: if old_version < 2 && new_version >= 2 { Self::migrate_v1_to_v2(env); }
-        
-        // Future migrations follow the pattern:
-        // if old_version < 3 && new_version >= 3 { Self::migrate_v2_to_v3(env); }
+    fn run_migrations(env: &Env, old_version: u32, new_version: u32) {
+        if old_version == 0 || new_version <= old_version || new_version > CURRENT_STORAGE_VERSION {
+            panic!("invalid migration version");
+        }
+
+        let mut version = old_version;
+        while version < new_version {
+            match version {
+                1 => {
+                    Self::migrate_v1_to_v2(env);
+                    version = 2;
+                }
+                2 => {
+                    Self::migrate_v2_to_v3(env);
+                    version = 3;
+                }
+                _ => panic!("unsupported migration path"),
+            }
+        }
     }
+
+    fn migrate_v1_to_v2(env: &Env) {
+        if !env
+            .storage()
+            .instance()
+            .has(&StorageKey::MaxProductsPerPool)
+        {
+            env.storage().instance().set(
+                &StorageKey::MaxProductsPerPool,
+                &DEFAULT_MAX_PRODUCTS_PER_POOL,
+            );
+        }
+    }
+
+    fn migrate_v2_to_v3(_env: &Env) {}
 }
 
 #[cfg(test)]

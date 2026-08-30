@@ -20,8 +20,8 @@ extern crate alloc;
 use alloc::string::ToString;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror, panic_with_error,
-    Address, BytesN, Env, Vec, Symbol,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, BytesN, Env,
+    Symbol, Vec,
 };
 
 pub mod types;
@@ -60,6 +60,7 @@ const TTL_THRESHOLD: u32 = 518_400;
 /// Extend persistent entries out to ~1 year (at ~5s/ledger) so pending claims
 /// survive long enough to be processed.
 const TTL_EXTEND_TO: u32 = 6_312_000;
+const CURRENT_STORAGE_VERSION: u32 = 3;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -70,13 +71,13 @@ enum StorageKey {
     PolicyEngine,
     RiskPool,
     OracleVerifier,
-    StalenessThreshold,  // u64 — max acceptable oracle data age in seconds
+    StalenessThreshold, // u64 — max acceptable oracle data age in seconds
     Claim(u128),
-    PolicyClaim(u128),   // policy_id → claim_id (one claim per policy)
+    PolicyClaim(u128), // policy_id → claim_id (one claim per policy)
     NextClaimId,
-    PendingClaims,       // Vec<u128>
-    Keeper(Address),     // keeper whitelist: address → bool
-    Paused,              // bool — emergency pause state
+    PendingClaims,   // Vec<u128>
+    Keeper(Address), // keeper whitelist: address → bool
+    Paused,          // bool — emergency pause state
     /// Contract version (u32) for storage migration tracking
     Version,
 }
@@ -88,14 +89,14 @@ enum StorageKey {
 #[repr(u32)]
 pub enum Error {
     AlreadyInitialized = 1,
-    NotInitialized     = 2,
-    Unauthorized       = 3,
-    ClaimNotFound      = 4,
-    PolicyNotActive    = 5,
-    AlreadyClaimed     = 6,
-    AlreadyProcessed   = 7,
-    InvalidAddress     = 8,
-    Paused             = 9,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    ClaimNotFound = 4,
+    PolicyNotActive = 5,
+    AlreadyClaimed = 6,
+    AlreadyProcessed = 7,
+    InvalidAddress = 8,
+    Paused = 9,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -105,7 +106,6 @@ pub struct ClaimsProcessor;
 
 #[contractimpl]
 impl ClaimsProcessor {
-
     // ── Lifecycle ────────────────────────────────────────────────────────────
 
     /// One-time initialisation. Links the contract to `policy_engine`, `risk_pool`, and
@@ -123,7 +123,7 @@ impl ClaimsProcessor {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
         let admin_str = admin.to_string();
-        
+
         if false {
             panic!("invalid address: admin must be an account address");
         }
@@ -138,8 +138,7 @@ impl ClaimsProcessor {
 
         let policy_engine_str = policy_engine.to_string();
         let oracle_verifier_str = oracle_verifier.to_string();
-        
-        
+
         if policy_engine_str.len() != 56 {
             panic!("invalid address: policy_engine must be a contract address");
         }
@@ -164,15 +163,29 @@ impl ClaimsProcessor {
         Self::validate_stellar_address(&env, &policy_engine);
         Self::validate_stellar_address(&env, &risk_pool);
         Self::validate_stellar_address(&env, &oracle_verifier);
-        
-        env.storage().instance().set(&StorageKey::Initialized, &true);
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::Initialized, &true);
         env.storage().instance().set(&StorageKey::Admin, &admin);
-        env.storage().instance().set(&StorageKey::PolicyEngine, &policy_engine);
-        env.storage().instance().set(&StorageKey::RiskPool, &risk_pool);
-        env.storage().instance().set(&StorageKey::OracleVerifier, &oracle_verifier);
-        env.storage().instance().set(&StorageKey::StalenessThreshold, &staleness_threshold);
-        env.storage().instance().set(&StorageKey::NextClaimId, &1u128);
-        env.storage().instance().set(&StorageKey::PendingClaims, &Vec::<u128>::new(&env));
+        env.storage()
+            .instance()
+            .set(&StorageKey::PolicyEngine, &policy_engine);
+        env.storage()
+            .instance()
+            .set(&StorageKey::RiskPool, &risk_pool);
+        env.storage()
+            .instance()
+            .set(&StorageKey::OracleVerifier, &oracle_verifier);
+        env.storage()
+            .instance()
+            .set(&StorageKey::StalenessThreshold, &staleness_threshold);
+        env.storage()
+            .instance()
+            .set(&StorageKey::NextClaimId, &1u128);
+        env.storage()
+            .instance()
+            .set(&StorageKey::PendingClaims, &Vec::<u128>::new(&env));
         env.storage().instance().set(&StorageKey::Paused, &false);
 
         env.events().publish(
@@ -193,26 +206,27 @@ impl ClaimsProcessor {
     /// batch_auto_process. Without this, no address can settle claims.
     pub fn add_keeper(env: Env, admin: Address, keeper: Address) {
         Self::require_admin(&env, &admin);
-        env.storage().persistent().set(&StorageKey::Keeper(keeper.clone()), &true);
-        env.events().publish(
-            (Symbol::new(&env, "keeper_added"),),
-            keeper,
-        );
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Keeper(keeper.clone()), &true);
+        env.events()
+            .publish((Symbol::new(&env, "keeper_added"),), keeper);
     }
 
     /// Admin-only: revoke a keeper's settlement authority.
     pub fn remove_keeper(env: Env, admin: Address, keeper: Address) {
         Self::require_admin(&env, &admin);
-        env.storage().persistent().remove(&StorageKey::Keeper(keeper.clone()));
-        env.events().publish(
-            (Symbol::new(&env, "keeper_removed"),),
-            keeper,
-        );
+        env.storage()
+            .persistent()
+            .remove(&StorageKey::Keeper(keeper.clone()));
+        env.events()
+            .publish((Symbol::new(&env, "keeper_removed"),), keeper);
     }
 
     /// Whether `keeper` is currently authorized to settle claims.
     pub fn is_keeper(env: Env, keeper: Address) -> bool {
-        env.storage().persistent()
+        env.storage()
+            .persistent()
             .get(&StorageKey::Keeper(keeper))
             .unwrap_or(false)
     }
@@ -226,16 +240,21 @@ impl ClaimsProcessor {
         Self::require_not_paused(&env);
 
         // Guard: one claim per policy
-        if env.storage().persistent().has(&StorageKey::PolicyClaim(policy_id)) {
+        if env
+            .storage()
+            .persistent()
+            .has(&StorageKey::PolicyClaim(policy_id))
+        {
             panic_with_error!(&env, Error::AlreadyClaimed);
         }
 
         // Verify policy is Active via Policy Engine
-        let policy_engine: Address = env.storage().instance()
+        let policy_engine: Address = env
+            .storage()
+            .instance()
             .get(&StorageKey::PolicyEngine)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-        let policy = PolicyEngineClient::new(&env, &policy_engine)
-            .get_policy(&policy_id);
+        let policy = PolicyEngineClient::new(&env, &policy_engine).get_policy(&policy_id);
 
         if policy.policyholder != claimant {
             panic_with_error!(&env, Error::Unauthorized);
@@ -244,8 +263,8 @@ impl ClaimsProcessor {
             panic_with_error!(&env, Error::PolicyNotActive);
         }
 
-        let claim_id   = Self::next_claim_id(&env);
-        let now        = env.ledger().timestamp();
+        let claim_id = Self::next_claim_id(&env);
+        let now = env.ledger().timestamp();
         let claim = Claim {
             id: claim_id,
             policy_id,
@@ -258,15 +277,32 @@ impl ClaimsProcessor {
             processed_at: None,
             dispute_reason: None,
         };
-        env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
-        env.storage().persistent().extend_ttl(&StorageKey::Claim(claim_id), TTL_THRESHOLD, TTL_EXTEND_TO);
-        env.storage().persistent().set(&StorageKey::PolicyClaim(policy_id), &claim_id);
-        env.storage().persistent().extend_ttl(&StorageKey::PolicyClaim(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Claim(claim_id), &claim);
+        env.storage().persistent().extend_ttl(
+            &StorageKey::Claim(claim_id),
+            TTL_THRESHOLD,
+            TTL_EXTEND_TO,
+        );
+        env.storage()
+            .persistent()
+            .set(&StorageKey::PolicyClaim(policy_id), &claim_id);
+        env.storage().persistent().extend_ttl(
+            &StorageKey::PolicyClaim(policy_id),
+            TTL_THRESHOLD,
+            TTL_EXTEND_TO,
+        );
 
-        let mut pending: Vec<u128> = env.storage().instance()
-            .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(&env));
+        let mut pending: Vec<u128> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PendingClaims)
+            .unwrap_or_else(|| Vec::new(&env));
         pending.push_back(claim_id);
-        env.storage().instance().set(&StorageKey::PendingClaims, &pending);
+        env.storage()
+            .instance()
+            .set(&StorageKey::PendingClaims, &pending);
 
         env.events().publish(
             (Symbol::new(&env, "claim_submitted"),),
@@ -285,7 +321,9 @@ impl ClaimsProcessor {
     pub fn process_claim(env: Env, keeper: Address, claim_id: u128) -> ClaimResult {
         Self::require_keeper(&env, &keeper);
         Self::require_not_paused(&env);
-        let mut claim: Claim = env.storage().persistent()
+        let mut claim: Claim = env
+            .storage()
+            .persistent()
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
 
@@ -293,11 +331,12 @@ impl ClaimsProcessor {
             return ClaimResult::AlreadyProcessed;
         }
 
-        let policy_engine: Address = env.storage().instance()
+        let policy_engine: Address = env
+            .storage()
+            .instance()
             .get(&StorageKey::PolicyEngine)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-        let policy = PolicyEngineClient::new(&env, &policy_engine)
-            .get_policy(&claim.policy_id);
+        let policy = PolicyEngineClient::new(&env, &policy_engine).get_policy(&claim.policy_id);
 
         Self::evaluate_and_settle(&env, &mut claim, &policy)
     }
@@ -311,29 +350,43 @@ impl ClaimsProcessor {
 
         // ─── IDEMPOTENCY GUARD ───
         // Check if an evaluation record already exists for this policy in our storage
-        if env.storage().persistent().has(&StorageKey::PolicyClaim(policy_id)) {
-            let existing_claim_id: u128 = env.storage().persistent()
-                .get(&StorageKey::PolicyClaim(policy_id)).unwrap();
-            
-            if let Some(existing_claim) = env.storage().persistent().get::<StorageKey, Claim>(&StorageKey::Claim(existing_claim_id)) {
+        if env
+            .storage()
+            .persistent()
+            .has(&StorageKey::PolicyClaim(policy_id))
+        {
+            let existing_claim_id: u128 = env
+                .storage()
+                .persistent()
+                .get(&StorageKey::PolicyClaim(policy_id))
+                .unwrap();
+
+            if let Some(existing_claim) = env
+                .storage()
+                .persistent()
+                .get::<StorageKey, Claim>(&StorageKey::Claim(existing_claim_id))
+            {
                 if existing_claim.status != ClaimStatus::Pending {
                     return ClaimResult::AlreadyProcessed;
                 }
             }
         }
 
-        let policy_engine: Address = env.storage().instance()
+        let policy_engine: Address = env
+            .storage()
+            .instance()
             .get(&StorageKey::PolicyEngine)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-        let policy = PolicyEngineClient::new(&env, &policy_engine)
-            .get_policy(&policy_id);
+        let policy = PolicyEngineClient::new(&env, &policy_engine).get_policy(&policy_id);
 
         // Idempotency: check current policy status from down-stream contract
         match policy.status {
-            parashield_policy_engine::PolicyStatus::Claimed    => return ClaimResult::AlreadyClaimed,
-            parashield_policy_engine::PolicyStatus::Expired    => return ClaimResult::Expired,
-            parashield_policy_engine::PolicyStatus::Cancelled  => return ClaimResult::PolicyNotActive,
-            parashield_policy_engine::PolicyStatus::Active     => {}
+            parashield_policy_engine::PolicyStatus::Claimed => return ClaimResult::AlreadyClaimed,
+            parashield_policy_engine::PolicyStatus::Expired => return ClaimResult::Expired,
+            parashield_policy_engine::PolicyStatus::Cancelled => {
+                return ClaimResult::PolicyNotActive
+            }
+            parashield_policy_engine::PolicyStatus::Active => {}
         }
 
         // Check if policy has expired with no trigger
@@ -345,9 +398,15 @@ impl ClaimsProcessor {
         }
 
         // Create or get the internal claim record
-        let claim_id = if env.storage().persistent().has(&StorageKey::PolicyClaim(policy_id)) {
-            env.storage().persistent()
-                .get(&StorageKey::PolicyClaim(policy_id)).unwrap()
+        let claim_id = if env
+            .storage()
+            .persistent()
+            .has(&StorageKey::PolicyClaim(policy_id))
+        {
+            env.storage()
+                .persistent()
+                .get(&StorageKey::PolicyClaim(policy_id))
+                .unwrap()
         } else {
             let cid = Self::next_claim_id(&env);
             let claim = Claim {
@@ -362,21 +421,41 @@ impl ClaimsProcessor {
                 processed_at: None,
                 dispute_reason: None,
             };
-            env.storage().persistent().set(&StorageKey::Claim(cid), &claim);
-            env.storage().persistent().extend_ttl(&StorageKey::Claim(cid), TTL_THRESHOLD, TTL_EXTEND_TO);
-            env.storage().persistent().set(&StorageKey::PolicyClaim(policy_id), &cid);
-            env.storage().persistent().extend_ttl(&StorageKey::PolicyClaim(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
+            env.storage()
+                .persistent()
+                .set(&StorageKey::Claim(cid), &claim);
+            env.storage().persistent().extend_ttl(
+                &StorageKey::Claim(cid),
+                TTL_THRESHOLD,
+                TTL_EXTEND_TO,
+            );
+            env.storage()
+                .persistent()
+                .set(&StorageKey::PolicyClaim(policy_id), &cid);
+            env.storage().persistent().extend_ttl(
+                &StorageKey::PolicyClaim(policy_id),
+                TTL_THRESHOLD,
+                TTL_EXTEND_TO,
+            );
 
             // Make the new claim visible to batch processors and monitoring.
-            let mut pending: Vec<u128> = env.storage().instance()
-                .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(&env));
+            let mut pending: Vec<u128> = env
+                .storage()
+                .instance()
+                .get(&StorageKey::PendingClaims)
+                .unwrap_or_else(|| Vec::new(&env));
             pending.push_back(cid);
-            env.storage().instance().set(&StorageKey::PendingClaims, &pending);
+            env.storage()
+                .instance()
+                .set(&StorageKey::PendingClaims, &pending);
             cid
         };
 
-        let mut claim: Claim = env.storage().persistent()
-            .get(&StorageKey::Claim(claim_id)).unwrap();
+        let mut claim: Claim = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap();
         if claim.status != ClaimStatus::Pending {
             return ClaimResult::AlreadyProcessed;
         }
@@ -389,29 +468,40 @@ impl ClaimsProcessor {
     pub fn batch_auto_process(env: Env, caller: Address, limit: u32) -> Vec<(u128, ClaimResult)> {
         Self::require_keeper(&env, &caller);
         Self::require_not_paused(&env);
-        let pending: Vec<u128> = env.storage().instance()
+        let pending: Vec<u128> = env
+            .storage()
+            .instance()
             .get(&StorageKey::PendingClaims)
             .unwrap_or_else(|| Vec::new(&env));
 
         let mut results: Vec<(u128, ClaimResult)> = Vec::new(&env);
-        let process_count = if pending.len() < limit { pending.len() } else { limit };
+        let process_count = if pending.len() < limit {
+            pending.len()
+        } else {
+            limit
+        };
 
-        let policy_engine: Address = env.storage().instance()
+        let policy_engine: Address = env
+            .storage()
+            .instance()
             .get(&StorageKey::PolicyEngine)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
 
         for i in 0..process_count {
             let claim_id = pending.get_unchecked(i);
-            let mut claim: Claim = match env.storage().persistent()
-                .get(&StorageKey::Claim(claim_id)) {
-                Some(c) => c,
-                None    => continue,
-            };
-            if claim.status != ClaimStatus::Pending { continue; }
-            if claim.processed_at.is_some() { continue; }
+            let mut claim: Claim =
+                match env.storage().persistent().get(&StorageKey::Claim(claim_id)) {
+                    Some(c) => c,
+                    None => continue,
+                };
+            if claim.status != ClaimStatus::Pending {
+                continue;
+            }
+            if claim.processed_at.is_some() {
+                continue;
+            }
 
-            let policy = PolicyEngineClient::new(&env, &policy_engine)
-                .get_policy(&claim.policy_id);
+            let policy = PolicyEngineClient::new(&env, &policy_engine).get_policy(&claim.policy_id);
             let result = Self::evaluate_and_settle(&env, &mut claim, &policy);
             results.push_back((claim_id, result));
         }
@@ -425,10 +515,14 @@ impl ClaimsProcessor {
     /// so it is not auto-processed again until an admin resolves the dispute.
     pub fn dispute_claim(env: Env, claimant: Address, claim_id: u128, reason: soroban_sdk::Symbol) {
         claimant.require_auth();
-        let mut claim: Claim = env.storage().persistent()
+        let mut claim: Claim = env
+            .storage()
+            .persistent()
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
-        if claim.claimant != claimant { panic_with_error!(&env, Error::Unauthorized); }
+        if claim.claimant != claimant {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
         // Only open (Pending) or rejected claims are disputable. A Paid claim is
         // already settled (USDC transferred) and a Disputed claim is already open,
         // so neither may be overwritten.
@@ -437,7 +531,9 @@ impl ClaimsProcessor {
         }
         claim.status = ClaimStatus::Disputed;
         claim.dispute_reason = Some(reason.clone());
-        env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Claim(claim_id), &claim);
 
         // A disputed claim is no longer pending — drop it from the queue so it is
         // not re-evaluated and does not grow the queue unboundedly.
@@ -457,83 +553,99 @@ impl ClaimsProcessor {
 
     /// Return the `Claim` record for the given `claim_id`. Panics with `ClaimNotFound` if it does not exist.
     pub fn get_claim(env: Env, claim_id: u128) -> Claim {
-        env.storage().persistent()
+        env.storage()
+            .persistent()
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound))
     }
 
     /// Return the claim ID associated with `policy_id`, or `None` if no claim has been filed.
     pub fn get_claim_id_for_policy(env: Env, policy_id: u128) -> Option<u128> {
-        env.storage().persistent()
+        env.storage()
+            .persistent()
             .get(&StorageKey::PolicyClaim(policy_id))
     }
 
     /// Return the list of claim IDs that are currently in `Pending` status.
     pub fn get_pending_claims(env: Env) -> Vec<u128> {
-        env.storage().instance()
+        env.storage()
+            .instance()
             .get(&StorageKey::PendingClaims)
             .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Return the current admin address. Panics with `NotInitialized` if the contract has not been set up.
     pub fn get_admin(env: Env) -> Address {
-        env.storage().instance().get(&StorageKey::Admin)
+        env.storage()
+            .instance()
+            .get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
     }
 
     /// Return the current storage schema version (defaults to 1 before any migration).
     pub fn get_version(env: Env) -> u32 {
-        env.storage().instance().get(&StorageKey::Version).unwrap_or(1)
+        env.storage()
+            .instance()
+            .get(&StorageKey::Version)
+            .unwrap_or(1)
     }
 
     /// Admin-only: pause all claim submissions and processing.
     pub fn pause(env: Env, admin: Address) {
         Self::require_admin(&env, &admin);
         env.storage().instance().set(&StorageKey::Paused, &true);
-        env.events().publish(
-            (Symbol::new(&env, "paused"),),
-            admin,
-        );
+        env.events().publish((Symbol::new(&env, "paused"),), admin);
     }
 
     /// Admin-only: resume claim submissions and processing.
     pub fn resume(env: Env, admin: Address) {
         Self::require_admin(&env, &admin);
         env.storage().instance().set(&StorageKey::Paused, &false);
-        env.events().publish(
-            (Symbol::new(&env, "resumed"),),
-            admin,
-        );
+        env.events().publish((Symbol::new(&env, "resumed"),), admin);
     }
 
     /// Check whether the contract is currently paused.
     pub fn is_paused(env: Env) -> bool {
-        env.storage().instance().get(&StorageKey::Paused).unwrap_or(false)
+        env.storage()
+            .instance()
+            .get(&StorageKey::Paused)
+            .unwrap_or(false)
     }
 
     /// Upgrade the contract WASM in-place. Only the admin may call this.
     /// Storage is preserved across upgrades; only the execution code changes.
     /// Runs storage migrations if the new version requires them.
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>, new_version: u32) {
-        let stored_admin: Address = env.storage().instance().get(&StorageKey::Admin)
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-        if admin != stored_admin { panic_with_error!(&env, Error::Unauthorized); }
+        if admin != stored_admin {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
         admin.require_auth();
-        
-        let current_version: u32 = env.storage().instance().get(&StorageKey::Version).unwrap_or(1);
+
+        let current_version: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Version)
+            .unwrap_or(1);
         if new_version <= current_version {
             panic!("new version must be greater than current version");
         }
-        
+
         // Run migrations from current_version to new_version
         Self::run_migrations(&env, current_version, new_version);
-        
+
         // Update the stored version
-        env.storage().instance().set(&StorageKey::Version, &new_version);
-        
+        env.storage()
+            .instance()
+            .set(&StorageKey::Version, &new_version);
+
         // Perform the actual WASM upgrade
         env.deployer().update_current_contract_wasm(new_wasm_hash);
-        
+
         env.events().publish(
             (Symbol::new(&env, "contract_upgraded"),),
             ContractUpgraded {
@@ -545,58 +657,89 @@ impl ClaimsProcessor {
 
     /// Run storage migrations from old_version to new_version.
     /// Each migration function handles a specific version transition.
-    fn run_migrations(_env: &Env, _old_version: u32, _new_version: u32) {
-        // Migration from v1 to v2: No storage changes needed yet
-        // This is where you would add migration logic for specific version bumps
-        // Example: if old_version < 2 && new_version >= 2 { Self::migrate_v1_to_v2(env); }
-        
-        // Future migrations follow the pattern:
-        // if old_version < 3 && new_version >= 3 { Self::migrate_v2_to_v3(env); }
+    fn run_migrations(env: &Env, old_version: u32, new_version: u32) {
+        if old_version == 0 || new_version <= old_version || new_version > CURRENT_STORAGE_VERSION {
+            panic!("invalid migration version");
+        }
+
+        let mut version = old_version;
+        while version < new_version {
+            match version {
+                1 => {
+                    Self::migrate_v1_to_v2(env);
+                    version = 2;
+                }
+                2 => {
+                    Self::migrate_v2_to_v3(env);
+                    version = 3;
+                }
+                _ => panic!("unsupported migration path"),
+            }
+        }
     }
+
+    fn migrate_v1_to_v2(env: &Env) {
+        if !env.storage().instance().has(&StorageKey::Paused) {
+            env.storage().instance().set(&StorageKey::Paused, &false);
+        }
+    }
+
+    fn migrate_v2_to_v3(_env: &Env) {}
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     /// Core evaluation: check oracle, update claim record, instruct Policy Engine.
     /// After successful claim payment, atomically releases the coverage lock on Risk Pool
     /// to prevent coverage from remaining locked indefinitely.
-    fn evaluate_and_settle(env: &Env, claim: &mut Claim, policy: &parashield_policy_engine::Policy) -> ClaimResult {
-        // Validate claim is in Pending state before transitioning (atomic state guard)  
+    fn evaluate_and_settle(
+        env: &Env,
+        claim: &mut Claim,
+        policy: &parashield_policy_engine::Policy,
+    ) -> ClaimResult {
+        // Validate claim is in Pending state before transitioning (atomic state guard)
         if claim.status != ClaimStatus::Pending {
             panic_with_error!(env, Error::AlreadyProcessed);
         }
-        let oracle_verifier: Address = env.storage().instance()
+        let oracle_verifier: Address = env
+            .storage()
+            .instance()
             .get(&StorageKey::OracleVerifier)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
-        let policy_engine: Address = env.storage().instance()
+        let policy_engine: Address = env
+            .storage()
+            .instance()
             .get(&StorageKey::PolicyEngine)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
-        let risk_pool: Address = env.storage().instance()
+        let risk_pool: Address = env
+            .storage()
+            .instance()
             .get(&StorageKey::RiskPool)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         // Configurable staleness threshold (default 7 days = 604_800 s if not set)
-        let staleness_threshold: u64 = env.storage().instance()
+        let staleness_threshold: u64 = env
+            .storage()
+            .instance()
             .get(&StorageKey::StalenessThreshold)
             .unwrap_or(604_800u64);
 
         let condition = parashield_oracle_verifier::TriggerCondition {
-            data_type:   policy.oracle_data_type.clone(),
-            key:         policy.oracle_key.clone(),
-            threshold:   policy.trigger_threshold,
-            comparison:  map_comparison(&policy.trigger_comparison),
-            tolerance:   0,  // Standard comparison without tolerance
+            data_type: policy.oracle_data_type.clone(),
+            key: policy.oracle_key.clone(),
+            threshold: policy.trigger_threshold,
+            comparison: map_comparison(&policy.trigger_comparison),
+            tolerance: 0, // Standard comparison without tolerance
         };
 
         // verify_trigger_fresh re-queries the oracle and rejects stale data
         // in the same atomic call, preventing stale-data and TOCTOU issues.
-        let trigger_met = OracleVerifierClient::new(env, &oracle_verifier)
-            .verify_trigger_fresh(
-                &policy.oracle_data_type,
-                &policy.oracle_key,
-                &condition,
-                &staleness_threshold,
-            );
+        let trigger_met = OracleVerifierClient::new(env, &oracle_verifier).verify_trigger_fresh(
+            &policy.oracle_data_type,
+            &policy.oracle_key,
+            &condition,
+            &staleness_threshold,
+        );
 
-        claim.trigger_met  = trigger_met;
+        claim.trigger_met = trigger_met;
         claim.processed_at = Some(env.ledger().timestamp());
 
         let result = if trigger_met {
@@ -613,8 +756,14 @@ impl ClaimsProcessor {
             ClaimResult::Rejected
         };
 
-        env.storage().persistent().set(&StorageKey::Claim(claim.id), claim);
-        env.storage().persistent().extend_ttl(&StorageKey::Claim(claim.id), TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Claim(claim.id), claim);
+        env.storage().persistent().extend_ttl(
+            &StorageKey::Claim(claim.id),
+            TTL_THRESHOLD,
+            TTL_EXTEND_TO,
+        );
 
         // The claim is now settled (Paid/Rejected) — drop it from the pending
         // queue so it is neither re-evaluated nor allowed to grow the queue
@@ -625,7 +774,11 @@ impl ClaimsProcessor {
         if !trigger_met {
             env.events().publish(
                 (Symbol::new(env, "claim_rejected"),),
-                (claim.id, claim.policy_id, Symbol::new(env, "trigger_not_met")),
+                (
+                    claim.id,
+                    claim.policy_id,
+                    Symbol::new(env, "trigger_not_met"),
+                ),
             );
         }
 
@@ -639,7 +792,9 @@ impl ClaimsProcessor {
 
     /// Remove a claim id from the pending queue, if present.
     fn remove_from_pending(env: &Env, claim_id: u128) {
-        let pending: Vec<u128> = env.storage().instance()
+        let pending: Vec<u128> = env
+            .storage()
+            .instance()
             .get(&StorageKey::PendingClaims)
             .unwrap_or_else(|| Vec::new(env));
         let mut updated: Vec<u128> = Vec::new(env);
@@ -649,14 +804,17 @@ impl ClaimsProcessor {
             }
         }
         if updated.len() != pending.len() {
-            env.storage().instance().set(&StorageKey::PendingClaims, &updated);
+            env.storage()
+                .instance()
+                .set(&StorageKey::PendingClaims, &updated);
         }
     }
 
-
     /// Panic unless `caller` is a registered keeper and authorizes the call.
     fn require_keeper(env: &Env, caller: &Address) {
-        let authorized: bool = env.storage().persistent()
+        let authorized: bool = env
+            .storage()
+            .persistent()
             .get(&StorageKey::Keeper(caller.clone()))
             .unwrap_or(false);
         if !authorized {
@@ -667,7 +825,9 @@ impl ClaimsProcessor {
 
     /// Panic unless `caller` is the admin and authorizes the call.
     fn require_admin(env: &Env, caller: &Address) {
-        let admin: Address = env.storage().instance()
+        let admin: Address = env
+            .storage()
+            .instance()
             .get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         if *caller != admin {
@@ -678,7 +838,9 @@ impl ClaimsProcessor {
 
     /// Panic if the contract is currently paused.
     fn require_not_paused(env: &Env) {
-        let paused: bool = env.storage().instance()
+        let paused: bool = env
+            .storage()
+            .instance()
             .get(&StorageKey::Paused)
             .unwrap_or(false);
         if paused {
@@ -687,23 +849,28 @@ impl ClaimsProcessor {
     }
 
     fn next_claim_id(env: &Env) -> u128 {
-        let id: u128 = env.storage().instance()
-            .get(&StorageKey::NextClaimId).unwrap_or(1);
-        env.storage().instance().set(&StorageKey::NextClaimId, &(id + 1));
+        let id: u128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::NextClaimId)
+            .unwrap_or(1);
+        env.storage()
+            .instance()
+            .set(&StorageKey::NextClaimId, &(id + 1));
         id
     }
 
     fn validate_stellar_address(env: &Env, address: &Address) {
         let addr_str = address.to_string();
-        
+
         // Check length: Stellar public keys are exactly 56 characters
         if addr_str.len() != 56 {
             panic_with_error!(env, Error::InvalidAddress);
         }
-        
+
         let mut buf = [0u8; 56];
         addr_str.copy_into_slice(&mut buf);
-        
+
         // Check prefix: G (Stellar account) or C (Stellar contract)
         if buf[0] != b'G' && buf[0] != b'C' {
             panic_with_error!(env, Error::InvalidAddress);
@@ -716,18 +883,21 @@ fn map_comparison(
     c: &parashield_policy_engine::TriggerComparison,
 ) -> parashield_oracle_verifier::TriggerComparison {
     match c {
-        parashield_policy_engine::TriggerComparison::LessThan    =>
-            parashield_oracle_verifier::TriggerComparison::LessThan,
-        parashield_policy_engine::TriggerComparison::GreaterThan =>
-            parashield_oracle_verifier::TriggerComparison::GreaterThan,
-        parashield_policy_engine::TriggerComparison::Equal       =>
-            parashield_oracle_verifier::TriggerComparison::Equal,
+        parashield_policy_engine::TriggerComparison::LessThan => {
+            parashield_oracle_verifier::TriggerComparison::LessThan
+        }
+        parashield_policy_engine::TriggerComparison::GreaterThan => {
+            parashield_oracle_verifier::TriggerComparison::GreaterThan
+        }
+        parashield_policy_engine::TriggerComparison::Equal => {
+            parashield_oracle_verifier::TriggerComparison::Equal
+        }
     }
 }
 
 #[cfg(test)]
 mod test;
 #[cfg(test)]
-mod test_integration;
-#[cfg(test)]
 mod test_advanced;
+#[cfg(test)]
+mod test_integration;

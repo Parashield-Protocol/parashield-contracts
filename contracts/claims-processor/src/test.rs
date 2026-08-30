@@ -1,29 +1,28 @@
 use super::*;
+use parashield_oracle_verifier::{OracleVerifier, OracleVerifierClient};
+use parashield_policy_engine::{
+    CreateProductParams, PolicyEngine, PolicyEngineClient, TriggerComparison, TriggerType,
+};
+use parashield_risk_pool::{RiskPool, RiskPoolClient};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Ledger},
     token::StellarAssetClient,
     Env,
 };
-use parashield_oracle_verifier::{OracleVerifier, OracleVerifierClient};
-use parashield_policy_engine::{
-    PolicyEngine, PolicyEngineClient,
-    TriggerType, TriggerComparison, CreateProductParams,
-};
-use parashield_risk_pool::{RiskPool, RiskPoolClient};
 
 const COVERAGE: i128 = 1_000_000_000; // 100 USDC
 
 struct World {
-    env:       Env,
-    admin:     Address,
-    keeper:    Address,
-    oracle_w:  Address,
-    usdc:      Address,
+    env: Env,
+    admin: Address,
+    keeper: Address,
+    oracle_w: Address,
+    usdc: Address,
     oracle_id: Address,
     policy_id: Address,
     claims_id: Address,
-    pool_id:   Address,
+    pool_id: Address,
 }
 
 fn deploy() -> World {
@@ -31,26 +30,34 @@ fn deploy() -> World {
     env.mock_all_auths();
     env.cost_estimate().budget().reset_unlimited();
 
-    let admin  = Address::generate(&env);
+    let admin = Address::generate(&env);
     let keeper = Address::generate(&env);
     let oracle_wallet = Address::generate(&env);
 
-    let usdc = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let usdc = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
 
     // 1. Deploy oracle verifier
     let oracle_id = env.register(OracleVerifier, ());
     OracleVerifierClient::new(&env, &oracle_id).initialize(&admin);
-    OracleVerifierClient::new(&env, &oracle_id)
-        .add_oracle(&admin, &oracle_wallet, &symbol_short!("weather"), &90u32);
+    OracleVerifierClient::new(&env, &oracle_id).add_oracle(
+        &admin,
+        &oracle_wallet,
+        &symbol_short!("weather"),
+        &90u32,
+    );
 
     // 2. Deploy risk pool (category: crop)
-    let backstop = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    let backstop = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
     let treasury = Address::generate(&env);
     let pool_id = env.register(RiskPool, ());
 
     // 3. Deploy policy engine (placeholder for risk pool init)
     let policy_id = env.register(PolicyEngine, ());
-    
+
     // 4. Deploy claims processor (placeholder for risk pool init)
     let claims_id = env.register(ClaimsProcessor, ());
 
@@ -66,38 +73,50 @@ fn deploy() -> World {
     );
 
     // Initialize other contracts
-    PolicyEngineClient::new(&env, &policy_id)
-        .initialize(&admin, &usdc, &oracle_id);
-    
-    ClaimsProcessorClient::new(&env, &claims_id)
-        .initialize(&admin, &policy_id, &pool_id, &oracle_id, &604_800u64);
-    
+    PolicyEngineClient::new(&env, &policy_id).initialize(&admin, &usdc, &oracle_id);
+
+    ClaimsProcessorClient::new(&env, &claims_id).initialize(
+        &admin,
+        &policy_id,
+        &pool_id,
+        &oracle_id,
+        &604_800u64,
+    );
+
     // Authorize keeper on the claims processor
-    ClaimsProcessorClient::new(&env, &claims_id)
-        .add_keeper(&admin, &keeper);
+    ClaimsProcessorClient::new(&env, &claims_id).add_keeper(&admin, &keeper);
 
     // Wire claims processor as authorized caller on policy engine
-    PolicyEngineClient::new(&env, &policy_id)
-        .set_claims_processor(&admin, &claims_id);
+    PolicyEngineClient::new(&env, &policy_id).set_claims_processor(&admin, &claims_id);
 
-    World { env, admin, keeper, oracle_w: oracle_wallet, usdc, oracle_id, policy_id, claims_id, pool_id }
+    World {
+        env,
+        admin,
+        keeper,
+        oracle_w: oracle_wallet,
+        usdc,
+        oracle_id,
+        policy_id,
+        claims_id,
+        pool_id,
+    }
 }
 
 fn create_crop_product(w: &World) -> u128 {
     PolicyEngineClient::new(&w.env, &w.policy_id).create_product(
         &w.admin,
         &CreateProductParams {
-            name:               symbol_short!("crop_kism"),
-            category:           symbol_short!("crop"),
-            oracle_key:         symbol_short!("kis2606"),
-            trigger_type:       TriggerType::Threshold,
-            oracle_data_type:   symbol_short!("weather"),
-            trigger_threshold:  50_000_000,
+            name: symbol_short!("crop_kism"),
+            category: symbol_short!("crop"),
+            oracle_key: symbol_short!("kis2606"),
+            trigger_type: TriggerType::Threshold,
+            oracle_data_type: symbol_short!("weather"),
+            trigger_threshold: 50_000_000,
             trigger_comparison: TriggerComparison::LessThan,
-            coverage_min:       100_000_000,
-            coverage_max:       10_000_000_000,
-            premium_rate_bps:   500,
-            max_duration_days:  365,
+            coverage_min: 100_000_000,
+            coverage_max: 10_000_000_000,
+            premium_rate_bps: 500,
+            max_duration_days: 365,
         },
     )
 }
@@ -108,13 +127,18 @@ fn buy_crop_policy(w: &World, buyer: &Address, product_id: u128) -> u128 {
     StellarAssetClient::new(&w.env, &w.usdc).mint(&w.pool_id, &10_000_000_000i128);
     // Deposit to pool and lock coverage for the policy
     RiskPoolClient::new(&w.env, &w.pool_id).deposit(&buyer, &1_000_000_000i128, &0i128);
-    
-    let policy_id = PolicyEngineClient::new(&w.env, &w.policy_id)
-        .buy_policy(buyer, &product_id, &COVERAGE, &30u32, &symbol_short!("kis2606"));
-    
+
+    let policy_id = PolicyEngineClient::new(&w.env, &w.policy_id).buy_policy(
+        buyer,
+        &product_id,
+        &COVERAGE,
+        &30u32,
+        &symbol_short!("kis2606"),
+    );
+
     // Lock coverage in the pool for this policy
     RiskPoolClient::new(&w.env, &w.pool_id).lock_for_policy(&w.admin, &policy_id, &COVERAGE);
-    
+
     policy_id
 }
 
@@ -134,16 +158,15 @@ fn submit_rainfall(w: &World, mm_7dec: i128) {
 /// Buy policy → oracle submits below threshold → auto_process pays out.
 #[test]
 fn test_drought_trigger_pays_out() {
-    let w      = deploy();
-    let pid    = create_crop_product(&w);
-    let buyer  = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let pol_id = buy_crop_policy(&w, &buyer, pid);
 
     // 32mm < 50mm threshold → trigger MET
     submit_rainfall(&w, 32_000_000);
 
-    let result = ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .auto_process(&w.keeper, &pol_id);
+    let result = ClaimsProcessorClient::new(&w.env, &w.claims_id).auto_process(&w.keeper, &pol_id);
 
     assert_eq!(result, ClaimResult::Paid);
     // Buyer: minted 5_000_000_000, paid 50_000_000 premium, received 1_000_000_000 coverage
@@ -154,57 +177,62 @@ fn test_drought_trigger_pays_out() {
 /// Buy policy → oracle submits above threshold → auto_process rejects.
 #[test]
 fn test_good_rainfall_no_payout() {
-    let w      = deploy();
-    let pid    = create_crop_product(&w);
-    let buyer  = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let pol_id = buy_crop_policy(&w, &buyer, pid);
 
     // 72mm > 50mm → trigger NOT met
     submit_rainfall(&w, 72_000_000);
 
-    let result = ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .auto_process(&w.keeper, &pol_id);
+    let result = ClaimsProcessorClient::new(&w.env, &w.claims_id).auto_process(&w.keeper, &pol_id);
 
     assert_eq!(result, ClaimResult::Rejected);
     // Buyer: minted 5_000_000_000, paid 50_000_000 premium, no payout received
     let buyer_bal = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
-    assert_eq!(buyer_bal, 5_000_000_000 - 4_109_589, "no payout when trigger not met");
+    assert_eq!(
+        buyer_bal,
+        5_000_000_000 - 4_109_589,
+        "no payout when trigger not met"
+    );
 }
 
 /// Policy past end_time with no trigger → auto_process marks Expired.
 #[test]
 fn test_expired_policy_no_payout() {
-    let w      = deploy();
-    let pid    = create_crop_product(&w);
-    let buyer  = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let pol_id = buy_crop_policy(&w, &buyer, pid);
 
     // Advance time past 30-day policy duration (2,592,000 seconds)
     w.env.ledger().with_mut(|l| l.timestamp += 31 * 86_400);
 
-    let result = ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .auto_process(&w.keeper, &pol_id);
+    let result = ClaimsProcessorClient::new(&w.env, &w.claims_id).auto_process(&w.keeper, &pol_id);
 
     assert_eq!(result, ClaimResult::Expired);
     let policy = PolicyEngineClient::new(&w.env, &w.policy_id).get_policy(&pol_id);
-    assert_eq!(policy.status, parashield_policy_engine::PolicyStatus::Expired);
+    assert_eq!(
+        policy.status,
+        parashield_policy_engine::PolicyStatus::Expired
+    );
 }
 
 /// auto_process on already-paid policy returns AlreadyProcessed (idempotent).
 #[test]
 fn test_double_process_idempotent() {
-    let w      = deploy();
-    let pid    = create_crop_product(&w);
-    let buyer  = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let pol_id = buy_crop_policy(&w, &buyer, pid);
 
     submit_rainfall(&w, 20_000_000); // 20mm — well below threshold
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
-    let first  = cp.auto_process(&w.keeper, &pol_id);
+    let first = cp.auto_process(&w.keeper, &pol_id);
     let second = cp.auto_process(&w.keeper, &pol_id);
 
-    assert_eq!(first,  ClaimResult::Paid);
+    assert_eq!(first, ClaimResult::Paid);
     assert_eq!(second, ClaimResult::AlreadyProcessed);
 
     // Buyer should NOT receive double coverage — exactly one payout
@@ -214,9 +242,9 @@ fn test_double_process_idempotent() {
 
 #[test]
 fn test_process_claim_is_idempotent_after_first_settlement() {
-    let w      = deploy();
-    let pid    = create_crop_product(&w);
-    let buyer  = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let pol_id = buy_crop_policy(&w, &buyer, pid);
     submit_rainfall(&w, 20_000_000);
 
@@ -233,9 +261,9 @@ fn test_process_claim_is_idempotent_after_first_settlement() {
 #[test]
 #[should_panic(expected = "Error(Contract, #6)")]
 fn test_double_submit_claim_panics() {
-    let w      = deploy();
-    let pid    = create_crop_product(&w);
-    let buyer  = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let pol_id = buy_crop_policy(&w, &buyer, pid);
     submit_rainfall(&w, 20_000_000);
 
@@ -249,29 +277,28 @@ fn test_double_submit_claim_panics() {
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn test_non_policyholder_cannot_submit_claim() {
-    let w        = deploy();
-    let pid      = create_crop_product(&w);
-    let buyer    = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let stranger = Address::generate(&w.env);
-    let pol_id   = buy_crop_policy(&w, &buyer, pid);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
     submit_rainfall(&w, 20_000_000);
 
-    ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .submit_claim(&stranger, &pol_id);
+    ClaimsProcessorClient::new(&w.env, &w.claims_id).submit_claim(&stranger, &pol_id);
 }
 
 /// Manual submit_claim + process_claim flow works end-to-end.
 #[test]
 fn test_manual_claim_flow() {
-    let w      = deploy();
-    let pid    = create_crop_product(&w);
-    let buyer  = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let pol_id = buy_crop_policy(&w, &buyer, pid);
     submit_rainfall(&w, 30_000_000); // below threshold
 
-    let cp       = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let claim_id = cp.submit_claim(&buyer, &pol_id);
-    let result   = cp.process_claim(&w.keeper, &claim_id);
+    let result = cp.process_claim(&w.keeper, &claim_id);
 
     assert_eq!(result, ClaimResult::Paid);
     let claim = cp.get_claim(&claim_id);
@@ -285,27 +312,26 @@ fn test_manual_claim_flow() {
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn test_auto_process_rejects_unregistered_keeper() {
-    let w        = deploy();
-    let pid      = create_crop_product(&w);
-    let buyer    = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let stranger = Address::generate(&w.env);
-    let pol_id   = buy_crop_policy(&w, &buyer, pid);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
     submit_rainfall(&w, 20_000_000);
 
     // `stranger` is not in the keeper registry → Unauthorized
-    ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .auto_process(&stranger, &pol_id);
+    ClaimsProcessorClient::new(&w.env, &w.claims_id).auto_process(&stranger, &pol_id);
 }
 
 /// process_claim from an unregistered address is rejected.
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn test_process_claim_rejects_unregistered_keeper() {
-    let w        = deploy();
-    let pid      = create_crop_product(&w);
-    let buyer    = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let stranger = Address::generate(&w.env);
-    let pol_id   = buy_crop_policy(&w, &buyer, pid);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
     submit_rainfall(&w, 20_000_000);
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
@@ -317,9 +343,9 @@ fn test_process_claim_rejects_unregistered_keeper() {
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn test_removed_keeper_cannot_process() {
-    let w      = deploy();
-    let pid    = create_crop_product(&w);
-    let buyer  = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let pol_id = buy_crop_policy(&w, &buyer, pid);
     submit_rainfall(&w, 20_000_000);
 
@@ -332,11 +358,10 @@ fn test_removed_keeper_cannot_process() {
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn test_non_admin_cannot_add_keeper() {
-    let w        = deploy();
+    let w = deploy();
     let stranger = Address::generate(&w.env);
     let new_keep = Address::generate(&w.env);
-    ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .add_keeper(&stranger, &new_keep);
+    ClaimsProcessorClient::new(&w.env, &w.claims_id).add_keeper(&stranger, &new_keep);
 }
 
 // ── Pending queue lifecycle (Issues #76, #74) ────────────────────────────────
@@ -345,9 +370,9 @@ fn test_non_admin_cannot_add_keeper() {
 /// from the pending queue — the queue never accumulates settled claims.
 #[test]
 fn test_pending_queue_cleared_after_auto_process() {
-    let w      = deploy();
-    let pid    = create_crop_product(&w);
-    let buyer  = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let pol_id = buy_crop_policy(&w, &buyer, pid);
     submit_rainfall(&w, 20_000_000);
 
@@ -358,15 +383,19 @@ fn test_pending_queue_cleared_after_auto_process() {
     assert_eq!(result, ClaimResult::Paid);
 
     // Settled claim must not linger in the pending queue.
-    assert_eq!(cp.get_pending_claims().len(), 0, "settled claim left in queue");
+    assert_eq!(
+        cp.get_pending_claims().len(),
+        0,
+        "settled claim left in queue"
+    );
 }
 
 /// submit_claim enqueues; process_claim settlement dequeues.
 #[test]
 fn test_pending_queue_cleared_after_process_claim() {
-    let w      = deploy();
-    let pid    = create_crop_product(&w);
-    let buyer  = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let pol_id = buy_crop_policy(&w, &buyer, pid);
     submit_rainfall(&w, 30_000_000);
 
@@ -375,15 +404,19 @@ fn test_pending_queue_cleared_after_process_claim() {
     assert_eq!(cp.get_pending_claims().len(), 1);
 
     cp.process_claim(&w.keeper, &claim_id);
-    assert_eq!(cp.get_pending_claims().len(), 0, "settled claim left in queue");
+    assert_eq!(
+        cp.get_pending_claims().len(),
+        0,
+        "settled claim left in queue"
+    );
 }
 
 /// Disputing a still-pending claim removes it from the pending queue.
 #[test]
 fn test_dispute_pending_claim_dequeues() {
-    let w      = deploy();
-    let pid    = create_crop_product(&w);
-    let buyer  = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let pol_id = buy_crop_policy(&w, &buyer, pid);
     submit_rainfall(&w, 30_000_000);
 
@@ -393,7 +426,11 @@ fn test_dispute_pending_claim_dequeues() {
 
     cp.dispute_claim(&buyer, &claim_id, &symbol_short!("disagree"));
     assert_eq!(cp.get_claim(&claim_id).status, ClaimStatus::Disputed);
-    assert_eq!(cp.get_pending_claims().len(), 0, "disputed claim left in queue");
+    assert_eq!(
+        cp.get_pending_claims().len(),
+        0,
+        "disputed claim left in queue"
+    );
 }
 
 // ── Dispute status guard (Issue #78) ─────────────────────────────────────────
@@ -402,9 +439,9 @@ fn test_dispute_pending_claim_dequeues() {
 #[test]
 #[should_panic(expected = "Error(Contract, #7)")]
 fn test_cannot_dispute_paid_claim() {
-    let w      = deploy();
-    let pid    = create_crop_product(&w);
-    let buyer  = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let pol_id = buy_crop_policy(&w, &buyer, pid);
     submit_rainfall(&w, 20_000_000);
 
@@ -420,9 +457,9 @@ fn test_cannot_dispute_paid_claim() {
 /// A rejected claim may be disputed; re-disputing it then fails.
 #[test]
 fn test_rejected_claim_disputable_then_locked() {
-    let w      = deploy();
-    let pid    = create_crop_product(&w);
-    let buyer  = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let pol_id = buy_crop_policy(&w, &buyer, pid);
     submit_rainfall(&w, 72_000_000); // above threshold → rejected
 
@@ -440,9 +477,9 @@ fn test_rejected_claim_disputable_then_locked() {
 #[test]
 #[should_panic(expected = "Error(Contract, #7)")]
 fn test_cannot_redispute_disputed_claim() {
-    let w      = deploy();
-    let pid    = create_crop_product(&w);
-    let buyer  = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let pol_id = buy_crop_policy(&w, &buyer, pid);
     submit_rainfall(&w, 72_000_000);
 
@@ -461,16 +498,21 @@ fn test_cannot_redispute_disputed_claim() {
 fn test_initialize_with_valid_addresses_succeeds() {
     let env = Env::default();
     env.mock_all_auths();
-    
-    let admin           = Address::generate(&env);
-    let policy_engine   = Address::generate(&env);
-    let risk_pool       = Address::generate(&env);
+
+    let admin = Address::generate(&env);
+    let policy_engine = Address::generate(&env);
+    let risk_pool = Address::generate(&env);
     let oracle_verifier = Address::generate(&env);
-    
+
     let claims_id = env.register(ClaimsProcessor, ());
-    ClaimsProcessorClient::new(&env, &claims_id)
-        .initialize(&admin, &policy_engine, &risk_pool, &oracle_verifier, &604_800u64);
-    
+    ClaimsProcessorClient::new(&env, &claims_id).initialize(
+        &admin,
+        &policy_engine,
+        &risk_pool,
+        &oracle_verifier,
+        &604_800u64,
+    );
+
     // Should succeed without panic
     let stored_admin = ClaimsProcessorClient::new(&env, &claims_id).get_admin();
     assert_eq!(stored_admin, admin);
@@ -486,15 +528,18 @@ fn test_address_validation_function_exists() {
     // Actual invalid address testing is limited by Soroban's type-safe Address type
     let env = Env::default();
     let valid_addr = Address::generate(&env);
-    
+
     // The validation should succeed for valid addresses
     // We can't test invalid addresses because Address::from_string() would fail first
     let addr_str = valid_addr.to_string();
     assert_eq!(addr_str.len(), 56, "Stellar addresses are 56 characters");
-    
+
     let mut buf = [0u8; 56];
     addr_str.copy_into_slice(&mut buf);
-    assert!(buf[0] == b'G' || buf[0] == b'C', "Stellar addresses start with 'G' or 'C'");
+    assert!(
+        buf[0] == b'G' || buf[0] == b'C',
+        "Stellar addresses start with 'G' or 'C'"
+    );
 }
 
 // ── Keeper authorization ───────────────────────────────────────────────────────
@@ -503,25 +548,24 @@ fn test_address_validation_function_exists() {
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn test_non_keeper_cannot_auto_process() {
-    let w      = deploy();
-    let pid    = create_crop_product(&w);
-    let buyer  = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let pol_id = buy_crop_policy(&w, &buyer, pid);
     submit_rainfall(&w, 20_000_000);
 
     // A stranger that is not an authorized keeper tries to auto_process
     let stranger = Address::generate(&w.env);
-    ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .auto_process(&stranger, &pol_id);
+    ClaimsProcessorClient::new(&w.env, &w.claims_id).auto_process(&stranger, &pol_id);
 }
 
 /// Non-keeper cannot call process_claim.
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn test_non_keeper_cannot_process_claim() {
-    let w      = deploy();
-    let pid    = create_crop_product(&w);
-    let buyer  = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let pol_id = buy_crop_policy(&w, &buyer, pid);
     submit_rainfall(&w, 20_000_000);
 
@@ -540,9 +584,9 @@ fn test_non_keeper_cannot_process_claim() {
 /// process_claim level (PolicyClaim check at line 292 of lib.rs).
 #[test]
 fn test_process_claim_double_processing_returns_already_processed() {
-    let w      = deploy();
-    let pid    = create_crop_product(&w);
-    let buyer  = Address::generate(&w.env);
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
     let pol_id = buy_crop_policy(&w, &buyer, pid);
 
     // Submit low rainfall so the trigger is met

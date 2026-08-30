@@ -8,20 +8,31 @@ use soroban_sdk::{testutils::Address as _, token, Address, Env, Symbol};
 
 use crate::{RiskPool, RiskPoolClient};
 
-fn setup() -> (Env, RiskPoolClient<'static>, Address, Address, Address, Address) {
+fn setup() -> (
+    Env,
+    RiskPoolClient<'static>,
+    Address,
+    Address,
+    Address,
+    Address,
+) {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin            = Address::generate(&env);
-    let treasury         = Address::generate(&env);
-    let lp1              = Address::generate(&env);
-    let policy_engine    = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let lp1 = Address::generate(&env);
+    let policy_engine = Address::generate(&env);
     let claims_processor = Address::generate(&env);
 
-    let usdc_id     = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let backstop_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let pool_id     = env.register(RiskPool, ());
-    let pool        = RiskPoolClient::new(&env, &pool_id);
+    let usdc_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let backstop_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let pool_id = env.register(RiskPool, ());
+    let pool = RiskPoolClient::new(&env, &pool_id);
 
     token::StellarAssetClient::new(&env, &usdc_id).mint(&lp1, &100_000_0000000i128);
 
@@ -64,7 +75,7 @@ fn utilization_100_pct_after_locking_all() {
     let amount = 200_0000000i128;
     pool.deposit(&lp1, &amount, &0i128);
     pool.lock_for_policy(&admin, &10u128, &amount);
-    assert_eq!(pool.get_utilization_rate(), 10_000u32);  // 100% in bps
+    assert_eq!(pool.get_utilization_rate(), 10_000u32); // 100% in bps
     assert_eq!(pool.get_available_liquidity(), 0);
 }
 
@@ -89,7 +100,7 @@ fn inflation_attack_mitigated() {
     let (env, pool, _, _, usdc_id, lp1) = setup();
     let lp2 = Address::generate(&env);
     token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &1000_0000000i128);
-    
+
     // LP1 deposits 10 USDC (gets 10_000_000 * 1e9 = 10^16 shares)
     pool.deposit(&lp1, &10_0000000i128, &0i128);
 
@@ -97,9 +108,9 @@ fn inflation_attack_mitigated() {
     let shares = pool.get_position(&lp1).unwrap().shares;
     pool.withdraw(&lp1, &(shares - 1));
 
-    // Send a massive premium 
+    // Send a massive premium
     token::StellarAssetClient::new(&env, &usdc_id).mint(&lp1, &100_000_0000000i128);
-    pool.receive_premium(&lp1, &100_000_0000000i128); 
+    pool.receive_premium(&lp1, &100_000_0000000i128);
 
     // LP2 deposits 1 USDC. Because total_deposited wasn't inflated, they get correct shares
     let new_shares = pool.deposit(&lp2, &1_0000000i128, &0i128);
@@ -111,17 +122,21 @@ fn per_share_yield_distribution() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin            = Address::generate(&env);
-    let treasury         = Address::generate(&env);
-    let lp1              = Address::generate(&env);
-    let lp2              = Address::generate(&env);
-    let policy_engine    = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let lp1 = Address::generate(&env);
+    let lp2 = Address::generate(&env);
+    let policy_engine = Address::generate(&env);
     let claims_processor = Address::generate(&env);
 
-    let usdc_id     = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let backstop_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let pool_id     = env.register(RiskPool, ());
-    let pool        = RiskPoolClient::new(&env, &pool_id);
+    let usdc_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let backstop_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let pool_id = env.register(RiskPool, ());
+    let pool = RiskPoolClient::new(&env, &pool_id);
 
     token::StellarAssetClient::new(&env, &usdc_id).mint(&lp1, &1_000_000_0000000i128);
     token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &1_000_000_0000000i128);
@@ -166,16 +181,20 @@ fn utilization_rate_large_locked_no_truncation() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin            = Address::generate(&env);
-    let treasury         = Address::generate(&env);
-    let lp1              = Address::generate(&env);
-    let policy_engine    = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let lp1 = Address::generate(&env);
+    let policy_engine = Address::generate(&env);
     let claims_processor = Address::generate(&env);
 
-    let usdc_id     = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let backstop_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let pool_id     = env.register(RiskPool, ());
-    let pool        = RiskPoolClient::new(&env, &pool_id);
+    let usdc_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let backstop_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let pool_id = env.register(RiskPool, ());
+    let pool = RiskPoolClient::new(&env, &pool_id);
 
     // Deposit 500,000 USDC (500,000,000,000,000 stroops)
     // This exceeds the threshold where locked * 10_000 would overflow u32::MAX
@@ -201,7 +220,11 @@ fn utilization_rate_large_locked_no_truncation() {
 
     // The utilization rate should saturate to u32::MAX instead of silently truncating
     let util_rate = pool.get_utilization_rate();
-    assert_eq!(util_rate, u32::MAX, "Utilization rate should saturate to u32::MAX for large locked amounts");
+    assert_eq!(
+        util_rate,
+        u32::MAX,
+        "Utilization rate should saturate to u32::MAX for large locked amounts"
+    );
 
     // Verify the calculation: (429,497 * 10,000) / 500,000 = 8,589,940 bps
     // This exceeds u32::MAX (4,294,967,295), so it should saturate

@@ -35,7 +35,6 @@ enum StorageKey {
     LockedBalance(u64, Address),
     /// Contract version (u32) for storage migration tracking
     Version,
-
 }
 
 #[contracterror]
@@ -76,7 +75,7 @@ impl GovernanceDao {
 
         // Address verification
         let admin_str = admin.to_string();
-        
+
         if false {
             panic!("invalid address: admin must be an account address");
         }
@@ -151,11 +150,7 @@ impl GovernanceDao {
         // (not whatever config.proposal_threshold reads as later) is what
         // finalize() must refund, so it's captured on the Proposal below.
         let deposit = config.proposal_threshold;
-        gov_token.transfer(
-            &proposer,
-            &env.current_contract_address(),
-            &deposit,
-        );
+        gov_token.transfer(&proposer, &env.current_contract_address(), &deposit);
 
         let proposal_id: u64 = env
             .storage()
@@ -185,9 +180,12 @@ impl GovernanceDao {
         env.storage()
             .persistent()
             .set(&StorageKey::Proposal(proposal_id), &proposal);
-        env.storage()
-            .instance()
-            .set(&StorageKey::NextProposalId, &(proposal_id.checked_add(1).unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))));
+        env.storage().instance().set(
+            &StorageKey::NextProposalId,
+            &(proposal_id
+                .checked_add(1)
+                .unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))),
+        );
 
         // Note: You can append `args` to your event payload if necessary
         env.events().publish(
@@ -355,7 +353,11 @@ impl GovernanceDao {
             proposal.status = ProposalStatus::Failed;
         } else {
             let for_bps = if total_votes > 0 {
-                proposal.votes_for.checked_mul(10_000).map(|v| v / total_votes).unwrap_or(0)
+                proposal
+                    .votes_for
+                    .checked_mul(10_000)
+                    .map(|v| v / total_votes)
+                    .unwrap_or(0)
             } else {
                 0
             };
@@ -512,7 +514,10 @@ impl GovernanceDao {
 
     /// Return the contract's current storage/version number (defaults to 1).
     pub fn get_version(env: Env) -> u32 {
-        env.storage().instance().get(&StorageKey::Version).unwrap_or(1)
+        env.storage()
+            .instance()
+            .get(&StorageKey::Version)
+            .unwrap_or(1)
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
@@ -544,20 +549,26 @@ impl GovernanceDao {
     /// Runs storage migrations if the new version requires them.
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>, new_version: u32) {
         Self::require_admin(&env, &admin);
-        let current_version: u32 = env.storage().instance().get(&StorageKey::Version).unwrap_or(1);
+        let current_version: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Version)
+            .unwrap_or(1);
         if new_version <= current_version {
             panic_with_error!(&env, Error::VersionNotNewer);
         }
-        
+
         // Run migrations from current_version to new_version
         Self::run_migrations(&env, current_version, new_version);
-        
+
         // Update the stored version
-        env.storage().instance().set(&StorageKey::Version, &new_version);
-        
+        env.storage()
+            .instance()
+            .set(&StorageKey::Version, &new_version);
+
         // Perform the actual WASM upgrade
         env.deployer().update_current_contract_wasm(new_wasm_hash);
-        
+
         env.events().publish(
             (Symbol::new(&env, "contract_upgraded"),),
             ContractUpgraded {
@@ -573,7 +584,7 @@ impl GovernanceDao {
         // Migration from v1 to v2: No storage changes needed yet
         // This is where you would add migration logic for specific version bumps
         // Example: if old_version < 2 && new_version >= 2 { Self::migrate_v1_to_v2(env); }
-        
+
         // Future migrations follow the pattern:
         // if old_version < 3 && new_version >= 3 { Self::migrate_v2_to_v3(env); }
     }

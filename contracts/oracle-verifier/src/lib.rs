@@ -48,6 +48,7 @@ enum StorageKey {
     MaxDataAge,
     PendingAdmin,
     MinOracleCount,
+    DataTypePaused(Symbol),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -67,6 +68,7 @@ pub enum Error {
     StaleData = 9,
     TooManyOracles = 10,
     InvalidTimestamp = 11,
+    DataTypePaused = 12,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -221,7 +223,9 @@ impl OracleVerifier {
                 pruned.push_back(addr);
             }
         }
-        env.storage().instance().set(&StorageKey::OracleList, &pruned);
+        env.storage()
+            .instance()
+            .set(&StorageKey::OracleList, &pruned);
 
         env.events().publish(
             (Symbol::new(&env, "oracle_removed"),),
@@ -334,6 +338,34 @@ impl OracleVerifier {
             .unwrap_or(1)
     }
 
+    /// Admin-only: pause submissions and trigger verification for one data type.
+    pub fn pause_data_type(env: Env, admin: Address, data_type: Symbol) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::DataTypePaused(data_type.clone()), &true);
+        env.events()
+            .publish((Symbol::new(&env, "data_type_paused"),), data_type);
+    }
+
+    /// Admin-only: resume submissions and trigger verification for one data type.
+    pub fn resume_data_type(env: Env, admin: Address, data_type: Symbol) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::DataTypePaused(data_type.clone()), &false);
+        env.events()
+            .publish((Symbol::new(&env, "data_type_resumed"),), data_type);
+    }
+
+    /// Return whether a data type is currently paused.
+    pub fn is_data_type_paused(env: Env, data_type: Symbol) -> bool {
+        env.storage()
+            .instance()
+            .get(&StorageKey::DataTypePaused(data_type))
+            .unwrap_or(false)
+    }
+
     // ── Data Submission ───────────────────────────────────────────────────────
 
     /// Submit a data point for a (data_type, key) pair.
@@ -353,6 +385,7 @@ impl OracleVerifier {
         timestamp: u64,
     ) {
         oracle.require_auth();
+        Self::require_data_type_active(&env, &data_type);
         if confidence == 0 || confidence > 100 {
             panic_with_error!(&env, Error::InvalidConfidence);
         }
@@ -429,6 +462,7 @@ impl OracleVerifier {
         key: Symbol,
         condition: TriggerCondition,
     ) -> bool {
+        Self::require_data_type_active(&env, &data_type);
         let median = Self::get_median_value(&env, &data_type, &key);
         match condition.comparison {
             TriggerComparison::LessThan => median < condition.threshold,
@@ -522,7 +556,11 @@ impl OracleVerifier {
         let mut active_oracle_count: u32 = 0;
         for addr in oracle_list.iter() {
             let oracle_key = StorageKey::Oracle(data_type.clone(), addr.clone());
-            if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<_, OracleEntry>(&oracle_key)
+            {
                 if entry.active {
                     active_oracle_count += 1;
                 }
@@ -549,6 +587,7 @@ impl OracleVerifier {
         condition: TriggerCondition,
         max_age_seconds: u64,
     ) -> bool {
+        Self::require_data_type_active(&env, &data_type);
         let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
         let points: Vec<OracleDataPoint> = env
             .storage()
@@ -581,13 +620,13 @@ impl OracleVerifier {
                 diff.abs() <= condition.tolerance
             }
         };
-        
+
         // Emit event for verification result to enable monitoring and auditing
         env.events().publish(
             (Symbol::new(&env, "verification_result"),),
             (data_type, key, result, median, condition.threshold),
         );
-        
+
         result
     }
 
@@ -600,6 +639,7 @@ impl OracleVerifier {
         submissions: Vec<(Symbol, i128, u32, u64)>,
     ) {
         oracle.require_auth();
+        Self::require_data_type_active(&env, &data_type);
         let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         let entry: OracleEntry = env
             .storage()
@@ -680,6 +720,7 @@ impl OracleVerifier {
         submissions: Vec<OracleDataSubmission>,
     ) {
         oracle.require_auth();
+        Self::require_data_type_active(&env, &data_type);
 
         let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         let entry: OracleEntry = env
@@ -774,6 +815,17 @@ impl OracleVerifier {
             panic_with_error!(env, Error::Unauthorized);
         }
         caller.require_auth();
+    }
+
+    fn require_data_type_active(env: &Env, data_type: &Symbol) {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&StorageKey::DataTypePaused(data_type.clone()))
+            .unwrap_or(false);
+        if paused {
+            panic_with_error!(env, Error::DataTypePaused);
+        }
     }
 
     /// Compute the weighted median of active, sufficiently fresh submissions.

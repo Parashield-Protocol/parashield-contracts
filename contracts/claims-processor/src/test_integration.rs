@@ -10,30 +10,30 @@ use soroban_sdk::{
     token, Address, Env,
 };
 
+use crate::{ClaimResult, ClaimsProcessor, ClaimsProcessorClient};
 use parashield_oracle_verifier::{OracleVerifier, OracleVerifierClient};
 use parashield_policy_engine::{
-    PolicyEngine, PolicyEngineClient,
-    CreateProductParams,
-    TriggerComparison, TriggerType,
+    CreateProductParams, PolicyEngine, PolicyEngineClient, TriggerComparison, TriggerType,
 };
 use parashield_risk_pool::{RiskPool, RiskPoolClient};
-use crate::{ClaimsProcessor, ClaimsProcessorClient, ClaimResult};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 use soroban_sdk::{symbol_short, Symbol};
 
-fn weather() -> Symbol { symbol_short!("weather") }
+fn weather() -> Symbol {
+    symbol_short!("weather")
+}
 
 struct TestEnv {
-    env:       Env,
-    oracle:    Address,
-    policy:    Address,
-    claims:    Address,
-    admin:     Address,
-    usdc:      Address,
+    env: Env,
+    oracle: Address,
+    policy: Address,
+    claims: Address,
+    admin: Address,
+    usdc: Address,
     oracle_node: Address,
-    pool:      Address,
+    pool: Address,
 }
 
 fn full_setup() -> TestEnv {
@@ -43,51 +43,72 @@ fn full_setup() -> TestEnv {
     let admin = Address::generate(&env);
     let oracle_node = Address::generate(&env);
 
-    let usdc_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let usdc_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
     let oracle_id = env.register(OracleVerifier, ());
     let policy_id = env.register(PolicyEngine, ());
     let claims_id = env.register(ClaimsProcessor, ());
-    let backstop = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let backstop = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
     let treasury = Address::generate(&env);
     let pool_id = env.register(RiskPool, ());
 
     OracleVerifierClient::new(&env, &oracle_id).initialize(&admin);
-    PolicyEngineClient::new(&env, &policy_id)
-        .initialize(&admin, &usdc_id, &oracle_id);
-    
-    // Initialize risk pool (will be reinitialized with correct addresses later)
-    RiskPoolClient::new(&env, &pool_id)
-        .initialize(&admin, &usdc_id, &treasury, &backstop, &Symbol::new(&env, "crop"), &policy_id, &claims_id);
-    
-    ClaimsProcessorClient::new(&env, &claims_id)
-        .initialize(&admin, &policy_id, &pool_id, &oracle_id, &604_800u64);
-    // Authorize admin as a keeper for tests
-    ClaimsProcessorClient::new(&env, &claims_id)
-        .add_keeper(&admin, &admin);
-    PolicyEngineClient::new(&env, &policy_id)
-        .set_claims_processor(&admin, &claims_id);
-    // The integration tests drive settlement through the admin address.
-    ClaimsProcessorClient::new(&env, &claims_id)
-        .add_keeper(&admin, &admin);
+    PolicyEngineClient::new(&env, &policy_id).initialize(&admin, &usdc_id, &oracle_id);
 
-    TestEnv { env, oracle: oracle_id, policy: policy_id, claims: claims_id, admin, usdc: usdc_id, oracle_node, pool: pool_id }
+    // Initialize risk pool (will be reinitialized with correct addresses later)
+    RiskPoolClient::new(&env, &pool_id).initialize(
+        &admin,
+        &usdc_id,
+        &treasury,
+        &backstop,
+        &Symbol::new(&env, "crop"),
+        &policy_id,
+        &claims_id,
+    );
+
+    ClaimsProcessorClient::new(&env, &claims_id).initialize(
+        &admin,
+        &policy_id,
+        &pool_id,
+        &oracle_id,
+        &604_800u64,
+    );
+    // Authorize admin as a keeper for tests
+    ClaimsProcessorClient::new(&env, &claims_id).add_keeper(&admin, &admin);
+    PolicyEngineClient::new(&env, &policy_id).set_claims_processor(&admin, &claims_id);
+    // The integration tests drive settlement through the admin address.
+    ClaimsProcessorClient::new(&env, &claims_id).add_keeper(&admin, &admin);
+
+    TestEnv {
+        env,
+        oracle: oracle_id,
+        policy: policy_id,
+        claims: claims_id,
+        admin,
+        usdc: usdc_id,
+        oracle_node,
+        pool: pool_id,
+    }
 }
 
 fn create_drought_product(te: &TestEnv) -> u128 {
     PolicyEngineClient::new(&te.env, &te.policy).create_product(
         &te.admin,
         &CreateProductParams {
-            name:               symbol_short!("drght"),
-            category:           symbol_short!("crop"),
-            oracle_key:         symbol_short!("kis2606"),
-            trigger_type:       TriggerType::Threshold,
-            oracle_data_type:   weather(),
-            trigger_threshold:  500_000_000i128,
+            name: symbol_short!("drght"),
+            category: symbol_short!("crop"),
+            oracle_key: symbol_short!("kis2606"),
+            trigger_type: TriggerType::Threshold,
+            oracle_data_type: weather(),
+            trigger_threshold: 500_000_000i128,
             trigger_comparison: TriggerComparison::LessThan,
-            coverage_min:       1_000_0000000i128,
-            coverage_max:       100_000_0000000i128,
-            premium_rate_bps:   300u32,
-            max_duration_days:  180u32,
+            coverage_min: 1_000_0000000i128,
+            coverage_max: 100_000_0000000i128,
+            premium_rate_bps: 300u32,
+            max_duration_days: 180u32,
         },
     )
 }
@@ -105,23 +126,33 @@ fn batch_processes_multiple_pending_claims() {
 
     oracle_client.add_oracle(&te.admin, &te.oracle_node, &weather(), &90u32);
     oracle_client.submit_data(
-        &te.oracle_node, &weather(), &symbol_short!("kis2606"),
-        &30_000_000i128, &95u32, &te.env.ledger().timestamp(),
+        &te.oracle_node,
+        &weather(),
+        &symbol_short!("kis2606"),
+        &30_000_000i128,
+        &95u32,
+        &te.env.ledger().timestamp(),
     );
 
     let farmer1 = Address::generate(&te.env);
     let farmer2 = Address::generate(&te.env);
     token::StellarAssetClient::new(&te.env, &te.usdc).mint(&farmer1, &10_000_0000000i128);
     token::StellarAssetClient::new(&te.env, &te.usdc).mint(&farmer2, &10_000_0000000i128);
-    token::StellarAssetClient::new(&te.env, &te.usdc).mint(
-        &te.policy, &1_000_000_0000000i128,
-    );
+    token::StellarAssetClient::new(&te.env, &te.usdc).mint(&te.policy, &1_000_000_0000000i128);
 
     let p1 = policy_client.buy_policy(
-        &farmer1, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+        &farmer1,
+        &prod_id,
+        &1_000_0000000i128,
+        &30u32,
+        &symbol_short!("kis2606"),
     );
     let p2 = policy_client.buy_policy(
-        &farmer2, &prod_id, &2_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+        &farmer2,
+        &prod_id,
+        &2_000_0000000i128,
+        &30u32,
+        &symbol_short!("kis2606"),
     );
 
     claims_client.submit_claim(&farmer1, &p1);
@@ -147,8 +178,12 @@ fn batch_skips_non_pending_claims() {
 
     oracle_client.add_oracle(&te.admin, &te.oracle_node, &weather(), &90u32);
     oracle_client.submit_data(
-        &te.oracle_node, &weather(), &symbol_short!("kis2606"),
-        &30_000_000i128, &95u32, &te.env.ledger().timestamp(),
+        &te.oracle_node,
+        &weather(),
+        &symbol_short!("kis2606"),
+        &30_000_000i128,
+        &95u32,
+        &te.env.ledger().timestamp(),
     );
 
     let farmer = Address::generate(&te.env);
@@ -156,7 +191,11 @@ fn batch_skips_non_pending_claims() {
     token::StellarAssetClient::new(&te.env, &te.usdc).mint(&te.policy, &1_000_000_0000000i128);
 
     let p1 = policy_client.buy_policy(
-        &farmer, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+        &farmer,
+        &prod_id,
+        &1_000_0000000i128,
+        &30u32,
+        &symbol_short!("kis2606"),
     );
     let _claim_id = claims_client.submit_claim(&farmer, &p1);
     // Process it once
@@ -185,8 +224,12 @@ fn test_stale_oracle_data_rejected() {
     // Submit oracle data with an old timestamp (well within a recognisable epoch)
     let data_ts: u64 = 1_000_000;
     oracle_client.submit_data(
-        &te.oracle_node, &weather(), &symbol_short!("kis2606"),
-        &30_000_000i128, &95u32, &data_ts,
+        &te.oracle_node,
+        &weather(),
+        &symbol_short!("kis2606"),
+        &30_000_000i128,
+        &95u32,
+        &data_ts,
     );
 
     let farmer = Address::generate(&te.env);
@@ -194,7 +237,11 @@ fn test_stale_oracle_data_rejected() {
     token::StellarAssetClient::new(&te.env, &te.usdc).mint(&te.policy, &1_000_000_0000000i128);
 
     let pol_id = policy_client.buy_policy(
-        &farmer, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+        &farmer,
+        &prod_id,
+        &1_000_0000000i128,
+        &30u32,
+        &symbol_short!("kis2606"),
     );
 
     // Advance ledger to more than staleness_threshold (604_800 s) past the data timestamp
@@ -221,8 +268,12 @@ fn test_fresh_oracle_data_accepted() {
     let data_ts: u64 = 1_000_000;
     te.env.ledger().with_mut(|l| l.timestamp = data_ts);
     oracle_client.submit_data(
-        &te.oracle_node, &weather(), &symbol_short!("kis2606"),
-        &30_000_000i128, &95u32, &data_ts,
+        &te.oracle_node,
+        &weather(),
+        &symbol_short!("kis2606"),
+        &30_000_000i128,
+        &95u32,
+        &data_ts,
     );
 
     let farmer = Address::generate(&te.env);
@@ -230,7 +281,11 @@ fn test_fresh_oracle_data_accepted() {
     token::StellarAssetClient::new(&te.env, &te.usdc).mint(&te.policy, &1_000_000_0000000i128);
 
     let pol_id = policy_client.buy_policy(
-        &farmer, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+        &farmer,
+        &prod_id,
+        &1_000_0000000i128,
+        &30u32,
+        &symbol_short!("kis2606"),
     );
 
     // Set ledger to within the staleness threshold (data is fresh)
@@ -252,17 +307,17 @@ fn test_equal_comparison() {
     let prod_id = policy_client.create_product(
         &te.admin,
         &CreateProductParams {
-            name:               symbol_short!("equal"),
-            category:           symbol_short!("flight"),
-            oracle_key:         symbol_short!("flight1"),
-            trigger_type:       TriggerType::Threshold,
-            oracle_data_type:   weather(),
-            trigger_threshold:  100_000_000i128,
+            name: symbol_short!("equal"),
+            category: symbol_short!("flight"),
+            oracle_key: symbol_short!("flight1"),
+            trigger_type: TriggerType::Threshold,
+            oracle_data_type: weather(),
+            trigger_threshold: 100_000_000i128,
             trigger_comparison: TriggerComparison::Equal,
-            coverage_min:       1_000_0000000i128,
-            coverage_max:       100_000_0000000i128,
-            premium_rate_bps:   300u32,
-            max_duration_days:  180u32,
+            coverage_min: 1_000_0000000i128,
+            coverage_max: 100_000_0000000i128,
+            premium_rate_bps: 300u32,
+            max_duration_days: 180u32,
         },
     );
 
@@ -270,8 +325,12 @@ fn test_equal_comparison() {
     let data_ts: u64 = 1_000_000;
     te.env.ledger().with_mut(|l| l.timestamp = data_ts);
     oracle_client.submit_data(
-        &te.oracle_node, &weather(), &symbol_short!("flight1"),
-        &100_000_000i128, &95u32, &data_ts,
+        &te.oracle_node,
+        &weather(),
+        &symbol_short!("flight1"),
+        &100_000_000i128,
+        &95u32,
+        &data_ts,
     );
 
     let farmer = Address::generate(&te.env);
@@ -279,7 +338,11 @@ fn test_equal_comparison() {
     token::StellarAssetClient::new(&te.env, &te.usdc).mint(&te.policy, &1_000_000_0000000i128);
 
     let pol_id = policy_client.buy_policy(
-        &farmer, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("flight1"),
+        &farmer,
+        &prod_id,
+        &1_000_0000000i128,
+        &30u32,
+        &symbol_short!("flight1"),
     );
 
     let fresh_now = data_ts + 3_600;
@@ -304,7 +367,11 @@ fn dispute_removes_claim_from_pending_queue() {
     token::StellarAssetClient::new(&te.env, &te.usdc).mint(&te.policy, &1_000_000_0000000i128);
 
     let pol_id = policy_client.buy_policy(
-        &farmer, &prod_id, &1_000_0000000i128, &30u32, &symbol_short!("kis2606"),
+        &farmer,
+        &prod_id,
+        &1_000_0000000i128,
+        &30u32,
+        &symbol_short!("kis2606"),
     );
 
     // Submit enqueues the claim.
