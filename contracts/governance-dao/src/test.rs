@@ -6,7 +6,7 @@ extern crate std;
 
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, Address, Bytes, Env, Symbol, Val, Vec,
+    token, Address, Bytes, Env, IntoVal, Symbol, Val, Vec,
 };
 
 use crate::{DaoConfig, GovernanceDao, GovernanceDaoClient, ProposalStatus, VoteChoice};
@@ -14,6 +14,15 @@ use crate::{DaoConfig, GovernanceDao, GovernanceDaoClient, ProposalStatus, VoteC
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 const VOTING_PERIOD: u64 = 7 * 24 * 3600; // 7 days in seconds
+
+#[soroban_sdk::contract]
+pub struct MockTarget;
+
+#[soroban_sdk::contractimpl]
+impl MockTarget {
+    pub fn update(_env: Env) {}
+    pub fn upgrade(_env: Env) {}
+}
 
 pub fn setup() -> (
     Env,
@@ -29,7 +38,7 @@ pub fn setup() -> (
     let admin = Address::generate(&env);
     let voter1 = Address::generate(&env);
     let voter2 = Address::generate(&env);
-    let target = Address::generate(&env);
+    let target = env.register(MockTarget, ());
 
     let gov_token_id = env
         .register_stellar_asset_contract_v2(admin.clone())
@@ -54,6 +63,8 @@ pub fn setup() -> (
             majority_bps: 5_100u32,                 // 51%
             voting_period: VOTING_PERIOD,
             proposal_timelock: 0,
+            discussion_period: 0,
+            vote_weight_cap: 0,
         },
     );
 
@@ -88,6 +99,8 @@ fn cannot_initialize_twice() {
             majority_bps: 0,
             voting_period: 0,
             proposal_timelock: 0,
+            discussion_period: 0,
+            vote_weight_cap: 0,
         },
     );
 }
@@ -329,7 +342,7 @@ fn test_proposal_timelock_execution() {
 
     let admin = Address::generate(&env);
     let voter1 = Address::generate(&env);
-    let target = Address::generate(&env);
+    let target = env.register(MockTarget, ());
     let gov_token_id = env
         .register_stellar_asset_contract_v2(admin.clone())
         .address();
@@ -350,6 +363,8 @@ fn test_proposal_timelock_execution() {
             majority_bps: 5_100u32,
             voting_period: 604800,
             proposal_timelock: 604800,
+            discussion_period: 0,
+            vote_weight_cap: 0,
         },
     );
 
@@ -582,3 +597,745 @@ fn test_finalize_does_not_pull_raised_live_threshold() {
     assert_eq!(p.deposit, deposit_before);
     assert_eq!(p.status, ProposalStatus::Passed);
 }
+
+#[test]
+fn test_proposal_expires_after_voting_period() {
+    let (env, dao, _, voter1, _, target) = setup();
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Expire proposal"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+    // Move time past the voting period AND finalize delay buffer (24h)
+    env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+    
+    // Finalize it without votes, it should fail
+    dao.finalize(&pid);
+    
+    let p = dao.get_proposal(&pid);
+    assert_eq!(p.status, crate::ProposalStatus::Failed);
+}
+
+#[test]
+fn test_cancel_refunds_deposit_to_proposer() {
+    let (env, dao, admin, voter1, _, target) = setup();
+    
+    let config = dao.get_config();
+    let gov_token = token::Client::new(&env, &config.gov_token);
+    let balance_before = gov_token.balance(&voter1);
+    
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Refund proposal"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+    
+    assert_eq!(gov_token.balance(&voter1), balance_before - config.proposal_threshold);
+    
+    dao.cancel(&admin, &pid);
+    
+    assert_eq!(gov_token.balance(&voter1), balance_before);
+}
+
+// ── adaptive quorum (issue #374) ──────────────────────────────────────────────
+
+/// Create a proposal, cast `votes`, and finalize it. Returns the status.
+fn run_proposal(
+    env: &Env,
+    dao: &GovernanceDaoClient,
+    proposer: &Address,
+    target: &Address,
+    votes: &[(Address, VoteChoice)],
+) -> ProposalStatus {
+    let args: Vec<Val> = Vec::new(env);
+    let pid = dao.create_proposal(
+        proposer,
+        &Bytes::from_slice(env, b"proposal"),
+        target,
+        &Symbol::new(env, "update"),
+        &args,
+    );
+
+    for (voter, choice) in votes.iter() {
+        dao.vote(voter, &pid, choice);
+    }
+
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + VOTING_PERIOD + 301);
+    dao.finalize(&pid);
+
+    dao.get_proposal(&pid).status
+}
+
+#[test]
+fn quorum_decay_is_disabled_by_default() {
+    let (_env, dao, _admin, _v1, _v2, _target) = setup();
+
+    let decay = dao.get_quorum_decay();
+
+    // An existing DAO's behaviour must not change until it opts in.
+    assert!(!decay.enabled);
+}
+
+#[test]
+fn effective_quorum_matches_config_with_no_history() {
+    let (_env, dao, _admin, _v1, _v2, _target) = setup();
+
+    let eff = dao.get_effective_quorum();
+
+    assert_eq!(eff.quorum_bps, 1_000);
+    assert_eq!(eff.base_bps, 1_000);
+    assert!(!eff.decayed, "no history is not evidence of low turnout");
+}
+
+#[test]
+fn admin_can_enable_quorum_decay() {
+    let (_env, dao, admin, _v1, _v2, _target) = setup();
+
+    dao.set_quorum_decay(&admin, &true, &500u32, &100u32, &3u32);
+
+    let decay = dao.get_quorum_decay();
+    assert!(decay.enabled);
+    assert_eq!(decay.decay_per_period_bps, 100);
+    assert_eq!(decay.window, 3);
+}
+
+#[test]
+fn quorum_floor_is_clamped_to_the_contract_minimum() {
+    let (_env, dao, admin, _v1, _v2, _target) = setup();
+
+    // Ask for a 1% floor; the contract refuses to go below its own 10% MIN.
+    dao.set_quorum_decay(&admin, &true, &100u32, &100u32, &3u32);
+
+    assert_eq!(
+        dao.get_quorum_decay().floor_bps,
+        1_000,
+        "decay must never take quorum below MIN_QUORUM_BPS"
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #25)")]
+fn floor_at_or_above_base_quorum_is_rejected() {
+    let (_env, dao, admin, _v1, _v2, _target) = setup();
+
+    // A floor >= the configured quorum makes decay a no-op — a config
+    // mistake worth surfacing rather than silently accepting.
+    dao.set_quorum_decay(&admin, &true, &1_000u32, &100u32, &3u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #25)")]
+fn zero_decay_step_is_rejected() {
+    let (_env, dao, admin, _v1, _v2, _target) = setup();
+
+    dao.set_quorum_decay(&admin, &true, &500u32, &0u32, &3u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #25)")]
+fn oversized_participation_window_is_rejected() {
+    let (_env, dao, admin, _v1, _v2, _target) = setup();
+
+    dao.set_quorum_decay(&admin, &true, &500u32, &100u32, &50u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn set_quorum_decay_requires_admin() {
+    let (env, dao, _admin, _v1, _v2, _target) = setup();
+
+    let impostor = Address::generate(&env);
+    dao.set_quorum_decay(&impostor, &true, &500u32, &100u32, &3u32);
+}
+
+#[test]
+fn participation_is_recorded_on_finalize() {
+    let (env, dao, _admin, voter1, _v2, target) = setup();
+
+    assert_eq!(dao.get_participation_history().total_recorded, 0);
+
+    run_proposal(
+        &env,
+        &dao,
+        &voter1,
+        &target,
+        &[(voter1.clone(), VoteChoice::For)],
+    );
+
+    let history = dao.get_participation_history();
+    assert_eq!(history.total_recorded, 1);
+    assert_eq!(history.recent_bps.len(), 1);
+}
+
+#[test]
+fn participation_is_recorded_for_failed_proposals_too() {
+    let (env, dao, _admin, voter1, _v2, target) = setup();
+
+    // Against-only: fails on majority, but turnout still happened and the
+    // history should reflect actual participation, not only successes.
+    let status = run_proposal(
+        &env,
+        &dao,
+        &voter1,
+        &target,
+        &[(voter1.clone(), VoteChoice::Against)],
+    );
+
+    assert_eq!(status, ProposalStatus::Failed);
+    assert_eq!(dao.get_participation_history().total_recorded, 1);
+}
+
+#[test]
+fn low_turnout_history_decays_the_effective_quorum() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+
+    // Base quorum 10%; allow decay down to a 5%-equivalent floor, clamped to
+    // the contract minimum.
+    dao.set_quorum_decay(&admin, &true, &500u32, &100u32, &3u32);
+
+    // admin holds 100k of 1.6M supply — about 6.25% turnout, below the bar.
+    run_proposal(
+        &env,
+        &dao,
+        &voter1,
+        &target,
+        &[(admin.clone(), VoteChoice::For)],
+    );
+
+    let eff = dao.get_effective_quorum();
+    let _ = voter2;
+
+    assert!(eff.avg_participation_bps < 1_000, "turnout was below quorum");
+    assert!(eff.quorum_bps <= eff.base_bps);
+    assert!(
+        eff.quorum_bps >= 1_000,
+        "never below MIN_QUORUM_BPS, whatever the history"
+    );
+}
+
+#[test]
+fn healthy_turnout_does_not_decay_quorum() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+
+    dao.set_quorum_decay(&admin, &true, &500u32, &100u32, &3u32);
+
+    // voter1 holds 1M of 1.6M — well above the 10% bar.
+    run_proposal(
+        &env,
+        &dao,
+        &voter1,
+        &target,
+        &[(voter1.clone(), VoteChoice::For)],
+    );
+
+    let eff = dao.get_effective_quorum();
+
+    assert!(eff.avg_participation_bps >= 1_000);
+    assert!(!eff.decayed, "participation at or above the bar decays nothing");
+    assert_eq!(eff.quorum_bps, eff.base_bps);
+}
+
+#[test]
+fn disabled_decay_leaves_quorum_untouched_despite_low_turnout() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+
+    // Decay left off — the default.
+    run_proposal(
+        &env,
+        &dao,
+        &voter1,
+        &target,
+        &[(admin.clone(), VoteChoice::For)],
+    );
+
+    let eff = dao.get_effective_quorum();
+
+    assert!(eff.avg_participation_bps < 1_000, "turnout really was low");
+    assert!(!eff.decayed);
+    assert_eq!(eff.quorum_bps, 1_000, "static quorum stands when opted out");
+}
+
+#[test]
+fn participation_window_drops_the_oldest_entry() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+
+    dao.set_quorum_decay(&admin, &true, &500u32, &100u32, &2u32);
+
+    for round in 0..3u64 {
+        run_proposal(
+            &env,
+            &dao,
+            &voter1,
+            &target,
+            &[(voter1.clone(), VoteChoice::For)],
+        );
+        // Voting locks the voter's balance against that proposal; release it
+        // so the same holder can vote in the next round.
+        dao.withdraw_tokens(&voter1, &round);
+    }
+
+    let history = dao.get_participation_history();
+
+    assert_eq!(history.total_recorded, 3);
+    assert_eq!(history.recent_bps.len(), 2, "window bounds stored history");
+}
+
+// ── delegation (issue #363) ───────────────────────────────────────────────────
+
+#[test]
+fn no_delegation_by_default() {
+    let (_env, dao, _admin, voter1, _v2, _target) = setup();
+
+    assert_eq!(dao.get_delegate(&voter1), None);
+}
+
+#[test]
+fn delegating_records_both_directions() {
+    let (_env, dao, _admin, voter1, voter2, _target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+
+    assert_eq!(dao.get_delegate(&voter1), Some(voter2.clone()));
+
+    let info = dao.get_delegate_info(&voter2);
+    assert_eq!(info.delegators.len(), 1);
+    assert_eq!(info.delegators.get_unchecked(0), voter1);
+}
+
+#[test]
+fn delegate_info_sums_live_balances() {
+    let (_env, dao, _admin, voter1, voter2, _target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+
+    let info = dao.get_delegate_info(&voter2);
+
+    // voter1 holds 1M, voter2 holds 500k.
+    assert_eq!(info.own_weight, 500_000_0000000i128);
+    assert_eq!(info.delegated_weight, 1_000_000_0000000i128);
+    assert_eq!(info.total_weight, 1_500_000_0000000i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn self_delegation_is_refused() {
+    let (_env, dao, _admin, voter1, _v2, _target) = setup();
+
+    dao.delegate(&voter1, &voter1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn delegation_chains_are_refused() {
+    let (env, dao, _admin, voter1, voter2, _target) = setup();
+
+    let third = Address::generate(&env);
+    dao.delegate(&voter2, &third);
+
+    // voter2 has already delegated away — pointing at them would build a
+    // chain, and the weight behind a vote would stop being visible.
+    dao.delegate(&voter1, &voter2);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn a_delegate_cannot_themselves_delegate() {
+    let (_env, dao, _admin, voter1, voter2, _target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+
+    // voter2 now holds delegated authority; letting them pass it on is the
+    // same ambiguity as a chain, one hop later.
+    dao.delegate(&voter2, &voter1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn delegating_twice_to_the_same_delegate_is_refused() {
+    let (_env, dao, _admin, voter1, voter2, _target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+    dao.delegate(&voter1, &voter2);
+}
+
+#[test]
+fn redirecting_a_delegation_detaches_from_the_old_delegate() {
+    let (env, dao, _admin, voter1, voter2, _target) = setup();
+
+    let third = Address::generate(&env);
+    dao.delegate(&voter1, &voter2);
+    dao.delegate(&voter1, &third);
+
+    assert_eq!(dao.get_delegate(&voter1), Some(third.clone()));
+    // The old delegate must not keep a stale entry.
+    assert_eq!(dao.get_delegate_info(&voter2).delegators.len(), 0);
+    assert_eq!(dao.get_delegate_info(&third).delegators.len(), 1);
+}
+
+#[test]
+fn revoking_clears_the_delegation() {
+    let (_env, dao, _admin, voter1, voter2, _target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+    dao.revoke_delegation(&voter1);
+
+    assert_eq!(dao.get_delegate(&voter1), None);
+    assert_eq!(dao.get_delegate_info(&voter2).delegators.len(), 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #27)")]
+fn revoking_without_a_delegation_is_refused() {
+    let (_env, dao, _admin, voter1, _v2, _target) = setup();
+
+    dao.revoke_delegation(&voter1);
+}
+
+#[test]
+fn a_delegate_votes_with_the_combined_weight() {
+    let (env, dao, _admin, voter1, voter2, target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter2,
+        &Bytes::from_slice(&env, b"delegated"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+
+    let proposal = dao.get_proposal(&pid);
+    // voter2's own balance plus voter1's delegated weight — one vote, both
+    // holders represented.
+    assert!(
+        proposal.votes_for > 500_000_0000000i128,
+        "delegated weight should exceed the delegate's own balance, got {}",
+        proposal.votes_for
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #29)")]
+fn a_delegator_cannot_also_vote() {
+    let (env, dao, _admin, voter1, voter2, target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter2,
+        &Bytes::from_slice(&env, b"delegated"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+
+    // Authority was handed over; voting too would count the same tokens twice.
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #29)")]
+fn a_delegator_cannot_vote_after_their_delegate_has() {
+    let (env, dao, _admin, voter1, voter2, target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter2,
+        &Bytes::from_slice(&env, b"delegated"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    dao.revoke_delegation(&voter1);
+
+    // Revoking after the fact must not unlock a second vote for weight that
+    // has already been counted.
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+}
+
+#[test]
+fn revoking_before_the_delegate_votes_restores_the_holder_s_vote() {
+    let (env, dao, _admin, voter1, voter2, target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+    dao.revoke_delegation(&voter1);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"restored"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+
+    assert!(dao.get_proposal(&pid).votes_for > 0);
+}
+
+#[test]
+fn only_the_delegate_s_own_tokens_are_locked() {
+    let (env, dao, _admin, voter1, voter2, target) = setup();
+
+    let gov_token = token::Client::new(&env, &dao.get_config().gov_token);
+    let delegator_before = gov_token.balance(&voter1);
+
+    dao.delegate(&voter1, &voter2);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter2,
+        &Bytes::from_slice(&env, b"custody"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+
+    // Delegation moves authority, not custody — the delegator's balance is
+    // untouched by their delegate voting.
+    assert_eq!(gov_token.balance(&voter1), delegator_before);
+}
+
+// ── deposit reclaim on timeout (issue #378) ───────────────────────────────────
+
+#[test]
+fn reclaim_deposit_refunds_proposer_after_timeout() {
+    let (env, dao, _admin, voter1, _v2, target) = setup();
+
+    let config = dao.get_config();
+    let gov_token = token::Client::new(&env, &config.gov_token);
+    let balance_before = gov_token.balance(&voter1);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Never finalized"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+    assert_eq!(gov_token.balance(&voter1), balance_before - config.proposal_threshold);
+
+    // Well past vote_end + DEPOSIT_RECLAIM_TIMEOUT, and nobody ever called finalize().
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + 14 * 24 * 3600 + 1);
+
+    dao.reclaim_deposit(&pid);
+
+    assert_eq!(gov_token.balance(&voter1), balance_before);
+    assert_eq!(dao.get_proposal(&pid).status, ProposalStatus::Failed);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn reclaim_deposit_before_timeout_fails() {
+    let (env, dao, _admin, voter1, _v2, target) = setup();
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Too early"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+    env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
+    dao.reclaim_deposit(&pid);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn reclaim_deposit_after_finalize_fails() {
+    let (env, dao, _admin, voter1, _v2, target) = setup();
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Finalized already"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + 301);
+    dao.finalize(&pid);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp += 14 * 24 * 3600 + 1);
+    dao.reclaim_deposit(&pid);
+}
+
+// ── proposal templates (issue #381) ───────────────────────────────────────────
+
+#[test]
+fn register_template_lists_it() {
+    let (env, dao, admin, _v1, _v2, _target) = setup();
+    dao.register_template(
+        &admin,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Treasury spend proposal"),
+        &10u32,
+        &2u32,
+    );
+    let names = dao.list_templates();
+    assert_eq!(names.len(), 1);
+    let t = dao.get_template(&Symbol::new(&env, "spend"));
+    assert_eq!(t.min_title_len, 10);
+    assert_eq!(t.required_arg_count, 2);
+    assert!(t.active);
+}
+
+#[test]
+fn create_proposal_from_template_enforces_structure() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+    dao.register_template(
+        &admin,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Treasury spend proposal"),
+        &10u32,
+        &1u32,
+    );
+
+    let mut args: Vec<Val> = Vec::new(&env);
+    args.push_back(1i128.into_val(&env));
+    let pid = dao.create_proposal_from_template(
+        &voter1,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Spend on audits"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+    assert_eq!(dao.proposal_count(), 1);
+    let _ = pid;
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #29)")]
+fn create_proposal_from_template_rejects_short_title() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+    dao.register_template(
+        &admin,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Treasury spend proposal"),
+        &50u32,
+        &0u32,
+    );
+    let args: Vec<Val> = Vec::new(&env);
+    dao.create_proposal_from_template(
+        &voter1,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"short"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #30)")]
+fn create_proposal_from_template_rejects_wrong_arg_count() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+    dao.register_template(
+        &admin,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Treasury spend proposal"),
+        &0u32,
+        &2u32,
+    );
+    let args: Vec<Val> = Vec::new(&env);
+    dao.create_proposal_from_template(
+        &voter1,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Spend on audits"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+}
+
+#[test]
+fn deactivated_template_cannot_be_used() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+    dao.register_template(
+        &admin,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Treasury spend proposal"),
+        &0u32,
+        &0u32,
+    );
+    dao.deactivate_template(&admin, &Symbol::new(&env, "spend"));
+
+    let args: Vec<Val> = Vec::new(&env);
+    let result = dao.try_create_proposal_from_template(
+        &voter1,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Spend on audits"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+    assert!(result.is_err());
+}
+
+// ── Governance Execution Audit Trail (Issue #428) ─────────────────────────────
+
+#[test]
+fn test_get_execution_audit_records_data() {
+    let (env, dao, _, voter1, voter2, target) = setup();
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Execute and audit me"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+
+    dao.finalize(&pid);
+    dao.execute(&pid);
+
+    let audit = dao.get_execution_audit(&pid);
+    assert_eq!(audit.proposal_id, pid);
+    assert_eq!(audit.target, target);
+    assert_eq!(audit.function, Symbol::new(&env, "update"));
+    assert_eq!(audit.executed_at, env.ledger().timestamp());
+    assert!(audit.votes_for > 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_get_execution_audit_unexecuted_panics() {
+    let (env, dao, _, voter1, _, target) = setup();
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Unexecuted"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+    dao.get_execution_audit(&pid);
+}
+

@@ -24,13 +24,15 @@ fn base_config(gov_token: Address) -> DaoConfig {
         majority_bps: 5_100u32,
         voting_period: VOTING_PERIOD,
         proposal_timelock: 0,
+        discussion_period: 0,
+        vote_weight_cap: 0,
     }
 }
 
 fn make_dao(env: &Env) -> (GovernanceDaoClient<'static>, Address, Address, Address) {
     let admin = Address::generate(env);
     let voter = Address::generate(env);
-    let target = Address::generate(env);
+    let target = env.register(crate::test::MockTarget, ());
 
     let gov_token_id = env
         .register_stellar_asset_contract_v2(admin.clone())
@@ -282,4 +284,85 @@ fn admin_cannot_manipulate_total_supply_during_active_vote() {
     // If admin manipulation worked, new supply (500k) would make quorum = 50k,
     // but the fix prevents this by using proposal.total_supply.
     assert_eq!(p.status, ProposalStatus::Passed);
+}
+
+// ── Issue #260: proposal_id u64 overflow guard ──────────────────────────────
+
+/// When NextProposalId is at u64::MAX, the next create_proposal must panic
+/// with LimitReached (#16) instead of wrapping around to 0.
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_proposal_id_overflow_panics_with_limit_reached() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (dao, _, voter, target) = make_dao(&env);
+
+    // Force the counter to u64::MAX so the next increment overflows.
+    env.as_contract(&dao.address, || {
+        env.storage()
+            .instance()
+            .set(&crate::StorageKey::NextProposalId, &u64::MAX);
+    });
+
+    let args: Vec<Val> = Vec::new(&env);
+    // This must panic with LimitReached — not silently wrap to 0.
+    dao.create_proposal(
+        &voter,
+        &Bytes::from_slice(&env, b"Overflow test"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+}
+
+// ── #355: minimum quorum floor ───────────────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #24)")]
+fn initialize_rejects_quorum_below_floor() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let gov_token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let dao_id = env.register(GovernanceDao, ());
+    let dao = GovernanceDaoClient::new(&env, &dao_id);
+    let mut cfg = base_config(gov_token_id);
+    cfg.quorum_bps = 999; // just under the 10% floor
+    dao.initialize(&admin, &cfg);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #24)")]
+fn update_config_rejects_quorum_below_floor() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (dao, admin, _, _) = make_dao(&env);
+    let mut cfg = dao.get_config();
+    cfg.quorum_bps = 0;
+    dao.update_config(&admin, &cfg);
+}
+
+#[test]
+fn finalize_fails_proposal_with_zero_votes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (dao, _admin, voter, target) = make_dao(&env);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter,
+        &Bytes::from_slice(&env, b"No turnout"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+    );
+
+    // Nobody votes.
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+    dao.finalize(&pid);
+
+    assert_eq!(dao.get_proposal(&pid).status, ProposalStatus::Failed);
 }

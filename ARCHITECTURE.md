@@ -68,27 +68,6 @@ No adjuster. No form. No delay.
    - If trigger not met AND policy expired: Policy Engine.expire_policy()
 ```
 
-## Fixed-Point Math
-
-All monetary values use 7-decimal fixed point matching Stellar's native precision:
-
-| Display value | On-chain representation |
-|---------------|------------------------|
-| 1 USDC        | 10_000_000             |
-| 50.5 mm rain  | 505_000_000            |
-| 120 min delay | 1_200_000_000          |
-
-## Oracle Key Format
-
-Oracle keys follow a structured naming convention (max 9 chars = Soroban Symbol):
-
-| Data type   | Key format                    | Example     |
-|-------------|-------------------------------|-------------|
-| Rainfall    | `{loc}{yyyymm}`               | `kis2606`   |
-| Temperature | `tmp{loc}{mm}`                | `tmpkis06`  |
-| Flight      | `fl{flight}{dd}`              | `flkq10015` |
-| Wind speed  | `wnd{loc}{mm}`                | `wndmom06`  |
-| DeFi event  | `defi{proto}`                 | `defiave`   |
 
 ## Risk Pool Economics (v2)
 
@@ -123,6 +102,29 @@ SHIELD token holders govern protocol parameters:
 - Emergency pause individual contracts
 
 **Proposal lifecycle:** Draft → Active (7-day voting) → Passed (≥10% quorum, simple majority) → Executed (2-day timelock)
+
+## Fixed-Point Math
+
+All monetary values use 7-decimal fixed point matching Stellar's native precision:
+
+| Display value | On-chain representation |
+|---------------|------------------------|
+| 1 USDC        | 10_000_000             |
+| 50.5 mm rain  | 505_000_000            |
+| 120 min delay | 1_200_000_000          |
+
+## Oracle Key Format
+
+Oracle keys follow a structured naming convention (max 9 chars = Soroban Symbol):
+
+| Data type   | Key format                    | Example     |
+|-------------|-------------------------------|-------------|
+| Rainfall    | `{loc}{yyyymm}`               | `kis2606`   |
+| Temperature | `tmp{loc}{mm}`                | `tmpkis06`  |
+| Flight      | `fl{flight}{dd}`              | `flkq10015` |
+| Wind speed  | `wnd{loc}{mm}`                | `wndmom06`  |
+| DeFi event  | `defi{proto}`                 | `defiave`   |
+
 
 ## Security Notes
 

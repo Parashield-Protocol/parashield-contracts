@@ -291,3 +291,153 @@ fn test_pay_claim_insufficient_funds_reverts_policy_active() {
     let policy = pe.get_policy(&policy_id);
     assert_eq!(policy.status, crate::PolicyStatus::Active);
 }
+
+// ── #357: batch_buy_policy ────────────────────────────────────────────────────
+
+#[test]
+fn batch_buy_policy_creates_all_policies_and_pulls_premium() {
+    let (env, pe, admin, _oracle, user) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params());
+
+    let items = vec![
+        &env,
+        BatchBuyItem {
+            product_id: prod_id,
+            coverage_amount: 200_0000000i128,
+            duration_days: 30,
+            oracle_key: symbol_short!("kis2606"),
+        },
+        BatchBuyItem {
+            product_id: prod_id,
+            coverage_amount: 300_0000000i128,
+            duration_days: 45,
+            oracle_key: symbol_short!("kis2606"),
+        },
+    ];
+
+    let ids = pe.batch_buy_policy(&user, &items);
+    assert_eq!(ids.len(), 2);
+
+    let listed = pe.get_user_policies(&user, &0u32, &10u32);
+    assert_eq!(listed.len(), 2);
+    assert_eq!(pe.get_policy(&ids.get_unchecked(0)).coverage_amount, 200_0000000i128);
+    assert_eq!(pe.get_policy(&ids.get_unchecked(1)).coverage_amount, 300_0000000i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #29)")]
+fn batch_buy_policy_rejects_empty_batch() {
+    let (env, pe, _admin, _oracle, user) = setup();
+    let items: soroban_sdk::Vec<BatchBuyItem> = soroban_sdk::Vec::new(&env);
+    pe.batch_buy_policy(&user, &items);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #30)")]
+fn batch_buy_policy_rejects_oversized_batch() {
+    let (env, pe, admin, _oracle, user) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params());
+    let mut items = soroban_sdk::Vec::new(&env);
+    for _ in 0..21u32 {
+        items.push_back(BatchBuyItem {
+            product_id: prod_id,
+            coverage_amount: 100_0000000i128,
+            duration_days: 1,
+            oracle_key: symbol_short!("kis2606"),
+        });
+    }
+    pe.batch_buy_policy(&user, &items);
+}
+
+#[test]
+#[should_panic]
+fn batch_buy_policy_is_atomic_on_bad_item() {
+    let (env, pe, admin, _oracle, user) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params());
+    // Second item has a bogus product id -> whole batch reverts.
+    let items = vec![
+        &env,
+        BatchBuyItem {
+            product_id: prod_id,
+            coverage_amount: 200_0000000i128,
+            duration_days: 30,
+            oracle_key: symbol_short!("kis2606"),
+        },
+        BatchBuyItem {
+            product_id: 9_999u128,
+            coverage_amount: 200_0000000i128,
+            duration_days: 30,
+            oracle_key: symbol_short!("kis2606"),
+        },
+    ];
+    pe.batch_buy_policy(&user, &items);
+}
+
+// ── #358: transfer_policy ─────────────────────────────────────────────────────
+
+#[test]
+fn transfer_policy_moves_ownership_and_index() {
+    let (env, pe, admin, _oracle, user) = setup();
+    let to = Address::generate(&env);
+    let prod_id = pe.create_product(&admin, &basic_params());
+    let policy_id = pe.buy_policy(
+        &user, &prod_id, &500_0000000i128, &30u32, &symbol_short!("kis2606"),
+    );
+
+    pe.transfer_policy(&user, &to, &policy_id);
+
+    assert_eq!(pe.get_policy(&policy_id).policyholder, to);
+    assert_eq!(pe.get_user_policies(&user, &0u32, &10u32).len(), 0);
+    let to_list = pe.get_user_policies(&to, &0u32, &10u32);
+    assert_eq!(to_list.len(), 1);
+    assert_eq!(to_list.get_unchecked(0), policy_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn transfer_policy_rejects_non_owner() {
+    let (env, pe, admin, _oracle, user) = setup();
+    let stranger = Address::generate(&env);
+    let to = Address::generate(&env);
+    let prod_id = pe.create_product(&admin, &basic_params());
+    let policy_id = pe.buy_policy(
+        &user, &prod_id, &500_0000000i128, &30u32, &symbol_short!("kis2606"),
+    );
+    pe.transfer_policy(&stranger, &to, &policy_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn transfer_policy_rejects_cancelled_policy() {
+    let (env, pe, admin, _oracle, user) = setup();
+    let to = Address::generate(&env);
+    let prod_id = pe.create_product(&admin, &basic_params());
+    let policy_id = pe.buy_policy(
+        &user, &prod_id, &500_0000000i128, &30u32, &symbol_short!("kis2606"),
+    );
+    pe.cancel_policy(&user, &policy_id);
+    pe.transfer_policy(&user, &to, &policy_id);
+}
+
+// ── #356: admin transfer timelock ────────────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn accept_admin_rejected_before_timelock() {
+    let (env, pe, admin, _oracle, _user) = setup();
+    let new_admin = Address::generate(&env);
+    pe.propose_new_admin(&admin, &new_admin);
+    // Immediately accepting must fail — 48h has not elapsed.
+    pe.accept_admin(&new_admin);
+}
+
+#[test]
+fn accept_admin_succeeds_after_timelock() {
+    let (env, pe, admin, _oracle, _user) = setup();
+    let new_admin = Address::generate(&env);
+    pe.propose_new_admin(&admin, &new_admin);
+    env.ledger().with_mut(|l| l.timestamp += 48 * 60 * 60 + 1);
+    pe.accept_admin(&new_admin);
+    assert_eq!(pe.get_admin(), new_admin);
+    assert_eq!(pe.get_pending_admin_since(), 0);
+}
