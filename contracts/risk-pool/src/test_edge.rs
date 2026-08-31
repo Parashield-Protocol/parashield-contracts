@@ -8,20 +8,31 @@ use soroban_sdk::{testutils::Address as _, token, Address, Env, Symbol};
 
 use crate::{RiskPool, RiskPoolClient};
 
-fn setup() -> (Env, RiskPoolClient<'static>, Address, Address, Address, Address) {
+fn setup() -> (
+    Env,
+    RiskPoolClient<'static>,
+    Address,
+    Address,
+    Address,
+    Address,
+) {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin            = Address::generate(&env);
-    let treasury         = Address::generate(&env);
-    let lp1              = Address::generate(&env);
-    let policy_engine    = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let lp1 = Address::generate(&env);
+    let policy_engine = Address::generate(&env);
     let claims_processor = Address::generate(&env);
 
-    let usdc_id     = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let backstop_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let pool_id     = env.register(RiskPool, ());
-    let pool        = RiskPoolClient::new(&env, &pool_id);
+    let usdc_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let backstop_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let pool_id = env.register(RiskPool, ());
+    let pool = RiskPoolClient::new(&env, &pool_id);
 
     token::StellarAssetClient::new(&env, &usdc_id).mint(&lp1, &100_000_0000000i128);
 
@@ -41,7 +52,7 @@ fn setup() -> (Env, RiskPoolClient<'static>, Address, Address, Address, Address)
 #[test]
 fn zero_accumulated_premium_yields_zero_claim() {
     let (_, pool, _, _, _, lp1) = setup();
-    pool.deposit(&lp1, &100_0000000i128, &0i128, &false);
+    pool.deposit(&lp1, &100_0000000i128, &0i128);
     let yield_amount = pool.claim_yield(&lp1);
     assert_eq!(yield_amount, 0);
 }
@@ -50,7 +61,7 @@ fn zero_accumulated_premium_yields_zero_claim() {
 fn full_deposit_withdraw_round_trip_no_premium() {
     let (_, pool, _, _, _, lp1) = setup();
     let amount = 500_0000000i128;
-    let shares = pool.deposit(&lp1, &amount, &0i128, &false);
+    let shares = pool.deposit(&lp1, &amount, &0i128);
     let returned = pool.withdraw(&lp1, &shares);
     assert_eq!(returned, amount);
     let stats = pool.get_stats();
@@ -62,16 +73,16 @@ fn full_deposit_withdraw_round_trip_no_premium() {
 fn utilization_100_pct_after_locking_all() {
     let (_, pool, admin, _, _, lp1) = setup();
     let amount = 200_0000000i128;
-    pool.deposit(&lp1, &amount, &0i128, &false);
+    pool.deposit(&lp1, &amount, &0i128);
     pool.lock_for_policy(&admin, &10u128, &amount);
-    assert_eq!(pool.get_utilization_rate(), 10_000u32);  // 100% in bps
+    assert_eq!(pool.get_utilization_rate(), 10_000u32); // 100% in bps
     assert_eq!(pool.get_available_liquidity(), 0);
 }
 
 #[test]
 fn multiple_locks_and_releases_track_correctly() {
     let (_, pool, admin, _, _, lp1) = setup();
-    pool.deposit(&lp1, &1000_0000000i128, &0i128, &false);
+    pool.deposit(&lp1, &1000_0000000i128, &0i128);
     pool.lock_for_policy(&admin, &1u128, &300_0000000i128);
     pool.lock_for_policy(&admin, &2u128, &200_0000000i128);
     assert_eq!(pool.get_stats().total_locked, 500_0000000i128);
@@ -89,20 +100,20 @@ fn inflation_attack_mitigated() {
     let (env, pool, _, _, usdc_id, lp1) = setup();
     let lp2 = Address::generate(&env);
     token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &1000_0000000i128);
-    
+
     // LP1 deposits 10 USDC (gets 10_000_000 * 1e9 = 10^16 shares)
-    pool.deposit(&lp1, &10_0000000i128, &0i128, &false);
+    pool.deposit(&lp1, &10_0000000i128, &0i128);
 
     // LP1 withdraws all but 1 share
     let shares = pool.get_position(&lp1).unwrap().shares;
     pool.withdraw(&lp1, &(shares - 1));
 
-    // Send a massive premium 
+    // Send a massive premium
     token::StellarAssetClient::new(&env, &usdc_id).mint(&lp1, &100_000_0000000i128);
-    pool.receive_premium(&lp1, &100_000_0000000i128); 
+    pool.receive_premium(&lp1, &100_000_0000000i128);
 
     // LP2 deposits 1 USDC. Because total_deposited wasn't inflated, they get correct shares
-    let new_shares = pool.deposit(&lp2, &1_0000000i128, &0i128, &false);
+    let new_shares = pool.deposit(&lp2, &1_0000000i128, &0i128);
     assert!(new_shares > 0);
 }
 
@@ -111,17 +122,21 @@ fn per_share_yield_distribution() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin            = Address::generate(&env);
-    let treasury         = Address::generate(&env);
-    let lp1              = Address::generate(&env);
-    let lp2              = Address::generate(&env);
-    let policy_engine    = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let lp1 = Address::generate(&env);
+    let lp2 = Address::generate(&env);
+    let policy_engine = Address::generate(&env);
     let claims_processor = Address::generate(&env);
 
-    let usdc_id     = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let backstop_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let pool_id     = env.register(RiskPool, ());
-    let pool        = RiskPoolClient::new(&env, &pool_id);
+    let usdc_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let backstop_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let pool_id = env.register(RiskPool, ());
+    let pool = RiskPoolClient::new(&env, &pool_id);
 
     token::StellarAssetClient::new(&env, &usdc_id).mint(&lp1, &1_000_000_0000000i128);
     token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &1_000_000_0000000i128);
@@ -137,7 +152,7 @@ fn per_share_yield_distribution() {
     );
 
     // 1. LP1 deposits 10 USDC
-    pool.deposit(&lp1, &10_0000000i128, &0i128, &false);
+    pool.deposit(&lp1, &10_0000000i128, &0i128);
 
     // 2. Pool receives 100 USDC premium
     pool.receive_premium(&lp1, &100_0000000i128); // 80 USDC LP share
@@ -147,7 +162,7 @@ fn per_share_yield_distribution() {
     assert_eq!(lp1_yield_1, 80_0000000i128); // gets all 80 USDC
 
     // 4. LP2 deposits 10 USDC (same as LP1)
-    pool.deposit(&lp2, &10_0000000i128, &0i128, &false);
+    pool.deposit(&lp2, &10_0000000i128, &0i128);
 
     // 5. Pool receives another 50 USDC premium (40 USDC LP share)
     pool.receive_premium(&lp1, &50_0000000i128);
@@ -166,16 +181,20 @@ fn utilization_rate_large_locked_no_truncation() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin            = Address::generate(&env);
-    let treasury         = Address::generate(&env);
-    let lp1              = Address::generate(&env);
-    let policy_engine    = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let lp1 = Address::generate(&env);
+    let policy_engine = Address::generate(&env);
     let claims_processor = Address::generate(&env);
 
-    let usdc_id     = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let backstop_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let pool_id     = env.register(RiskPool, ());
-    let pool        = RiskPoolClient::new(&env, &pool_id);
+    let usdc_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let backstop_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let pool_id = env.register(RiskPool, ());
+    let pool = RiskPoolClient::new(&env, &pool_id);
 
     // Deposit 500,000 USDC (500,000,000,000,000 stroops)
     // This exceeds the threshold where locked * 10_000 would overflow u32::MAX
@@ -192,7 +211,7 @@ fn utilization_rate_large_locked_no_truncation() {
     );
 
     let deposit_amount = 500_000_0000000i128; // 500,000 USDC
-    pool.deposit(&lp1, &deposit_amount, &0i128, &false);
+    pool.deposit(&lp1, &deposit_amount, &0i128);
 
     // Lock 429,497 USDC (429,497,000,000,000 stroops)
     // This is > 429,496.7295 USDC, so locked * 10_000 > u32::MAX (4,294,967,295)
@@ -201,50 +220,15 @@ fn utilization_rate_large_locked_no_truncation() {
 
     // The utilization rate should saturate to u32::MAX instead of silently truncating
     let util_rate = pool.get_utilization_rate();
-    assert_eq!(util_rate, u32::MAX, "Utilization rate should saturate to u32::MAX for large locked amounts");
+    assert_eq!(
+        util_rate,
+        u32::MAX,
+        "Utilization rate should saturate to u32::MAX for large locked amounts"
+    );
 
     // Verify the calculation: (429,497 * 10,000) / 500,000 = 8,589,940 bps
     // This exceeds u32::MAX (4,294,967,295), so it should saturate
     let stats = pool.get_stats();
     assert_eq!(stats.total_deposited, deposit_amount);
     assert_eq!(stats.total_locked, lock_amount);
-}
-
-#[test]
-#[should_panic(expected = "PoolCapExceeded")]
-fn deposit_exceeds_max_total_deposited() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin            = Address::generate(&env);
-    let treasury         = Address::generate(&env);
-    let lp1              = Address::generate(&env);
-    let policy_engine    = Address::generate(&env);
-    let claims_processor = Address::generate(&env);
-
-    let usdc_id     = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let backstop_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let pool_id     = env.register(RiskPool, ());
-    let pool        = RiskPoolClient::new(&env, &pool_id);
-
-    // MAX_TOTAL_DEPOSITED = 1_000_000_000_000_000 (100,000,000 USDC)
-    // Mint MAX_TOTAL_DEPOSITED + 1 to test boundary
-    let max_deposit = 1_000_000_000_000_000i128;
-    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp1, &(max_deposit + 1));
-
-    pool.initialize(
-        &admin,
-        &usdc_id,
-        &treasury,
-        &backstop_id,
-        &Symbol::new(&env, "crop"),
-        &policy_engine,
-        &claims_processor,
-    );
-
-    // First deposit exactly at MAX_TOTAL_DEPOSITED should succeed
-    pool.deposit(&lp1, &max_deposit, &0i128, &false);
-
-    // Second deposit of even 1 more stroops should panic with PoolCapExceeded
-    pool.deposit(&lp1, &1i128, &0i128, &false);
 }

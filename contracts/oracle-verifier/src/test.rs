@@ -18,7 +18,7 @@ fn setup() -> (Env, Address, Address) {
     let contract_id = env.register(OracleVerifier, ());
 
     let client = OracleVerifierClient::new(&env, &contract_id);
-  
+
     client.initialize(&admin);
 
     (env, admin, contract_id)
@@ -107,9 +107,30 @@ fn test_update_oracle_weight_changes_aggregation() {
     client.add_oracle(&admin, &oracle1, &weather(), &60u32);
     client.add_oracle(&admin, &oracle2, &weather(), &20u32);
     client.add_oracle(&admin, &oracle3, &weather(), &20u32);
-    client.submit_data(&oracle1, &weather(), &kisumu_key(), &10i128, &100u32, &1748736000u64);
-    client.submit_data(&oracle2, &weather(), &kisumu_key(), &20i128, &100u32, &1748736000u64);
-    client.submit_data(&oracle3, &weather(), &kisumu_key(), &30i128, &100u32, &1748736000u64);
+    client.submit_data(
+        &oracle1,
+        &weather(),
+        &kisumu_key(),
+        &10i128,
+        &100u32,
+        &1748736000u64,
+    );
+    client.submit_data(
+        &oracle2,
+        &weather(),
+        &kisumu_key(),
+        &20i128,
+        &100u32,
+        &1748736000u64,
+    );
+    client.submit_data(
+        &oracle3,
+        &weather(),
+        &kisumu_key(),
+        &30i128,
+        &100u32,
+        &1748736000u64,
+    );
     assert_eq!(
         client
             .get_aggregated(&weather(), &kisumu_key())
@@ -165,20 +186,34 @@ fn test_remove_oracle_deactivates() {
     let client = OracleVerifierClient::new(&env, &contract_id);
     let oracle1 = Address::generate(&env);
     let oracle2 = Address::generate(&env);
-    
+
     client.add_oracle(&admin, &oracle1, &weather(), &80u32);
     client.add_oracle(&admin, &oracle2, &weather(), &80u32);
-    
-    client.submit_data(&oracle1, &weather(), &kisumu_key(), &10_000_000i128, &90u32, &1748736000u64);
-    client.submit_data(&oracle2, &weather(), &kisumu_key(), &50_000_000i128, &90u32, &1748736000u64);
-    
+
+    client.submit_data(
+        &oracle1,
+        &weather(),
+        &kisumu_key(),
+        &10_000_000i128,
+        &90u32,
+        &1748736000u64,
+    );
+    client.submit_data(
+        &oracle2,
+        &weather(),
+        &kisumu_key(),
+        &50_000_000i128,
+        &90u32,
+        &1748736000u64,
+    );
+
     let agg_before = client.get_aggregated(&weather(), &kisumu_key());
     assert_eq!(agg_before.oracle_count, 2);
     assert_eq!(agg_before.median_value, 30_000_000i128); // (10M + 50M) / 2
-    
+
     // Remove oracle1
     client.remove_oracle(&admin, &oracle1, &weather());
-    
+
     // Aggregation should now only include oracle2
     let agg_after = client.get_aggregated(&weather(), &kisumu_key());
     assert_eq!(agg_after.oracle_count, 1);
@@ -221,11 +256,28 @@ fn test_active_oracle_count_reflects_registrations_not_submissions() {
     client.add_oracle(&admin, &oracle2, &weather(), &80u32);
     client.add_oracle(&admin, &oracle3, &weather(), &80u32);
 
-    client.submit_data(&oracle1, &weather(), &kisumu_key(), &10_000_000i128, &90u32, &1748736000u64);
-    client.submit_data(&oracle2, &weather(), &kisumu_key(), &50_000_000i128, &90u32, &1748736000u64);
+    client.submit_data(
+        &oracle1,
+        &weather(),
+        &kisumu_key(),
+        &10_000_000i128,
+        &90u32,
+        &1748736000u64,
+    );
+    client.submit_data(
+        &oracle2,
+        &weather(),
+        &kisumu_key(),
+        &50_000_000i128,
+        &90u32,
+        &1748736000u64,
+    );
 
     let agg = client.get_aggregated(&weather(), &kisumu_key());
-    assert_eq!(agg.oracle_count, 2, "oracle_count is submissions for this key");
+    assert_eq!(
+        agg.oracle_count, 2,
+        "oracle_count is submissions for this key"
+    );
     assert_eq!(
         agg.active_oracle_count, 3,
         "active_oracle_count is all active registrations for the data_type"
@@ -247,7 +299,14 @@ fn test_removed_oracle_cannot_submit() {
     let oracle = Address::generate(&env);
     client.add_oracle(&admin, &oracle, &weather(), &80u32);
     client.remove_oracle(&admin, &oracle, &weather());
-    client.submit_data(&oracle, &weather(), &kisumu_key(), &10_000_000i128, &90u32, &1748736000u64);
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &10_000_000i128,
+        &90u32,
+        &1748736000u64,
+    );
 }
 
 /// Test that an oracle that was never registered cannot submit data.
@@ -279,6 +338,67 @@ fn test_set_min_confidence_invalid() {
     let (env, admin, contract_id) = setup();
     let client = OracleVerifierClient::new(&env, &contract_id);
     client.set_min_confidence(&admin, &101u32);
+}
+
+#[test]
+fn admin_can_pause_and_resume_one_data_type() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let flight = symbol_short!("flight");
+
+    assert!(!client.is_data_type_paused(&weather()));
+    client.pause_data_type(&admin, &weather());
+    assert!(client.is_data_type_paused(&weather()));
+    assert!(!client.is_data_type_paused(&flight));
+    client.resume_data_type(&admin, &weather());
+    assert!(!client.is_data_type_paused(&weather()));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn paused_data_type_rejects_submission() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &50u32);
+    client.pause_data_type(&admin, &weather());
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &10_000_000i128,
+        &90u32,
+        &1748736000u64,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn paused_data_type_rejects_trigger_verification() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &50u32);
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &10_000_000i128,
+        &90u32,
+        &1748736000u64,
+    );
+    client.pause_data_type(&admin, &weather());
+    client.verify_trigger(
+        &weather(),
+        &kisumu_key(),
+        &TriggerCondition {
+            data_type: weather(),
+            key: kisumu_key(),
+            threshold: 20_000_000,
+            comparison: TriggerComparison::LessThan,
+            tolerance: 0,
+        },
+    );
 }
 
 #[test]
