@@ -1,10 +1,10 @@
-use soroban_sdk::{contracttype, Address, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec};
 
 /// Paginated result from `get_lp_list`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaginatedLps {
-    pub lps: Vec<Address>,
+    pub lps:         Vec<Address>,
     pub total_count: u32,
 }
 
@@ -18,30 +18,68 @@ pub enum PoolStatus {
     WindingDown,
 }
 
+/// Admin-adjustable premium split ratios, in basis points, summing to 10,000.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PremiumSplit {
+    pub lp_bps:       i128,
+    pub treas_bps:    i128,
+    pub backstop_bps: i128,
+}
+
 /// A liquidity provider's position in the pool.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LpPosition {
-    pub provider: Address,
+    pub provider:          Address,
     /// Amount of USDC deposited (7-decimal stroops)
-    pub deposited: i128,
+    pub deposited:         i128,
     /// Pool-share tokens held (7-decimal, proportional to ownership)
-    pub shares: i128,
+    pub shares:            i128,
     /// Total accumulated premium yield already claimed by this LP
-    pub yield_claimed: i128,
-    pub yield_debt: i128,
-    pub deposited_at: u64,
-    pub last_yield_claim: u64,
+    pub yield_claimed:     i128,
+    pub yield_debt:        i128,
+    pub deposited_at:      u64,
+    pub last_yield_claim:  u64,
+    /// Whether this LP has opted into compound yield (reinvest instead of claim).
+    pub compound_enabled:  bool,
+    /// Whether this LP has purchased optional insurance coverage for smart contract risk.
+    /// Insured positions are protected against losses from contract bugs (e.g., infinite mints).
+    /// Insurance premium is paid via reduced yield allocation.
+    pub insurance_enabled: bool,
+    /// Total insurance premium paid by this LP in stroops.
+    pub insurance_paid:    i128,
+}
+
+/// A soulbound NFT representing an LP's position in the pool.
+/// Non-transferable by design — only the provider can interact with it.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LpNft {
+    /// Unique token ID (sequential, minted on first deposit).
+    pub token_id:    u64,
+    /// The LP provider address.
+    pub provider:    Address,
+    /// Pool category this NFT represents.
+    pub category:    Symbol,
+    /// Timestamp when the NFT was minted (first deposit).
+    pub minted_at:   u64,
+    /// Current share count held by this position.
+    pub shares:      i128,
+    /// Total deposited amount.
+    pub deposited:   i128,
+    /// Whether the position is still active (shares > 0).
+    pub active:      bool,
 }
 
 /// A capital lock placed on the pool when a policy is active.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapitalLock {
-    pub policy_id: u128,
-    pub amount: i128,
-    pub locked_at: u64,
-    pub released: bool,
+    pub policy_id:   u128,
+    pub amount:      i128,
+    pub locked_at:   u64,
+    pub released:    bool,
 }
 
 /// Aggregate pool stats exposed via queries.
@@ -49,13 +87,91 @@ pub struct CapitalLock {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolStats {
     /// Category: "crop" | "flight" | "disaster" | "defi"
-    pub category: Symbol,
+    pub category:             Symbol,
+    pub total_deposited:      i128,
+    pub total_locked:         i128,
+    pub total_shares:         i128,
+    pub accumulated_premium:  i128,
+    pub accumulated_backstop: i128,
+    pub status:               PoolStatus,
+}
+
+/// Capacity limits governing how much risk the pool will take on.
+///
+/// A pool with no ceiling is a pool that can be talked into insuring more than
+/// it can pay. Two different limits matter, and conflating them hides the
+/// second one:
+///
+/// - `max_total_deposited` bounds how much capital the pool holds. This is a
+///   solvency-of-share-value concern.
+/// - `max_utilization_bps` bounds how much of that capital may be committed to
+///   active coverage at once. This is the correlated-risk concern: a pool 100%
+///   committed to weather policies in one region is one storm away from
+///   insolvency regardless of how much capital it holds.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolCapacity {
+    /// Ceiling on cumulative deposits, in 7-decimal USDC stroops.
+    pub max_total_deposited: i128,
+    /// Ceiling on `total_locked / total_deposited`, in basis points.
+    /// 10_000 = the pool may commit every unit of capital it holds.
+    pub max_utilization_bps: u32,
+}
+
+/// A snapshot of how much of the pool's capacity is currently consumed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapacityStatus {
     pub total_deposited: i128,
     pub total_locked: i128,
-    pub total_shares: i128,
-    pub accumulated_premium: i128,
-    pub accumulated_backstop: i128,
-    pub status: PoolStatus,
+    pub max_total_deposited: i128,
+    /// Current `total_locked / total_deposited` in basis points.
+    pub utilization_bps: u32,
+    pub max_utilization_bps: u32,
+    /// Capital that may still be deposited before the ceiling is reached.
+    pub remaining_deposit_capacity: i128,
+    /// Coverage that may still be underwritten before the utilization cap
+    /// is reached.
+    pub remaining_coverage_capacity: i128,
+}
+
+/// One LP's queued exit request.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExitRequest {
+    pub provider: Address,
+    /// Shares reserved for this exit. They stay in the LP's position and keep
+    /// earning until the exit is claimed, but cannot be queued twice.
+    pub shares: i128,
+    /// When the request was made.
+    pub requested_at: u64,
+    /// Earliest timestamp at which `claim_exit` will succeed.
+    pub claimable_at: u64,
+}
+
+/// Where a queued exit stands.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExitStatus {
+    /// No request outstanding for this provider.
+    None,
+    /// Requested, still inside the delay window.
+    Pending,
+    /// Delay elapsed — `claim_exit` will settle it.
+    Claimable,
+}
+
+/// Full view of a provider's exit request, safe to call for any address.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExitInfo {
+    pub provider: Address,
+    pub status: ExitStatus,
+    pub shares: i128,
+    pub requested_at: u64,
+    pub claimable_at: u64,
+    /// Seconds still to wait, or 0 once claimable.
+    pub seconds_remaining: u64,
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
@@ -63,13 +179,13 @@ pub struct PoolStats {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Initialized {
-    pub admin: Address,
-    pub usdc_token: Address,
-    pub treasury: Address,
-    pub backstop: Address,
-    pub category: Symbol,
-    pub policy_engine: Address,
-    pub claims_processor: Address,
+    pub admin:             Address,
+    pub usdc_token:        Address,
+    pub treasury:          Address,
+    pub backstop:          Address,
+    pub category:          Symbol,
+    pub policy_engine:     Address,
+    pub claims_processor:  Address,
 }
 
 #[contracttype]
@@ -145,12 +261,21 @@ pub struct PoolResumed {
 }
 
 /// A timelocked admin withdrawal request.
-/// Once created, the admin must wait TIMELOCK_SECONDS before executing.
+/// Once created, the admin must wait until `execute_after` before executing.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminWithdrawalRequest {
     pub amount: i128,
     pub requested_at: u64,
+    /// Absolute timestamp the request becomes executable, fixed when the
+    /// request is made.
+    ///
+    /// The deadline is stored rather than recomputed from `requested_at +
+    /// TIMELOCK_SECONDS` at execution time, so that upgrading the contract
+    /// with a shorter `TIMELOCK_SECONDS` cannot retroactively shorten the
+    /// wait on a request that is already in flight — the guarantee LPs relied
+    /// on when the request was published.
+    pub execute_after: u64,
     pub executed: bool,
 }
 
@@ -186,4 +311,415 @@ pub struct AdminUpdated {
 pub struct ContractUpgraded {
     pub old_version: u32,
     pub new_version: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PremiumSplitUpdated {
+    pub lp_bps:       i128,
+    pub treas_bps:    i128,
+    pub backstop_bps: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolWindingDown {
+    pub admin: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuardiansUpdated {
+    pub guardians: Vec<Address>,
+    pub threshold: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeApproved {
+    pub new_wasm_hash: BytesN<32>,
+    pub approver: Address,
+    pub approvals: u32,
+    pub threshold: u32,
+}
+
+/// A pending contract-upgrade action awaiting guardian approvals.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUpgrade {
+    pub new_wasm_hash: BytesN<32>,
+    pub new_version: u32,
+    pub approvals: Vec<Address>,
+}
+
+/// A pending admin-transfer proposal awaiting guardian approvals.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminChange {
+    pub new_admin: Address,
+    pub approvals: Vec<Address>,
+}
+
+/// A time-locked change to the premium-split ratios, awaiting execution once
+/// `executable_after` has passed. LPs can exit during the timelock window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingParameterChange {
+    pub new_lp_bps: i128,
+    pub new_treas_bps: i128,
+    pub new_backstop_bps: i128,
+    pub proposed_at: u64,
+    pub executable_after: u64,
+    pub executed: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParameterChangeScheduled {
+    pub admin: Address,
+    pub new_lp_bps: i128,
+    pub new_treas_bps: i128,
+    pub new_backstop_bps: i128,
+    pub executable_after: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParameterChangeExecuted {
+    pub admin: Address,
+    pub lp_bps: i128,
+    pub treas_bps: i128,
+    pub backstop_bps: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParameterChangeCancelled {
+    pub admin: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LpNftMinted {
+    pub token_id:  u64,
+    pub provider:  Address,
+    pub category:  Symbol,
+    pub minted_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LpNftUpdated {
+    pub token_id:  u64,
+    pub provider:  Address,
+    pub shares:    i128,
+    pub deposited: i128,
+    pub active:    bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompoundYieldToggled {
+    pub provider:  Address,
+    pub enabled:   bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LpPositionTransferred {
+    pub from:   Address,
+    pub to:     Address,
+    pub shares: i128,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolCapacityUpdated {
+    pub max_total_deposited: i128,
+    pub max_utilization_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExitDelayUpdated {
+    pub delay_seconds: u64,
+}
+
+/// Dynamic fee adjustment configuration based on market conditions.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicFeeConfig {
+    /// Base fee in basis points (0-10000).
+    pub base_fee_bps: u32,
+    /// Maximum fee in basis points (0-10000).
+    pub max_fee_bps: u32,
+    /// Minimum fee in basis points (0-10000).
+    pub min_fee_bps: u32,
+    /// Utilization threshold at which fees start increasing (basis points).
+    pub utilization_threshold_bps: u32,
+    /// Fee adjustment per 1% increase in utilization above threshold (basis points).
+    pub fee_adjustment_per_1pct_bps: u32,
+    /// Whether dynamic fee adjustment is enabled.
+    pub enabled: bool,
+    /// Last time the dynamic fee was updated.
+    pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExitRequested {
+    pub provider: Address,
+    pub shares: i128,
+    pub claimable_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExitCancelled {
+    pub provider: Address,
+    pub shares: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExitClaimed {
+    pub provider: Address,
+    pub shares_burned: i128,
+    pub amount_returned: i128,
+    /// Seconds the provider actually waited between request and claim.
+    pub waited: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MinReserveUpdated {
+    pub min_reserve: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReserveFundUpdated {
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicFeeAdjusted {
+    pub previous_fee_bps: u32,
+    pub new_fee_bps: u32,
+    pub utilization_bps: u32,
+    pub adjusted_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicFeeConfigUpdated {
+    pub base_fee_bps: u32,
+    pub max_fee_bps: u32,
+    pub min_fee_bps: u32,
+    pub utilization_threshold_bps: u32,
+    pub fee_adjustment_per_1pct_bps: u32,
+    pub enabled: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VotesDelegated {
+    pub provider: Address,
+    pub delegate: Address,
+}
+
+/// An external reinsurance arrangement that backstops this pool against
+/// catastrophic (large single-claim) losses.
+///
+/// The pool retains every loss up to `attachment_point` itself; only the
+/// portion of a claim above that point is eligible for recovery from
+/// `reinsurer`, capped over the arrangement's lifetime by `coverage_limit`.
+/// This is a per-claim ("excess of loss") layer, not aggregate stop-loss —
+/// each claim is evaluated against `attachment_point` independently.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReinsuranceConfig {
+    /// Contract this pool cedes premium to and recovers claims from.
+    pub reinsurer: Address,
+    /// Per-claim loss threshold below which the pool bears the loss alone.
+    pub attachment_point: i128,
+    /// Cumulative lifetime cap on reinsurance recoveries this pool can draw.
+    pub coverage_limit: i128,
+    /// Whether recovery requests are currently honored. Config (and prior
+    /// usage) is preserved when set to `false` — this pauses the
+    /// arrangement without discarding it.
+    pub active: bool,
+}
+
+/// Running totals for the pool's reinsurance arrangement.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReinsuranceStats {
+    /// Total premium ceded to the reinsurer so far.
+    pub total_premium_paid: i128,
+    /// Total claims recovered from the reinsurer so far.
+    pub total_recovered: i128,
+    /// `coverage_limit - total_recovered`, floored at 0.
+    pub coverage_remaining: i128,
+}
+
+/// Collateralization ratio for an LP position.
+///
+/// Measures how well-backed an LP's position is by available liquidity
+/// relative to their share of locked capital. A ratio below 10000 (100%)
+/// means the position is undercollateralized and may be subject to
+/// liquidation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollateralizationInfo {
+    pub provider: Address,
+    /// LP's share of available pool liquidity (deposited - locked).
+    pub position_value: i128,
+    /// LP's proportional share of locked capital.
+    pub position_liability: i128,
+    /// Collateralization ratio in basis points (position_value / position_liability * 10000).
+    /// 10000 = 100% collateralized. 0 = no locked liability (fully collateralized).
+    pub collateralization_bps: u32,
+}
+
+/// Result of a liquidation attempt on an undercollateralized LP position.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidationResult {
+    pub provider: Address,
+    pub shares_seized: i128,
+    pub amount_recovered: i128,
+    pub previous_ratio_bps: u32,
+}
+
+/// An LP fee tier based on deposit amount and/or lock duration.
+/// LPs with larger deposits or longer commitment get lower fees.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeTier {
+    /// Minimum deposit amount for this tier (7-decimal stroops). 0 = no minimum.
+    pub min_deposit: i128,
+    /// Minimum lock duration in seconds for this tier. 0 = no lock required.
+    pub min_lock_duration: u64,
+    /// Fee discount in basis points (0-10000). 0 = no discount, 10000 = 100% off.
+    pub discount_bps: u32,
+    /// Human-readable tier name.
+    pub name: Symbol,
+}
+
+/// Optional vesting schedule for LP deposits to prevent large LPs from exiting immediately.
+/// Vesting ensures LPs gradually unlock their shares over time, reducing exit risk.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestingSchedule {
+    /// Total number of vesting periods.
+    pub total_periods: u32,
+    /// Duration of each vesting period in seconds.
+    pub period_duration: u64,
+    /// Shares that vest per period (can be 0 for cliff vesting).
+    pub amount_per_period: i128,
+    /// Cliff period (shares locked until this many periods have passed).
+    /// 0 = no cliff, vesting starts immediately.
+    pub cliff_periods: u32,
+    /// Absolute timestamp when vesting started.
+    pub vesting_start: u64,
+    /// Shares already vested and available for withdrawal.
+    pub vested_amount: i128,
+    /// Total shares subject to this vesting schedule.
+    pub total_amount: i128,
+}
+
+/// LP position with optional vesting constraint.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestedLpPosition {
+    pub provider: Address,
+    pub position: LpPosition,
+    /// Optional vesting schedule. If present (non-empty), constrains
+    /// withdrawals. `Vec` instead of `Option<VestingSchedule>` because the
+    /// soroban-sdk XDR (`ScVal`) conversion generated for a contracttype
+    /// struct does not support `Option<CustomStruct>` fields — only `Vec<T>`
+    /// round-trips a custom struct through both the WASM `Val` path and the
+    /// host-side `ScVal` path used by test tooling.
+    pub vesting: Vec<VestingSchedule>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReinsuranceConfigured {
+    pub reinsurer: Address,
+    pub attachment_point: i128,
+    pub coverage_limit: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeTierUpdated {
+    pub tier_name: Symbol,
+    pub min_deposit: i128,
+    pub min_lock_duration: u64,
+    pub discount_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReinsuranceActiveSet {
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PositionLiquidated {
+    pub provider: Address,
+    pub shares_seized: i128,
+    pub amount_recovered: i128,
+    pub collateralization_bps: u32,
+}
+
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestingScheduleCreated {
+    pub provider: Address,
+    pub total_periods: u32,
+    pub period_duration: u64,
+    pub cliff_periods: u32,
+    pub vesting_start: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReinsurancePremiumPaid {
+    pub reinsurer: Address,
+    pub amount: i128,
+    pub total_premium_paid: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestingSharesReleased {
+    pub provider: Address,
+    pub newly_vested_amount: i128,
+    pub total_vested: i128,
+    pub vesting_period: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReinsuranceRecovered {
+    pub policy_id: u128,
+    pub loss_amount: i128,
+    pub recovered_amount: i128,
+    pub coverage_remaining: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawalBlockedByVesting {
+    pub provider: Address,
+    pub requested_shares: i128,
+    pub available_shares: i128,
+    pub vesting_period: u32,
 }

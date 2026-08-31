@@ -116,6 +116,9 @@ pub struct Proposal {
     pub verification_callback: Option<Symbol>,
     /// Whether execution has been verified (callback succeeded or not required).
     pub execution_verified: bool,
+    /// Set by a guardian via `veto_proposal`. A vetoed proposal can never be
+    /// executed, even if it passed voting and the timelock has expired.
+    pub is_vetoed: bool,
 }
 
 /// A single vote record stored per (proposal_id, voter) key.

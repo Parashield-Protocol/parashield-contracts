@@ -117,6 +117,7 @@ fn create_proposal_increments_counter() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     assert_eq!(id, 0u64);
     assert_eq!(dao.proposal_count(), 1);
@@ -134,6 +135,7 @@ fn create_proposal_below_threshold_fails() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 }
 
@@ -149,6 +151,7 @@ fn vote_for_records_weight() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     dao.vote(&voter1, &pid, &VoteChoice::For);
     let rec = dao.get_vote(&pid, &voter1).unwrap();
@@ -167,6 +170,7 @@ fn double_vote_fails() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     dao.vote(&voter1, &pid, &VoteChoice::For);
     dao.vote(&voter1, &pid, &VoteChoice::Against);
@@ -183,6 +187,7 @@ fn vote_after_period_fails() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
     dao.vote(&voter1, &pid, &VoteChoice::For);
@@ -200,6 +205,7 @@ fn proposal_passes_with_quorum_and_majority() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     dao.vote(&voter1, &pid, &VoteChoice::For);
     dao.vote(&voter2, &pid, &VoteChoice::For);
@@ -222,6 +228,7 @@ fn proposal_fails_without_quorum() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     env.ledger()
@@ -243,6 +250,7 @@ fn finalize_while_voting_open_fails() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     dao.finalize(&pid);
 }
@@ -259,6 +267,7 @@ fn execute_passed_proposal() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     dao.vote(&voter1, &pid, &VoteChoice::For);
     dao.vote(&voter2, &pid, &VoteChoice::For);
@@ -284,6 +293,7 @@ fn execute_failed_proposal_panics() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     // Fast-forward past both voting period AND the 24-hour finalize delay buffer
@@ -304,6 +314,7 @@ fn admin_can_cancel_active_proposal() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     dao.cancel(&admin, &pid);
     let p = dao.get_proposal(&pid);
@@ -321,6 +332,7 @@ fn non_admin_cannot_cancel() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     dao.cancel(&voter2, &pid);
 }
@@ -375,6 +387,7 @@ fn test_proposal_timelock_execution() {
         &target,
         &Symbol::new(&env, "upgrade"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     dao.vote(&voter1, &pid, &VoteChoice::For);
@@ -401,6 +414,7 @@ fn test_finalize_cooldown_delay_enforced() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     dao.vote(&voter1, &pid, &VoteChoice::For);
@@ -441,6 +455,7 @@ fn test_execute_active_proposal_without_voting_panics() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     // Attempt to execute without any voting - should panic with ProposalNotPassed
@@ -460,6 +475,7 @@ fn test_execute_rejected_proposal_panics() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     // Vote against the proposal
@@ -503,6 +519,7 @@ fn finalize_with_exactly_tied_votes_fails() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     dao.vote(&voter_a, &pid, &VoteChoice::For);
@@ -536,6 +553,7 @@ fn test_finalize_refunds_deposit_locked_at_creation_not_live_config() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     // Deposit was actually taken.
@@ -578,6 +596,7 @@ fn test_finalize_does_not_pull_raised_live_threshold() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     // Admin raises the live threshold well above what the contract holds.
@@ -608,6 +627,7 @@ fn test_proposal_expires_after_voting_period() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     // Move time past the voting period AND finalize delay buffer (24h)
     env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
@@ -634,6 +654,7 @@ fn test_cancel_refunds_deposit_to_proposer() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     
     assert_eq!(gov_token.balance(&voter1), balance_before - config.proposal_threshold);
@@ -660,6 +681,7 @@ fn run_proposal(
         target,
         &Symbol::new(env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     for (voter, choice) in votes.iter() {
@@ -1011,6 +1033,7 @@ fn a_delegate_votes_with_the_combined_weight() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     dao.vote(&voter2, &pid, &VoteChoice::For);
@@ -1039,6 +1062,7 @@ fn a_delegator_cannot_also_vote() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     // Authority was handed over; voting too would count the same tokens twice.
@@ -1059,6 +1083,7 @@ fn a_delegator_cannot_vote_after_their_delegate_has() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     dao.vote(&voter2, &pid, &VoteChoice::For);
@@ -1083,6 +1108,7 @@ fn revoking_before_the_delegate_votes_restores_the_holder_s_vote() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     dao.vote(&voter1, &pid, &VoteChoice::For);
@@ -1106,6 +1132,7 @@ fn only_the_delegate_s_own_tokens_are_locked() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     dao.vote(&voter2, &pid, &VoteChoice::For);
 
@@ -1131,6 +1158,7 @@ fn reclaim_deposit_refunds_proposer_after_timeout() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     assert_eq!(gov_token.balance(&voter1), balance_before - config.proposal_threshold);
 
@@ -1155,6 +1183,7 @@ fn reclaim_deposit_before_timeout_fails() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
     dao.reclaim_deposit(&pid);
@@ -1171,6 +1200,7 @@ fn reclaim_deposit_after_finalize_fails() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     env.ledger()
         .with_mut(|l| l.timestamp += VOTING_PERIOD + 301);
@@ -1221,6 +1251,7 @@ fn create_proposal_from_template_enforces_structure() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     assert_eq!(dao.proposal_count(), 1);
     let _ = pid;
@@ -1245,6 +1276,7 @@ fn create_proposal_from_template_rejects_short_title() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 }
 
@@ -1267,6 +1299,7 @@ fn create_proposal_from_template_rejects_wrong_arg_count() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 }
 
@@ -1290,6 +1323,7 @@ fn deactivated_template_cannot_be_used() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     assert!(result.is_err());
 }
@@ -1306,6 +1340,7 @@ fn test_get_execution_audit_records_data() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     dao.vote(&voter1, &pid, &VoteChoice::For);
     dao.vote(&voter2, &pid, &VoteChoice::For);
@@ -1335,6 +1370,7 @@ fn test_get_execution_audit_unexecuted_panics() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     dao.get_execution_audit(&pid);
 }
