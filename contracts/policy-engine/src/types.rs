@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, Symbol};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,17 +61,6 @@ pub struct InsuranceProduct {
     pub max_duration_days: u32,
     pub status: ProductStatus,
     pub created_at: u64,
-}
-
-/// One line item for `batch_buy_policy` — the same four arguments `buy_policy`
-/// takes, bundled so several policies can be purchased in a single call.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BatchBuyItem {
-    pub product_id: u128,
-    pub coverage_amount: i128,
-    pub duration_days: u32,
-    pub oracle_key: Symbol,
 }
 
 /// Input struct for creating a new insurance product (avoids >10 param limit).
@@ -140,12 +129,6 @@ pub struct ClaimsProcessorUpdated {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RiskPoolUpdated {
-    pub risk_pool: Address,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProductCreated {
     pub product_id: u128,
     pub name: Symbol,
@@ -185,14 +168,6 @@ pub struct PolicyCancelled {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PolicyTransferred {
-    pub policy_id: u128,
-    pub from: Address,
-    pub to: Address,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyClaimed {
     pub policy_id: u128,
     pub policyholder: Address,
@@ -201,72 +176,8 @@ pub struct PolicyClaimed {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ContractPaused {
-    pub admin: Address,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ContractResumed {
-    pub admin: Address,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyExpired {
     pub policy_id: u128,
-}
-
-/// Emitted when a still-Active policy enters its expiry warning window.
-///
-/// Coverage lapsing is not a state change the chain announces on its own —
-/// `end_time` simply passes. Without this, the only on-chain signal is
-/// `PolicyExpired`, which fires *after* cover has already gone. An indexer
-/// watching for this topic can notify the holder while renewing still helps.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PolicyExpiringSoon {
-    pub policy_id: u128,
-    pub policyholder: Address,
-    pub product_id: u128,
-    pub coverage_amount: i128,
-    pub end_time: u64,
-    /// Seconds remaining until `end_time` at the moment of emission.
-    pub seconds_remaining: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExpiryWarningWindowUpdated {
-    pub window: u64,
-}
-
-/// Where a policy sits relative to its own expiry.
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ExpiryState {
-    /// Not Active — claimed, cancelled, or already marked expired.
-    NotActive,
-    /// Active, and outside the warning window.
-    Active,
-    /// Active, inside the warning window, still covered.
-    ExpiringSoon,
-    /// `end_time` has passed but the policy has not been marked Expired yet.
-    Lapsed,
-}
-
-/// Expiry status for one policy, returned without panicking.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PolicyExpiryInfo {
-    pub policy_id: u128,
-    pub state: ExpiryState,
-    pub end_time: u64,
-    /// Seconds until `end_time`, or 0 once it has passed.
-    pub seconds_remaining: u64,
-    /// True when a warning event has already been emitted for this policy, so
-    /// a keeper can skip it instead of paying to re-emit.
-    pub warned: bool,
 }
 
 #[contracttype]
@@ -281,37 +192,3 @@ pub struct ContractUpgraded {
     pub old_version: u32,
     pub new_version: u32,
 }
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GuardiansUpdated {
-    pub guardians: Vec<Address>,
-    pub threshold: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UpgradeApproved {
-    pub new_wasm_hash: BytesN<32>,
-    pub approver: Address,
-    pub approvals: u32,
-    pub threshold: u32,
-}
-
-/// A pending contract-upgrade action awaiting guardian approvals.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingUpgrade {
-    pub new_wasm_hash: BytesN<32>,
-    pub new_version: u32,
-    pub approvals: Vec<Address>,
-}
-
-/// A pending admin-transfer proposal awaiting guardian approvals.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingAdminChange {
-    pub new_admin: Address,
-    pub approvals: Vec<Address>,
-}
-

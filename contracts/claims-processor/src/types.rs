@@ -240,7 +240,6 @@ pub struct AdminUpdated {
     pub new_admin: Address,
 }
 
-/// oracle-verifier.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CrossChainAttestation {
