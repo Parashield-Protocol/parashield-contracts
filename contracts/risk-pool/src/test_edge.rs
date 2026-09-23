@@ -232,3 +232,69 @@ fn utilization_rate_large_locked_no_truncation() {
     assert_eq!(stats.total_deposited, deposit_amount);
     assert_eq!(stats.total_locked, lock_amount);
 }
+
+// ── Issue #454: zero-share precision loss regression tests ─────────────────
+
+/// Regression test for issue #454: a deposit that would produce 0 shares
+/// after integer truncation must be rejected with `Error::ZeroAmount` (#5).
+///
+/// Scenario (from the issue):
+///   1. Pool has a large total_deposited relative to a small total_shares.
+///   2. A new deposit is small enough that `amount * total_shares / total_deposited`
+///      truncates to 0.
+///   3. Without the guard the depositor would lose their tokens entirely.
+///
+/// We construct this scenario by:
+///   - LP1 deposits 100 USDC (total_deposited = 100_0000000).
+///   - LP1 withdraws all but 1 share (total_shares = 1, total_deposited ≈ 1 stroop).
+///   - The share-to-deposit ratio is now maximally skewed.
+///   - LP2 deposits MIN_DEPOSIT; because 1_000_000 * 1 / remaining_deposited ≈ 1 or 0,
+///     we force the ratio so it truncates to 0 by first inflating total_deposited via
+///     a premium.
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn deposit_that_rounds_to_zero_shares_is_rejected() {
+    let (env, pool, _admin, _treasury, usdc_id, lp1) = setup();
+    let lp2 = Address::generate(&env);
+
+    // LP1 deposits 10 USDC
+    pool.deposit(&lp1, &10_0000000i128, &0i128);
+
+    // LP1 withdraws all but 1 share, leaving total_shares = 1
+    let pos = pool.get_position(&lp1).unwrap();
+    pool.withdraw(&lp1, &(pos.shares - 1));
+
+    // Now total_shares = 1, total_deposited is the value backing that 1 share.
+    // Feed a large premium so total_deposited grows while total_shares stays at 1.
+    // 80% of 100_000 USDC premium goes to LP pool → total_deposited ≈ 80_000 USDC.
+    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp1, &100_000_0000000i128);
+    pool.receive_premium(&lp1, &100_000_0000000i128);
+
+    // LP2 deposits MIN_DEPOSIT = 1_000_000 stroops (0.1 USDC).
+    // shares = 1_000_000 * 1 / ~80_000_0000000 ≈ 0 → must panic.
+    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &1_000_000i128);
+    pool.deposit(&lp2, &1_000_000i128, &0i128);
+    // ↑ Should panic with Error::ZeroAmount (#5) — depositor is protected.
+}
+
+/// Verify the `min_shares` slippage parameter rejects a deposit that
+/// produces fewer shares than the depositor expects.  This is the
+/// complementary protection to the zero-share guard: even when shares > 0,
+/// the depositor should be able to set a floor.
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn deposit_below_min_shares_is_rejected() {
+    let (env, pool, _, _, usdc_id, lp1) = setup();
+    let lp2 = Address::generate(&env);
+
+    // LP1 seeds the pool with 1000 USDC
+    pool.deposit(&lp1, &1000_0000000i128, &0i128);
+
+    // LP2 deposits 1 USDC (10_000_000 stroops).
+    // Expected shares = 10_000_000 * (1000_0000000 * 1e9) / 1000_0000000
+    //                  = 10_000_000 * 1e9 = 10_000_000_000_000_000.
+    // Set min_shares ridiculously high to trigger InsufficientShares (#17).
+    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &1_0000000i128);
+    pool.deposit(&lp2, &1_0000000i128, &i128::MAX);
+    // ↑ Should panic with Error::InsufficientShares (#17).
+}

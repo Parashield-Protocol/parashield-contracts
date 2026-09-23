@@ -343,6 +343,10 @@ impl RiskPool {
                 .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow))
         };
 
+        // Safety: integer division above can truncate to 0 for deposits that
+        // are tiny relative to total_deposited. Without this guard the
+        // depositor's tokens would be absorbed by the pool with no shares
+        // minted in return — an irreversible loss of funds.  See issue #454.
         if new_shares == 0 {
             panic_with_error!(&env, Error::ZeroAmount);
         }
