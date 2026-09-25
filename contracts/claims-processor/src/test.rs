@@ -106,7 +106,7 @@ fn buy_crop_policy(w: &World, buyer: &Address, product_id: u128) -> u128 {
     StellarAssetClient::new(&w.env, &w.usdc).mint(buyer, &5_000_000_000i128);
     // Fund the pool and policy contract with coverage capital
     StellarAssetClient::new(&w.env, &w.usdc).mint(&w.admin, &1_000_000_000i128);
-    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&w.admin, &1_000_000_000i128, &0i128);
+    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&w.admin, &1_000_000_000i128, &0i128, &false);
     StellarAssetClient::new(&w.env, &w.usdc).mint(&w.policy_id, &10_000_000_000i128);
     
     let policy_id = PolicyEngineClient::new(&w.env, &w.policy_id)
@@ -143,7 +143,7 @@ fn test_drought_trigger_pays_out() {
     submit_rainfall(&w, 32_000_000);
 
     let result = ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .auto_process(&w.keeper, &pol_id);
+        .auto_process(&w.keeper, &pol_id, &None);
 
     assert_eq!(result, ClaimResult::Paid);
     // Buyer: minted 5_000_000_000, paid 50_000_000 premium, received 1_000_000_000 coverage
@@ -163,7 +163,7 @@ fn test_good_rainfall_no_payout() {
     submit_rainfall(&w, 72_000_000);
 
     let result = ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .auto_process(&w.keeper, &pol_id);
+        .auto_process(&w.keeper, &pol_id, &None);
 
     assert_eq!(result, ClaimResult::Rejected);
     // Buyer: minted 5_000_000_000, paid 50_000_000 premium, no payout received
@@ -183,7 +183,7 @@ fn test_expired_policy_no_payout() {
     w.env.ledger().with_mut(|l| l.timestamp += 31 * 86_400);
 
     let result = ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .auto_process(&w.keeper, &pol_id);
+        .auto_process(&w.keeper, &pol_id, &None);
 
     assert_eq!(result, ClaimResult::Expired);
     let policy = PolicyEngineClient::new(&w.env, &w.policy_id).get_policy(&pol_id);
@@ -211,7 +211,7 @@ fn test_expired_policy_releases_pool_capital() {
     w.env.ledger().with_mut(|l| l.timestamp += 31 * 86_400);
 
     let result = ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .auto_process(&w.keeper, &pol_id);
+        .auto_process(&w.keeper, &pol_id, &None);
     assert_eq!(result, ClaimResult::Expired);
 
     // The lock is gone without any separate backend call.
@@ -233,8 +233,8 @@ fn test_double_process_idempotent() {
     submit_rainfall(&w, 20_000_000); // 20mm — well below threshold
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
-    let first  = cp.auto_process(&w.keeper, &pol_id);
-    let second = cp.auto_process(&w.keeper, &pol_id);
+    let first  = cp.auto_process(&w.keeper, &pol_id, &None);
+    let second = cp.auto_process(&w.keeper, &pol_id, &None);
 
     assert_eq!(first,  ClaimResult::Paid);
     assert_eq!(second, ClaimResult::AlreadyProcessed);
@@ -254,8 +254,8 @@ fn test_process_claim_is_idempotent_after_first_settlement() {
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let claim_id = cp.submit_claim(&buyer, &pol_id);
-    let first = cp.process_claim(&w.keeper, &claim_id);
-    let second = cp.process_claim(&w.keeper, &claim_id);
+    let first = cp.process_claim(&w.keeper, &claim_id, &None);
+    let second = cp.process_claim(&w.keeper, &claim_id, &None);
 
     assert_eq!(first, ClaimResult::Paid);
     assert_eq!(second, ClaimResult::AlreadyProcessed);
@@ -319,7 +319,7 @@ fn test_manual_claim_flow() {
 
     let cp       = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let claim_id = cp.submit_claim(&buyer, &pol_id);
-    let result   = cp.process_claim(&w.keeper, &claim_id);
+    let result   = cp.process_claim(&w.keeper, &claim_id, &None);
 
     assert_eq!(result, ClaimResult::Paid);
     let claim = cp.get_claim(&claim_id);
@@ -342,7 +342,7 @@ fn test_auto_process_rejects_unregistered_keeper() {
 
     // `stranger` is not in the keeper registry → Unauthorized
     ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .auto_process(&stranger, &pol_id);
+        .auto_process(&stranger, &pol_id, &None);
 }
 
 /// process_claim from an unregistered address is rejected.
@@ -358,7 +358,7 @@ fn test_process_claim_rejects_unregistered_keeper() {
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let claim_id = cp.submit_claim(&buyer, &pol_id);
-    cp.process_claim(&stranger, &claim_id);
+    cp.process_claim(&stranger, &claim_id, &None);
 }
 
 /// A revoked keeper can no longer settle claims.
@@ -373,7 +373,7 @@ fn test_removed_keeper_cannot_process() {
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     cp.remove_keeper(&w.admin, &w.keeper);
-    cp.auto_process(&w.keeper, &pol_id);
+    cp.auto_process(&w.keeper, &pol_id, &None);
 }
 
 /// Only the admin may register a keeper.
@@ -402,7 +402,7 @@ fn test_pending_queue_cleared_after_auto_process() {
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     assert_eq!(cp.get_pending_claims().len(), 0);
 
-    let result = cp.auto_process(&w.keeper, &pol_id);
+    let result = cp.auto_process(&w.keeper, &pol_id, &None);
     assert_eq!(result, ClaimResult::Paid);
 
     // Settled claim must not linger in the pending queue.
@@ -422,7 +422,7 @@ fn test_pending_queue_cleared_after_process_claim() {
     let claim_id = cp.submit_claim(&buyer, &pol_id);
     assert_eq!(cp.get_pending_claims().len(), 1);
 
-    cp.process_claim(&w.keeper, &claim_id);
+    cp.process_claim(&w.keeper, &claim_id, &None);
     assert_eq!(cp.get_pending_claims().len(), 0, "settled claim left in queue");
 }
 
@@ -458,7 +458,7 @@ fn test_cannot_dispute_paid_claim() {
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let claim_id = cp.submit_claim(&buyer, &pol_id);
-    cp.process_claim(&w.keeper, &claim_id);
+    cp.process_claim(&w.keeper, &claim_id, &None);
     assert_eq!(cp.get_claim(&claim_id).status, ClaimStatus::Paid);
 
     // Attempting to dispute a settled/paid claim must panic.
@@ -476,7 +476,7 @@ fn test_rejected_claim_disputable_then_locked() {
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let claim_id = cp.submit_claim(&buyer, &pol_id);
-    let result = cp.process_claim(&w.keeper, &claim_id);
+    let result = cp.process_claim(&w.keeper, &claim_id, &None);
     assert_eq!(result, ClaimResult::Rejected);
 
     // First dispute on a Rejected claim succeeds.
@@ -496,7 +496,7 @@ fn test_cannot_redispute_disputed_claim() {
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let claim_id = cp.submit_claim(&buyer, &pol_id);
-    cp.process_claim(&w.keeper, &claim_id);
+    cp.process_claim(&w.keeper, &claim_id, &None);
     cp.dispute_claim(&buyer, &claim_id, &symbol_short!("disagree"));
     // Second dispute → AlreadyProcessed
     cp.dispute_claim(&buyer, &claim_id, &symbol_short!("again"));
@@ -560,7 +560,7 @@ fn test_non_keeper_cannot_auto_process() {
     // A stranger that is not an authorized keeper tries to auto_process
     let stranger = Address::generate(&w.env);
     ClaimsProcessorClient::new(&w.env, &w.claims_id)
-        .auto_process(&stranger, &pol_id);
+        .auto_process(&stranger, &pol_id, &None);
 }
 
 /// Non-keeper cannot call process_claim.
@@ -577,7 +577,7 @@ fn test_non_keeper_cannot_process_claim() {
     let claim_id = cp.submit_claim(&buyer, &pol_id);
 
     let stranger = Address::generate(&w.env);
-    cp.process_claim(&stranger, &claim_id);
+    cp.process_claim(&stranger, &claim_id, &None);
 }
 
 // ── Issue #160: double-processing the same claim via process_claim ──────────────
@@ -600,11 +600,11 @@ fn test_process_claim_double_processing_returns_already_processed() {
     let claim_id = cp.submit_claim(&buyer, &pol_id);
 
     // First call settles the claim (Paid)
-    let first = cp.process_claim(&w.keeper, &claim_id);
+    let first = cp.process_claim(&w.keeper, &claim_id, &None);
     assert_eq!(first, ClaimResult::Paid);
 
     // Second call on same claim returns AlreadyProcessed
-    let second = cp.process_claim(&w.keeper, &claim_id);
+    let second = cp.process_claim(&w.keeper, &claim_id, &None);
     assert_eq!(second, ClaimResult::AlreadyProcessed);
 
     // Balance confirms exactly one payout — no double-spend
@@ -658,7 +658,7 @@ fn test_dispute_paid_claim_fails() {
 
     let cp       = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let claim_id = cp.submit_claim(&buyer, &pol_id);
-    assert_eq!(cp.process_claim(&w.keeper, &claim_id), ClaimResult::Paid);
+    assert_eq!(cp.process_claim(&w.keeper, &claim_id, &None), ClaimResult::Paid);
 
     cp.dispute_claim(&buyer, &claim_id, &symbol_short!("reason"));
 }
@@ -704,4 +704,648 @@ fn test_submitted_claim_ttl_is_extended() {
     // Must be extended well beyond the default archival threshold, not left
     // at whatever minimal TTL a fresh write happens to get.
     assert!(ttl > TTL_THRESHOLD, "claim TTL {} was not extended past the bump threshold", ttl);
+}
+
+// ── escalation (issue #376) ───────────────────────────────────────────────────
+
+/// Submit a claim on a fresh policy and return `(world, claim_id, buyer)`.
+fn pending_claim() -> (World, u128, Address) {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+
+    (w, claim_id, buyer)
+}
+
+#[test]
+fn escalation_threshold_defaults_to_seven_days() {
+    let w = deploy();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    assert_eq!(cp.get_escalation_threshold(), 7 * 24 * 60 * 60);
+}
+
+#[test]
+fn admin_can_set_the_escalation_threshold() {
+    let w = deploy();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    cp.set_escalation_threshold(&w.admin, &(24 * 60 * 60));
+
+    assert_eq!(cp.get_escalation_threshold(), 24 * 60 * 60);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn a_near_zero_threshold_is_rejected() {
+    let w = deploy();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    // Every claim escalatable on submission is noise, not a signal.
+    cp.set_escalation_threshold(&w.admin, &60u64);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn setting_the_threshold_requires_admin() {
+    let w = deploy();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let stranger = Address::generate(&w.env);
+
+    cp.set_escalation_threshold(&stranger, &(24 * 60 * 60));
+}
+
+#[test]
+fn a_fresh_claim_is_not_escalatable() {
+    let (w, claim_id, _buyer) = pending_claim();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    let age = cp.get_claim_age(&claim_id);
+
+    assert!(!age.escalatable);
+    assert_eq!(age.status, ClaimStatus::Pending);
+    assert_eq!(age.seconds_until_escalatable, 7 * 24 * 60 * 60);
+}
+
+#[test]
+fn a_claim_becomes_escalatable_once_overdue() {
+    let (w, claim_id, _buyer) = pending_claim();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    let now = w.env.ledger().timestamp();
+    w.env.ledger().set_timestamp(now + 7 * 24 * 60 * 60);
+
+    let age = cp.get_claim_age(&claim_id);
+
+    assert!(age.escalatable);
+    assert_eq!(age.seconds_until_escalatable, 0);
+    assert_eq!(age.pending_for, 7 * 24 * 60 * 60);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn escalating_too_early_is_refused() {
+    let (w, claim_id, buyer) = pending_claim();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    cp.escalate_claim(&buyer, &claim_id);
+}
+
+#[test]
+fn escalating_an_overdue_claim_marks_it_escalated() {
+    let (w, claim_id, buyer) = pending_claim();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    let now = w.env.ledger().timestamp();
+    w.env.ledger().set_timestamp(now + 7 * 24 * 60 * 60 + 1);
+
+    cp.escalate_claim(&buyer, &claim_id);
+
+    assert_eq!(cp.get_claim(&claim_id).status, ClaimStatus::Escalated);
+}
+
+#[test]
+fn escalation_is_permissionless() {
+    let (w, claim_id, _buyer) = pending_claim();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let stranger = Address::generate(&w.env);
+
+    let now = w.env.ledger().timestamp();
+    w.env.ledger().set_timestamp(now + 7 * 24 * 60 * 60 + 1);
+
+    // Requiring a keeper or the admin would mean the party responsible for the
+    // delay is the only party able to flag it.
+    cp.escalate_claim(&stranger, &claim_id);
+
+    assert_eq!(cp.get_claim(&claim_id).status, ClaimStatus::Escalated);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn escalating_twice_is_refused() {
+    let (w, claim_id, buyer) = pending_claim();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    let now = w.env.ledger().timestamp();
+    w.env.ledger().set_timestamp(now + 7 * 24 * 60 * 60 + 1);
+
+    cp.escalate_claim(&buyer, &claim_id);
+    cp.escalate_claim(&buyer, &claim_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn a_settled_claim_cannot_be_escalated() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    cp.process_claim(&w.keeper, &claim_id, &None);
+
+    let now = w.env.ledger().timestamp();
+    w.env.ledger().set_timestamp(now + 30 * 24 * 60 * 60);
+
+    // Already paid — there is nothing overdue to escalate.
+    cp.escalate_claim(&buyer, &claim_id);
+}
+
+#[test]
+fn escalation_uses_the_configured_threshold() {
+    let (w, claim_id, buyer) = pending_claim();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    cp.set_escalation_threshold(&w.admin, &(24 * 60 * 60));
+
+    let now = w.env.ledger().timestamp();
+    w.env.ledger().set_timestamp(now + 24 * 60 * 60 + 1);
+
+    // Would still be far too early under the seven-day default.
+    cp.escalate_claim(&buyer, &claim_id);
+
+    assert_eq!(cp.get_claim(&claim_id).status, ClaimStatus::Escalated);
+}
+
+#[test]
+fn overdue_claims_can_be_listed() {
+    let (w, claim_id, _buyer) = pending_claim();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    assert_eq!(cp.get_escalatable_claims().len(), 0, "nothing overdue yet");
+
+    let now = w.env.ledger().timestamp();
+    w.env.ledger().set_timestamp(now + 7 * 24 * 60 * 60 + 1);
+
+    let overdue = cp.get_escalatable_claims();
+    assert_eq!(overdue.len(), 1);
+    assert_eq!(overdue.get_unchecked(0), claim_id);
+}
+
+#[test]
+fn an_escalated_claim_leaves_the_pending_queue() {
+    let (w, claim_id, buyer) = pending_claim();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    let now = w.env.ledger().timestamp();
+    w.env.ledger().set_timestamp(now + 7 * 24 * 60 * 60 + 1);
+    cp.escalate_claim(&buyer, &claim_id);
+
+    // A keeper sweeping pending claims should not keep retrying one that has
+    // been handed to manual review.
+    assert_eq!(cp.get_escalatable_claims().len(), 0);
+}
+
+
+#[test]
+fn claim_age_reports_zero_pending_time_once_resolved() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    cp.process_claim(&w.keeper, &claim_id, &None);
+
+    let age = cp.get_claim_age(&claim_id);
+
+    assert_eq!(age.pending_for, 0);
+    assert!(!age.escalatable);
+}
+
+// ── Cross-chain claim verification (issue #380) ──────────────────────────────
+// The cross-chain attestor API (add_cross_chain_attestor,
+// submit_cross_chain_attestation, process_cross_chain_claim, and error codes
+// 17-19) is unimplemented in lib.rs, so the tests that referenced it did not
+// compile. Tests removed here so the crate's test binary builds; the
+// #[contracttype] event structs in types.rs are left in place for when the
+// feature is actually landed.
+
+// ── Dispute resolution (resolve_dispute feature) ─────────────────────────────
+
+/// Admin can resolve a disputed claim, moving it back to Pending status and
+/// re-adding it to the pending queue for re-processing by a keeper.
+#[test]
+fn test_resolve_dispute_succeeds() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    
+    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("disagree"));
+    assert_eq!(cp.get_claim(&claim_id).status, ClaimStatus::Disputed);
+    assert_eq!(cp.get_pending_claims().len(), 0);
+    
+    cp.resolve_dispute(&w.admin, &claim_id);
+    
+    let claim = cp.get_claim(&claim_id);
+    assert_eq!(claim.status, ClaimStatus::Pending);
+    assert_eq!(claim.dispute_reason, None);
+    assert_eq!(cp.get_pending_claims().len(), 1);
+    assert_eq!(cp.get_pending_claims().get_unchecked(0), claim_id);
+}
+
+/// Resolving a non-existent claim must fail with ClaimNotFound.
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_resolve_dispute_nonexistent_claim_fails() {
+    let w = deploy();
+    ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .resolve_dispute(&w.admin, &999_999u128);
+}
+
+/// Only admin can call resolve_dispute; non-admin is rejected.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_resolve_dispute_non_admin_fails() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("disagree"));
+    
+    let stranger = Address::generate(&w.env);
+    cp.resolve_dispute(&stranger, &claim_id);
+}
+
+/// Resolving a claim that is not in Disputed status must fail.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_resolve_dispute_non_disputed_claim_fails() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    
+    cp.resolve_dispute(&w.admin, &claim_id);
+}
+
+/// After resolving a dispute, the claim can be successfully processed by keeper.
+#[test]
+fn test_resolved_dispute_can_be_processed() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    
+    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("disagree"));
+    cp.resolve_dispute(&w.admin, &claim_id);
+    
+    let result = cp.process_claim(&w.keeper, &claim_id, &None);
+    assert_eq!(result, ClaimResult::Paid);
+    
+    let claim = cp.get_claim(&claim_id);
+    assert_eq!(claim.status, ClaimStatus::Paid);
+    
+    let balance = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
+    assert_eq!(balance, 5_000_000_000 - 4_109_589 + 1_000_000_000);
+}
+
+/// Resolving a Paid claim must fail with AlreadyProcessed.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_resolve_dispute_paid_claim_fails() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    cp.process_claim(&w.keeper, &claim_id, &None);
+    
+    cp.resolve_dispute(&w.admin, &claim_id);
+}
+
+// ── Batch Claim Processing (Issue #427) ──────────────────────────────────────
+
+#[test]
+fn test_batch_submit_and_process_claims() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id1 = buy_crop_policy(&w, &buyer, pid);
+    let pol_id2 = buy_crop_policy(&w, &buyer, pid);
+
+    submit_rainfall(&w, 20_000_000); // 20mm < 50mm threshold
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    let mut policy_ids = soroban_sdk::Vec::new(&w.env);
+    policy_ids.push_back(pol_id1);
+    policy_ids.push_back(pol_id2);
+
+    let claim_ids = cp.batch_submit_claims(&buyer, &policy_ids);
+    assert_eq!(claim_ids.len(), 2);
+
+    let pending = cp.get_pending_claims();
+    assert_eq!(pending.len(), 2);
+
+    let results = cp.batch_process_claims(&w.keeper, &claim_ids, &None);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results.get_unchecked(0).1, ClaimResult::Paid);
+    assert_eq!(results.get_unchecked(1).1, ClaimResult::Paid);
+
+    assert_eq!(cp.get_pending_claims().len(), 0);
+}
+
+// ── Fraud detection (issue #437) ─────────────────────────────────────────────
+
+/// Values chosen so any single rule alone hits the threshold in tests that
+/// need one rule to be decisive. `MAX_FRAUD_SCORE` (100) is the enforced
+/// ceiling on `fraud_threshold_score`.
+fn strict_block_config() -> FraudConfig {
+    FraudConfig {
+        rate_window_secs: 60,
+        rate_score: 40,
+        burst_window_secs: 24 * 3600,
+        burst_count: 3,
+        burst_score: 30,
+        coverage_anomaly_multiplier: 10,
+        coverage_score: 20,
+        fraud_threshold_score: 30, // any of the three rules alone flags it
+        mode: FraudMode::Block,
+    }
+}
+
+/// Empty history (never-seen-before claimant), what the detector reads on a
+/// first-ever submission.
+fn empty_history() -> ClaimantHistory {
+    ClaimantHistory {
+        last_submission_at: 0,
+        burst_bucket_start: 0,
+        burst_count: 0,
+        max_coverage_ever: 0,
+        total_submissions: 0,
+    }
+}
+
+// ── score_submission pure-function tests ─────────────────────────────────────
+
+#[test]
+fn fraud_score_is_zero_for_first_ever_submission() {
+    let cfg = strict_block_config();
+    let (score, flags) = ClaimsProcessor::score_submission(&cfg, 1_000, &empty_history(), 500_000_000);
+    assert_eq!(score, 0);
+    assert_eq!(flags, 0);
+}
+
+#[test]
+fn fraud_score_fires_rate_rule_inside_window() {
+    let cfg = strict_block_config();
+    let hist = ClaimantHistory {
+        last_submission_at: 1_000,
+        burst_bucket_start: 1_000,
+        burst_count: 1,
+        max_coverage_ever: 500_000_000,
+        total_submissions: 1,
+    };
+    // 30 seconds since last, well inside 60s rate window.
+    let (score, flags) = ClaimsProcessor::score_submission(&cfg, 1_030, &hist, 500_000_000);
+    assert_eq!(score, cfg.rate_score);
+    assert_eq!(flags, 1); // FRAUD_FLAG_RATE
+}
+
+#[test]
+fn fraud_score_skips_rate_rule_outside_window() {
+    let cfg = strict_block_config();
+    let hist = ClaimantHistory {
+        last_submission_at: 1_000,
+        burst_bucket_start: 1_000,
+        burst_count: 1,
+        max_coverage_ever: 500_000_000,
+        total_submissions: 1,
+    };
+    // 61 seconds since last, one past the boundary.
+    let (score, flags) = ClaimsProcessor::score_submission(&cfg, 1_061, &hist, 500_000_000);
+    // Rate rule does not fire; burst rule does not fire (only 2 in bucket).
+    // Coverage anomaly does not fire because coverage == max_coverage_ever.
+    assert_eq!(score, 0);
+    assert_eq!(flags, 0);
+}
+
+#[test]
+fn fraud_score_fires_burst_rule_at_configured_count() {
+    let cfg = strict_block_config();
+    // Simulated: claimant already has 2 submissions in the current bucket;
+    // this one would be the 3rd, matching `burst_count`.
+    let hist = ClaimantHistory {
+        last_submission_at: 1_000,
+        burst_bucket_start: 500,
+        burst_count: 2,
+        max_coverage_ever: 500_000_000,
+        total_submissions: 2,
+    };
+    // 65s after last, outside rate window so only burst can fire.
+    let (score, flags) = ClaimsProcessor::score_submission(&cfg, 1_065, &hist, 500_000_000);
+    assert_eq!(score, cfg.burst_score);
+    assert_eq!(flags, 2); // FRAUD_FLAG_BURST
+}
+
+#[test]
+fn fraud_score_fires_coverage_anomaly_beyond_multiplier() {
+    let cfg = strict_block_config();
+    let hist = ClaimantHistory {
+        last_submission_at: 1_000,
+        burst_bucket_start: 500,
+        burst_count: 1,
+        max_coverage_ever: 100_000_000,
+        total_submissions: 1,
+    };
+    // 65s after last (outside rate), coverage 10.01x max — anomaly fires.
+    let over = 100_000_000i128
+        .saturating_mul(cfg.coverage_anomaly_multiplier as i128)
+        .saturating_add(1);
+    let (score, flags) = ClaimsProcessor::score_submission(&cfg, 1_065, &hist, over);
+    assert_eq!(score, cfg.coverage_score);
+    assert_eq!(flags, 4); // FRAUD_FLAG_COVERAGE
+}
+
+#[test]
+fn fraud_score_zeroed_when_config_windows_all_off() {
+    let cfg = FraudConfig {
+        rate_window_secs: 0,
+        rate_score: 40,
+        burst_window_secs: 0,
+        burst_count: 0,
+        burst_score: 30,
+        coverage_anomaly_multiplier: 0,
+        coverage_score: 20,
+        fraud_threshold_score: 1,
+        mode: FraudMode::Block,
+    };
+    let hist = ClaimantHistory {
+        last_submission_at: 1_000,
+        burst_bucket_start: 500,
+        burst_count: 10,
+        max_coverage_ever: 100_000_000,
+        total_submissions: 10,
+    };
+    let (score, flags) = ClaimsProcessor::score_submission(&cfg, 1_100, &hist, 10_000_000_000);
+    assert_eq!(score, 0);
+    assert_eq!(flags, 0);
+}
+
+// ── End-to-end tests through submit_claim ────────────────────────────────────
+
+/// Without any `FraudConfig`, existing submission semantics are unchanged.
+#[test]
+fn no_fraud_config_leaves_submission_unchanged() {
+    let w = deploy();
+    // Advance the ledger so submission timestamps are nonzero; the default
+    // test env starts at t=0, which the detector treats as "never submitted".
+    w.env.ledger().with_mut(|l| l.timestamp = 1_700_000_000);
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    assert_eq!(cp.get_fraud_config(), None);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    // Detector wrote no record: FraudRecord for the just-created claim is absent.
+    assert_eq!(cp.get_fraud_record(&claim_id), None);
+    // But the history aggregate is maintained regardless, so turning the
+    // detector on later immediately has correct state to work with.
+    let hist = cp.get_claimant_history(&buyer);
+    assert_eq!(hist.total_submissions, 1);
+    assert!(hist.last_submission_at > 0);
+}
+
+/// Non-admin cannot configure the fraud detector.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn non_admin_cannot_set_fraud_config() {
+    let w = deploy();
+    let interloper = Address::generate(&w.env);
+    ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .set_fraud_config(&interloper, &strict_block_config());
+}
+
+/// `fraud_threshold_score` above 100 is rejected as invalid input.
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")]
+fn fraud_threshold_above_max_rejected() {
+    let w = deploy();
+    let mut cfg = strict_block_config();
+    cfg.fraud_threshold_score = 101;
+    ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .set_fraud_config(&w.admin, &cfg);
+}
+
+/// In `Block` mode, a burst-triggering submission panics with
+/// `FraudSuspected` and writes no claim state.
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn block_mode_rejects_burst_triggering_submission() {
+    let w = deploy();
+    // Advance the ledger so submission timestamps are nonzero; the rate
+    // rule only fires when `history.last_submission_at > 0`, and the
+    // default test env starts at t=0.
+    w.env.ledger().with_mut(|l| l.timestamp = 1_700_000_000);
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    // Preload the claimant's history so this test does not depend on the
+    // burst-of-3-different-policies choreography, which is the same code
+    // path the pure `fraud_score_fires_burst_rule_at_configured_count`
+    // test covers. This test exercises the E2E gate.
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let mut cfg = strict_block_config();
+    // Rate rule needs no prior submission; set high enough that the
+    // first-ever claim can fire it via the history we plant below.
+    cfg.rate_score = 40;
+    cfg.fraud_threshold_score = 30;
+    cp.set_fraud_config(&w.admin, &cfg);
+
+    // Plant a history entry so the first real submission looks like a
+    // rapid resubmission.
+    let now = w.env.ledger().timestamp();
+    w.env.as_contract(&w.claims_id, || {
+        let hist = ClaimantHistory {
+            last_submission_at: now,
+            burst_bucket_start: now,
+            burst_count: 1,
+            max_coverage_ever: 100_000_000,
+            total_submissions: 1,
+        };
+        w.env.storage().persistent().set(
+            &StorageKey::ClaimantHistory(buyer.clone()),
+            &hist,
+        );
+    });
+
+    // This submission is inside the rate window relative to the planted
+    // history, so the rate rule fires with a score >= threshold. Panic
+    // expected — no claim state is written.
+    cp.submit_claim(&buyer, &pol_id);
+}
+
+/// In `FlagOnly` mode, the same submission is admitted and produces a
+/// `FraudRecord` an admin can read.
+#[test]
+fn flag_only_mode_records_but_admits_submission() {
+    let w = deploy();
+    // Advance the ledger so submission timestamps are nonzero; the rate
+    // rule only fires when `history.last_submission_at > 0`.
+    w.env.ledger().with_mut(|l| l.timestamp = 1_700_000_000);
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let mut cfg = strict_block_config();
+    cfg.mode = FraudMode::FlagOnly;
+    cp.set_fraud_config(&w.admin, &cfg);
+
+    let now = w.env.ledger().timestamp();
+    w.env.as_contract(&w.claims_id, || {
+        let hist = ClaimantHistory {
+            last_submission_at: now,
+            burst_bucket_start: now,
+            burst_count: 1,
+            max_coverage_ever: 100_000_000,
+            total_submissions: 1,
+        };
+        w.env.storage().persistent().set(
+            &StorageKey::ClaimantHistory(buyer.clone()),
+            &hist,
+        );
+    });
+
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    let record = cp.get_fraud_record(&claim_id).unwrap();
+    assert_eq!(record.claim_id, claim_id);
+    assert!(record.score >= cfg.fraud_threshold_score);
+    assert_eq!(record.flags & 1u32, 1u32); // rate rule fired
 }

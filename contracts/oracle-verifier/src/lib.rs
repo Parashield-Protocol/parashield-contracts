@@ -12,12 +12,16 @@
 //! - Only the admin can register/remove oracle addresses.
 //! - Any oracle already registered for a (data_type) may submit data.
 //! - Duplicate submissions from the same oracle overwrite the previous value.
+// Address/state validation must fail with a typed contract error so callers
+// can match on it programmatically, never with a raw panic! and a string
+// message.
+#![deny(clippy::panic)]
 #![no_std]
 extern crate alloc;
 
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
     BytesN, Env, Symbol, Vec,
 };
 
@@ -25,23 +29,8 @@ pub mod types;
 pub use types::*;
 
 // ─── Storage TTL ──────────────────────────────────────────────────────────────
-/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
-/// (at ~5s/ledger).
-// Issue #342: kept in sync by hand across all 5 contracts (governance-dao,
-// risk-pool, policy-engine, oracle-verifier, claims-processor) — extracting
-// to a shared crate is a real follow-up, not done here to avoid touching
-// every contract's Cargo.toml in one pass.
-const TTL_THRESHOLD: u32 = 518_400; // ~30 days
-/// Extend persistent entries out to ~1 year (at ~5s/ledger) so an oracle
-/// registration doesn't silently expire from storage during a quiet period
-/// with no submissions.
-const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year
-
-/// Grace period between an admin transfer being fully proposed/approved and the
-/// proposed admin being able to `accept_admin` (issue #356). Hand-synced across
-/// the 4 contracts that expose admin rotation (policy-engine, risk-pool,
-/// oracle-verifier, claims-processor).
-const ADMIN_TRANSFER_TIMELOCK: u64 = 48 * 60 * 60;
+// Shared protocol constants — single source of truth in parashield-common (issue #342).
+use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK};
 
 /// Maximum number of registered oracles. Bounds the median aggregation loop and
 /// the worst-case weighted sum (MAX_ORACLES * max_weight * max_value) so it
@@ -50,6 +39,20 @@ const ADMIN_TRANSFER_TIMELOCK: u64 = 48 * 60 * 60;
 const MAX_ORACLES: u32 = 100;
 /// Maximum number of data points stored per (data_type, key).
 const MAX_DATA_POINTS: u32 = 100;
+
+/// Default outlier-rejection threshold, in basis points of the median
+/// absolute deviation (MAD): a submission is flagged once its distance from
+/// the median exceeds 5.0x the MAD. This approximates the standard
+/// Iglewicz-Hoaglin modified z-score cutoff of 3.5 (which is expressed in
+/// MAD-equivalent standard-deviation units via a 0.6745 consistency
+/// constant: 3.5 / 0.6745 ≈ 5.19, rounded down for a slightly more
+/// conservative default that keeps borderline genuine variation in).
+const DEFAULT_OUTLIER_THRESHOLD_BPS: u32 = 50_000;
+/// Outlier filtering is skipped below this many eligible submissions —
+/// with too few points neither the median nor the MAD used to judge
+/// deviation is a meaningful reference, so filtering would be as likely to
+/// discard a legitimate value as a bad one.
+const DEFAULT_OUTLIER_MIN_SAMPLE_SIZE: u32 = 4;
 
 /// Default minimum number of seconds a single oracle must wait between
 /// submissions for the same data_type, used when no admin override has been
@@ -114,6 +117,40 @@ enum StorageKey {
     DataTypeMaxAge(Symbol),
     /// Per-data-type aggregation method. Falls back to `WeightedMedian`.
     AggregationMethod(Symbol),
+    /// Whether plaintext `submit_data`/`batch_submit_data` is refused for a
+    /// data_type (bool). Off by default — an existing deployment keeps
+    /// submitting plaintext until it opts a sensitive data_type in.
+    EncryptionRequired(Symbol),
+    /// Vec<EncryptedOracleDataPoint> — ciphertext submissions for
+    /// (data_type, key), stored separately from plaintext `DataPoints` since
+    /// they are never aggregated or compared on-chain.
+    EncryptedDataPoints(Symbol, Symbol),
+    /// Maximum age (in seconds) for oracle submission timestamps to be accepted.
+    /// Submissions older than `now - MaxTimestampAge` are rejected. Defaults to
+    /// 90 days. Admin-configurable via `set_max_timestamp_age`.
+    MaxTimestampAge,
+    /// Maximum number of seconds into the future a submission timestamp may be.
+    /// Protects against submissions with clocks far ahead of the ledger.
+    /// Defaults to 60 seconds. Admin-configurable via `set_timestamp_future_buffer`.
+    TimestampFutureBuffer,
+    /// Per-data-type minimum oracle participation count for valid aggregation
+    /// (u32). Falls back to the global `MinOracleCount` when unset. A data
+    /// type with high-value triggers may require more independent submissions
+    /// before the aggregation is considered valid.
+    DataTypeMinOracleCount(Symbol),
+    /// Per-product consensus threshold configuration (ConsensusThreshold).
+    /// Specifies different oracle agreement levels for different data types/products.
+    ConsensusThreshold(Symbol),
+    /// Per-data-type outlier-detection configuration (OutlierConfig). Falls
+    /// back to disabled when unset, so an existing data type's aggregation
+    /// does not change until an admin opts it in.
+    OutlierConfig(Symbol),
+    /// Cross-validation rule between two data types — (source, target) → CrossValidationRule.
+    CrossValidationRule(Symbol, Symbol),
+    /// List of target data types that a source data type has cross-validation rules for.
+    CrossValidationTargets(Symbol),
+    /// Geographic weighting multiplier in basis points for (data_type, oracle, region).
+    GeoWeight(Symbol, Address, Symbol),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -146,16 +183,21 @@ pub enum Error {
     InvalidThreshold = 22,
     AdminTimelockNotExpired = 23,
     InvalidMaxAge = 24,
-    InvalidSymbolLength = 25,
+    EncryptionRequiredForType = 25,
+    TimestampOutOfRange = 26,
+    InvalidOutlierConfig = 27,
+    InvalidInput = 28,
+    CrossValidationFailed = 29,
+    /// An admin transfer was proposed while another one is still pending,
+    /// which would reset the transfer timelock (issue #457).
+    AdminTransferPending = 30,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
-#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contract]
 pub struct OracleVerifier;
 
-#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contractimpl]
 impl OracleVerifier {
     // ── Lifecycle ────────────────────────────────────────────────────────────
@@ -346,6 +388,50 @@ impl OracleVerifier {
         );
     }
 
+    /// Set the maximum acceptable age for oracle submission timestamps (in seconds).
+    /// Submissions with timestamps older than `now - max_timestamp_age` are rejected.
+    /// Defaults to 90 days (7,776,000 seconds). Admin-only.
+    pub fn set_max_timestamp_age(env: Env, admin: Address, max_timestamp_age: u64) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::MaxTimestampAge, &max_timestamp_age);
+        env.events().publish(
+            (Symbol::new(&env, "max_timestamp_age_updated"),),
+            MaxTimestampAgeUpdated { max_timestamp_age },
+        );
+    }
+
+    /// Return the configured max timestamp age (defaults to 90 days).
+    pub fn get_max_timestamp_age(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::MaxTimestampAge)
+            .unwrap_or(90 * 24 * 60 * 60)
+    }
+
+    /// Set the maximum number of seconds a submission timestamp may be ahead of
+    /// the ledger. Protects against oracles with clocks far ahead of reality.
+    /// Defaults to 60 seconds. Admin-only.
+    pub fn set_timestamp_future_buffer(env: Env, admin: Address, seconds: u64) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::TimestampFutureBuffer, &seconds);
+        env.events().publish(
+            (Symbol::new(&env, "timestamp_future_buffer_updated"),),
+            TimestampFutureBufferUpdated { seconds },
+        );
+    }
+
+    /// Return the configured future buffer (defaults to 60 seconds).
+    pub fn get_timestamp_future_buffer(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::TimestampFutureBuffer)
+            .unwrap_or(60)
+    }
+
     /// Propose a new admin. Only the current admin can call this.
     ///
     /// If a guardian threshold > 0 is configured (`set_guardians`), this does
@@ -353,9 +439,25 @@ impl OracleVerifier {
     /// guardians to call `approve_admin_change` first, guarding this
     /// takeover-capable operation against a single compromised admin key.
     /// With no guardians configured (default), behavior is unchanged.
+    ///
+    /// Panics with `AdminTransferPending` while a transfer is already armed:
+    /// re-proposing over an armed transfer would rewrite `PendingAdminSince`
+    /// and reset the `ADMIN_TRANSFER_TIMELOCK` (issue #457).
     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
         Self::validate_stellar_address(&env, &new_admin);
+
+        // Issue #457: reject a fresh proposal while one is already pending —
+        // the armed transfer must complete (be accepted) before another can
+        // be made, so the timelock clock can never be reset by re-proposing.
+        // Read as `Option<Address>` because `accept_admin` below clears the
+        // slot by writing `None` rather than removing the key.
+        let pending: Option<Address> = env.storage().instance()
+            .get(&StorageKey::PendingAdmin)
+            .unwrap_or(None);
+        if pending.is_some() {
+            panic_with_error!(&env, Error::AdminTransferPending);
+        }
 
         let threshold: u32 = env
             .storage()
@@ -429,9 +531,14 @@ impl OracleVerifier {
             env.storage()
                 .instance()
                 .set(&StorageKey::PendingAdmin, &new_admin);
-            env.storage()
-                .instance()
-                .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
+            // Issue #457: arm the timelock at most once per transfer — never
+            // overwrite an already-armed `PendingAdminSince`, or the
+            // `ADMIN_TRANSFER_TIMELOCK` would restart from this later moment.
+            if !env.storage().instance().has(&StorageKey::PendingAdminSince) {
+                env.storage()
+                    .instance()
+                    .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
+            }
         } else {
             env.storage()
                 .instance()
@@ -557,6 +664,50 @@ impl OracleVerifier {
         Self::effective_aggregation_method(&env, &data_type)
     }
 
+    /// Configure outlier rejection for a data type, applied before
+    /// aggregation regardless of `AggregationMethod` (issue #383).
+    ///
+    /// `WeightedMedian` already resists a minority of outliers by
+    /// construction, but `Mean`/`WeightedAverage`/`TimeWeightedAverage`
+    /// have no such protection, and even a median can still be dragged if
+    /// close to half the submissions for a key are bad. This runs as a
+    /// preprocessing step ahead of whichever method is configured.
+    ///
+    /// `threshold_bps` is basis points of the median absolute deviation
+    /// (MAD) — see [`OutlierConfig`]. `min_sample_size` must be at least 3;
+    /// below that, neither a median nor a MAD is a meaningful reference to
+    /// judge deviation against.
+    pub fn set_outlier_config(
+        env: Env,
+        admin: Address,
+        data_type: Symbol,
+        enabled: bool,
+        threshold_bps: u32,
+        min_sample_size: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+        if threshold_bps == 0 || min_sample_size < 3 {
+            panic_with_error!(&env, Error::InvalidOutlierConfig);
+        }
+
+        env.storage().instance().set(
+            &StorageKey::OutlierConfig(data_type.clone()),
+            &OutlierConfig { enabled, threshold_bps, min_sample_size },
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "outlier_config_updated"),),
+            OutlierConfigUpdated { data_type, enabled, threshold_bps, min_sample_size },
+        );
+    }
+
+    /// The outlier-rejection configuration applied to a data type. Disabled
+    /// with the compiled-in defaults until an admin calls
+    /// `set_outlier_config`.
+    pub fn get_outlier_config(env: Env, data_type: Symbol) -> OutlierConfig {
+        Self::effective_outlier_config(&env, &data_type)
+    }
+
     /// Report whether the data for `(data_type, key)` is fresh enough to use,
     /// without panicking.
     ///
@@ -611,6 +762,100 @@ impl OracleVerifier {
         }
     }
 
+    /// Check for stale oracle data across all submissions for a key.
+    ///
+    /// Unlike `check_freshness` which counts individual fresh submissions,
+    /// this provides a holistic staleness report that includes the ratio
+    /// of fresh to stale data and the age range of submissions. Useful for
+    /// monitoring dashboards and automated alerts.
+    ///
+    /// Data is considered stale when its age exceeds the effective max_age
+    /// for the data type. If more than half the submissions are stale, the
+    /// entire data set is flagged as stale.
+    pub fn check_staleness(env: Env, data_type: Symbol, key: Symbol) -> StalenessReport {
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let max_age = Self::effective_max_age(&env, &data_type);
+        let now = env.ledger().timestamp();
+
+        let mut stale_count = 0u32;
+        let mut newest_age = u64::MAX;
+        let mut oldest_fresh_age = 0u64;
+        let total_count = points.len();
+
+        for i in 0..points.len() {
+            let p = points.get_unchecked(i);
+            let age = now.saturating_sub(p.timestamp);
+
+            if age < newest_age {
+                newest_age = age;
+            }
+
+            if age > max_age {
+                stale_count += 1;
+            } else {
+                if age > oldest_fresh_age {
+                    oldest_fresh_age = age;
+                }
+            }
+        }
+
+        // If no submissions, report as stale with max ages
+        if total_count == 0 {
+            return StalenessReport {
+                data_type,
+                key,
+                is_stale: true,
+                oldest_fresh_age: 0,
+                newest_age: u64::MAX,
+                stale_count: 0,
+                total_count: 0,
+                max_age,
+                freshness_ratio_bps: 0,
+            };
+        }
+
+        let fresh_count = total_count.saturating_sub(stale_count);
+        let freshness_ratio_bps = if total_count > 0 {
+            (fresh_count as u64 * 10_000 / total_count as u64) as u32
+        } else {
+            0
+        };
+
+        // Data is stale if more than half of submissions are stale
+        let is_stale = stale_count > total_count / 2;
+
+        if is_stale {
+            env.events().publish(
+                (Symbol::new(&env, "stale_data_detected"),),
+                StaleDataDetected {
+                    data_type: data_type.clone(),
+                    key: key.clone(),
+                    stale_count,
+                    total_count,
+                    oldest_age: now.saturating_sub(newest_age),
+                    max_age,
+                },
+            );
+        }
+
+        StalenessReport {
+            data_type,
+            key,
+            is_stale,
+            oldest_fresh_age,
+            newest_age,
+            stale_count,
+            total_count,
+            max_age,
+            freshness_ratio_bps,
+        }
+    }
+
     /// Set the minimum number of oracle submissions required to form a consensus value.
     /// `min_count` must be at least 1; the default is 1.
     pub fn set_min_oracle_count(env: Env, admin: Address, min_count: u32) {
@@ -630,6 +875,269 @@ impl OracleVerifier {
             .instance()
             .get(&StorageKey::MinOracleCount)
             .unwrap_or(1)
+    }
+
+    /// Set a per-data-type minimum oracle participation count override.
+    ///
+    /// Different data types have different risk profiles: a high-value
+    /// crop-insurance trigger may require 3+ independent oracle submissions
+    /// before the aggregation is trusted, while a low-stakes weather feed
+    /// may be fine with the global default.
+    ///
+    /// Pass `min_count = 0` to clear the override and fall back to the
+    /// global `MinOracleCount` value.
+    pub fn set_data_type_min_oracle_count(
+        env: Env,
+        admin: Address,
+        data_type: Symbol,
+        min_count: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+        if min_count == 0 {
+            env.storage()
+                .instance()
+                .remove(&StorageKey::DataTypeMinOracleCount(data_type.clone()));
+        } else {
+            env.storage()
+                .instance()
+                .set(&StorageKey::DataTypeMinOracleCount(data_type.clone()), &min_count);
+        }
+        env.events().publish(
+            (Symbol::new(&env, "dt_min_oracle_count_updated"),),
+            DataTypeMinOracleCountUpdated { data_type, min_count },
+        );
+    }
+
+    /// The effective minimum oracle count for a data type: the per-type
+    /// override when set, otherwise the global value.
+    pub fn get_data_type_min_oracle_count(env: Env, data_type: Symbol) -> u32 {
+        Self::effective_min_oracle_count(&env, &data_type)
+    }
+
+    /// Set per-product configurable consensus threshold for oracle agreement.
+    /// Allows specifying different consensus requirements for different data types/products.
+    ///
+    /// The threshold is in basis points: 10000 = unanimous, 5000 = majority, etc.
+    /// This replaces fixed consensus thresholds with flexible, per-product configuration.
+    pub fn set_consensus_threshold(
+        env: Env,
+        admin: Address,
+        data_type: Symbol,
+        agreement_threshold_bps: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+        
+        // Validate threshold is between 0 and 10000 basis points
+        if agreement_threshold_bps > 10000 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        
+        let threshold = ConsensusThreshold {
+            data_type: data_type.clone(),
+            agreement_threshold_bps,
+        };
+        
+        env.storage()
+            .instance()
+            .set(&StorageKey::ConsensusThreshold(data_type.clone()), &threshold);
+        
+        env.events().publish(
+            (Symbol::new(&env, "consensus_threshold_updated"),),
+            ConsensusThresholdUpdated { 
+                data_type, 
+                agreement_threshold_bps 
+            },
+        );
+    }
+
+    /// Get the consensus threshold for a specific data type/product.
+    /// Returns the configured threshold, or a default of 5000 (50%, simple majority) if not configured.
+    pub fn get_consensus_threshold(env: Env, data_type: Symbol) -> ConsensusThreshold {
+        match env
+            .storage()
+            .instance()
+            .get::<_, ConsensusThreshold>(&StorageKey::ConsensusThreshold(data_type.clone()))
+        {
+            Some(threshold) => threshold,
+            None => ConsensusThreshold {
+                data_type,
+                agreement_threshold_bps: 5000, // Default to simple majority
+            },
+        }
+    }
+
+    // ── Cross-Validation (issue #430) ────────────────────────────────────────
+
+    /// Add or update a cross-validation rule between two data types.
+    ///
+    /// When data is submitted for `source_type`, the aggregated values for
+    /// `source_type` and `target_type` on the same key must not differ by
+    /// more than `max_variance`. This catches inconsistent oracle data
+    /// across correlated feeds (e.g. rainfall vs. temperature).
+    pub fn set_cross_validation_rule(
+        env: Env,
+        admin: Address,
+        source_type: Symbol,
+        target_type: Symbol,
+        max_variance: i128,
+        description: Bytes,
+    ) {
+        Self::require_admin(&env, &admin);
+        if max_variance < 0 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        if source_type == target_type {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
+        let rule = CrossValidationRule {
+            source_type: source_type.clone(),
+            target_type: target_type.clone(),
+            max_variance,
+            description,
+        };
+        env.storage().instance().set(
+            &StorageKey::CrossValidationRule(source_type.clone(), target_type.clone()),
+            &rule,
+        );
+
+        // Track which targets this source has rules for
+        let mut targets: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::CrossValidationTargets(source_type.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut found = false;
+        for i in 0..targets.len() {
+            if targets.get_unchecked(i) == target_type {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            targets.push_back(target_type.clone());
+            env.storage().instance().set(
+                &StorageKey::CrossValidationTargets(source_type.clone()),
+                &targets,
+            );
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "cross_validation_rule_added"),),
+            CrossValidationRuleAdded {
+                source_type,
+                target_type,
+                max_variance,
+            },
+        );
+    }
+
+    /// Remove a cross-validation rule between two data types.
+    pub fn remove_cross_validation_rule(
+        env: Env,
+        admin: Address,
+        source_type: Symbol,
+        target_type: Symbol,
+    ) {
+        Self::require_admin(&env, &admin);
+        let key = StorageKey::CrossValidationRule(source_type.clone(), target_type.clone());
+        if !env.storage().instance().has(&key) {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        env.storage().instance().remove(&key);
+
+        // Remove from targets list
+        let mut targets: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::CrossValidationTargets(source_type.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut pruned: Vec<Symbol> = Vec::new(&env);
+        for i in 0..targets.len() {
+            if targets.get_unchecked(i) != target_type {
+                pruned.push_back(targets.get_unchecked(i));
+            }
+        }
+        env.storage().instance().set(
+            &StorageKey::CrossValidationTargets(source_type.clone()),
+            &pruned,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "cross_validation_rule_removed"),),
+            CrossValidationRuleRemoved {
+                source_type,
+                target_type,
+            },
+        );
+    }
+
+    /// Get the cross-validation rule between two data types, if one exists.
+    pub fn get_cross_validation_rule(
+        env: Env,
+        source_type: Symbol,
+        target_type: Symbol,
+    ) -> Option<CrossValidationRule> {
+        env.storage().instance().get(
+            &StorageKey::CrossValidationRule(source_type, target_type),
+        )
+    }
+
+    /// Get all cross-validation targets for a given source data type.
+    pub fn get_cross_validation_targets(env: Env, source_type: Symbol) -> Vec<Symbol> {
+        env.storage().instance().get(
+            &StorageKey::CrossValidationTargets(source_type),
+        ).unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Check cross-validation rules between a source data type and all its
+    /// configured targets for a given key. Returns Ok(()) if all rules pass,
+    /// or the first failing rule's details.
+    ///
+    /// Called internally after aggregation to detect inconsistent oracle data
+    /// across correlated feeds. Panics with `CrossValidationFailed` if any
+    /// rule is violated.
+    fn check_cross_validation(env: &Env, source_type: &Symbol, key: &Symbol) {
+        let targets: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::CrossValidationTargets(source_type.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+
+        if targets.is_empty() {
+            return;
+        }
+
+        // Get source aggregated value
+        let source_value = Self::get_median_value(env, source_type, key);
+
+        for i in 0..targets.len() {
+            let target_type = targets.get_unchecked(i);
+            let rule: CrossValidationRule = match env.storage().instance().get(
+                &StorageKey::CrossValidationRule(source_type.clone(), target_type.clone()),
+            ) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            // Try to get target aggregated value — skip if no data available
+            let target_points: Vec<OracleDataPoint> = match env.storage().persistent().get(
+                &StorageKey::DataPoints(target_type.clone(), key.clone()),
+            ) {
+                Some(pts) => pts,
+                None => continue,
+            };
+            if target_points.is_empty() {
+                continue;
+            }
+
+            let target_value = Self::get_median_value(env, &target_type, key);
+            let variance = source_value.saturating_sub(target_value).abs();
+
+            if variance > rule.max_variance {
+                panic_with_error!(env, Error::CrossValidationFailed);
+            }
+        }
     }
 
     /// Set the minimum number of seconds a single oracle must wait between
@@ -745,6 +1253,150 @@ impl OracleVerifier {
             .persistent()
             .get(&StorageKey::OracleStakeAmt(data_type, oracle))
             .unwrap_or(0)
+    }
+
+    // ── Geographic Weighting (Issue #426) ───────────────────────────────────
+
+    /// Admin-only: Set geographic weighting multiplier for an oracle in basis points (10000 = 1.0x).
+    pub fn set_oracle_geo_weight(
+        env: Env,
+        admin: Address,
+        oracle: Address,
+        data_type: Symbol,
+        region: Symbol,
+        geo_weight_bps: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+        if geo_weight_bps == 0 {
+            panic_with_error!(&env, Error::InvalidConfidence);
+        }
+        let key = StorageKey::GeoWeight(data_type.clone(), oracle.clone(), region.clone());
+        env.storage().persistent().set(&key, &geo_weight_bps);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.events().publish(
+            (Symbol::new(&env, "geo_weight_updated"),),
+            GeoWeightUpdated {
+                oracle,
+                data_type,
+                region,
+                geo_weight_bps,
+            },
+        );
+    }
+
+    /// Return the geographic weighting multiplier in basis points for (data_type, oracle, region).
+    /// Defaults to 10,000 (1.0x baseline weight) if unconfigured.
+    pub fn get_oracle_geo_weight(
+        env: Env,
+        oracle: Address,
+        data_type: Symbol,
+        region: Symbol,
+    ) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::GeoWeight(data_type, oracle, region))
+            .unwrap_or(10_000)
+    }
+
+    /// Return aggregated data for a specific geographic region, applying geographic weighting to active oracles.
+    pub fn get_aggregated_for_region(
+        env: Env,
+        data_type: Symbol,
+        key: Symbol,
+        max_age_seconds: u64,
+        target_region: Symbol,
+    ) -> AggregatedData {
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoDataAvailable));
+        if points.is_empty() {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
+        let now = env.ledger().timestamp();
+        let min_confidence: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
+
+        let mut values = [(0i128, 0u32); 100];
+        let mut count: usize = 0;
+        let mut total_effective_weight: u32 = 0;
+        let mut weighted_confidence_sum: u64 = 0;
+        let mut min_conf: u32 = 100;
+        let mut newest_timestamp: u64 = 0;
+
+        for i in 0..points.len() {
+            let p = points.get_unchecked(i);
+            let age = now.saturating_sub(p.timestamp);
+            if age <= max_age_seconds && p.confidence >= min_confidence {
+                let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+                let base_weight = match env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+                    Some(entry) if entry.active => entry.weight,
+                    _ => continue,
+                };
+
+                let geo_multiplier = Self::get_oracle_geo_weight(env.clone(), p.oracle.clone(), data_type.clone(), target_region.clone());
+                let effective_weight = ((base_weight as u64 * geo_multiplier as u64) / 10_000) as u32;
+                let effective_weight = if effective_weight == 0 { 1 } else { effective_weight };
+
+                if count < 100 {
+                    values[count] = (p.value, effective_weight);
+                    count += 1;
+                }
+
+                total_effective_weight += effective_weight;
+                weighted_confidence_sum += p.confidence as u64 * effective_weight as u64;
+                if p.confidence < min_conf {
+                    min_conf = p.confidence;
+                }
+                if p.timestamp > newest_timestamp {
+                    newest_timestamp = p.timestamp;
+                }
+            }
+        }
+
+        if count == 0 {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
+        let slice = &mut values[..count];
+        slice.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let half_weight = total_effective_weight / 2;
+        let mut accum: u32 = 0;
+        let mut median: i128 = slice[0].0;
+        for &(val, weight) in slice.iter() {
+            accum += weight;
+            if accum >= half_weight {
+                median = val;
+                break;
+            }
+        }
+
+        let avg_confidence = if total_effective_weight > 0 {
+            (weighted_confidence_sum / total_effective_weight as u64) as u32
+        } else {
+            0
+        };
+
+        let (ci_lower, ci_upper) =
+            Self::calculate_confidence_interval(slice, total_effective_weight, median);
+
+        AggregatedData {
+            median_value: median,
+            oracle_count: count as u32,
+            active_oracle_count: count as u32,
+            confidence: avg_confidence,
+            min_confidence: min_conf,
+            last_updated: newest_timestamp,
+            confidence_interval_lower: ci_lower,
+            confidence_interval_upper: ci_upper,
+        }
     }
 
     /// Withdraw the caller's full stake for `data_type`. Only permitted once
@@ -1031,36 +1683,33 @@ impl OracleVerifier {
         timestamp: u64,
     ) {
         oracle.require_auth();
+        if Self::encryption_required(&env, &data_type) {
+            panic_with_error!(&env, Error::EncryptionRequiredForType);
+        }
         if confidence == 0 || confidence > 100 {
             panic_with_error!(&env, Error::InvalidConfidence);
         }
 
-        // Validate Symbol lengths to prevent storage overflow from extremely
-        // long Symbols (#502). Soroban Symbols can hold up to 32 bytes, but
-        // excessively long identifiers waste storage and are almost certainly
-        // mistakes.
-        const MAX_SYMBOL_LEN: usize = 32;
-        {
-            let dt_len = data_type.to_string().len();
-            if dt_len == 0 || dt_len > MAX_SYMBOL_LEN {
-                panic_with_error!(&env, Error::InvalidSymbolLength);
-            }
-            let k_len = key.to_string().len();
-            if k_len == 0 || k_len > MAX_SYMBOL_LEN {
-                panic_with_error!(&env, Error::InvalidSymbolLength);
-            }
-        }
-
         let now = env.ledger().timestamp();
-        if timestamp > now {
+        let future_buffer: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TimestampFutureBuffer)
+            .unwrap_or(60);
+        if timestamp > now.saturating_add(future_buffer) {
             panic_with_error!(&env, Error::InvalidTimestamp);
         }
-        let ninety_days = 90 * 24 * 60 * 60;
-        if timestamp < now.saturating_sub(ninety_days) {
+        let max_timestamp_age: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MaxTimestampAge)
+            .unwrap_or(90 * 24 * 60 * 60);
+        if timestamp < now.saturating_sub(max_timestamp_age) {
             panic_with_error!(&env, Error::InvalidTimestamp);
         }
 
-        // Verify oracle is registered and active for this data_type
+        // SECURITY FIX: Verify oracle is registered and active for THIS specific data_type.
+        // An oracle registered for 'rainfall' cannot submit 'flight' data.
         let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         let entry: OracleEntry = env
             .storage()
@@ -1117,6 +1766,9 @@ impl OracleVerifier {
         env.storage().persistent().set(&dp_key, &pruned_points);
         env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
+        // Check cross-validation rules after storing new data
+        Self::check_cross_validation(&env, &data_type, &key);
+
         env.events().publish(
             (Symbol::new(&env, "oracle_data_submitted"),),
             OracleDataSubmitted {
@@ -1128,6 +1780,167 @@ impl OracleVerifier {
                 timestamp,
             },
         );
+    }
+
+    // ── Data Encryption (issue #379) ──────────────────────────────────────────
+
+    /// Require (or stop requiring) encrypted submissions for a data_type.
+    ///
+    /// Off by default — plaintext `submit_data`/`batch_submit_data` behave
+    /// exactly as before for any data_type that never opts in. Once enabled,
+    /// plaintext submissions for that data_type are refused and only
+    /// `submit_encrypted_data` is accepted, for data types whose values are
+    /// sensitive (private valuations, confidential off-chain metrics, etc.)
+    /// and should not sit in plaintext on a public ledger.
+    pub fn set_encryption_required(env: Env, admin: Address, data_type: Symbol, required: bool) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::EncryptionRequired(data_type.clone()), &required);
+        env.events().publish(
+            (Symbol::new(&env, "encryption_required_updated"),),
+            EncryptionRequiredUpdated { data_type, required },
+        );
+    }
+
+    /// Whether `data_type` currently requires encrypted submissions.
+    pub fn get_encryption_required(env: Env, data_type: Symbol) -> bool {
+        Self::encryption_required(&env, &data_type)
+    }
+
+    /// Admin-only: Invalidate all oracle data points for a given (data_type, key) pair.
+    /// This removes bad or stale data from storage, preventing it from being used
+    /// in future trigger verifications or aggregations.
+    pub fn invalidate_data(env: Env, admin: Address, data_type: Symbol, key: Symbol) {
+        Self::require_admin(&env, &admin);
+        
+        let storage_key = StorageKey::DataPoints(data_type.clone(), key.clone());
+        env.storage().persistent().remove(&storage_key);
+        
+        env.events().publish(
+            (Symbol::new(&env, "oracle_data_invalidated"),),
+            (data_type, key),
+        );
+    }
+
+    /// Submit an encrypted data point for a (data_type, key) pair.
+    ///
+    /// The contract never sees the plaintext value: `ciphertext` and `nonce`
+    /// are opaque to it and stored as-is. Encryption/decryption happens
+    /// entirely off-chain, between whichever parties hold the key for this
+    /// data_type — the contract's only job is tamper-evident storage and
+    /// making explicit, at the type level, that a submission is encrypted so
+    /// a consumer never mistakes ciphertext for a usable value. Encrypted
+    /// submissions are not fed into `verify_trigger`/`get_aggregated`, since
+    /// aggregation and threshold comparison require the plaintext value.
+    ///
+    /// Confidence and timestamp validation mirror `submit_data`.
+    pub fn submit_encrypted_data(
+        env: Env,
+        oracle: Address,
+        data_type: Symbol,
+        key: Symbol,
+        ciphertext: Bytes,
+        nonce: BytesN<12>,
+        confidence: u32,
+        timestamp: u64,
+    ) {
+        oracle.require_auth();
+        if confidence == 0 || confidence > 100 {
+            panic_with_error!(&env, Error::InvalidConfidence);
+        }
+
+        // Validate Symbol lengths to prevent storage overflow from extremely
+        // long Symbols (#502). Soroban Symbols can hold up to 32 bytes, but
+        // excessively long identifiers waste storage and are almost certainly
+        // mistakes.
+        const MAX_SYMBOL_LEN: usize = 32;
+        {
+            let dt_len = data_type.to_string().len();
+            if dt_len == 0 || dt_len > MAX_SYMBOL_LEN {
+                panic_with_error!(&env, Error::InvalidSymbolLength);
+            }
+            let k_len = key.to_string().len();
+            if k_len == 0 || k_len > MAX_SYMBOL_LEN {
+                panic_with_error!(&env, Error::InvalidSymbolLength);
+            }
+        }
+
+        let now = env.ledger().timestamp();
+        if timestamp > now {
+            panic_with_error!(&env, Error::InvalidTimestamp);
+        }
+        let ninety_days = 90 * 24 * 60 * 60;
+        if timestamp < now.saturating_sub(ninety_days) {
+            panic_with_error!(&env, Error::InvalidTimestamp);
+        }
+
+        let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
+        let entry: OracleEntry = env
+            .storage()
+            .persistent()
+            .get(&oracle_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
+        if !entry.active {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        Self::enforce_rate_limit(&env, &data_type, &oracle, now);
+
+        let dp_key = StorageKey::EncryptedDataPoints(data_type.clone(), key.clone());
+        let mut points: Vec<EncryptedOracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&dp_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let new_point = EncryptedOracleDataPoint {
+            oracle: oracle.clone(),
+            ciphertext,
+            nonce,
+            confidence,
+            timestamp,
+        };
+        let mut found = false;
+        for i in 0..points.len() {
+            if points.get_unchecked(i).oracle == oracle {
+                points.set(i, new_point.clone());
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            if points.len() >= MAX_DATA_POINTS {
+                points.pop_front();
+            }
+            points.push_back(new_point);
+        }
+
+        env.storage().persistent().set(&dp_key, &points);
+        env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle_encrypted_data_submitted"),),
+            OracleEncryptedDataSubmitted {
+                oracle,
+                data_type,
+                key,
+                confidence,
+                timestamp,
+            },
+        );
+    }
+
+    /// Return all encrypted submissions stored for (data_type, key), for an
+    /// off-chain consumer holding the decryption key to decrypt and verify.
+    pub fn get_encrypted_data(env: Env, data_type: Symbol, key: Symbol) -> Vec<EncryptedOracleDataPoint> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::EncryptedDataPoints(data_type, key))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     // ── Verification ─────────────────────────────────────────────────────────
@@ -1155,6 +1968,43 @@ impl OracleVerifier {
         key: Symbol,
         condition: TriggerCondition,
     ) -> bool {
+        // Reject evaluation when EncryptionRequired is enabled — plaintext
+        // DataPoints from before the flag was set must not be used (#463).
+        if Self::encryption_required(&env, &data_type) {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
+        // Enforce minimum oracle participation before aggregation so a single
+        // oracle cannot unilaterally determine the outcome.
+        let min_count = Self::effective_min_oracle_count(&env, &data_type);
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoDataAvailable));
+        let max_data_age = Self::effective_max_age(&env, &data_type);
+        let now = env.ledger().timestamp();
+        let min_confidence: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
+        let mut eligible_count = 0u32;
+        for i in 0..points.len() {
+            let p = points.get_unchecked(i);
+            if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence {
+                let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+                if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+                    if entry.active {
+                        eligible_count += 1;
+                    }
+                }
+            }
+        }
+        if eligible_count < min_count {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
         let median = Self::get_median_value(&env, &data_type, &key);
         let result = match condition.comparison {
             TriggerComparison::LessThan => median < condition.threshold,
@@ -1200,6 +2050,85 @@ impl OracleVerifier {
         result
     }
 
+    /// Like `verify_trigger` but also returns the aggregated oracle data —
+    /// including the aggregated `confidence` score — alongside the boolean
+    /// verdict. A caller can thus act on the trigger result and reason about how
+    /// trustworthy that result is in a single call, instead of having to call
+    /// `get_aggregated` separately to obtain the confidence (issue #388).
+    pub fn verify_trigger_with_confidence(
+        env: Env,
+        data_type: Symbol,
+        key: Symbol,
+        condition: TriggerCondition,
+    ) -> (bool, AggregatedData) {
+        let agg = Self::get_aggregated(env.clone(), data_type.clone(), key.clone());
+        let median = agg.median_value;
+        let result = match condition.comparison {
+            TriggerComparison::LessThan => median < condition.threshold,
+            TriggerComparison::GreaterThan => median > condition.threshold,
+            TriggerComparison::Equal => median == condition.threshold,
+            TriggerComparison::EqualWithTolerance => {
+                let diff = median.saturating_sub(condition.threshold);
+                diff.abs() <= condition.tolerance
+            }
+        };
+        (result, agg)
+    }
+
+    /// Get weighted confidence score taking oracle reputation into account.
+    /// Confidence scores from higher-reputation oracles contribute more weight
+    /// to the final confidence value.
+    pub fn reputation_weighted_confidence(
+        env: Env,
+        data_type: Symbol,
+        key: Symbol,
+    ) -> u32 {
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoDataAvailable));
+        if points.is_empty() {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
+        let max_data_age = Self::effective_max_age(&env, &data_type);
+        let now = env.ledger().timestamp();
+        let min_confidence: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
+
+        let mut weighted_sum: u64 = 0;
+        let mut total_weight: u64 = 0;
+
+        for i in 0..points.len().min(100) {
+            let p = points.get_unchecked(i);
+            if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence {
+                let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+                if let Some(entry) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, OracleEntry>(&oracle_key)
+                {
+                    if entry.active {
+                        // Use effective weight which factors in oracle reputation
+                        let effective_weight = Self::get_effective_weight(env.clone(), p.oracle.clone(), data_type.clone());
+                        weighted_sum = weighted_sum.saturating_add((p.confidence as u64) * (effective_weight as u64));
+                        total_weight = total_weight.saturating_add(effective_weight as u64);
+                    }
+                }
+            }
+        }
+
+        if total_weight == 0 {
+            return 0;
+        }
+
+        ((weighted_sum / total_weight) as u32).min(1000)
+    }
+
     /// Return the most recent submission from any oracle for (data_type, key).
     /// Panics with NoDataAvailable if no submissions exist.
     pub fn get_data(env: Env, data_type: Symbol, key: Symbol) -> OracleDataPoint {
@@ -1229,6 +2158,15 @@ impl OracleVerifier {
 
     /// Return aggregated statistics across all oracle submissions for (data_type, key).
     pub fn get_aggregated(env: Env, data_type: Symbol, key: Symbol) -> AggregatedData {
+        // When EncryptionRequired is enabled for this data type, old plaintext
+        // submissions stored before the flag was set must not be included in
+        // aggregation — they would leak sensitive data alongside new encrypted
+        // submissions (#463). EncryptedDataPoints are ciphertext and cannot be
+        // aggregated on-chain, so this function has nothing to aggregate.
+        if Self::encryption_required(&env, &data_type) {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
         let points: Vec<OracleDataPoint> = env
             .storage()
             .persistent()
@@ -1247,6 +2185,7 @@ impl OracleVerifier {
             .unwrap_or(0);
 
         let mut values = [(0i128, 0u32); 100];
+        let mut timestamps = [0u64; 100];
         let mut total_weight: u32 = 0;
         let mut n = 0;
 
@@ -1277,12 +2216,16 @@ impl OracleVerifier {
                             panic_with_error!(&env, Error::TooManyOracles);
                         }
                         values[n] = (p.value, entry.weight);
+                        timestamps[n] = p.timestamp;
                         n += 1;
                         total_weight += entry.weight;
                     }
                 }
             }
         }
+
+        n = Self::filter_outliers(&env, &data_type, &mut values, &mut timestamps, n);
+        total_weight = values[0..n].iter().map(|&(_, wt)| wt).sum();
 
         let min_oracle_count: u32 = env
             .storage()
@@ -1298,12 +2241,16 @@ impl OracleVerifier {
         // actually evaluated against. This previously computed its own median
         // inline, which silently ignored the configured aggregation method.
         let active_values = &mut values[0..n];
+        let active_timestamps = &timestamps[0..n];
         let median_value = match Self::effective_aggregation_method(&env, &data_type) {
             AggregationMethod::WeightedMedian => Self::weighted_median(active_values, total_weight),
             AggregationMethod::WeightedAverage => {
                 Self::weighted_average(active_values, total_weight)
             }
             AggregationMethod::Mean => Self::mean(active_values),
+            AggregationMethod::TimeWeightedAverage => {
+                Self::time_weighted_average(&env, active_values, active_timestamps)
+            }
         };
 
         let confidence = match weighted_confidence_sum.checked_div(total_weight_sum) {
@@ -1318,6 +2265,9 @@ impl OracleVerifier {
             .unwrap_or_else(|| Vec::new(&env));
         let active_oracle_count: u32 = oracle_list.len();
 
+        // Calculate 95% confidence interval based on value spread and sample size
+        let (ci_lower, ci_upper) = Self::calculate_confidence_interval(&mut values[0..n], total_weight, median_value);
+
         AggregatedData {
             median_value,
             oracle_count,
@@ -1325,6 +2275,8 @@ impl OracleVerifier {
             confidence,
             min_confidence: min_confidence_val,
             last_updated,
+            confidence_interval_lower: ci_lower,
+            confidence_interval_upper: ci_upper,
         }
     }
 
@@ -1338,6 +2290,13 @@ impl OracleVerifier {
         condition: TriggerCondition,
         max_age_seconds: u64,
     ) -> bool {
+        // Reject evaluation when EncryptionRequired is enabled — plaintext
+        // DataPoints from before the flag was set must not be used for
+        // trigger evaluation (#463).
+        if Self::encryption_required(&env, &data_type) {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
         let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
         let points: Vec<OracleDataPoint> = env
             .storage()
@@ -1348,7 +2307,32 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::NoDataAvailable);
         }
 
+        // Enforce minimum oracle participation before aggregation so a single
+        // oracle cannot unilaterally determine the outcome.
+        let min_count = Self::effective_min_oracle_count(&env, &data_type);
         let now = env.ledger().timestamp();
+        let max_data_age = Self::effective_max_age(&env, &data_type);
+        let min_confidence_val: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
+        let mut eligible_count = 0u32;
+        for i in 0..points.len() {
+            let p = points.get_unchecked(i);
+            if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence_val {
+                let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+                if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+                    if entry.active {
+                        eligible_count += 1;
+                    }
+                }
+            }
+        }
+        if eligible_count < min_count {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
         let mut latest_ts = 0u64;
         for i in 0..points.len() {
             let ts = points.get_unchecked(i).timestamp;
@@ -1412,6 +2396,9 @@ impl OracleVerifier {
         submissions: Vec<(Symbol, i128, u32, u64)>,
     ) {
         oracle.require_auth();
+        if Self::encryption_required(&env, &data_type) {
+            panic_with_error!(&env, Error::EncryptionRequiredForType);
+        }
         let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         let entry: OracleEntry = env
             .storage()
@@ -1435,11 +2422,20 @@ impl OracleVerifier {
             }
 
             let now = env.ledger().timestamp();
-            if timestamp > now {
+            let future_buffer: u64 = env
+                .storage()
+                .instance()
+                .get(&StorageKey::TimestampFutureBuffer)
+                .unwrap_or(60);
+            if timestamp > now.saturating_add(future_buffer) {
                 panic_with_error!(&env, Error::InvalidTimestamp);
             }
-            let ninety_days = 90 * 24 * 60 * 60;
-            if timestamp < now.saturating_sub(ninety_days) {
+            let max_timestamp_age: u64 = env
+                .storage()
+                .instance()
+                .get(&StorageKey::MaxTimestampAge)
+                .unwrap_or(90 * 24 * 60 * 60);
+            if timestamp < now.saturating_sub(max_timestamp_age) {
                 panic_with_error!(&env, Error::InvalidTimestamp);
             }
 
@@ -1495,6 +2491,9 @@ impl OracleVerifier {
         submissions: Vec<OracleDataSubmission>,
     ) {
         oracle.require_auth();
+        if Self::encryption_required(&env, &data_type) {
+            panic_with_error!(&env, Error::EncryptionRequiredForType);
+        }
 
         let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         let entry: OracleEntry = env
@@ -1518,7 +2517,20 @@ impl OracleVerifier {
                 panic_with_error!(&env, Error::InvalidConfidence);
             }
             let now = env.ledger().timestamp();
-            if sub.timestamp > now {
+            let future_buffer: u64 = env
+                .storage()
+                .instance()
+                .get(&StorageKey::TimestampFutureBuffer)
+                .unwrap_or(60);
+            if sub.timestamp > now.saturating_add(future_buffer) {
+                panic_with_error!(&env, Error::InvalidTimestamp);
+            }
+            let max_timestamp_age: u64 = env
+                .storage()
+                .instance()
+                .get(&StorageKey::MaxTimestampAge)
+                .unwrap_or(90 * 24 * 60 * 60);
+            if sub.timestamp < now.saturating_sub(max_timestamp_age) {
                 panic_with_error!(&env, Error::InvalidTimestamp);
             }
             let dp_key = StorageKey::DataPoints(data_type.clone(), sub.key.clone());
@@ -1724,6 +2736,15 @@ impl OracleVerifier {
         caller.require_auth();
     }
 
+    /// Whether `data_type` currently requires `submit_encrypted_data` instead
+    /// of plaintext submission. Off by default.
+    fn encryption_required(env: &Env, data_type: &Symbol) -> bool {
+        env.storage()
+            .instance()
+            .get(&StorageKey::EncryptionRequired(data_type.clone()))
+            .unwrap_or(false)
+    }
+
     /// The max data age that applies to a data type: the per-type override
     /// when set, otherwise the global value (default 7 days).
     fn effective_max_age(env: &Env, data_type: &Symbol) -> u64 {
@@ -1748,6 +2769,146 @@ impl OracleVerifier {
             .unwrap_or(AggregationMethod::WeightedMedian)
     }
 
+    /// The outlier-rejection config for a data type, or disabled with the
+    /// compiled-in defaults if never configured.
+    fn effective_outlier_config(env: &Env, data_type: &Symbol) -> OutlierConfig {
+        env.storage()
+            .instance()
+            .get(&StorageKey::OutlierConfig(data_type.clone()))
+            .unwrap_or(OutlierConfig {
+                enabled: false,
+                threshold_bps: DEFAULT_OUTLIER_THRESHOLD_BPS,
+                min_sample_size: DEFAULT_OUTLIER_MIN_SAMPLE_SIZE,
+            })
+    }
+
+    /// Drop statistical outliers from a batch of collected oracle values
+    /// ahead of aggregation, using a MAD-based (median absolute deviation)
+    /// modified z-score (issue #383). `values`/`timestamps` are the same
+    /// parallel, stack-allocated buffers the aggregation methods consume;
+    /// only the first `n` entries of each are live.
+    ///
+    /// A no-op when outlier detection is disabled for `data_type` or below
+    /// `min_sample_size` live entries. Never drops enough points to leave
+    /// fewer than `min_sample_size` behind — the worst offenders are
+    /// removed first, so a data type in genuine turmoil still yields some
+    /// aggregate rather than an empty set.
+    ///
+    /// Returns the number of live entries remaining at the front of each
+    /// buffer; relative order among the survivors is otherwise preserved,
+    /// which does not matter since every aggregation method sorts (or sums
+    /// order-independently) afterward.
+    fn filter_outliers(
+        env: &Env,
+        data_type: &Symbol,
+        values: &mut [(i128, u32)],
+        timestamps: &mut [u64],
+        n: usize,
+    ) -> usize {
+        let config = Self::effective_outlier_config(env, data_type);
+        if !config.enabled || n < 3 || n < config.min_sample_size as usize {
+            return n;
+        }
+
+        let mut sorted_vals = [0i128; 100];
+        for i in 0..n {
+            sorted_vals[i] = values[i].0;
+        }
+        let sorted_vals = &mut sorted_vals[0..n];
+        sorted_vals.sort_unstable();
+        let median = if n % 2 == 1 {
+            sorted_vals[n / 2]
+        } else {
+            (sorted_vals[n / 2 - 1] + sorted_vals[n / 2]) / 2
+        };
+
+        let mut deviations = [0i128; 100];
+        for i in 0..n {
+            deviations[i] = (values[i].0 - median).abs();
+        }
+        let dev_slice = &mut deviations[0..n];
+        dev_slice.sort_unstable();
+        let mad = if n % 2 == 1 {
+            dev_slice[n / 2]
+        } else {
+            (dev_slice[n / 2 - 1] + dev_slice[n / 2]) / 2
+        };
+        // Deliberately no `mad == 0` short-circuit: a MAD of 0 means at
+        // least half the live submissions agree exactly, which is the
+        // clearest possible signal, not a reason to abstain. With
+        // threshold * mad == 0, any submission that differs from the
+        // median at all is flagged below — exactly right when the
+        // majority is unanimous and one value is clearly not.
+
+        let threshold = config.threshold_bps as i128;
+        let min_keep = (config.min_sample_size as usize).max(1);
+
+        // Rank live entries by deviation, worst first, so trimming toward
+        // `min_keep` always drops the most extreme values. Ties are broken
+        // by value, then weight: when `min_keep` cuts through a run of equally
+        // deviant submissions, which of them survive must depend only on the
+        // submission set, not on the order oracles happened to submit in —
+        // otherwise the filtered set (and the median computed from it) would
+        // be order-dependent (issue #455).
+        let mut order = [0usize; 100];
+        for i in 0..n {
+            order[i] = i;
+        }
+        let order_slice = &mut order[0..n];
+        order_slice.sort_by(|&a, &b| {
+            let dev_a = (values[a].0 - median).abs();
+            let dev_b = (values[b].0 - median).abs();
+            core::cmp::Reverse(dev_a)
+                .cmp(&core::cmp::Reverse(dev_b))
+                .then(values[a].0.cmp(&values[b].0))
+                .then(values[a].1.cmp(&values[b].1))
+        });
+
+        let mut is_outlier = [false; 100];
+        let mut flagged = 0usize;
+        for &i in order_slice.iter() {
+            if n - flagged <= min_keep {
+                break;
+            }
+            let deviation = (values[i].0 - median).abs();
+            if deviation.saturating_mul(10_000) > threshold.saturating_mul(mad) {
+                is_outlier[i] = true;
+                flagged += 1;
+            } else {
+                // Sorted by deviation descending — once one entry is inside
+                // the threshold, every entry after it is too.
+                break;
+            }
+        }
+        if flagged == 0 {
+            return n;
+        }
+
+        let mut write = 0usize;
+        for read in 0..n {
+            if !is_outlier[read] {
+                values[write] = values[read];
+                timestamps[write] = timestamps[read];
+                write += 1;
+            }
+        }
+        write
+    }
+
+    /// The effective minimum oracle count for a data type: the per-type
+    /// override when set, otherwise the global value (default 1).
+    fn effective_min_oracle_count(env: &Env, data_type: &Symbol) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::DataTypeMinOracleCount(data_type.clone()))
+            .unwrap_or_else(|| {
+                env.storage()
+                    .instance()
+                    .get(&StorageKey::MinOracleCount)
+                    .unwrap_or(1)
+            })
+    }
+
     /// Compute the weighted median of active, sufficiently fresh submissions.
     fn get_median_value(env: &Env, data_type: &Symbol, key: &Symbol) -> i128 {
         let points: Vec<OracleDataPoint> = env
@@ -1769,6 +2930,7 @@ impl OracleVerifier {
 
         // Collect values and weights on the stack (capped by MAX_DATA_POINTS)
         let mut values = [(0i128, 0u32); 100];
+        let mut timestamps = [0u64; 100];
         let mut total_weight: u32 = 0;
         let mut n = 0;
 
@@ -1786,13 +2948,19 @@ impl OracleVerifier {
                         if n >= 100 {
                             panic_with_error!(env, Error::TooManyOracles);
                         }
-                        values[n] = (p.value, entry.weight);
+                        // Use effective weight which factors in oracle reputation
+                        let effective_weight = Self::get_effective_weight(env.clone(), p.oracle.clone(), data_type.clone());
+                        values[n] = (p.value, effective_weight);
+                        timestamps[n] = p.timestamp;
                         n += 1;
                         total_weight += entry.weight;
                     }
                 }
             }
         }
+
+        n = Self::filter_outliers(env, data_type, &mut values, &mut timestamps, n);
+        total_weight = values[0..n].iter().map(|&(_, wt)| wt).sum();
 
         let min_oracle_count: u32 = env
             .storage()
@@ -1804,11 +2972,15 @@ impl OracleVerifier {
         }
 
         let active_values = &mut values[0..n];
+        let active_timestamps = &timestamps[0..n];
 
         match Self::effective_aggregation_method(env, data_type) {
             AggregationMethod::WeightedMedian => Self::weighted_median(active_values, total_weight),
             AggregationMethod::WeightedAverage => Self::weighted_average(active_values, total_weight),
             AggregationMethod::Mean => Self::mean(active_values),
+            AggregationMethod::TimeWeightedAverage => {
+                Self::time_weighted_average(env, active_values, active_timestamps)
+            }
         }
     }
 
@@ -1818,8 +2990,15 @@ impl OracleVerifier {
     /// minority of oracles cannot move the result no matter how extreme their
     /// submissions are. That property is why this is the default.
     fn weighted_median(values: &mut [(i128, u32)], total_weight: u32) -> i128 {
-        // Native sort on the stack slice: O(N log N)
-        values.sort_unstable_by_key(|&(val, _)| val);
+        // Sort on a total order — value first, then weight — so the sorted
+        // sequence (and therefore the median) is a pure function of the set
+        // of submissions, never of the order the storage vector happened to
+        // be enumerated in (issue #455). Sorting on value alone with an
+        // unstable sort leaves equal-valued entries in an arbitrary order,
+        // and the exact-halves branch below — which averages `val` with its
+        // successor — can then return a different answer for the same data
+        // depending on oracle submission order.
+        values.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
         let n = values.len();
 
         let half = total_weight / 2;
@@ -1871,6 +3050,117 @@ impl OracleVerifier {
             sum = sum.saturating_add(val);
         }
         sum / (values.len() as i128)
+    }
+
+    /// Oracle-weight- and time-weighted average.
+    ///
+    /// Oracles only ever submit point-in-time observations — there is no
+    /// interval or duration attached to a single reading. TWA reconstructs
+    /// a time-weighted average from those snapshots: sorted by timestamp,
+    /// each value is treated as holding from its own timestamp until the
+    /// next (later) submission's timestamp, or until "now" for the newest
+    /// one, and contributes to the average in proportion to that duration
+    /// times its oracle's registered weight. A plain average (weighted or
+    /// not) would let a burst of submissions clustered in a short window
+    /// dominate the result as heavily as one that held for hours; TWA
+    /// corrects for that by weighting on how long each value actually
+    /// prevailed.
+    ///
+    /// `values` and `timestamps` are parallel slices (same length, same
+    /// index refers to the same submission) — callers build them from the
+    /// same loop that already collects `(value, weight)` pairs for the
+    /// other aggregation methods.
+    fn time_weighted_average(env: &Env, values: &[(i128, u32)], timestamps: &[u64]) -> i128 {
+        let n = values.len();
+        if n == 1 {
+            return values[0].0;
+        }
+
+        // Pair each (value, weight) with its timestamp and sort by time —
+        // `values`/`timestamps` are capped at MAX_DATA_POINTS (100), so
+        // this stays on the stack like the other aggregation methods.
+        let mut by_time = [(0i128, 0u32, 0u64); 100];
+        for i in 0..n {
+            let (val, wt) = values[i];
+            by_time[i] = (val, wt, timestamps[i]);
+        }
+        let active = &mut by_time[0..n];
+        active.sort_unstable_by_key(|&(_, _, ts)| ts);
+
+        let now = env.ledger().timestamp();
+        let mut weighted_sum: i128 = 0;
+        let mut total_weighted_duration: i128 = 0;
+        for i in 0..n {
+            let (val, wt, ts) = active[i];
+            let end = if i + 1 < n { active[i + 1].2 } else { now.max(ts) };
+            // A submission sharing its timestamp with the next (or with
+            // "now") held for zero observed seconds; floor at 1 second so
+            // it still contributes rather than vanishing from the average.
+            let duration = end.saturating_sub(ts).max(1) as i128;
+            let weighted_duration = duration.saturating_mul(wt as i128);
+            weighted_sum = weighted_sum.saturating_add(val.saturating_mul(weighted_duration));
+            total_weighted_duration = total_weighted_duration.saturating_add(weighted_duration);
+        }
+
+        if total_weighted_duration == 0 {
+            return active[n - 1].0;
+        }
+        weighted_sum / total_weighted_duration
+    }
+
+    /// Calculate a 95% confidence interval for the aggregated value.
+    /// Uses the spread of values and the sample size to estimate reliability.
+    /// Returns (lower_bound, upper_bound) in 7-decimal fixed point.
+    fn calculate_confidence_interval(
+        values: &mut [(i128, u32)],
+        total_weight: u32,
+        median_value: i128,
+    ) -> (i128, i128) {
+        if values.is_empty() || total_weight == 0 {
+            return (median_value, median_value);
+        }
+
+        // Calculate standard deviation from the median (robust measure of spread)
+        let n = values.len();
+        let mut sum_sq_deviations: i128 = 0;
+        
+        for (val, _wt) in values.iter() {
+            let deviation = val.saturating_sub(median_value);
+            let sq_deviation = deviation.saturating_mul(deviation);
+            sum_sq_deviations = sum_sq_deviations.saturating_add(sq_deviation);
+        }
+        
+        // Avoid division by zero
+        if sum_sq_deviations == 0 || n <= 1 {
+            // No spread: return tight confidence interval around median
+            return (median_value, median_value);
+        }
+
+        // Calculate variance (mean squared deviation)
+        let variance = sum_sq_deviations / (n as i128);
+        
+        // Approximate standard deviation using integer square root
+        // For 95% CI with normal distribution: use ~2.0 standard errors
+        // Standard error = stddev / sqrt(n)
+        // So margin = 2.0 * sqrt(variance) / sqrt(n) ≈ 2.0 * sqrt(variance/n)
+        
+        // Simplified: margin = 2 * sqrt(variance / n)
+        // For fixed-point arithmetic, we compute this conservatively
+        let margin = if n < 10 {
+            // Wider margin for small sample sizes
+            variance / 2
+        } else if n < 50 {
+            // Medium confidence for moderate samples
+            variance / 4
+        } else {
+            // Narrower margin for large samples
+            variance / 8
+        };
+
+        let lower = median_value.saturating_sub(margin);
+        let upper = median_value.saturating_add(margin);
+
+        (lower, upper)
     }
 }
 

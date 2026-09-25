@@ -623,6 +623,116 @@ fn test_aggregation_method_changes_trigger_outcome() {
     );
 }
 
+// ── Time-weighted average aggregation ────────────────────────────────────────
+
+#[test]
+fn test_time_weighted_average_weights_longer_held_values_more() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+
+    let o1 = Address::generate(&env);
+    let o2 = Address::generate(&env);
+    client.add_oracle(&admin, &o1, &wt(), &100u32);
+    client.add_oracle(&admin, &o2, &wt(), &100u32);
+
+    // o1's reading holds for 800s before o2 supersedes it; o2's reading
+    // then holds for only 200s before "now".
+    let t0 = env.ledger().timestamp();
+    client.submit_data(&o1, &wt(), &kk(), &10_000_000, &90u32, &t0);
+
+    env.ledger().set_timestamp(t0 + 800);
+    client.submit_data(&o2, &wt(), &kk(), &110_000_000, &90u32, &(t0 + 800));
+
+    env.ledger().set_timestamp(t0 + 1000);
+
+    client.set_aggregation_method(&admin, &wt(), &AggregationMethod::TimeWeightedAverage);
+    let twa = client.get_aggregated(&wt(), &kk()).median_value;
+
+    // (10 * 800 + 110 * 200) / 1000 = 30
+    assert_eq!(twa, 30_000_000);
+
+    // A plain mean treats both snapshots as equally significant regardless
+    // of how long each one held, so it lands far higher.
+    client.set_aggregation_method(&admin, &wt(), &AggregationMethod::Mean);
+    let mean = client.get_aggregated(&wt(), &kk()).median_value;
+    assert_eq!(mean, 60_000_000, "plain mean ignores how long each value held");
+}
+
+#[test]
+fn test_time_weighted_average_respects_oracle_weight() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+
+    let o1 = Address::generate(&env);
+    let o2 = Address::generate(&env);
+    client.add_oracle(&admin, &o1, &wt(), &75u32);
+    client.add_oracle(&admin, &o2, &wt(), &25u32);
+
+    let t0 = env.ledger().timestamp();
+    client.submit_data(&o1, &wt(), &kk(), &10_000_000, &90u32, &t0);
+
+    env.ledger().set_timestamp(t0 + 100);
+    client.submit_data(&o2, &wt(), &kk(), &110_000_000, &90u32, &(t0 + 100));
+
+    env.ledger().set_timestamp(t0 + 200);
+
+    client.set_aggregation_method(&admin, &wt(), &AggregationMethod::TimeWeightedAverage);
+    let twa = client.get_aggregated(&wt(), &kk()).median_value;
+
+    // Both readings hold for 100s, but o1 carries 3x the weight:
+    // (10*100*75 + 110*100*25) / (100*75 + 100*25) = 35
+    assert_eq!(twa, 35_000_000);
+}
+
+#[test]
+fn test_time_weighted_average_single_submission_returns_value() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+
+    let o1 = Address::generate(&env);
+    client.add_oracle(&admin, &o1, &wt(), &100u32);
+
+    let t0 = env.ledger().timestamp();
+    client.submit_data(&o1, &wt(), &kk(), &42_000_000, &90u32, &t0);
+
+    client.set_aggregation_method(&admin, &wt(), &AggregationMethod::TimeWeightedAverage);
+    assert_eq!(client.get_aggregated(&wt(), &kk()).median_value, 42_000_000);
+}
+
+#[test]
+fn test_time_weighted_average_used_by_verify_trigger() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+
+    let o1 = Address::generate(&env);
+    let o2 = Address::generate(&env);
+    client.add_oracle(&admin, &o1, &wt(), &100u32);
+    client.add_oracle(&admin, &o2, &wt(), &100u32);
+
+    let t0 = env.ledger().timestamp();
+    client.submit_data(&o1, &wt(), &kk(), &10_000_000, &90u32, &t0);
+
+    env.ledger().set_timestamp(t0 + 800);
+    client.submit_data(&o2, &wt(), &kk(), &110_000_000, &90u32, &(t0 + 800));
+
+    env.ledger().set_timestamp(t0 + 1000);
+
+    client.set_aggregation_method(&admin, &wt(), &AggregationMethod::TimeWeightedAverage);
+
+    // Same scenario as test_time_weighted_average_weights_longer_held_values_more:
+    // TWA = 30, which is < 50. verify_trigger has its own aggregation code
+    // path (`get_median_value`), separate from `get_aggregated` — exercise
+    // it here so both stay in sync.
+    let condition = TriggerCondition {
+        data_type: wt(),
+        key: kk(),
+        threshold: 50_000_000,
+        comparison: TriggerComparison::LessThan,
+        tolerance: 0,
+    };
+    assert!(client.verify_trigger(&wt(), &kk(), &condition));
+}
+
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn test_set_aggregation_method_requires_admin() {
@@ -641,4 +751,117 @@ fn test_set_data_type_max_age_requires_admin() {
 
     let impostor = Address::generate(&env);
     client.set_data_type_max_age(&impostor, &wt(), &600u64);
+}
+
+// ── outlier detection (issue #383) ──────────────────────────────────────────
+
+#[test]
+fn outlier_config_disabled_by_default() {
+    let (env, _admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let cfg = c.get_outlier_config(&wt());
+    assert!(!cfg.enabled);
+    assert_eq!(cfg.threshold_bps, DEFAULT_OUTLIER_THRESHOLD_BPS);
+    assert_eq!(cfg.min_sample_size, DEFAULT_OUTLIER_MIN_SAMPLE_SIZE);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #27)")]
+fn set_outlier_config_rejects_zero_threshold() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    c.set_outlier_config(&admin, &wt(), &true, &0u32, &4u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #27)")]
+fn set_outlier_config_rejects_tiny_sample_size() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    c.set_outlier_config(&admin, &wt(), &true, &50_000u32, &2u32);
+}
+
+/// Five oracles, four in tight agreement and one reporting a value 1000x
+/// larger. With outlier detection off, `Mean` (which has no built-in
+/// resistance to outliers the way `WeightedMedian` does) is dragged far
+/// above what every well-behaved oracle actually reported.
+#[test]
+fn mean_without_outlier_filtering_is_skewed_by_one_bad_oracle() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    c.set_aggregation_method(&admin, &wt(), &AggregationMethod::Mean);
+
+    let oracles: std::vec::Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
+    for o in oracles.iter() {
+        c.add_oracle(&admin, o, &wt(), &50u32);
+    }
+
+    env.ledger().set_timestamp(1);
+    let good = 100_0000000i128;
+    let bad = 100_000_0000000i128; // 1000x the honest value
+    for o in oracles.iter().take(4) {
+        c.submit_data(o, &wt(), &kk(), &good, &90u32, &1u64);
+    }
+    c.submit_data(&oracles[4], &wt(), &kk(), &bad, &90u32, &1u64);
+
+    let agg = c.get_aggregated(&wt(), &kk());
+    // (4*100 + 100_000) / 5 = 20_080 — nowhere near the honest value of 100.
+    assert!(agg.median_value > good * 100);
+}
+
+/// Same five submissions as above, but with outlier detection enabled for
+/// the data type. The lone extreme submission is dropped before
+/// aggregation, so `Mean` reflects only the four honest oracles.
+#[test]
+fn outlier_filtering_protects_mean_from_one_bad_oracle() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    c.set_aggregation_method(&admin, &wt(), &AggregationMethod::Mean);
+    c.set_outlier_config(&admin, &wt(), &true, &DEFAULT_OUTLIER_THRESHOLD_BPS, &DEFAULT_OUTLIER_MIN_SAMPLE_SIZE);
+
+    let oracles: std::vec::Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
+    for o in oracles.iter() {
+        c.add_oracle(&admin, o, &wt(), &50u32);
+    }
+
+    env.ledger().set_timestamp(1);
+    let good = 100_0000000i128;
+    let bad = 100_000_0000000i128;
+    for o in oracles.iter().take(4) {
+        c.submit_data(o, &wt(), &kk(), &good, &90u32, &1u64);
+    }
+    c.submit_data(&oracles[4], &wt(), &kk(), &bad, &90u32, &1u64);
+
+    let agg = c.get_aggregated(&wt(), &kk());
+    assert_eq!(agg.median_value, good);
+}
+
+/// Outlier detection never removes enough entries to drop below
+/// `min_sample_size` — with exactly four submissions and a `min_sample_size`
+/// of 4, the arrangement has no slack to trim, so even a wild outlier
+/// survives into the aggregate untouched.
+#[test]
+fn outlier_filtering_never_drops_below_min_sample_size() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    c.set_aggregation_method(&admin, &wt(), &AggregationMethod::Mean);
+    c.set_outlier_config(&admin, &wt(), &true, &DEFAULT_OUTLIER_THRESHOLD_BPS, &4u32);
+
+    let oracles: std::vec::Vec<Address> = (0..4).map(|_| Address::generate(&env)).collect();
+    for o in oracles.iter() {
+        c.add_oracle(&admin, o, &wt(), &50u32);
+    }
+
+    env.ledger().set_timestamp(1);
+    let good = 100_0000000i128;
+    let bad = 100_000_0000000i128;
+    for o in oracles.iter().take(3) {
+        c.submit_data(o, &wt(), &kk(), &good, &90u32, &1u64);
+    }
+    c.submit_data(&oracles[3], &wt(), &kk(), &bad, &90u32, &1u64);
+
+    let agg = c.get_aggregated(&wt(), &kk());
+    // All 4 submissions survive (below the slack needed to trim), so the
+    // outlier still drags the mean up.
+    assert!(agg.median_value > good * 100);
 }

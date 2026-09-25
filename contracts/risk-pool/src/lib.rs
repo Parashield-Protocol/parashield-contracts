@@ -11,9 +11,11 @@
 //! - Target APY: 8-40% depending on risk category
 //!
 //! v2 — full implementation; Risk Pool is now deployable and testable.
+// Address/state validation must fail with a typed contract error so callers
+// can match on it programmatically, never with a raw panic! and a string
+// message.
+#![deny(clippy::panic)]
 #![no_std]
-extern crate alloc;
-use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
@@ -22,6 +24,20 @@ use soroban_sdk::{
 
 pub mod types;
 pub use types::*;
+
+/// Cross-contract interface for an external reinsurer this pool cedes
+/// catastrophic risk to. The reinsurer is any contract implementing this
+/// single entry point — how it sources the payout (its own reserves,
+/// retrocession, etc.) is entirely its own concern.
+#[allow(dead_code)]
+#[soroban_sdk::contractclient(name = "ReinsurerClient")]
+trait IReinsurer {
+    /// Pay out up to `amount` of the pool's USDC to `caller` (the ceding
+    /// pool), attributed to `policy_id`. Returns the amount actually paid,
+    /// which may be less than requested if the reinsurer's own capacity is
+    /// exhausted.
+    fn recover(env: Env, caller: Address, policy_id: u128, amount: i128) -> i128;
+}
 
 /// Default premium split, in effect until the admin calls `update_premium_split`.
 const DEFAULT_PREMIUM_LP_BPS:       i128 = 8_000;  // 80% of premium to LP pool
@@ -35,7 +51,26 @@ const _: () = assert!(DEFAULT_PREMIUM_LP_BPS + DEFAULT_PREMIUM_TREAS_BPS + DEFAU
 const MAX_TOTAL_DEPOSITED: i128 = 1_000_000_000_000_000;
 
 /// Minimum deposit amount (1_000_000 stroops).
-const MIN_DEPOSIT: i128 = 1_000_000;
+pub const MIN_DEPOSIT: i128 = 1_000_000;
+
+/// Minimum shares that must be minted on deposit (issue #493).
+/// Enforces that calculated shares cannot be 0 or infinitesimal when depositing into large pools.
+pub const MIN_SHARES: i128 = 1;
+
+/// Default ceiling on `total_locked / total_deposited`, in basis points.
+///
+/// 10_000 (100%) preserves the historical behaviour exactly: before this was
+/// configurable the pool would commit every unit of capital it held. Lowering
+/// it is how an admin expresses "keep a buffer against correlated risk", and
+/// that has to be an explicit choice rather than a silent change to how much
+/// coverage an existing pool can write.
+const DEFAULT_MAX_UTILIZATION_BPS: u32 = 10_000;
+
+/// Longest withdrawal delay an admin may configure (30 days).
+///
+/// An unbounded delay is indistinguishable from freezing LP funds, so the
+/// ceiling is part of what makes the queue safe to hand to an admin at all.
+const MAX_EXIT_DELAY: u64 = 30 * 24 * 60 * 60;
 
 /// Timelock duration for admin withdrawals: 7 days in seconds.
 const TIMELOCK_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -44,25 +79,11 @@ const TIMELOCK_SECONDS: u64 = 7 * 24 * 60 * 60;
 /// Shorter than withdrawal timelock since parameter changes are less risky.
 const PARAMETER_TIMELOCK_SECONDS: u64 = 2 * 24 * 60 * 60;
 
-/// Grace period between an admin transfer being fully proposed/approved and the
-/// proposed admin being able to `accept_admin` (issue #356). Hand-synced across
-/// the 4 contracts that expose admin rotation (policy-engine, risk-pool,
-/// oracle-verifier, claims-processor).
-const ADMIN_TRANSFER_TIMELOCK: u64 = 48 * 60 * 60;
-
-/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
-/// (at ~5s/ledger).
-// Issue #342: kept in sync by hand across all 5 contracts (governance-dao,
-// risk-pool, policy-engine, oracle-verifier, claims-processor) — extracting
-// to a shared crate is a real follow-up, not done here to avoid touching
-// every contract's Cargo.toml in one pass.
-const TTL_THRESHOLD: u32 = 518_400;
-/// Extend persistent entries out to ~1 year (at ~5s/ledger) so capital locks
-/// backing long-dated policies don't expire from storage before maturity.
-const TTL_EXTEND_TO: u32 = 6_312_000;
+// Shared protocol constants — single source of truth in parashield-common (issue #342).
+use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK};
 
 #[contracttype]
-enum StorageKey {
+pub(crate) enum StorageKey {
     Initialized,
     Admin,
     Treasury,
@@ -108,6 +129,30 @@ enum StorageKey {
     LpNft(u64),
     /// Maps provider address to their LP NFT token ID — Address → u64.
     ProviderNft(Address),
+    /// Admin-configured capacity limits (`PoolCapacity`). Falls back to the
+    /// compile-time defaults when unset.
+    Capacity,
+    /// Withdrawal delay in seconds (u64). 0 = instant withdrawals, the
+    /// historical behaviour and the default.
+    ExitDelay,
+    /// A provider's outstanding queued exit — Address → ExitRequest.
+    ExitReq(Address),
+    /// Total shares currently reserved by queued exits (i128), so the pool can
+    /// see committed outflow before it happens.
+    QueuedExitShares,
+    /// Dynamic fee adjustment configuration (DynamicFeeConfig).
+    /// Allows pool fees to automatically adjust based on market conditions and utilization.
+    DynamicFeeConfig,
+    /// Reinsurance arrangement backstopping this pool (`ReinsuranceConfig`).
+    Reinsurance,
+    /// Cumulative premium ceded to the reinsurer so far (i128).
+    ReinsurancePremiumPaid,
+    /// Cumulative claims recovered from the reinsurer so far (i128).
+    ReinsuranceRecovered,
+    /// Fee tier configuration — Symbol (tier name) → FeeTier.
+    FeeTier(Symbol),
+    /// Names of all registered fee tiers (Vec<Symbol>).
+    FeeTierList,
 }
 
 #[contracterror]
@@ -144,6 +189,18 @@ pub enum Error {
     NoPendingParameterChange  = 28,
     ParameterChangeNotReady   = 29,
     AdminTimelockNotExpired   = 30,
+    UtilizationCapExceeded    = 31,
+    InvalidCapacity           = 32,
+    ExitAlreadyQueued         = 33,
+    NoExitRequest             = 34,
+    ExitDelayNotElapsed       = 35,
+    ReinsuranceNotConfigured  = 36,
+    InvalidReinsuranceConfig  = 37,
+    InvalidParameter          = 38,
+    InvalidFeeTier            = 39,
+    /// An admin transfer was proposed while another transfer is still
+    /// pending, which would reset the transfer timelock (issue #457).
+    AdminTransferPending      = 40,
 }
 
 #[contract]
@@ -268,20 +325,31 @@ impl RiskPool {
         let total_shares: i128 = env.storage().instance()
             .get(&StorageKey::TotalShares).unwrap_or(0);
 
-        // Enforce the global pool size cap before accepting new liquidity.
-        if total_deposited + amount > MAX_TOTAL_DEPOSITED {
+        // Enforce the configured pool size cap before accepting new liquidity.
+        let capacity = Self::capacity(&env);
+        if total_deposited + amount > capacity.max_total_deposited {
             panic_with_error!(&env, Error::PoolCapExceeded);
         }
 
+        // Both branches use checked arithmetic: a share calculation that
+        // cannot be represented traps as a typed `Overflow` rather than
+        // silently wrapping or truncating (issue #454).
         let new_shares = if total_deposited == 0 {
-            amount * 1_000_000_000  // 1 share = 1 USDC * 1e9 precision
+            amount.checked_mul(1_000_000_000)  // 1 share = 1 USDC * 1e9 precision
+                .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow))
         } else {
             amount.checked_mul(total_shares)
                 .and_then(|v| v.checked_div(total_deposited))
                 .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow))
         };
 
-        if new_shares == 0 {
+        // Issue #454 / #493: `amount * total_shares / total_deposited` truncates
+        // toward zero, so a deposit that is small relative to the pool can
+        // round to 0 shares. MIN_DEPOSIT alone cannot rule this out (the
+        // share-to-deposit ratio is not fixed), and without this guard the
+        // depositor's tokens would be taken while nothing is minted in
+        // return — an irreversible loss. Enforce minimum share amount and reject.
+        if new_shares < MIN_SHARES {
             panic_with_error!(&env, Error::ZeroAmount);
         }
 
@@ -297,7 +365,7 @@ impl RiskPool {
         let lp_key = StorageKey::LpPosition(provider.clone());
         let mut pending_yield: i128 = 0;
         let mut is_new_lp = false;
-        let mut position: LpPosition = match env.storage().persistent().get::<_, LpPosition>(&lp_key) {
+        let position: LpPosition = match env.storage().persistent().get::<_, LpPosition>(&lp_key) {
             Some(mut pos) => {
                 pending_yield = Self::settle_yield(&env, &mut pos);
                 pos.deposited += amount;
@@ -324,6 +392,8 @@ impl RiskPool {
                     deposited_at:     now,
                     last_yield_claim: now,
                     compound_enabled,
+                    insurance_enabled: false,
+                    insurance_paid:    0,
                 }
             }
         };
@@ -367,6 +437,15 @@ impl RiskPool {
     /// is insufficient to cover the redemption.
     pub fn withdraw(env: Env, provider: Address, shares: i128) -> i128 {
         provider.require_auth();
+        Self::withdraw_inner(env, provider, shares)
+    }
+
+    /// Settlement body shared by `withdraw` and `claim_exit`.
+    ///
+    /// Takes no authorization of its own: the caller has already established
+    /// it. Calling `withdraw` from `claim_exit` instead would re-authorize a
+    /// frame that is already authorized, which the host rejects outright.
+    fn withdraw_inner(env: Env, provider: Address, shares: i128) -> i128 {
         // Guard: check for zero or negative shares input
         if shares <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         Self::assert_withdrawable(&env);
@@ -383,6 +462,14 @@ impl RiskPool {
 
         // Guard: prevent division by zero if total_shares == 0
         if total_shares == 0 { panic_with_error!(&env, Error::NoShares); }
+
+        // SECURITY FIX: Ensure available liquidity accounts for pending claims.
+        // The LP's proportional share of locked capital must be reserved.
+        let lp_share_of_locked = if total_shares > 0 {
+            (position.shares * total_locked) / total_shares
+        } else {
+            0
+        };
 
         let available_liquidity = total_deposited.saturating_sub(total_locked);
         if available_liquidity <= 0 { panic_with_error!(&env, Error::Undercollateralized); }
@@ -423,7 +510,194 @@ impl RiskPool {
         amount
     }
 
+    /// Emergency LP withdrawal with explicit admin approval.
+    /// Bypasses pool pause/winding-down status, but still only releases unlocked liquidity.
+    pub fn emergency_withdraw(env: Env, provider: Address, admin: Address, shares: i128) -> i128 {
+        provider.require_auth();
+        Self::require_admin(&env, &admin);
+        if shares <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+
+        let lp_key = StorageKey::LpPosition(provider.clone());
+        let mut position: LpPosition = env
+            .storage()
+            .persistent()
+            .get(&lp_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
+        if position.shares < shares {
+            panic_with_error!(&env, Error::InsufficientFunds);
+        }
+
+        let total_deposited: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TotalDeposited)
+            .unwrap_or(0);
+        let total_shares: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TotalShares)
+            .unwrap_or(0);
+        let total_locked: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TotalLocked)
+            .unwrap_or(0);
+        let available_liquidity = total_deposited.saturating_sub(total_locked);
+        if available_liquidity <= 0 {
+            panic_with_error!(&env, Error::Undercollateralized);
+        }
+
+        let amount = shares
+            .checked_mul(total_deposited)
+            .and_then(|v| v.checked_div(total_shares))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+        if amount == 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+        if amount > available_liquidity {
+            panic_with_error!(&env, Error::Undercollateralized);
+        }
+
+        let pending_yield = Self::settle_yield(&env, &mut position);
+        position.deposited = position.deposited.saturating_sub(amount);
+        position.shares -= shares;
+        position.yield_debt = (env
+            .storage()
+            .instance()
+            .get(&StorageKey::AccumulatedPerShare)
+            .unwrap_or(0)
+            * position.shares)
+            / 1_000_000_000_000;
+        env.storage().persistent().set(&lp_key, &position);
+        Self::extend_to_max(&env, &lp_key);
+        env.storage().instance().set(
+            &StorageKey::TotalDeposited,
+            &total_deposited
+                .checked_sub(amount)
+                .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow)),
+        );
+        env.storage()
+            .instance()
+            .set(&StorageKey::TotalShares, &(total_shares - shares));
+
+        Self::update_lp_nft(&env, &provider, &position);
+
+        let usdc: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::UsdcToken)
+            .unwrap();
+        let total_payout = amount + pending_yield;
+        token::Client::new(&env, &usdc).transfer(
+            &env.current_contract_address(),
+            &provider,
+            &total_payout,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "emergency_withdraw"), provider.clone()),
+            (admin, amount, shares),
+        );
+
+        amount
+    }
+
+    /// Transfer `shares` from `from` address to `to` address.
+    /// Returns the proportional USDC deposit amount transferred.
+    pub fn transfer_position(env: Env, from: Address, to: Address, shares: i128) -> i128 {
+        from.require_auth();
+        if shares <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
+        if from == to { panic_with_error!(&env, Error::InvalidAddress); }
+        Self::assert_active(&env);
+
+        let from_key = StorageKey::LpPosition(from.clone());
+        let mut from_pos: LpPosition = env.storage().persistent()
+            .get(&from_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
+
+        if from_pos.shares < shares {
+            panic_with_error!(&env, Error::InsufficientShares);
+        }
+
+        let amount = shares.checked_mul(from_pos.deposited)
+            .and_then(|v| v.checked_div(from_pos.shares))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+
+        let pending_yield_from = Self::settle_yield(&env, &mut from_pos);
+        from_pos.deposited = from_pos.deposited.saturating_sub(amount);
+        from_pos.shares -= shares;
+        let acc_per_share: i128 = env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0);
+        from_pos.yield_debt = (acc_per_share * from_pos.shares) / 1_000_000_000_000;
+        env.storage().persistent().set(&from_key, &from_pos);
+        Self::extend_to_max(&env, &from_key);
+
+        Self::update_lp_nft(&env, &from, &from_pos);
+        Self::pay_out_yield(&env, &from, pending_yield_from);
+
+        let now = env.ledger().timestamp();
+        let to_key = StorageKey::LpPosition(to.clone());
+        let mut is_new_lp = false;
+        let to_pos: LpPosition = match env.storage().persistent().get::<_, LpPosition>(&to_key) {
+            Some(mut pos) => {
+                let pending_yield_to = Self::settle_yield(&env, &mut pos);
+                pos.deposited += amount;
+                pos.shares += shares;
+                pos.yield_debt = (acc_per_share * pos.shares) / 1_000_000_000_000;
+                env.storage().persistent().set(&to_key, &pos);
+                Self::extend_to_max(&env, &to_key);
+                Self::pay_out_yield(&env, &to, pending_yield_to);
+                pos
+            }
+            None => {
+                is_new_lp = true;
+                let count: u32 = env.storage().instance()
+                    .get(&StorageKey::LpCount).unwrap_or(0);
+                let lp_address_key = StorageKey::LpAddress(count);
+                env.storage().persistent().set(&lp_address_key, &to);
+                Self::extend_to_max(&env, &lp_address_key);
+                env.storage().instance().set(&StorageKey::LpCount, &(count + 1));
+                let pos = LpPosition {
+                    provider: to.clone(),
+                    deposited: amount,
+                    shares,
+                    yield_claimed: 0,
+                    yield_debt: (acc_per_share * shares) / 1_000_000_000_000,
+                    deposited_at: now,
+                    last_yield_claim: now,
+                    compound_enabled: false,
+                    insurance_enabled: false,
+                    insurance_paid: 0,
+                };
+                env.storage().persistent().set(&to_key, &pos);
+                Self::extend_to_max(&env, &to_key);
+                pos
+            }
+        };
+
+        let category: Symbol = env.storage().instance().get(&StorageKey::Category).unwrap();
+        if is_new_lp {
+            Self::mint_lp_nft(&env, &to, &category, now, &to_pos);
+        } else {
+            Self::update_lp_nft(&env, &to, &to_pos);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "lp_position_transferred"),),
+            LpPositionTransferred {
+                from,
+                to,
+                shares,
+                amount,
+            },
+        );
+
+        amount
+    }
+
     // ── Premium and yield ─────────────────────────────────────────────────────
+
 
     /// Pull `amount` USDC from `caller` and split it among LPs, treasury, and backstop
     /// according to the protocol fee schedule. No-op if `amount` is zero or negative.
@@ -535,6 +809,311 @@ impl RiskPool {
         claimed
     }
 
+    // ── Capacity limits (issue #373) ──────────────────────────────────────────
+
+    /// Set the pool's capacity limits.
+    ///
+    /// Two ceilings, because two different things can go wrong:
+    ///
+    /// - `max_total_deposited` bounds the capital held, so share value cannot
+    ///   become infinitesimal and `total_shares` cannot overflow.
+    /// - `max_utilization_bps` bounds how much of that capital may be
+    ///   committed to active coverage at once. This is the correlated-risk
+    ///   limit: a pool fully committed to one category in one region is a
+    ///   single event away from insolvency however much capital it holds, and
+    ///   nothing in the deposit ceiling prevents that.
+    ///
+    /// Lowering a limit below current usage is allowed and does not claw
+    /// anything back — existing deposits and locks stand, and the pool simply
+    /// accepts nothing further until it is back under the line. Refusing the
+    /// change would leave an admin unable to stop an overexposed pool from
+    /// growing, which is the opposite of what this exists for.
+    pub fn set_capacity(
+        env: Env,
+        admin: Address,
+        max_total_deposited: i128,
+        max_utilization_bps: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        if max_total_deposited <= 0 || max_utilization_bps == 0 || max_utilization_bps > 10_000 {
+            panic_with_error!(&env, Error::InvalidCapacity);
+        }
+
+        env.storage().instance().set(
+            &StorageKey::Capacity,
+            &PoolCapacity {
+                max_total_deposited,
+                max_utilization_bps,
+            },
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "capacity_updated"),),
+            PoolCapacityUpdated {
+                max_total_deposited,
+                max_utilization_bps,
+            },
+        );
+    }
+
+    /// The configured capacity limits, or the built-in defaults.
+    pub fn get_capacity(env: Env) -> PoolCapacity {
+        Self::capacity(&env)
+    }
+
+    /// How much of the pool's capacity is currently consumed, and how much
+    /// room is left on each limit.
+    ///
+    /// Exposed so a front-end can tell an LP "this pool is full" and a policy
+    /// engine can tell a buyer "this coverage cannot be written right now"
+    /// before either submits a transaction that would revert.
+    pub fn get_capacity_status(env: Env) -> CapacityStatus {
+        let total_deposited: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TotalDeposited)
+            .unwrap_or(0);
+        let total_locked: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TotalLocked)
+            .unwrap_or(0);
+        let cap = Self::capacity(&env);
+
+        let utilization_bps = Self::utilization_bps(total_locked, total_deposited);
+
+        // What may still be underwritten before the utilization cap binds.
+        let max_lockable = total_deposited
+            .saturating_mul(cap.max_utilization_bps as i128)
+            / 10_000;
+
+        CapacityStatus {
+            total_deposited,
+            total_locked,
+            max_total_deposited: cap.max_total_deposited,
+            utilization_bps,
+            max_utilization_bps: cap.max_utilization_bps,
+            remaining_deposit_capacity: cap
+                .max_total_deposited
+                .saturating_sub(total_deposited)
+                .max(0),
+            remaining_coverage_capacity: max_lockable.saturating_sub(total_locked).max(0),
+        }
+    }
+
+    // ── Exit queue (issue #377) ───────────────────────────────────────────────
+
+    /// Set the withdrawal delay in seconds. 0 restores instant withdrawals.
+    ///
+    /// The delay exists because instant exit is a bank run waiting to happen:
+    /// when a pool looks stressed, the LPs who move first are made whole out
+    /// of the liquidity the remaining LPs were relying on. A queue makes every
+    /// LP wait the same interval, which removes the advantage of panicking and
+    /// gives the pool a window to see committed outflow coming.
+    ///
+    /// Capped at `MAX_EXIT_DELAY` (30 days). An unbounded delay would be
+    /// indistinguishable from freezing LP funds.
+    pub fn set_exit_delay(env: Env, admin: Address, delay_seconds: u64) {
+        Self::require_admin(&env, &admin);
+
+        if delay_seconds > MAX_EXIT_DELAY {
+            panic_with_error!(&env, Error::InvalidCapacity);
+        }
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::ExitDelay, &delay_seconds);
+
+        env.events().publish(
+            (Symbol::new(&env, "exit_delay_updated"),),
+            ExitDelayUpdated { delay_seconds },
+        );
+    }
+
+    /// The configured withdrawal delay in seconds (default 0 — instant).
+    pub fn get_exit_delay(env: Env) -> u64 {
+        Self::exit_delay(&env)
+    }
+
+    /// Queue a withdrawal of `shares`, claimable once the delay has elapsed.
+    ///
+    /// The shares stay in the LP's position and keep earning yield until the
+    /// exit is claimed — queuing is a commitment to leave, not a forfeiture.
+    /// What it does prevent is queuing twice: one outstanding request per
+    /// provider, so the reserved total cannot be inflated past what the LP
+    /// actually holds.
+    ///
+    /// Panics with `ExitAlreadyQueued` if a request is already outstanding;
+    /// cancel it first to change the amount.
+    pub fn request_exit(env: Env, provider: Address, shares: i128) {
+        provider.require_auth();
+        if shares <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+        Self::assert_withdrawable(&env);
+
+        let position: LpPosition = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::LpPosition(provider.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
+        if position.shares < shares {
+            panic_with_error!(&env, Error::InsufficientFunds);
+        }
+
+        let req_key = StorageKey::ExitReq(provider.clone());
+        if env.storage().persistent().has(&req_key) {
+            panic_with_error!(&env, Error::ExitAlreadyQueued);
+        }
+
+        let now = env.ledger().timestamp();
+        let claimable_at = now.saturating_add(Self::exit_delay(&env));
+
+        env.storage().persistent().set(
+            &req_key,
+            &ExitRequest {
+                provider: provider.clone(),
+                shares,
+                requested_at: now,
+                claimable_at,
+            },
+        );
+        Self::extend_to_max(&env, &req_key);
+
+        let queued: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::QueuedExitShares)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&StorageKey::QueuedExitShares, &queued.saturating_add(shares));
+
+        env.events().publish(
+            (Symbol::new(&env, "exit_requested"),),
+            ExitRequested {
+                provider,
+                shares,
+                claimable_at,
+            },
+        );
+    }
+
+    /// Withdraw a queued request whose delay has elapsed.
+    ///
+    /// Settlement runs through the same path as a direct `withdraw`, so the
+    /// amount is priced at the share value *at claim time* rather than at
+    /// request time. An LP cannot lock in a favourable price and wait to see
+    /// whether the pool takes a loss in the meantime — that would hand queued
+    /// LPs an option paid for by everyone else.
+    pub fn claim_exit(env: Env, provider: Address) -> i128 {
+        provider.require_auth();
+
+        let req_key = StorageKey::ExitReq(provider.clone());
+        let request: ExitRequest = env
+            .storage()
+            .persistent()
+            .get(&req_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoExitRequest));
+
+        let now = env.ledger().timestamp();
+        if now < request.claimable_at {
+            panic_with_error!(&env, Error::ExitDelayNotElapsed);
+        }
+
+        // Release the reservation before settling, so a failed withdrawal
+        // cannot leave the request stuck and double-counted.
+        Self::clear_exit_reservation(&env, &provider, request.shares);
+
+        let amount = Self::withdraw_inner(env.clone(), provider.clone(), request.shares);
+
+        env.events().publish(
+            (Symbol::new(&env, "exit_claimed"),),
+            ExitClaimed {
+                provider,
+                shares_burned: request.shares,
+                amount_returned: amount,
+                waited: now.saturating_sub(request.requested_at),
+            },
+        );
+
+        amount
+    }
+
+    /// Cancel an outstanding exit request and release its reservation.
+    ///
+    /// Always available, including before the delay elapses: an LP who changes
+    /// their mind should not be forced out, and a queue nobody can leave is a
+    /// worse trap than the instant withdrawals it replaced.
+    pub fn cancel_exit(env: Env, provider: Address) {
+        provider.require_auth();
+
+        let req_key = StorageKey::ExitReq(provider.clone());
+        let request: ExitRequest = env
+            .storage()
+            .persistent()
+            .get(&req_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoExitRequest));
+
+        Self::clear_exit_reservation(&env, &provider, request.shares);
+
+        env.events().publish(
+            (Symbol::new(&env, "exit_cancelled"),),
+            ExitCancelled {
+                provider,
+                shares: request.shares,
+            },
+        );
+    }
+
+    /// Where a provider's exit stands. Safe to call for any address — an
+    /// address with no request reports `ExitStatus::None` rather than panicking.
+    pub fn get_exit_info(env: Env, provider: Address) -> ExitInfo {
+        let request: Option<ExitRequest> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::ExitReq(provider.clone()));
+
+        match request {
+            None => ExitInfo {
+                provider,
+                status: ExitStatus::None,
+                shares: 0,
+                requested_at: 0,
+                claimable_at: 0,
+                seconds_remaining: 0,
+            },
+            Some(req) => {
+                let now = env.ledger().timestamp();
+                let claimable = now >= req.claimable_at;
+                ExitInfo {
+                    provider,
+                    status: if claimable {
+                        ExitStatus::Claimable
+                    } else {
+                        ExitStatus::Pending
+                    },
+                    shares: req.shares,
+                    requested_at: req.requested_at,
+                    claimable_at: req.claimable_at,
+                    seconds_remaining: req.claimable_at.saturating_sub(now),
+                }
+            }
+        }
+    }
+
+    /// Total shares reserved by all outstanding exit requests.
+    ///
+    /// This is the pool's forward view of committed outflow — the number that
+    /// makes a queue useful for anything beyond delay.
+    pub fn get_queued_exit_shares(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::QueuedExitShares)
+            .unwrap_or(0)
+    }
+
     // ── Capital locks ─────────────────────────────────────────────────────────
 
     /// Earmark `amount` USDC as collateral for `policy_id`. Only the policy engine or
@@ -550,6 +1129,21 @@ impl RiskPool {
         let total_locked: i128    = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
         let available = total_deposited.saturating_sub(total_locked);
         if available < amount { panic_with_error!(&env, Error::Undercollateralized); }
+
+        // Enforce the utilization ceiling. `available` alone only asks whether
+        // the pool *can* commit the capital; this asks whether it *should* —
+        // a pool committed to the last unit has no buffer left for correlated
+        // losses across the policies it already wrote.
+        let capacity = Self::capacity(&env);
+        if capacity.max_utilization_bps < 10_000 {
+            let max_lockable = total_deposited
+                .saturating_mul(capacity.max_utilization_bps as i128)
+                / 10_000;
+            if total_locked.saturating_add(amount) > max_lockable {
+                panic_with_error!(&env, Error::UtilizationCapExceeded);
+            }
+        }
+
         if env.storage().persistent().has(&StorageKey::Lock(policy_id)) { panic_with_error!(&env, Error::AlreadyLocked); }
 
         let lock_key = StorageKey::Lock(policy_id);
@@ -580,9 +1174,6 @@ impl RiskPool {
     /// ### Capital Effect
     /// This reduces `total_locked` in the pool, reflecting that the coverage lock is now removed.
     /// Since the claim was paid, the underwriting capital has been disbursed to the policyholder.
-    /// The utilization rate (total_locked / total_deposited) is computed on-the-fly by
-    /// `get_utilization_rate()`, so it is always consistent with the latest `total_locked`
-    /// value — no separate recalculation is needed (#505).
     ///
     /// ### Design Rationale
     /// Having separate functions (`release_for_claim` and `release_for_expiry`) instead of a single
@@ -598,20 +1189,16 @@ impl RiskPool {
         let mut lock: CapitalLock = env.storage().persistent()
             .get(&StorageKey::Lock(policy_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::LockNotFound));
-
+        
         // Guard: check for zero or negative amount before processing release metrics
         if lock.amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if lock.released { panic_with_error!(&env, Error::AlreadyReleased); }
-
+        
         lock.released = true;
         env.storage().persistent().set(&StorageKey::Lock(policy_id), &lock);
         env.storage().persistent().extend_ttl(&StorageKey::Lock(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
         let total_locked: i128 = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
-        let new_total_locked = total_locked.saturating_sub(lock.amount);
-        env.storage().instance().set(&StorageKey::TotalLocked, &new_total_locked);
-
-        // Utilization is computed on-the-fly from total_locked/total_deposited,
-        // so it is always consistent with the latest total_locked value (#505).
+        env.storage().instance().set(&StorageKey::TotalLocked, &(total_locked.saturating_sub(lock.amount)));
 
         env.events().publish(
             (Symbol::new(&env, "capital_released"),),
@@ -656,6 +1243,180 @@ impl RiskPool {
         env.storage().instance().set(&StorageKey::TotalLocked, &(total_locked.saturating_sub(lock.amount)));
     }
 
+    // ── Reinsurance ──────────────────────────────────────────────────────────
+
+    /// Configure (or replace) the pool's reinsurance arrangement.
+    ///
+    /// `attachment_point` and `coverage_limit` are per-claim and lifetime
+    /// caps respectively — see [`ReinsuranceConfig`]. Replacing an existing
+    /// arrangement does not reset `ReinsuranceStats`: prior premium paid and
+    /// claims recovered still count against the new `coverage_limit`, since
+    /// a re-negotiated arrangement with the same or a new reinsurer is a
+    /// continuation, not a fresh start.
+    pub fn set_reinsurance(
+        env: Env,
+        admin: Address,
+        reinsurer: Address,
+        attachment_point: i128,
+        coverage_limit: i128,
+    ) {
+        Self::require_admin(&env, &admin);
+        if attachment_point < 0 || coverage_limit < 0 {
+            panic_with_error!(&env, Error::InvalidReinsuranceConfig);
+        }
+        let config = ReinsuranceConfig {
+            reinsurer: reinsurer.clone(),
+            attachment_point,
+            coverage_limit,
+            active: true,
+        };
+        env.storage().instance().set(&StorageKey::Reinsurance, &config);
+        env.events().publish(
+            (Symbol::new(&env, "reinsurance_configured"),),
+            ReinsuranceConfigured { reinsurer, attachment_point, coverage_limit },
+        );
+    }
+
+    /// Pause or resume the reinsurance arrangement without discarding its
+    /// configuration or accumulated stats. While inactive,
+    /// `request_reinsurance_recovery` always returns 0.
+    pub fn set_reinsurance_active(env: Env, admin: Address, active: bool) {
+        Self::require_admin(&env, &admin);
+        let mut config: ReinsuranceConfig = env.storage().instance()
+            .get(&StorageKey::Reinsurance)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ReinsuranceNotConfigured));
+        config.active = active;
+        env.storage().instance().set(&StorageKey::Reinsurance, &config);
+        env.events().publish(
+            (Symbol::new(&env, "reinsurance_active_set"),),
+            ReinsuranceActiveSet { active },
+        );
+    }
+
+    /// Cede `amount` of USDC from the pool's own balance to the reinsurer as
+    /// reinsurance premium. Mirrors `send_premium_to_treasury`/
+    /// `send_premium_to_backstop` — called by the admin (typically from an
+    /// off-chain job) after premium income has accrued in the pool.
+    pub fn send_premium_to_reinsurer(env: Env, caller: Address, amount: i128) {
+        Self::require_admin(&env, &caller);
+        if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
+        let config: ReinsuranceConfig = env.storage().instance()
+            .get(&StorageKey::Reinsurance)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ReinsuranceNotConfigured));
+
+        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+        token::Client::new(&env, &usdc)
+            .transfer(&env.current_contract_address(), &config.reinsurer, &amount);
+
+        let paid: i128 = env.storage().instance()
+            .get(&StorageKey::ReinsurancePremiumPaid).unwrap_or(0);
+        let total_premium_paid = paid.saturating_add(amount);
+        env.storage().instance().set(&StorageKey::ReinsurancePremiumPaid, &total_premium_paid);
+
+        env.events().publish(
+            (Symbol::new(&env, "reinsurance_premium_paid"),),
+            ReinsurancePremiumPaid { reinsurer: config.reinsurer, amount, total_premium_paid },
+        );
+    }
+
+    /// Request recovery of a catastrophic claim loss from the reinsurer.
+    ///
+    /// Callable only by the admin, policy engine, or claims processor (the
+    /// same gate as `release_for_claim`), so it slots directly into the
+    /// existing claim-settlement flow. `loss_amount` is the size of the
+    /// claim payout being recovered against; only the portion above
+    /// `attachment_point` is eligible, and the total ever recovered is
+    /// capped at `coverage_limit`.
+    ///
+    /// This never panics on "no coverage available" — an unconfigured,
+    /// inactive, or exhausted arrangement simply recovers nothing (returns
+    /// 0), so a claim payout is never blocked by the state of a reinsurance
+    /// side-arrangement. Returns the amount actually recovered, which is
+    /// credited to `total_deposited` (replenishing pool capital) and may be
+    /// less than the eligible excess if the reinsurer's own capacity is
+    /// exhausted.
+    pub fn request_reinsurance_recovery(
+        env: Env,
+        caller: Address,
+        policy_id: u128,
+        loss_amount: i128,
+    ) -> i128 {
+        Self::require_protocol_caller(&env, &caller);
+        if loss_amount <= 0 { return 0; }
+
+        let config: ReinsuranceConfig = match env.storage().instance().get(&StorageKey::Reinsurance) {
+            Some(c) => c,
+            None => return 0,
+        };
+        if !config.active || loss_amount <= config.attachment_point {
+            return 0;
+        }
+
+        let excess = loss_amount - config.attachment_point;
+        let already_recovered: i128 = env.storage().instance()
+            .get(&StorageKey::ReinsuranceRecovered).unwrap_or(0);
+        let coverage_remaining = config.coverage_limit.saturating_sub(already_recovered).max(0);
+        if coverage_remaining <= 0 { return 0; }
+
+        let requested = excess.min(coverage_remaining);
+
+        let recovered = ReinsurerClient::new(&env, &config.reinsurer)
+            .recover(&env.current_contract_address(), &policy_id, &requested)
+            // The reinsurer's own report is trusted for *what* it paid, but
+            // never for *how much* — clamp to what was actually requested so
+            // a misbehaving or buggy reinsurer cannot inflate this pool's
+            // coverage accounting past what it asked for.
+            .clamp(0, requested);
+
+        if recovered > 0 {
+            let total_deposited: i128 = env.storage().instance()
+                .get(&StorageKey::TotalDeposited).unwrap_or(0);
+            env.storage().instance().set(
+                &StorageKey::TotalDeposited,
+                &total_deposited.checked_add(recovered).unwrap_or_else(|| panic_with_error!(&env, Error::Overflow)),
+            );
+
+            let total_recovered = already_recovered.saturating_add(recovered);
+            env.storage().instance().set(&StorageKey::ReinsuranceRecovered, &total_recovered);
+
+            env.events().publish(
+                (Symbol::new(&env, "reinsurance_recovered"),),
+                ReinsuranceRecovered {
+                    policy_id,
+                    loss_amount,
+                    recovered_amount: recovered,
+                    coverage_remaining: config.coverage_limit.saturating_sub(total_recovered).max(0),
+                },
+            );
+        }
+
+        recovered
+    }
+
+    /// Returns the pool's reinsurance configuration, or `None` if never set.
+    pub fn get_reinsurance(env: Env) -> Option<ReinsuranceConfig> {
+        env.storage().instance().get(&StorageKey::Reinsurance)
+    }
+
+    /// Returns cumulative reinsurance premium paid, claims recovered, and
+    /// remaining coverage. Coverage remaining is 0 (not an error) when no
+    /// arrangement has ever been configured.
+    pub fn get_reinsurance_stats(env: Env) -> ReinsuranceStats {
+        let total_premium_paid: i128 = env.storage().instance()
+            .get(&StorageKey::ReinsurancePremiumPaid).unwrap_or(0);
+        let total_recovered: i128 = env.storage().instance()
+            .get(&StorageKey::ReinsuranceRecovered).unwrap_or(0);
+        let coverage_limit = env.storage().instance()
+            .get::<_, ReinsuranceConfig>(&StorageKey::Reinsurance)
+            .map(|c| c.coverage_limit)
+            .unwrap_or(0);
+        ReinsuranceStats {
+            total_premium_paid,
+            total_recovered,
+            coverage_remaining: coverage_limit.saturating_sub(total_recovered).max(0),
+        }
+    }
+
     // ── Queries ───────────────────────────────────────────────────────────────
 
     /// Return aggregate pool statistics: total deposited, locked, shares, and premium accumulators.
@@ -691,6 +1452,261 @@ impl RiskPool {
         } else {
             util_bps as u32
         }
+    }
+
+    /// Return the dynamic premium rate (basis points) for a given base rate,
+    /// adjusted for the pool's current risk as measured by utilization.
+    ///
+    /// Premiums are static by default (`InsuranceProduct.premium_rate_bps`),
+    /// which means the protocol charges the same rate whether the pool is
+    /// nearly empty or almost fully committed. A pool running hot has a thinner
+    /// buffer to absorb a correlated payout, so its coverage is objectively
+    /// riskier — and should cost more (issue #386).
+    ///
+    /// The adjustment scales the base rate linearly with utilization: at 0%
+    /// utilization the rate is unchanged, and at 100% utilization it doubles
+    /// (`rate * (10_000 + utilization_bps) / 10_000`). Utilization is capped at
+    /// 10_000 bps so the multiplier never exceeds 2x. The policy engine calls
+    /// this on every purchase and uses the result in place of the static rate.
+    pub fn get_dynamic_premium_rate(env: Env, base_rate_bps: u32) -> u32 {
+        let status = Self::get_capacity_status(env);
+        let util = status.utilization_bps.min(10_000);
+        let scaled = (base_rate_bps as u128)
+            .saturating_mul((10_000u128).saturating_add(util as u128))
+            / 10_000u128;
+        u32::try_from(scaled).unwrap_or(u32::MAX)
+    }
+
+    /// Set dynamic fee adjustment configuration based on market conditions.
+    /// Allows pool fees to automatically adjust based on pool utilization.
+    ///
+    /// Parameters:
+    /// - `base_fee_bps`: Base fee in basis points
+    /// - `max_fee_bps`: Maximum fee cap in basis points
+    /// - `min_fee_bps`: Minimum fee floor in basis points
+    /// - `utilization_threshold_bps`: Utilization threshold (in bps) at which fees start increasing
+    /// - `fee_adjustment_per_1pct_bps`: Fee increase per 1% utilization above threshold
+    /// - `enabled`: Whether dynamic fee adjustment is active
+    pub fn set_dynamic_fee_config(
+        env: Env,
+        admin: Address,
+        base_fee_bps: u32,
+        max_fee_bps: u32,
+        min_fee_bps: u32,
+        utilization_threshold_bps: u32,
+        fee_adjustment_per_1pct_bps: u32,
+        enabled: bool,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        // Validate thresholds
+        if base_fee_bps > 10000 || max_fee_bps > 10000 || min_fee_bps > 10000 {
+            panic_with_error!(&env, Error::InvalidParameter);
+        }
+        if min_fee_bps > base_fee_bps || base_fee_bps > max_fee_bps {
+            panic_with_error!(&env, Error::InvalidParameter);
+        }
+        if utilization_threshold_bps > 10000 {
+            panic_with_error!(&env, Error::InvalidParameter);
+        }
+
+        let config = DynamicFeeConfig {
+            base_fee_bps,
+            max_fee_bps,
+            min_fee_bps,
+            utilization_threshold_bps,
+            fee_adjustment_per_1pct_bps,
+            enabled,
+            last_updated: env.ledger().timestamp(),
+        };
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::DynamicFeeConfig, &config);
+
+        env.events().publish(
+            (Symbol::new(&env, "dynamic_fee_config_updated"),),
+            DynamicFeeConfigUpdated {
+                base_fee_bps,
+                max_fee_bps,
+                min_fee_bps,
+                utilization_threshold_bps,
+                fee_adjustment_per_1pct_bps,
+                enabled,
+            },
+        );
+    }
+
+    /// Get current dynamic fee configuration.
+    pub fn get_dynamic_fee_config(env: Env) -> DynamicFeeConfig {
+        env.storage()
+            .instance()
+            .get(&StorageKey::DynamicFeeConfig)
+            .unwrap_or_else(|| DynamicFeeConfig {
+                base_fee_bps: 0,
+                max_fee_bps: 1000,
+                min_fee_bps: 0,
+                utilization_threshold_bps: 7000,
+                fee_adjustment_per_1pct_bps: 10,
+                enabled: false,
+                last_updated: 0,
+            })
+    }
+
+    /// Calculate the current dynamic fee based on pool utilization.
+    /// Returns adjusted fee in basis points within the configured min/max bounds.
+    pub fn calculate_dynamic_fee(env: Env) -> u32 {
+        let config = Self::get_dynamic_fee_config(env.clone());
+        if !config.enabled {
+            return config.base_fee_bps;
+        }
+
+        let status = Self::get_capacity_status(env);
+        let util_bps = status.utilization_bps;
+
+        // If below threshold, use base fee
+        if util_bps <= config.utilization_threshold_bps {
+            return config.base_fee_bps;
+        }
+
+        // Calculate fee increase based on utilization above threshold
+        let util_above_threshold = util_bps.saturating_sub(config.utilization_threshold_bps);
+        // Convert basis points (1/100th of 1%) to 1% increments
+        let pct_above_threshold = util_above_threshold / 100;
+        let fee_increase = pct_above_threshold.saturating_mul(config.fee_adjustment_per_1pct_bps);
+
+        let adjusted_fee = config.base_fee_bps.saturating_add(fee_increase);
+        adjusted_fee.min(config.max_fee_bps).max(config.min_fee_bps)
+    }
+
+    // ── Fee Tiers (issue #429) ────────────────────────────────────────────────
+
+    /// Add or update an LP fee tier. LPs meeting the tier's requirements
+    /// (minimum deposit and/or minimum lock duration) receive the discount
+    /// on protocol fees.
+    ///
+    /// `discount_bps` is in basis points: 500 = 5% discount, 1000 = 10%, etc.
+    /// Maximum 10000 (100% discount, i.e. zero fees).
+    pub fn set_fee_tier(
+        env: Env,
+        admin: Address,
+        name: Symbol,
+        min_deposit: i128,
+        min_lock_duration: u64,
+        discount_bps: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+        if discount_bps > 10_000 {
+            panic_with_error!(&env, Error::InvalidFeeTier);
+        }
+        if min_deposit < 0 {
+            panic_with_error!(&env, Error::InvalidFeeTier);
+        }
+
+        let tier = FeeTier {
+            min_deposit,
+            min_lock_duration,
+            discount_bps,
+            name: name.clone(),
+        };
+        env.storage().instance().set(&StorageKey::FeeTier(name.clone()), &tier);
+
+        // Track tier names
+        let mut names: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::FeeTierList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut found = false;
+        for i in 0..names.len() {
+            if names.get_unchecked(i) == name {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            names.push_back(name.clone());
+            env.storage().instance().set(&StorageKey::FeeTierList, &names);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "fee_tier_updated"),),
+            FeeTierUpdated {
+                tier_name: name,
+                min_deposit,
+                min_lock_duration,
+                discount_bps,
+            },
+        );
+    }
+
+    /// Remove an LP fee tier by name.
+    pub fn remove_fee_tier(env: Env, admin: Address, name: Symbol) {
+        Self::require_admin(&env, &admin);
+        let key = StorageKey::FeeTier(name.clone());
+        if !env.storage().instance().has(&key) {
+            panic_with_error!(&env, Error::InvalidFeeTier);
+        }
+        env.storage().instance().remove(&key);
+
+        let names: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::FeeTierList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut pruned: Vec<Symbol> = Vec::new(&env);
+        for i in 0..names.len() {
+            if names.get_unchecked(i) != name {
+                pruned.push_back(names.get_unchecked(i));
+            }
+        }
+        env.storage().instance().set(&StorageKey::FeeTierList, &pruned);
+    }
+
+    /// Get a specific fee tier by name.
+    pub fn get_fee_tier(env: Env, name: Symbol) -> Option<FeeTier> {
+        env.storage().instance().get(&StorageKey::FeeTier(name))
+    }
+
+    /// List all registered fee tier names.
+    pub fn get_fee_tier_names(env: Env) -> Vec<Symbol> {
+        env.storage().instance()
+            .get(&StorageKey::FeeTierList)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Get the effective fee discount for a provider based on their deposit
+    /// amount and lock duration. Returns the highest applicable discount.
+    pub fn get_lp_fee_discount(env: Env, provider: Address) -> u32 {
+        let position: LpPosition = match env.storage().persistent()
+            .get(&StorageKey::LpPosition(provider.clone()))
+        {
+            Some(p) => p,
+            None => return 0,
+        };
+
+        let names: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::FeeTierList)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let now = env.ledger().timestamp();
+        let mut best_discount: u32 = 0;
+
+        for i in 0..names.len() {
+            let tier_name = names.get_unchecked(i);
+            if let Some(tier) = env.storage().instance().get::<_, FeeTier>(&StorageKey::FeeTier(tier_name.clone())) {
+                let deposit_met = position.deposited >= tier.min_deposit;
+                let lock_duration = now.saturating_sub(position.deposited_at);
+                let lock_met = tier.min_lock_duration == 0 || lock_duration >= tier.min_lock_duration;
+                if deposit_met && lock_met && tier.discount_bps > best_discount {
+                    best_discount = tier.discount_bps;
+                }
+            }
+        }
+
+        best_discount
     }
 
     /// Return the current admin address. Panics with `NotInitialized` if not set up.
@@ -1233,9 +2249,24 @@ impl RiskPool {
     /// guardians to call `approve_admin_change` first, guarding this
     /// takeover-capable operation against a single compromised admin key.
     /// With no guardians configured (default), behavior is unchanged.
+    ///
+    /// Panics with `AdminTransferPending` while a transfer is already armed:
+    /// re-proposing over an armed transfer would rewrite `PendingAdminSince`
+    /// and reset the `ADMIN_TRANSFER_TIMELOCK`, letting the current admin
+    /// keep a transfer perpetually un-acceptable (issue #457).
     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
         Self::validate_stellar_address(&env, &new_admin);
+
+        // Issue #457: reject a fresh proposal while one is already pending —
+        // the armed transfer must complete (be accepted) before another can
+        // be made, so the timelock clock can never be reset by re-proposing.
+        let pending: Option<Address> = env.storage().instance()
+            .get(&StorageKey::PendingAdmin)
+            .unwrap_or(None);
+        if pending.is_some() {
+            panic_with_error!(&env, Error::AdminTransferPending);
+        }
 
         let threshold: u32 = env
             .storage()
@@ -1305,9 +2336,14 @@ impl RiskPool {
         if pending.approvals.len() >= threshold {
             env.storage().instance().remove(&StorageKey::PendingAdminChange);
             env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
-            env.storage()
-                .instance()
-                .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
+            // Issue #457: arm the timelock at most once per transfer — never
+            // overwrite an already-armed `PendingAdminSince`, or the
+            // `ADMIN_TRANSFER_TIMELOCK` would restart from this later moment.
+            if !env.storage().instance().has(&StorageKey::PendingAdminSince) {
+                env.storage()
+                    .instance()
+                    .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
+            }
         } else {
             env.storage()
                 .instance()
@@ -1398,6 +2434,55 @@ impl RiskPool {
 
     /// Withdrawals are allowed while the pool is `Active` or `WindingDown`, but not
     /// while `Paused`.
+    /// Configured capacity limits, or the built-in defaults.
+    ///
+    /// The default `max_total_deposited` is the historical `MAX_TOTAL_DEPOSITED`
+    /// constant and the default utilization ceiling is 100%, so an existing
+    /// pool behaves exactly as before until an admin sets a limit.
+    fn capacity(env: &Env) -> PoolCapacity {
+        env.storage()
+            .instance()
+            .get(&StorageKey::Capacity)
+            .unwrap_or(PoolCapacity {
+                max_total_deposited: MAX_TOTAL_DEPOSITED,
+                max_utilization_bps: DEFAULT_MAX_UTILIZATION_BPS,
+            })
+    }
+
+    /// Configured withdrawal delay in seconds (default 0 — instant).
+    fn exit_delay(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::ExitDelay)
+            .unwrap_or(0)
+    }
+
+    /// `total_locked / total_deposited` in basis points. An empty pool is 0%
+    /// utilized rather than a division by zero.
+    fn utilization_bps(total_locked: i128, total_deposited: i128) -> u32 {
+        if total_deposited <= 0 {
+            return 0;
+        }
+        let bps = total_locked.saturating_mul(10_000) / total_deposited;
+        bps.clamp(0, 10_000) as u32
+    }
+
+    /// Remove a provider's exit request and release its share reservation.
+    fn clear_exit_reservation(env: &Env, provider: &Address, shares: i128) {
+        env.storage()
+            .persistent()
+            .remove(&StorageKey::ExitReq(provider.clone()));
+
+        let queued: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::QueuedExitShares)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&StorageKey::QueuedExitShares, &queued.saturating_sub(shares).max(0));
+    }
+
     fn assert_withdrawable(env: &Env) {
         let status: PoolStatus = env.storage().instance()
             .get(&StorageKey::Status).unwrap_or(PoolStatus::Active);
@@ -1464,6 +2549,175 @@ impl RiskPool {
                 enabled,
             },
         );
+    }
+
+    /// Return the collateralization ratio for an LP position.
+    ///
+    /// The ratio measures how well-backed the LP's position is by available
+    /// liquidity relative to their share of locked capital. A ratio below
+    /// 10000 (100%) indicates the position is undercollateralized.
+    ///
+    /// - `position_value` = LP's proportional share of available liquidity
+    ///   (total_deposited - total_locked) based on their share ratio.
+    /// - `position_liability` = LP's proportional share of locked capital.
+    /// - `collateralization_bps` = (position_value / position_liability) * 10000,
+    ///   or u32::MAX if there is no locked liability.
+    pub fn get_collateralization_ratio(env: Env, provider: Address) -> CollateralizationInfo {
+        let position: LpPosition = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::LpPosition(provider.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
+
+        let total_deposited: i128 = env
+            .storage().instance().get(&StorageKey::TotalDeposited).unwrap_or(0);
+        let total_locked: i128 = env
+            .storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
+        let total_shares: i128 = env
+            .storage().instance().get(&StorageKey::TotalShares).unwrap_or(0);
+
+        if total_shares == 0 || position.shares == 0 {
+            return CollateralizationInfo {
+                provider,
+                position_value: 0,
+                position_liability: 0,
+                collateralization_bps: u32::MAX,
+            };
+        }
+
+        // LP's proportional share of available liquidity (deposited - locked)
+        let available = total_deposited.saturating_sub(total_locked);
+        let position_value = position.shares
+            .checked_mul(available)
+            .and_then(|v| v.checked_div(total_shares))
+            .unwrap_or(0);
+
+        // LP's proportional share of locked capital
+        let position_liability = position.shares
+            .checked_mul(total_locked)
+            .and_then(|v| v.checked_div(total_shares))
+            .unwrap_or(0);
+
+        // Calculate collateralization ratio in basis points
+        let collateralization_bps = if position_liability <= 0 {
+            u32::MAX // No liability = fully collateralized
+        } else {
+            let ratio = position_value
+                .checked_mul(10_000)
+                .and_then(|v| v.checked_div(position_liability))
+                .unwrap_or(0);
+            if ratio > u32::MAX as i128 { u32::MAX } else { ratio as u32 }
+        };
+
+        CollateralizationInfo {
+            provider,
+            position_value,
+            position_liability,
+            collateralization_bps,
+        }
+    }
+
+    /// Liquidate an undercollateralized LP position.
+    ///
+    /// When an LP's collateralization ratio falls below 100% (10000 bps),
+    /// their position poses a risk to other LPs. This function seizes a
+    /// portion of their shares to restore pool health.
+    ///
+    /// The seizure is proportional to the undercollateralization程度:
+    /// - At 50% collateralization, ~50% of shares are seized.
+    /// - At 0% collateralization, all shares are seized.
+    ///
+    /// Only callable by the admin or the claims processor.
+    pub fn liquidate_position(env: Env, caller: Address, provider: Address) -> LiquidationResult {
+        Self::require_protocol_caller(&env, &caller);
+
+        let position: LpPosition = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::LpPosition(provider.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
+
+        let info = Self::get_collateralization_ratio(env.clone(), provider.clone());
+
+        // Cannot liquidate if fully collateralized or no liability
+        if info.collateralization_bps >= 10_000 || info.position_liability <= 0 {
+            panic_with_error!(&env, Error::Undercollateralized);
+        }
+
+        // Calculate shares to seize: proportional to undercollateralization
+        // At 0 bps ratio, seize all shares. At 5000 bps (50%), seize ~50%.
+        let undercollateral_bps = 10_000u32.saturating_sub(info.collateralization_bps);
+        let shares_seized = position.shares
+            .checked_mul(undercollateral_bps as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .unwrap_or(0);
+
+        if shares_seized <= 0 {
+            panic_with_error!(&env, Error::Undercollateralized);
+        }
+
+        // Calculate amount recovered (proportional to shares seized)
+        let total_shares: i128 = env
+            .storage().instance().get(&StorageKey::TotalShares).unwrap_or(0);
+        let total_deposited: i128 = env
+            .storage().instance().get(&StorageKey::TotalDeposited).unwrap_or(0);
+
+        let amount_recovered = if total_shares > 0 {
+            shares_seized
+                .checked_mul(total_deposited)
+                .and_then(|v| v.checked_div(total_shares))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Update position
+        let mut new_position = position.clone();
+        new_position.shares = new_position.shares.saturating_sub(shares_seized);
+        new_position.deposited = new_position.deposited.saturating_sub(amount_recovered);
+
+        if new_position.shares <= 0 {
+            env.storage().persistent().remove(&StorageKey::LpPosition(provider.clone()));
+        } else {
+            env.storage().persistent().set(
+                &StorageKey::LpPosition(provider.clone()),
+                &new_position,
+            );
+        }
+
+        // Update pool totals
+        let current_total_shares: i128 = env
+            .storage().instance().get(&StorageKey::TotalShares).unwrap_or(0);
+        let current_total_deposited: i128 = env
+            .storage().instance().get(&StorageKey::TotalDeposited).unwrap_or(0);
+        env.storage().instance().set(
+            &StorageKey::TotalShares,
+            &current_total_shares.saturating_sub(shares_seized),
+        );
+        env.storage().instance().set(
+            &StorageKey::TotalDeposited,
+            &current_total_deposited.saturating_sub(amount_recovered),
+        );
+
+        // Return seized funds to pool (they stay as available liquidity)
+        // The recovered amount stays in the contract as pool liquidity
+
+        env.events().publish(
+            (Symbol::new(&env, "position_liquidated"),),
+            PositionLiquidated {
+                provider: provider.clone(),
+                shares_seized,
+                amount_recovered,
+                collateralization_bps: info.collateralization_bps,
+            },
+        );
+
+        LiquidationResult {
+            provider,
+            shares_seized,
+            amount_recovered,
+            previous_ratio_bps: info.collateralization_bps,
+        }
     }
 
     /// Return the LP NFT for a given token ID, if it exists.
@@ -1572,3 +2826,5 @@ mod test;
 mod test_advanced;
 #[cfg(test)]
 mod test_edge;
+#[cfg(test)]
+mod test_reinsurance;

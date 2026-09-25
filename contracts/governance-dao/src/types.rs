@@ -21,6 +21,8 @@ pub const GOVERNANCE_TTL_BUFFER_SECONDS: u64 = 30 * 24 * 3600;
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProposalStatus {
+    /// In mandatory discussion period before voting opens.
+    Discussion,
     /// Accepting votes
     Active,
     /// Passed quorum + majority; ready to execute
@@ -31,6 +33,21 @@ pub enum ProposalStatus {
     Executed,
     /// Cancelled by admin before vote close
     Cancelled,
+    /// Passed but execution deadline expired without execution
+    Expired,
+}
+
+/// On-chain comment on a proposal for discussion and feedback.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalComment {
+    pub id: u128,
+    pub proposal_id: u64,
+    pub author: Address,
+    pub text: Bytes,
+    pub created_at: u64,
+    /// Optional: ID of the comment this replies to, for threaded discussion
+    pub reply_to: Option<u128>,
 }
 
 /// Vote direction cast by a token holder.
@@ -81,11 +98,27 @@ pub struct Proposal {
     pub vote_end: u64,
     /// Timelock expiration timestamp for execution.
     pub execution_time: u64,
+    /// Timestamp after which a passed proposal can no longer be executed.
+    /// Defaults to vote_end + finalize_delay + 7 days. Prevents stale proposals from executing.
+    pub execution_deadline: u64,
     /// Total supply captured at proposal creation time for quorum calculation.
     /// This prevents admin manipulation of total_supply during active votes.
     pub total_supply: i128,
     /// Whether this is a generic call or a contract-upgrade proposal.
     pub kind: ProposalKind,
+    /// Mandatory impact analysis describing potential consequences of this proposal.
+    /// Max 4096 bytes to provide comprehensive risk assessment.
+    pub impact_analysis: Bytes,
+    /// Optional verification callback function on the target contract to confirm
+    /// execution produced the intended state change. Called as `target::verify_proposal_execution(proposal_id)`.
+    /// If specified and fails, execution is marked as failed with audit trail.
+    /// Signature: fn verify_proposal_execution(env: Env, proposal_id: u64) -> Result<bool, Symbol>
+    pub verification_callback: Option<Symbol>,
+    /// Whether execution has been verified (callback succeeded or not required).
+    pub execution_verified: bool,
+    /// Set by a guardian via `veto_proposal`. A vetoed proposal can never be
+    /// executed, even if it passed voting and the timelock has expired.
+    pub is_vetoed: bool,
 }
 
 /// A single vote record stored per (proposal_id, voter) key.
@@ -115,6 +148,13 @@ pub struct DaoConfig {
     pub voting_period: u64,
     /// Timelock period in seconds before an approved proposal can be executed.
     pub proposal_timelock: u64,
+    /// Mandatory discussion period in seconds before voting opens.
+    /// Set to 0 to disable (proposals go straight to Active).
+    pub discussion_period: u64,
+    /// Maximum voting weight any single address may cast per proposal (7-decimal).
+    /// 0 = no cap (unlimited whale voting). Capping prevents a single large
+    /// holder from dominating governance outcomes.
+    pub vote_weight_cap: i128,
 }
 
 /// Settings controlling adaptive (decaying) quorum.
@@ -171,6 +211,34 @@ pub struct EffectiveQuorum {
     pub decayed: bool,
 }
 
+/// A standing delegation of voting power from one holder to another.
+///
+/// Delegation transfers *authority*, never tokens. The delegator keeps custody
+/// throughout — the DAO simply counts their balance toward the delegate's vote
+/// at the moment that vote is cast.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Delegation {
+    pub delegator: Address,
+    pub delegate: Address,
+    pub delegated_at: u64,
+}
+
+/// A delegate's standing, for display and for pre-vote checks.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegateInfo {
+    pub delegate: Address,
+    /// Addresses currently delegating to this account.
+    pub delegators: Vec<Address>,
+    /// Sum of those delegators' live token balances.
+    pub delegated_weight: i128,
+    /// The delegate's own balance.
+    pub own_weight: i128,
+    /// `own_weight + delegated_weight` — what a vote right now would carry.
+    pub total_weight: i128,
+}
+
 // ─── Events ──────────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -207,13 +275,44 @@ pub struct ProposalFinalized {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionAuditRecord {
+    pub proposal_id: u64,
+    pub executor: Address,
+    pub target: Address,
+    pub function: Symbol,
+    pub executed_at: u64,
+    pub votes_for: i128,
+    pub votes_against: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProposalExecuted {
+    pub proposal_id: u64,
+    pub executor: Address,
+    pub target: Address,
+    pub function: Symbol,
+    pub executed_at: u64,
+}
+
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalCancelled {
     pub proposal_id: u64,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProposalCancelled {
+pub struct ProposalVetoed {
+    pub proposal_id: u64,
+    pub guardian: Address,
+    pub reason: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscussionPeriodEnded {
     pub proposal_id: u64,
 }
 
@@ -225,6 +324,21 @@ pub struct DaoConfigUpdated {
     pub total_supply: i128,
     pub voting_period: u64,
     pub proposal_timelock: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VotingPowerDelegated {
+    pub delegator: Address,
+    pub delegate: Address,
+    pub weight: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegationRevoked {
+    pub delegator: Address,
+    pub delegate: Address,
 }
 
 #[contracttype]
@@ -276,4 +390,158 @@ pub struct PendingUpgrade {
     pub new_wasm_hash: BytesN<32>,
     pub new_version: u32,
     pub approvals: Vec<Address>,
+}
+
+/// Emitted when a proposer (or anyone on their behalf) reclaims a deposit
+/// via `reclaim_deposit` on a proposal nobody ever finalized.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DepositReclaimed {
+    pub proposal_id: u64,
+    pub proposer: Address,
+    pub amount: i128,
+}
+
+/// A registered structural template for a common proposal type.
+///
+/// Standardizes the minimum shape a proposal of this kind must have —
+/// title length and argument count — so proposals created against it are
+/// consistent and reviewers spend less time parsing intent out of
+/// free-form submissions.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalTemplate {
+    pub name: Symbol,
+    /// Human-readable description of what this template is for.
+    pub description: Bytes,
+    /// Minimum number of bytes required in a proposal's `title`.
+    pub min_title_len: u32,
+    /// Exact number of entries required in a proposal's `args`.
+    pub required_arg_count: u32,
+    /// Whether new proposals may still be created from this template.
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TemplateRegistered {
+    pub name: Symbol,
+    pub min_title_len: u32,
+    pub required_arg_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalCreatedFromTemplate {
+    pub proposal_id: u64,
+    pub template_name: Symbol,
+}
+
+/// Emitted when the vote weight cap is updated via DAO config.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoteWeightCapUpdated {
+    pub vote_weight_cap: i128,
+}
+
+/// Emitted when a delegation's weight is used in a vote.
+///
+/// Tracks the moment delegated voting power is actually exercised,
+/// making it possible to see which delegations contributed to which
+/// proposals and how much weight they carried.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegationUsed {
+    pub proposal_id: u64,
+    pub delegate: Address,
+    pub delegator: Address,
+    pub weight: i128,
+}
+
+/// Emitted when a delegation is created or revoked, recording the
+/// full delegation graph at a point in time for off-chain indexing.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegationRecorded {
+    pub delegator: Address,
+    pub delegate: Address,
+    pub action: Symbol,
+    pub recorded_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionVerified {
+    pub proposal_id: u64,
+    pub executor: Address,
+    pub target: Address,
+    pub verification_callback: Symbol,
+    pub verified_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionVerificationFailed {
+    pub proposal_id: u64,
+    pub executor: Address,
+    pub target: Address,
+    pub callback: Symbol,
+    pub error: Symbol,
+}
+
+/// Emitted when a comment is posted on a proposal for discussion.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalCommentAdded {
+    pub proposal_id: u64,
+    pub comment_id: u128,
+    pub author: Address,
+    pub reply_to: Option<u128>,
+    pub created_at: u64,
+}
+
+// ─── Impact-based proposal threshold escalation (issue #438) ────────────────
+
+/// Escalation multipliers applied on top of `DaoConfig.proposal_threshold`
+/// based on the impact of the proposal. Stored separately from `DaoConfig`
+/// so an existing DAO's stored config layout is untouched until an admin
+/// opts in via `set_impact_multipliers`.
+///
+/// Multipliers are in basis points where 10_000 = 1x. All three fields must
+/// be at least 10_000 (`MIN_MULTIPLIER_BPS`): the goal is to raise the bar
+/// for high-impact proposals, never to lower it below the configured base.
+///
+/// Selection rule (see `effective_threshold`):
+///   1. `Upgrade` proposals always use `upgrade_bps`.
+///   2. `Standard` proposals targeting the DAO's own address use
+///      `self_target_bps`.
+///   3. All other `Standard` proposals use `standard_bps`.
+///
+/// When the storage key is absent, the contract behaves as `standard_bps =
+/// upgrade_bps = self_target_bps = 10_000` (1x, matches historical
+/// behaviour).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImpactMultipliers {
+    /// Multiplier for `Standard` proposals whose target is not the DAO.
+    /// 10_000 = 1x (default).
+    pub standard_bps: u32,
+    /// Multiplier for `Upgrade` proposals. Contract-code replacement is the
+    /// highest-impact governance action; the shipped default of 5x forces a
+    /// materially larger deposit than a routine parameter tweak.
+    pub upgrade_bps: u32,
+    /// Multiplier for `Standard` proposals whose target address is the DAO
+    /// contract itself (a proposal that mutates governance state directly,
+    /// e.g. `update_config`). Set higher than `standard_bps` so a proposer
+    /// cannot bypass upgrade-tier gating by wrapping a self-mutation in a
+    /// Standard call.
+    pub self_target_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImpactMultipliersUpdated {
+    pub standard_bps: u32,
+    pub upgrade_bps: u32,
+    pub self_target_bps: u32,
 }

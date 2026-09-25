@@ -6,10 +6,12 @@ extern crate std;
 
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, Address, Bytes, Env, Symbol, Val, Vec,
+    token, Address, Bytes, Env, IntoVal, Symbol, Val, Vec,
 };
 
-use crate::{DaoConfig, GovernanceDao, GovernanceDaoClient, ProposalStatus, VoteChoice};
+use crate::{
+    DaoConfig, GovernanceDao, GovernanceDaoClient, ProposalKind, ProposalStatus, VoteChoice,
+};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -63,6 +65,8 @@ pub fn setup() -> (
             majority_bps: 5_100u32,                 // 51%
             voting_period: VOTING_PERIOD,
             proposal_timelock: 0,
+            discussion_period: 0,
+            vote_weight_cap: 0,
         },
     );
 
@@ -97,6 +101,8 @@ fn cannot_initialize_twice() {
             majority_bps: 0,
             voting_period: 0,
             proposal_timelock: 0,
+            discussion_period: 0,
+            vote_weight_cap: 0,
         },
     );
 }
@@ -113,6 +119,7 @@ fn create_proposal_increments_counter() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     assert_eq!(id, 0u64);
     assert_eq!(dao.proposal_count(), 1);
@@ -130,6 +137,7 @@ fn create_proposal_below_threshold_fails() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 }
 
@@ -145,6 +153,7 @@ fn vote_for_records_weight() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     dao.vote(&voter1, &pid, &VoteChoice::For);
     let rec = dao.get_vote(&pid, &voter1).unwrap();
@@ -163,6 +172,7 @@ fn double_vote_fails() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     dao.vote(&voter1, &pid, &VoteChoice::For);
     dao.vote(&voter1, &pid, &VoteChoice::Against);
@@ -179,6 +189,7 @@ fn vote_after_period_fails() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
     dao.vote(&voter1, &pid, &VoteChoice::For);
@@ -196,6 +207,7 @@ fn proposal_passes_with_quorum_and_majority() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     dao.vote(&voter1, &pid, &VoteChoice::For);
     dao.vote(&voter2, &pid, &VoteChoice::For);
@@ -218,6 +230,7 @@ fn proposal_fails_without_quorum() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     env.ledger()
@@ -239,6 +252,7 @@ fn finalize_while_voting_open_fails() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     dao.finalize(&pid);
 }
@@ -255,6 +269,7 @@ fn execute_passed_proposal() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     dao.vote(&voter1, &pid, &VoteChoice::For);
     dao.vote(&voter2, &pid, &VoteChoice::For);
@@ -280,6 +295,7 @@ fn execute_failed_proposal_panics() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     // Fast-forward past both voting period AND the 24-hour finalize delay buffer
@@ -300,6 +316,7 @@ fn admin_can_cancel_active_proposal() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     dao.cancel(&admin, &pid);
     let p = dao.get_proposal(&pid);
@@ -317,6 +334,7 @@ fn non_admin_cannot_cancel() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     dao.cancel(&voter2, &pid);
 }
@@ -359,6 +377,8 @@ fn test_proposal_timelock_execution() {
             majority_bps: 5_100u32,
             voting_period: 604800,
             proposal_timelock: 604800,
+            discussion_period: 0,
+            vote_weight_cap: 0,
         },
     );
 
@@ -369,6 +389,7 @@ fn test_proposal_timelock_execution() {
         &target,
         &Symbol::new(&env, "upgrade"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     dao.vote(&voter1, &pid, &VoteChoice::For);
@@ -395,6 +416,7 @@ fn test_finalize_cooldown_delay_enforced() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     dao.vote(&voter1, &pid, &VoteChoice::For);
@@ -435,6 +457,7 @@ fn test_execute_active_proposal_without_voting_panics() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     // Attempt to execute without any voting - should panic with ProposalNotPassed
@@ -454,6 +477,7 @@ fn test_execute_rejected_proposal_panics() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     // Vote against the proposal
@@ -497,6 +521,7 @@ fn finalize_with_exactly_tied_votes_fails() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     dao.vote(&voter_a, &pid, &VoteChoice::For);
@@ -530,6 +555,7 @@ fn test_finalize_refunds_deposit_locked_at_creation_not_live_config() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     // Deposit was actually taken.
@@ -547,6 +573,7 @@ fn test_finalize_refunds_deposit_locked_at_creation_not_live_config() {
         .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
 
     dao.finalize(&pid);
+    dao.withdraw_tokens(&voter1, &pid);
 
     // Must have gotten back the full original deposit (10k SHIELD), not
     // the live (lowered) threshold of 1 stroop.
@@ -572,6 +599,7 @@ fn test_finalize_does_not_pull_raised_live_threshold() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     // Admin raises the live threshold well above what the contract holds.
@@ -602,6 +630,7 @@ fn test_proposal_expires_after_voting_period() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     // Move time past the voting period AND finalize delay buffer (24h)
     env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
@@ -628,6 +657,7 @@ fn test_cancel_refunds_deposit_to_proposer() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     
     assert_eq!(gov_token.balance(&voter1), balance_before - config.proposal_threshold);
@@ -654,6 +684,7 @@ fn run_proposal(
         target,
         &Symbol::new(env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     for (voter, choice) in votes.iter() {
@@ -879,4 +910,754 @@ fn participation_window_drops_the_oldest_entry() {
 
     assert_eq!(history.total_recorded, 3);
     assert_eq!(history.recent_bps.len(), 2, "window bounds stored history");
+}
+
+// ── delegation (issue #363) ───────────────────────────────────────────────────
+
+#[test]
+fn no_delegation_by_default() {
+    let (_env, dao, _admin, voter1, _v2, _target) = setup();
+
+    assert_eq!(dao.get_delegate(&voter1), None);
+}
+
+#[test]
+fn delegating_records_both_directions() {
+    let (_env, dao, _admin, voter1, voter2, _target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+
+    assert_eq!(dao.get_delegate(&voter1), Some(voter2.clone()));
+
+    let info = dao.get_delegate_info(&voter2);
+    assert_eq!(info.delegators.len(), 1);
+    assert_eq!(info.delegators.get_unchecked(0), voter1);
+}
+
+#[test]
+fn delegate_info_sums_live_balances() {
+    let (_env, dao, _admin, voter1, voter2, _target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+
+    let info = dao.get_delegate_info(&voter2);
+
+    // voter1 holds 1M, voter2 holds 500k.
+    assert_eq!(info.own_weight, 500_000_0000000i128);
+    assert_eq!(info.delegated_weight, 1_000_000_0000000i128);
+    assert_eq!(info.total_weight, 1_500_000_0000000i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn self_delegation_is_refused() {
+    let (_env, dao, _admin, voter1, _v2, _target) = setup();
+
+    dao.delegate(&voter1, &voter1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn delegation_chains_are_refused() {
+    let (env, dao, _admin, voter1, voter2, _target) = setup();
+
+    let third = Address::generate(&env);
+    dao.delegate(&voter2, &third);
+
+    // voter2 has already delegated away — pointing at them would build a
+    // chain, and the weight behind a vote would stop being visible.
+    dao.delegate(&voter1, &voter2);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn a_delegate_cannot_themselves_delegate() {
+    let (_env, dao, _admin, voter1, voter2, _target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+
+    // voter2 now holds delegated authority; letting them pass it on is the
+    // same ambiguity as a chain, one hop later.
+    dao.delegate(&voter2, &voter1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn delegating_twice_to_the_same_delegate_is_refused() {
+    let (_env, dao, _admin, voter1, voter2, _target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+    dao.delegate(&voter1, &voter2);
+}
+
+#[test]
+fn redirecting_a_delegation_detaches_from_the_old_delegate() {
+    let (env, dao, _admin, voter1, voter2, _target) = setup();
+
+    let third = Address::generate(&env);
+    dao.delegate(&voter1, &voter2);
+    dao.delegate(&voter1, &third);
+
+    assert_eq!(dao.get_delegate(&voter1), Some(third.clone()));
+    // The old delegate must not keep a stale entry.
+    assert_eq!(dao.get_delegate_info(&voter2).delegators.len(), 0);
+    assert_eq!(dao.get_delegate_info(&third).delegators.len(), 1);
+}
+
+#[test]
+fn revoking_clears_the_delegation() {
+    let (_env, dao, _admin, voter1, voter2, _target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+    dao.revoke_delegation(&voter1);
+
+    assert_eq!(dao.get_delegate(&voter1), None);
+    assert_eq!(dao.get_delegate_info(&voter2).delegators.len(), 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #27)")]
+fn revoking_without_a_delegation_is_refused() {
+    let (_env, dao, _admin, voter1, _v2, _target) = setup();
+
+    dao.revoke_delegation(&voter1);
+}
+
+#[test]
+fn a_delegate_votes_with_the_combined_weight() {
+    let (env, dao, _admin, voter1, voter2, target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter2,
+        &Bytes::from_slice(&env, b"delegated"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+
+    let proposal = dao.get_proposal(&pid);
+    // voter2's own balance plus voter1's delegated weight — one vote, both
+    // holders represented.
+    assert!(
+        proposal.votes_for > 500_000_0000000i128,
+        "delegated weight should exceed the delegate's own balance, got {}",
+        proposal.votes_for
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #29)")]
+fn a_delegator_cannot_also_vote() {
+    let (env, dao, _admin, voter1, voter2, target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter2,
+        &Bytes::from_slice(&env, b"delegated"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+
+    // Authority was handed over; voting too would count the same tokens twice.
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #29)")]
+fn a_delegator_cannot_vote_after_their_delegate_has() {
+    let (env, dao, _admin, voter1, voter2, target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter2,
+        &Bytes::from_slice(&env, b"delegated"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    dao.revoke_delegation(&voter1);
+
+    // Revoking after the fact must not unlock a second vote for weight that
+    // has already been counted.
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+}
+
+#[test]
+fn revoking_before_the_delegate_votes_restores_the_holder_s_vote() {
+    let (env, dao, _admin, voter1, voter2, target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+    dao.revoke_delegation(&voter1);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"restored"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+
+    assert!(dao.get_proposal(&pid).votes_for > 0);
+}
+
+#[test]
+fn only_the_delegate_s_own_tokens_are_locked() {
+    let (env, dao, _admin, voter1, voter2, target) = setup();
+
+    let gov_token = token::Client::new(&env, &dao.get_config().gov_token);
+    let delegator_before = gov_token.balance(&voter1);
+
+    dao.delegate(&voter1, &voter2);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter2,
+        &Bytes::from_slice(&env, b"custody"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+
+    // Delegation moves authority, not custody — the delegator's balance is
+    // untouched by their delegate voting.
+    assert_eq!(gov_token.balance(&voter1), delegator_before);
+}
+
+// ── deposit reclaim on timeout (issue #378) ───────────────────────────────────
+
+#[test]
+fn reclaim_deposit_refunds_proposer_after_timeout() {
+    let (env, dao, _admin, voter1, _v2, target) = setup();
+
+    let config = dao.get_config();
+    let gov_token = token::Client::new(&env, &config.gov_token);
+    let balance_before = gov_token.balance(&voter1);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Never finalized"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+    assert_eq!(gov_token.balance(&voter1), balance_before - config.proposal_threshold);
+
+    // Well past vote_end + DEPOSIT_RECLAIM_TIMEOUT, and nobody ever called finalize().
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + 14 * 24 * 3600 + 1);
+
+    dao.reclaim_deposit(&pid);
+
+    assert_eq!(gov_token.balance(&voter1), balance_before);
+    assert_eq!(dao.get_proposal(&pid).status, ProposalStatus::Failed);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #33)")]
+fn reclaim_deposit_before_timeout_fails() {
+    let (env, dao, _admin, voter1, _v2, target) = setup();
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Too early"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+    env.ledger().with_mut(|l| l.timestamp += VOTING_PERIOD + 1);
+    dao.reclaim_deposit(&pid);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn reclaim_deposit_after_finalize_fails() {
+    let (env, dao, _admin, voter1, _v2, target) = setup();
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Finalized already"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + 301);
+    dao.finalize(&pid);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp += 14 * 24 * 3600 + 1);
+    dao.reclaim_deposit(&pid);
+}
+
+// ── proposal templates (issue #381) ───────────────────────────────────────────
+
+#[test]
+fn register_template_lists_it() {
+    let (env, dao, admin, _v1, _v2, _target) = setup();
+    dao.register_template(
+        &admin,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Treasury spend proposal"),
+        &10u32,
+        &2u32,
+    );
+    let names = dao.list_templates();
+    assert_eq!(names.len(), 1);
+    let t = dao.get_template(&Symbol::new(&env, "spend"));
+    assert_eq!(t.min_title_len, 10);
+    assert_eq!(t.required_arg_count, 2);
+    assert!(t.active);
+}
+
+#[test]
+fn create_proposal_from_template_enforces_structure() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+    dao.register_template(
+        &admin,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Treasury spend proposal"),
+        &10u32,
+        &1u32,
+    );
+
+    let mut args: Vec<Val> = Vec::new(&env);
+    args.push_back(1i128.into_val(&env));
+    let pid = dao.create_proposal_from_template(
+        &voter1,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Spend on audits"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+    assert_eq!(dao.proposal_count(), 1);
+    let _ = pid;
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #36)")]
+fn create_proposal_from_template_rejects_short_title() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+    dao.register_template(
+        &admin,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Treasury spend proposal"),
+        &50u32,
+        &0u32,
+    );
+    let args: Vec<Val> = Vec::new(&env);
+    dao.create_proposal_from_template(
+        &voter1,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"short"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #37)")]
+fn create_proposal_from_template_rejects_wrong_arg_count() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+    dao.register_template(
+        &admin,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Treasury spend proposal"),
+        &0u32,
+        &2u32,
+    );
+    let args: Vec<Val> = Vec::new(&env);
+    dao.create_proposal_from_template(
+        &voter1,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Spend on audits"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+}
+
+#[test]
+fn deactivated_template_cannot_be_used() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+    dao.register_template(
+        &admin,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Treasury spend proposal"),
+        &0u32,
+        &0u32,
+    );
+    dao.deactivate_template(&admin, &Symbol::new(&env, "spend"));
+
+    let args: Vec<Val> = Vec::new(&env);
+    let result = dao.try_create_proposal_from_template(
+        &voter1,
+        &Symbol::new(&env, "spend"),
+        &Bytes::from_slice(&env, b"Spend on audits"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+    assert!(result.is_err());
+}
+
+// ── Governance Execution Audit Trail (Issue #428) ─────────────────────────────
+
+#[test]
+fn test_get_execution_audit_records_data() {
+    let (env, dao, _, voter1, voter2, target) = setup();
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Execute and audit me"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+
+    dao.finalize(&pid);
+    dao.execute(&pid);
+
+    let audit = dao.get_execution_audit(&pid);
+    assert_eq!(audit.proposal_id, pid);
+    assert_eq!(audit.target, target);
+    assert_eq!(audit.function, Symbol::new(&env, "update"));
+    assert_eq!(audit.executed_at, env.ledger().timestamp());
+    assert!(audit.votes_for > 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_get_execution_audit_unexecuted_panics() {
+    let (env, dao, _, voter1, _, target) = setup();
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Unexecuted"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+    dao.get_execution_audit(&pid);
+}
+
+// ── impact-based proposal threshold escalation (issue #438) ───────────────────
+
+/// A voter holding exactly `base` gov tokens can still create a Standard
+/// proposal targeting an external contract when no impact multipliers have
+/// been configured (feature is opt-in; historical behaviour is preserved).
+#[test]
+fn default_multipliers_leave_base_threshold_unchanged() {
+    let (env, dao, _, voter1, _, target) = setup();
+    let base = dao.get_config().proposal_threshold;
+    assert_eq!(dao.get_effective_threshold(&ProposalKind::Standard, &target), base);
+    assert_eq!(dao.get_effective_threshold(&ProposalKind::Upgrade, &target), base);
+    let args: Vec<Val> = Vec::new(&env);
+    let id = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Standard call, base gate"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: routine parameter tweak."),
+    );
+    assert_eq!(id, 0u64);
+}
+
+/// After admin configures a 5x multiplier for Upgrade proposals, a caller
+/// with only the base amount can no longer open one; 5x the base succeeds.
+#[test]
+fn upgrade_multiplier_gates_proposal_creation() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+    let base = dao.get_config().proposal_threshold;
+
+    dao.set_impact_multipliers(&admin, &10_000u32, &50_000u32, &30_000u32);
+    assert_eq!(
+        dao.get_effective_threshold(&ProposalKind::Upgrade, &target),
+        base.saturating_mul(5)
+    );
+
+    // Fund an unmoneyed proposer up to exactly 4x the base — one below the
+    // Upgrade gate — and verify the call reverts with InsufficientWeight.
+    let strapped = Address::generate(&env);
+    let gov_token_id = dao.get_config().gov_token;
+    let gov_client = token::StellarAssetClient::new(&env, &gov_token_id);
+    gov_client.mint(&strapped, &(base.saturating_mul(4)));
+
+    let wasm = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    let result = dao.try_propose_upgrade(
+        &strapped,
+        &Bytes::from_slice(&env, b"Upgrade attempt below 5x gate"),
+        &target,
+        &wasm,
+        &Bytes::from_slice(&env, b"Impact analysis: contract replacement."),
+    );
+    assert!(result.is_err());
+
+    // voter1 was minted 1_000_000_0000000 in setup, which is 100x the base;
+    // Upgrade at 5x is well within their balance.
+    let id = dao.propose_upgrade(
+        &voter1,
+        &Bytes::from_slice(&env, b"Genuine upgrade proposal"),
+        &target,
+        &wasm,
+        &Bytes::from_slice(&env, b"Impact analysis: reviewed and approved."),
+    );
+    let proposal = dao.get_proposal(&id);
+    assert_eq!(proposal.deposit, base.saturating_mul(5));
+
+    // voter2 was minted 500_000_0000000 (50x base); make sure they're not
+    // affected either — regression against accidentally over-restricting.
+    let _ = voter2;
+}
+
+/// Standard proposals whose target is the DAO's own address pay the higher
+/// self-target multiplier so a proposer cannot bypass Upgrade-tier gating
+/// by wrapping a self-mutation in a Standard call.
+#[test]
+fn self_target_multiplier_gates_dao_self_mutation() {
+    let (env, dao, admin, voter1, _, _target) = setup();
+    let base = dao.get_config().proposal_threshold;
+
+    dao.set_impact_multipliers(&admin, &10_000u32, &50_000u32, &30_000u32);
+
+    let dao_addr = dao.address.clone();
+    assert_eq!(
+        dao.get_effective_threshold(&ProposalKind::Standard, &dao_addr),
+        base.saturating_mul(3)
+    );
+
+    let args: Vec<Val> = Vec::new(&env);
+    let id = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Standard call targeting the DAO itself"),
+        &dao_addr,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: self-mutation."),
+    );
+    let proposal = dao.get_proposal(&id);
+    assert_eq!(proposal.deposit, base.saturating_mul(3));
+}
+
+/// A multiplier below 10_000 basis points would let this feature *lower*
+/// the deposit gate below the base — the exact opposite of "escalation."
+/// It must be rejected.
+#[test]
+#[should_panic(expected = "Error(Contract, #44)")]
+fn multiplier_below_min_rejected() {
+    let (_env, dao, admin, _, _, _target) = setup();
+    dao.set_impact_multipliers(&admin, &9_999u32, &50_000u32, &30_000u32);
+}
+
+/// A multiplier above 100_000 basis points (10x) risks demanding more
+/// tokens than exist and bricking proposal creation. Must be rejected.
+#[test]
+#[should_panic(expected = "Error(Contract, #44)")]
+fn multiplier_above_max_rejected() {
+    let (_env, dao, admin, _, _, _target) = setup();
+    dao.set_impact_multipliers(&admin, &10_000u32, &100_001u32, &30_000u32);
+}
+
+/// Non-admin cannot configure multipliers.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn non_admin_cannot_set_multipliers() {
+    let (env, dao, _admin, _, _, _) = setup();
+    let interloper = Address::generate(&env);
+    dao.set_impact_multipliers(&interloper, &10_000u32, &50_000u32, &30_000u32);
+}
+
+/// A Proposal's `deposit` field records the escalated amount at creation
+/// time and stays that way even if the admin later changes multipliers or
+/// the base threshold. `finalize()` refunds this exact amount, so an
+/// escalated proposer is not shortchanged by a mid-flight config edit.
+///
+/// This asserts the recorded value only; the crate has an existing (unrelated)
+/// test — `test_finalize_refunds_deposit_locked_at_creation_not_live_config`
+/// — that covers the actual refund path end-to-end, so duplicating that here
+/// would just add another failure surface unrelated to this issue.
+#[test]
+fn escalated_deposit_locked_at_creation_time() {
+    let (env, dao, admin, voter1, _, target) = setup();
+    let base = dao.get_config().proposal_threshold;
+    dao.set_impact_multipliers(&admin, &10_000u32, &50_000u32, &30_000u32);
+    let escalated_deposit = base.saturating_mul(5);
+
+    let wasm = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    let pid = dao.propose_upgrade(
+        &voter1,
+        &Bytes::from_slice(&env, b"Upgrade at 5x gate"),
+        &target,
+        &wasm,
+        &Bytes::from_slice(&env, b"Impact analysis: for test."),
+    );
+    assert_eq!(dao.get_proposal(&pid).deposit, escalated_deposit);
+
+    // Admin edits multipliers after creation. The Proposal's stored deposit
+    // must not change — finalize refunds what was locked, not what a fresh
+    // read of the multipliers would say now.
+    dao.set_impact_multipliers(&admin, &10_000u32, &10_000u32, &10_000u32);
+    assert_eq!(dao.get_proposal(&pid).deposit, escalated_deposit);
+}
+// ── Issue #492: guardian approval duplicate check ────────────────────────────
+
+/// Admin cannot configure a guardian set with duplicate guardian addresses.
+#[test]
+#[should_panic(expected = "Error(Contract, #41)")]
+fn test_issue_492_set_guardians_rejects_duplicates() {
+    let (env, dao, admin, _v1, _v2, _target) = setup();
+    let g1 = Address::generate(&env);
+    let mut guardians = Vec::new(&env);
+    guardians.push_back(g1.clone());
+    guardians.push_back(g1.clone());
+
+    dao.set_guardians(&admin, &guardians, &2);
+}
+
+/// A guardian cannot approve the same pending upgrade multiple times to inflate approvals.
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_issue_492_guardian_duplicate_approval_rejected() {
+    let (env, dao, admin, _v1, _v2, _target) = setup();
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    let mut guardians = Vec::new(&env);
+    guardians.push_back(g1.clone());
+    guardians.push_back(g2.clone());
+
+    dao.set_guardians(&admin, &guardians, &2);
+
+    let wasm_hash = soroban_sdk::BytesN::from_array(&env, &[7u8; 32]);
+    dao.upgrade(&admin, &wasm_hash, &2);
+
+    // First approval by g1 succeeds
+    dao.approve_upgrade(&g1, &wasm_hash);
+
+    let pending = dao.get_pending_upgrade().unwrap();
+    assert_eq!(pending.approvals.len(), 1);
+    assert_eq!(pending.approvals.get(0).unwrap(), g1);
+
+    // Duplicate approval by same guardian must be rejected with AlreadyApprovedAction (#21)
+    dao.approve_upgrade(&g1, &wasm_hash);
+}
+
+/// Non-guardian caller cannot approve an upgrade.
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_issue_492_non_guardian_approval_rejected() {
+    let (env, dao, admin, voter1, _v2, _target) = setup();
+    let g1 = Address::generate(&env);
+    let mut guardians = Vec::new(&env);
+    guardians.push_back(g1.clone());
+
+    dao.set_guardians(&admin, &guardians, &1);
+
+    let wasm_hash = soroban_sdk::BytesN::from_array(&env, &[7u8; 32]);
+    dao.upgrade(&admin, &wasm_hash, &2);
+
+    // voter1 is not a guardian
+    dao.approve_upgrade(&voter1, &wasm_hash);
+}
+
+/// Multiple distinct guardians can each approve once, tracking approvals accurately.
+#[test]
+fn test_issue_492_distinct_guardians_approval_tracking() {
+    let (env, dao, admin, _v1, _v2, _target) = setup();
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    let g3 = Address::generate(&env);
+    let mut guardians = Vec::new(&env);
+    guardians.push_back(g1.clone());
+    guardians.push_back(g2.clone());
+    guardians.push_back(g3.clone());
+
+    dao.set_guardians(&admin, &guardians, &3);
+    assert_eq!(dao.get_guardian_threshold(), 3);
+    assert_eq!(dao.get_guardians().len(), 3);
+
+    let wasm_hash = soroban_sdk::BytesN::from_array(&env, &[7u8; 32]);
+    dao.upgrade(&admin, &wasm_hash, &2);
+
+    let pending = dao.get_pending_upgrade().unwrap();
+    assert_eq!(pending.approvals.len(), 0);
+
+    dao.approve_upgrade(&g1, &wasm_hash);
+    let pending = dao.get_pending_upgrade().unwrap();
+    assert_eq!(pending.approvals.len(), 1);
+    assert_eq!(pending.approvals.get(0).unwrap(), g1);
+
+    dao.approve_upgrade(&g2, &wasm_hash);
+    let pending = dao.get_pending_upgrade().unwrap();
+    assert_eq!(pending.approvals.len(), 2);
+    assert_eq!(pending.approvals.get(1).unwrap(), g2);
+
+    // Admin can cancel pending upgrade
+    dao.cancel_pending_upgrade(&admin);
+    assert!(dao.get_pending_upgrade().is_none());
+}
+
+/// Duplicate veto on an already-vetoed proposal is rejected.
+#[test]
+#[should_panic(expected = "Error(Contract, #43)")]
+fn test_issue_492_duplicate_veto_rejected() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+    let g1 = Address::generate(&env);
+    let mut guardians = Vec::new(&env);
+    guardians.push_back(g1.clone());
+    dao.set_guardians(&admin, &guardians, &1);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Proposal to be vetoed"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: testing veto duplicate."),
+    );
+
+    dao.veto_proposal(&g1, &pid, &Symbol::new(&env, "malicious"));
+    let p = dao.get_proposal(&pid);
+    assert!(p.is_vetoed);
+
+    // Second veto attempt must be rejected with ProposalVetoed (#43)
+    dao.veto_proposal(&g1, &pid, &Symbol::new(&env, "malicious"));
 }

@@ -884,6 +884,7 @@ dependencies = [
 name = "parashield-claims-processor"
 version = "0.2.0"
 dependencies = [
+ "parashield-common",
  "parashield-oracle-verifier",
  "parashield-policy-engine",
  "parashield-risk-pool",
@@ -891,9 +892,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "parashield-common"
+version = "0.1.0"
+
+[[package]]
 name = "parashield-governance-dao"
 version = "0.2.0"
 dependencies = [
+ "parashield-common",
  "soroban-sdk",
 ]
 
@@ -901,6 +907,7 @@ dependencies = [
 name = "parashield-oracle-verifier"
 version = "0.2.0"
 dependencies = [
+ "parashield-common",
  "soroban-sdk",
 ]
 
@@ -908,6 +915,7 @@ dependencies = [
 name = "parashield-policy-engine"
 version = "0.2.0"
 dependencies = [
+ "parashield-common",
  "soroban-sdk",
 ]
 
@@ -915,6 +923,7 @@ dependencies = [
 name = "parashield-risk-pool"
 version = "0.2.0"
 dependencies = [
+ "parashield-common",
  "soroban-sdk",
 ]
 
