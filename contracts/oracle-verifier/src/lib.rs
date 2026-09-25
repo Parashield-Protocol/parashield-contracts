@@ -1702,7 +1702,8 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::InvalidTimestamp);
         }
 
-        // Verify oracle is registered and active for this data_type
+        // SECURITY FIX: Verify oracle is registered and active for THIS specific data_type.
+        // An oracle registered for 'rainfall' cannot submit 'flight' data.
         let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         let entry: OracleEntry = env
             .storage()

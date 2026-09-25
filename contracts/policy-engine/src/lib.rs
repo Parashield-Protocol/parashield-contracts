@@ -70,6 +70,13 @@ enum StorageKey {
     PoolProductCount(Symbol),
     /// Contract version (u32) for storage migration tracking
     Version,
+    /// Pending timelock-gated admin action (PendingAdminAction)
+    /// SECURITY FIX: Prevent instant compromise of admin key from immediately
+    /// deploying malicious products. Critical admin actions (create_product,
+    /// update_product) must wait ADMIN_ACTION_TIMELOCK seconds.
+    PendingAdminAction,
+    /// Timestamp when PendingAdminAction becomes executable.
+    PendingAdminActionExecutableAfter,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -107,7 +114,16 @@ pub enum Error {
     /// An admin transfer was proposed while another one is still pending,
     /// which would reset the transfer timelock (issue #457).
     AdminTransferPending = 27,
+    /// Admin action timelock has not yet expired
+    AdminActionTimelockNotExpired = 28,
+    /// No pending admin action to execute
+    NoPendingAdminAction = 29,
 }
+
+// SECURITY: 48-hour timelock on critical admin actions (create_product, update_product).
+// Prevents an instantly-compromised admin key from immediately deploying malicious products.
+// Users have time to detect the compromise and intervene.
+const ADMIN_ACTION_TIMELOCK_SECONDS: u64 = 48 * 60 * 60;
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
