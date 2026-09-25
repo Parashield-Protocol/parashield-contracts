@@ -693,7 +693,28 @@ impl ClaimsProcessor {
                 args,
             ) {
                 Ok(Ok(result)) => {
-                    results.push_back((claim_id, result));
+                    results.push_back((claim_id, result.clone()));
+                    
+                    // Emit individual claim processed event for tracking specific outcomes
+                    let claim: Option<Claim> = env.storage().persistent()
+                        .get(&StorageKey::Claim(claim_id));
+                    if let Some(c) = claim {
+                        let trigger_met = match &result {
+                            ClaimResult::Approved(_) => true,
+                            ClaimResult::Rejected => false,
+                            ClaimResult::PartiallyPaid(_) => true,
+                            ClaimResult::AlreadyProcessed => false,
+                        };
+                        env.events().publish(
+                            (Symbol::new(&env, "claim_processed"),),
+                            ClaimProcessed {
+                                claim_id,
+                                policy_id,
+                                trigger_met,
+                                status: c.status,
+                            },
+                        );
+                    }
                 }
                 // Sub-invocation failed or returned a contract error — skip
                 // this claim and continue processing the rest of the batch.
