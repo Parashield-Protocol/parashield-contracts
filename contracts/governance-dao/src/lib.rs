@@ -273,11 +273,12 @@ impl GovernanceDao {
         proposer.require_auth();
         Self::validate_stellar_address(&env, &target);
         
-        // Validate impact analysis is provided (non-empty)
+        // SECURITY FIX: Validate impact analysis length to prevent storage exhaustion.
+        // Limit to 4096 bytes — reasonable for a proposal description without enabling
+        // attacks that reserve huge storage or inflate transaction costs.
         if impact_analysis.is_empty() {
             panic_with_error!(&env, Error::InvalidInput);
         }
-        // Enforce maximum length for impact analysis (4096 bytes)
         if impact_analysis.len() > 4096 {
             panic_with_error!(&env, Error::InvalidInput);
         }
@@ -695,10 +696,9 @@ impl GovernanceDao {
         let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
         let gov_token = token::Client::new(&env, &config.gov_token);
 
-        // DELEGATION SAFEGUARD 1: A holder who has delegated has handed their 
-        // authority away. Letting them vote too would count the same tokens twice — 
-        // once here, once in their delegate's tally. This check prevents a 
-        // delegator from directly voting.
+        // A holder who has delegated has handed their authority away. Letting
+        // them vote too would count the same tokens twice — once here, once in
+        // their delegate's tally.
         if env
             .storage()
             .persistent()
@@ -707,11 +707,8 @@ impl GovernanceDao {
             panic_with_error!(&env, Error::WeightAlreadyCounted);
         }
 
-        // DELEGATION SAFEGUARD 2: If a delegate has already voted and swept this 
-        // holder's weight into their own tally by calling collect_delegated_weight,
-        // we mark the delegator with a DelegatedVote marker to prevent them from 
-        // voting again. This prevents double-counting of delegated power even if 
-        // a delegator tries to vote after their delegate has already voted.
+        // Likewise if a delegate has already voted and swept this holder's
+        // weight into their own tally.
         if env
             .storage()
             .persistent()
@@ -741,7 +738,7 @@ impl GovernanceDao {
         gov_token.transfer(&voter, &env.current_contract_address(), &capped_own_weight);
 
         // 3. Add any weight delegated to this voter, recording each delegator
-        //    so they cannot also vote this proposal themselves via DelegatedVote markers.
+        //    so they cannot also vote this proposal themselves.
         let delegated_weight = Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
         let weight = capped_own_weight.saturating_add(delegated_weight);
 
