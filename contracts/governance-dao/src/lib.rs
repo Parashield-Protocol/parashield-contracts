@@ -17,7 +17,6 @@
 // message.
 #![deny(clippy::panic)]
 #![no_std]
-extern crate alloc;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
@@ -1839,6 +1838,13 @@ impl GovernanceDao {
     /// guardians are explicitly configured.
     pub fn set_guardians(env: Env, admin: Address, guardians: Vec<Address>, threshold: u32) {
         Self::require_admin(&env, &admin);
+        for i in 0..guardians.len() {
+            for j in (i + 1)..guardians.len() {
+                if guardians.get(i).unwrap() == guardians.get(j).unwrap() {
+                    panic_with_error!(&env, Error::InvalidInput);
+                }
+            }
+        }
         if threshold > guardians.len() {
             panic_with_error!(&env, Error::InvalidThreshold);
         }
@@ -1990,6 +1996,10 @@ impl GovernanceDao {
         // Can only veto before execution
         if proposal.status == ProposalStatus::Executed {
             panic_with_error!(&env, Error::AlreadyExecuted);
+        }
+
+        if proposal.is_vetoed {
+            panic_with_error!(&env, Error::ProposalVetoed);
         }
 
         proposal.is_vetoed = true;

@@ -8,7 +8,7 @@ use soroban_sdk::{
     token, Address, Env, Symbol,
 };
 
-use crate::{RiskPool, RiskPoolClient};
+use crate::{RiskPool, RiskPoolClient, StorageKey, MIN_DEPOSIT, MIN_SHARES};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -112,23 +112,23 @@ fn test_initialize_with_non_token_usdc() {
 // ── deposits ──────────────────────────────────────────────────────────────────
 
 #[test]
-#[should_panic(expected = "Error(Contract, #17)")]
+#[should_panic(expected = "Error(Contract, #18)")]
 fn test_deposit_too_small_panics() {
     let (_, pool, _, _, _, lp1) = setup();
-    pool.deposit(&lp1, &999_999i128, &0i128);
+    pool.deposit(&lp1, &999_999i128, &0i128, &false);
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #17)")]
+#[should_panic(expected = "Error(Contract, #18)")]
 fn test_deposit_1_stroop_panics() {
     let (_, pool, _, _, _, lp1) = setup();
-    pool.deposit(&lp1, &1i128, &0i128); // 1 stroop
+    pool.deposit(&lp1, &1i128, &0i128, &false); // 1 stroop
 }
 
 #[test]
 fn first_deposit_mints_one_to_one_shares() {
     let (_, pool, _, _, _, lp1) = setup();
-    let shares = pool.deposit(&lp1, &500_000_0000000i128, &0i128);
+    let shares = pool.deposit(&lp1, &500_000_0000000i128, &0i128, &false);
     assert_eq!(shares, 500_000_0000000i128 * 1_000_000_000);
 
     let stats = pool.get_stats();
@@ -142,8 +142,8 @@ fn second_deposit_proportional_shares() {
     let lp2 = Address::generate(&env);
     token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &500_000_0000000i128);
 
-    pool.deposit(&lp1, &500_000_0000000i128, &0i128);
-    let shares2 = pool.deposit(&lp2, &250_000_0000000i128, &0i128);
+    pool.deposit(&lp1, &500_000_0000000i128, &0i128, &false);
+    let shares2 = pool.deposit(&lp2, &250_000_0000000i128, &0i128, &false);
     // shares2 should be half of lp1's shares
     assert_eq!(shares2, 250_000_0000000i128 * 1_000_000_000);
 }
@@ -151,7 +151,7 @@ fn second_deposit_proportional_shares() {
 #[test]
 fn utilization_zero_before_locks() {
     let (_, pool, _, _, _, lp1) = setup();
-    pool.deposit(&lp1, &1_000_0000000i128, &0i128);
+    pool.deposit(&lp1, &1_000_0000000i128, &0i128, &false);
     assert_eq!(pool.get_utilization_rate(), 0);
 }
 
@@ -161,7 +161,7 @@ fn utilization_zero_before_locks() {
 fn withdraw_full_position() {
     let (_, pool, _, _, _, lp1) = setup();
     let amount = 400_0000000i128;
-    let shares = pool.deposit(&lp1, &amount, &0i128);
+    let shares = pool.deposit(&lp1, &amount, &0i128, &false);
     let returned = pool.withdraw(&lp1, &shares);
     assert_eq!(returned, amount);
 
@@ -173,10 +173,11 @@ fn withdraw_full_position() {
 fn withdraw_uses_available_liquidity_after_locks() {
     let (_, pool, _, admin, _, lp1) = setup();
     let amount = 1000_0000000i128;
-    let shares = pool.deposit(&lp1, &amount, &0i128);
+    let shares = pool.deposit(&lp1, &amount, &0i128, &false);
 
     pool.lock_for_policy(&admin, &1u128, &300_0000000i128);
-    let returned = pool.withdraw(&lp1, &shares);
+    let available_shares = (700_0000000i128 * shares) / amount;
+    let returned = pool.withdraw(&lp1, &available_shares);
 
     assert_eq!(returned, 700_0000000i128);
 }
@@ -185,10 +186,11 @@ fn withdraw_uses_available_liquidity_after_locks() {
 fn withdraw_uses_available_liquidity_after_locks_2() {
     let (_, pool, _, admin, _, lp1) = setup();
     let amount = 1000_0000000i128;
-    let shares = pool.deposit(&lp1, &amount, &0i128);
+    let shares = pool.deposit(&lp1, &amount, &0i128, &false);
 
     pool.lock_for_policy(&admin, &1u128, &300_0000000i128);
-    let returned = pool.withdraw(&lp1, &shares);
+    let available_shares = (700_0000000i128 * shares) / amount;
+    let returned = pool.withdraw(&lp1, &available_shares);
 
     assert_eq!(returned, 700_0000000i128);
 }
@@ -198,7 +200,7 @@ fn withdraw_partial_position_decrements_shares() {
     let (_, pool, _, _, _, lp1) = setup();
     let amount = 1000_0000000i128;
     // deposit 1000 USDC
-    let shares = pool.deposit(&lp1, &amount, &0i128);
+    let shares = pool.deposit(&lp1, &amount, &0i128, &false);
 
     // withdraw half the shares
     let half_shares = shares / 2;
@@ -228,7 +230,7 @@ fn withdraw_without_position_fails() {
 fn withdraw_locked_capital_fails() {
     let (_env, pool, _, admin, _, lp1) = setup();
     let amount = 100_0000000i128;
-    let shares = pool.deposit(&lp1, &amount, &0i128);
+    let shares = pool.deposit(&lp1, &amount, &0i128, &false);
 
     pool.lock_for_policy(&admin, &1u128, &amount); // lock all capital
     pool.withdraw(&lp1, &shares); // should fail
@@ -256,7 +258,7 @@ fn receive_premium_distributes_1000_usdc_80_10_10() {
     let backstop = pool.get_backstop();
     let usdc = token::Client::new(&env, &usdc_id);
 
-    pool.deposit(&lp1, &1_000_0000000i128, &0i128);
+    pool.deposit(&lp1, &1_000_0000000i128, &0i128, &false);
 
     let treasury_before = usdc.balance(&treasury);
     let backstop_before = usdc.balance(&backstop);
@@ -278,7 +280,7 @@ fn receive_premium_distributes_1000_usdc_80_10_10() {
 #[test]
 fn receive_premium_adds_lp_share() {
     let (_, pool, _, _, _, lp1) = setup();
-    pool.deposit(&lp1, &1_000_0000000i128, &0i128);
+    pool.deposit(&lp1, &1_000_0000000i128, &0i128, &false);
 
     let before = pool.get_stats().accumulated_premium;
     pool.receive_premium(&lp1, &100_0000000i128);
@@ -294,8 +296,8 @@ fn claim_yield_proportional_to_shares() {
     let lp2 = Address::generate(&env);
     token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &1_000_0000000i128);
 
-    pool.deposit(&lp1, &500_0000000i128, &0i128);
-    pool.deposit(&lp2, &500_0000000i128, &0i128);
+    pool.deposit(&lp1, &500_0000000i128, &0i128, &false);
+    pool.deposit(&lp2, &500_0000000i128, &0i128, &false);
     pool.receive_premium(&lp1, &200_0000000i128); // 160 USDC to LP accumulated
 
     let yield1 = pool.claim_yield(&lp1);
@@ -310,7 +312,7 @@ fn claim_yield_proportional_to_shares() {
 #[test]
 fn lock_and_release_round_trip() {
     let (_, pool, _, admin, _, lp1) = setup();
-    pool.deposit(&lp1, &200_0000000i128, &0i128);
+    pool.deposit(&lp1, &200_0000000i128, &0i128, &false);
 
     pool.lock_for_policy(&admin, &42u128, &100_0000000i128);
     assert_eq!(pool.get_utilization_rate(), 5_000u32); // 50% utilization in bps
@@ -323,7 +325,7 @@ fn lock_and_release_round_trip() {
 #[should_panic(expected = "Error(Contract, #8)")]
 fn double_lock_fails() {
     let (_, pool, _, admin, _, lp1) = setup();
-    pool.deposit(&lp1, &200_0000000i128, &0i128);
+    pool.deposit(&lp1, &200_0000000i128, &0i128, &false);
     pool.lock_for_policy(&admin, &1u128, &50_0000000i128);
     pool.lock_for_policy(&admin, &1u128, &50_0000000i128); // duplicate
 }
@@ -332,7 +334,7 @@ fn double_lock_fails() {
 #[should_panic(expected = "Error(Contract, #10)")]
 fn double_release_fails() {
     let (_, pool, _, admin, _, lp1) = setup();
-    pool.deposit(&lp1, &200_0000000i128, &0i128);
+    pool.deposit(&lp1, &200_0000000i128, &0i128, &false);
     pool.lock_for_policy(&admin, &99u128, &50_0000000i128);
     pool.release_for_claim(&admin, &99u128);
     pool.release_for_claim(&admin, &99u128); // already released
@@ -344,7 +346,7 @@ fn double_release_fails() {
 #[test]
 fn lock_and_release_for_expiry_round_trip() {
     let (_, pool, _, admin, _, lp1) = setup();
-    pool.deposit(&lp1, &200_0000000i128, &0i128);
+    pool.deposit(&lp1, &200_0000000i128, &0i128, &false);
 
     pool.lock_for_policy(&admin, &42u128, &100_0000000i128);
     assert_eq!(pool.get_utilization_rate(), 5_000u32); // 50% utilization in bps
@@ -357,7 +359,7 @@ fn lock_and_release_for_expiry_round_trip() {
 #[test]
 fn lock_100_release_100_returns_total_locked_to_zero() {
     let (_, pool, _, admin, _, lp1) = setup();
-    pool.deposit(&lp1, &200_0000000i128, &0i128);
+    pool.deposit(&lp1, &200_0000000i128, &0i128, &false);
 
     let lock_amount = 100_0000000i128;
     pool.lock_for_policy(&admin, &1u128, &lock_amount);
@@ -372,7 +374,7 @@ fn lock_100_release_100_returns_total_locked_to_zero() {
 #[should_panic(expected = "Error(Contract, #10)")]
 fn double_release_for_expiry_fails() {
     let (_, pool, _, admin, _, lp1) = setup();
-    pool.deposit(&lp1, &200_0000000i128, &0i128);
+    pool.deposit(&lp1, &200_0000000i128, &0i128, &false);
     pool.lock_for_policy(&admin, &99u128, &50_0000000i128);
     pool.release_for_expiry(&admin, &99u128);
     pool.release_for_expiry(&admin, &99u128); // already released
@@ -385,7 +387,7 @@ fn double_release_for_expiry_fails() {
 fn pool_deposit_while_paused_fails() {
     let (_, pool, _, admin, _, lp1) = setup();
     pool.pause(&admin);
-    pool.deposit(&lp1, &100_0000000i128, &0i128);
+    pool.deposit(&lp1, &100_0000000i128, &0i128, &false);
 }
 
 #[test]
@@ -393,7 +395,7 @@ fn resume_allows_deposit() {
     let (_, pool, _, admin, _, lp1) = setup();
     pool.pause(&admin);
     pool.resume(&admin);
-    let shares = pool.deposit(&lp1, &100_0000000i128, &0i128);
+    let shares = pool.deposit(&lp1, &100_0000000i128, &0i128, &false);
     assert!(shares > 0);
 }
 
@@ -402,7 +404,7 @@ fn resume_allows_deposit() {
 #[test]
 fn get_position_returns_correct_state() {
     let (_, pool, _, _, _, lp1) = setup();
-    pool.deposit(&lp1, &300_0000000i128, &0i128);
+    pool.deposit(&lp1, &300_0000000i128, &0i128, &false);
     let pos = pool.get_position(&lp1).unwrap();
     assert_eq!(pos.deposited, 300_0000000i128);
     assert_eq!(pos.shares, 300_0000000i128 * 1_000_000_000);
@@ -422,11 +424,11 @@ fn test_deposit_precision_loss_prevented() {
     let lp2 = Address::generate(&env);
 
     // LP1 deposits 1000 USDC
-    pool.deposit(&lp1, &1000_0000000i128, &0i128);
+    pool.deposit(&lp1, &1000_0000000i128, &0i128, &false);
 
     // LP2 deposits the MIN_DEPOSIT (1_000_000 stroops)
     token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &1_000_000i128);
-    let shares = pool.deposit(&lp2, &1_000_000i128, &0i128);
+    let shares = pool.deposit(&lp2, &1_000_000i128, &0i128, &false);
 
     // 1_000_000 stroops yields 1_000_000_000_000_000 shares (because 1 USDC = 1e9 shares).
     assert_eq!(shares, 1_000_000_000_000_000i128);
@@ -447,7 +449,7 @@ fn test_deposit_precision_loss_prevented() {
 fn admin_cannot_drain_lp_funds_indirectly() {
     let (_, pool, _, admin, _, lp1) = setup();
     let amount = 500_0000000i128;
-    let _shares = pool.deposit(&lp1, &amount, &0i128);
+    let _shares = pool.deposit(&lp1, &amount, &0i128, &false);
 
     // There is no admin-only withdraw function.  Only `withdraw(lp, shares)`
     // exists, and it requires lp's auth.  Verify there are no other
@@ -466,7 +468,7 @@ fn admin_cannot_drain_lp_funds_indirectly() {
 fn emergency_withdraw_allows_admin_approved_lp_exit_while_paused() {
     let (env, pool, usdc_id, admin, _, lp1) = setup();
     let amount = 500_0000000i128;
-    let shares = pool.deposit(&lp1, &amount, &0i128);
+    let shares = pool.deposit(&lp1, &amount, &0i128, &false);
     pool.pause(&admin);
 
     let before = token::Client::new(&env, &usdc_id).balance(&lp1);
@@ -483,7 +485,7 @@ fn emergency_withdraw_allows_admin_approved_lp_exit_while_paused() {
 fn emergency_withdraw_requires_admin_approval() {
     let (env, pool, _, _admin, _, lp1) = setup();
     let amount = 500_0000000i128;
-    let shares = pool.deposit(&lp1, &amount, &0i128);
+    let shares = pool.deposit(&lp1, &amount, &0i128, &false);
     let impostor = Address::generate(&env);
     pool.emergency_withdraw(&lp1, &impostor, &shares);
 }
@@ -494,7 +496,7 @@ fn emergency_withdraw_requires_admin_approval() {
 #[should_panic(expected = "Error(Contract, #15)")]
 fn admin_timelock_withdrawal_not_ready_before_7_days() {
     let (_, pool, _usdc_id, admin, _treasury, lp1) = setup();
-    pool.deposit(&lp1, &1_000_0000000i128, &0i128);
+    pool.deposit(&lp1, &1_000_0000000i128, &0i128, &false);
 
     pool.request_admin_withdrawal(&admin, &100_0000000i128);
     // Attempt to execute immediately → TimelockNotReady (#14)
@@ -505,7 +507,7 @@ fn admin_timelock_withdrawal_not_ready_before_7_days() {
 #[test]
 fn admin_timelock_cancel_and_re_request() {
     let (env, pool, _usdc_id, admin, _treasury, lp1) = setup();
-    pool.deposit(&lp1, &1_000_0000000i128, &0i128);
+    pool.deposit(&lp1, &1_000_0000000i128, &0i128, &false);
 
     pool.request_admin_withdrawal(&admin, &100_0000000i128);
     pool.cancel_admin_withdrawal(&admin);
@@ -536,7 +538,7 @@ fn lock_for_policy_on_empty_pool_fails_undercollateralized() {
 #[should_panic(expected = "Error(Contract, #3)")]
 fn non_admin_cannot_lock_for_policy() {
     let (_, pool, _usdc_id, _admin, _treasury, lp1) = setup();
-    pool.deposit(&lp1, &500_0000000i128, &0i128);
+    pool.deposit(&lp1, &500_0000000i128, &0i128, &false);
 
     pool.lock_for_policy(&lp1, &1u128, &100_0000000i128);
 }
@@ -546,7 +548,7 @@ fn non_admin_cannot_lock_for_policy() {
 #[should_panic(expected = "Error(Contract, #3)")]
 fn non_admin_cannot_release_for_claim() {
     let (_, pool, _usdc_id, admin, _treasury, lp1) = setup();
-    pool.deposit(&lp1, &500_0000000i128, &0i128);
+    pool.deposit(&lp1, &500_0000000i128, &0i128, &false);
     pool.lock_for_policy(&admin, &1u128, &100_0000000i128);
 
     pool.release_for_claim(&lp1, &1u128);
@@ -557,7 +559,7 @@ fn non_admin_cannot_release_for_claim() {
 #[should_panic(expected = "Error(Contract, #3)")]
 fn non_admin_cannot_release_for_expiry() {
     let (_, pool, _usdc_id, admin, _treasury, lp1) = setup();
-    pool.deposit(&lp1, &500_0000000i128, &0i128);
+    pool.deposit(&lp1, &500_0000000i128, &0i128, &false);
     pool.lock_for_policy(&admin, &1u128, &100_0000000i128);
 
     pool.release_for_expiry(&lp1, &1u128);
@@ -572,7 +574,7 @@ fn test_get_lp_list_pagination() {
     for _ in 0..200 {
         let lp = Address::generate(&env);
         usdc_client.mint(&lp, &10_000_000i128);
-        pool.deposit(&lp, &10_000_000i128, &0i128);
+        pool.deposit(&lp, &10_000_000i128, &0i128, &false);
     }
 
     assert_eq!(pool.get_lp_count(), 200);
@@ -594,7 +596,7 @@ fn withdraw_exact_available_balance_leaves_zero_remaining() {
     let total = 1_000_0000000i128; // 1000 USDC
     let locked_amount = 300_0000000i128; // 300 USDC locked for policy
 
-    let shares = pool.deposit(&lp1, &total, &0i128);
+    let _shares = pool.deposit(&lp1, &total, &0i128, &false);
     pool.lock_for_policy(&admin, &1u128, &locked_amount);
 
     // Available = total - locked = 700 USDC
@@ -616,3 +618,66 @@ fn withdraw_exact_available_balance_leaves_zero_remaining() {
 fn total_shares(deposited: i128) -> i128 {
     deposited * 1_000_000_000
 }
+
+// ── Issue #493: zero / infinitesimal share rounding protection ────────────────
+
+/// Issue #493: When total_deposited is large relative to total_shares,
+/// depositing a small amount (even >= MIN_DEPOSIT) could result in
+/// integer division rounding shares down to 0:
+/// `(amount * total_shares) / total_deposited == 0`.
+///
+/// Without protection, the contract would transfer USDC from the LP but mint
+/// 0 shares (loss of funds). The contract must enforce MIN_SHARES >= 1 and
+/// reject the deposit with Error::ZeroAmount (#5).
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_issue_493_deposit_zero_shares_panics() {
+    let (env, pool, usdc_id, _, _, _) = setup();
+    let lp2 = Address::generate(&env);
+
+    // Directly set total_deposited and total_shares representing a pool with large deposited balance:
+    // e.g. total_deposited = 10^15 (MAX_TOTAL_DEPOSITED) and total_shares = 100
+    env.as_contract(&pool.address, || {
+        env.storage().instance().set(&StorageKey::TotalDeposited, &500_000_000_000_000i128);
+        env.storage().instance().set(&StorageKey::TotalShares, &100i128);
+    });
+
+    // LP2 deposits MIN_DEPOSIT (1_000_000 stroops = 0.1 USDC).
+    // shares = (1_000_000 * 100) / 1_000_000_000_000_000 = 100_000_000 / 10^15 = 0.
+    // Without MIN_SHARES check, this would mint 0 shares and lock the LP's deposit.
+    // With MIN_SHARES check, it panics with Error::ZeroAmount (#5).
+    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &MIN_DEPOSIT);
+    pool.deposit(&lp2, &MIN_DEPOSIT, &0i128, &false);
+}
+
+/// Issue #493: Test that deposits resulting in >= MIN_SHARES succeed,
+/// and returns at least MIN_SHARES.
+#[test]
+fn test_issue_493_deposit_valid_shares_succeeds() {
+    let (env, pool, usdc_id, _, _, lp1) = setup();
+    let lp2 = Address::generate(&env);
+
+    // Initial deposit
+    pool.deposit(&lp1, &1000_0000000i128, &0i128, &false);
+
+    // LP2 deposits valid amount and specifies min_shares = MIN_SHARES
+    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &100_0000000i128);
+    let shares = pool.deposit(&lp2, &100_0000000i128, &MIN_SHARES, &false);
+    assert!(shares >= MIN_SHARES);
+}
+
+/// Issue #493: Test that min_shares slippage protection reverts with InsufficientShares
+/// if fewer shares than requested would be minted.
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_issue_493_deposit_slippage_protection_panics() {
+    let (env, pool, usdc_id, _, _, lp1) = setup();
+    let lp2 = Address::generate(&env);
+
+    pool.deposit(&lp1, &1000_0000000i128, &0i128, &false);
+
+    // Request impossibly high min_shares
+    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &100_0000000i128);
+    pool.deposit(&lp2, &100_0000000i128, &i128::MAX, &false);
+}
+
