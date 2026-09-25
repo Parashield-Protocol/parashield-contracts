@@ -315,3 +315,28 @@ pub struct PendingAdminChange {
     pub approvals: Vec<Address>,
 }
 
+/// Emitted when an admin proposes a new admin (with or without guardians).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminChangeProposed {
+    pub new_admin: Address,
+    pub guardian_required: bool,
+}
+
+/// Emitted when a guardian approves a pending admin-change proposal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminChangeApproved {
+    pub new_admin: Address,
+    pub approver: Address,
+    pub approvals: u32,
+    pub threshold: u32,
+}
+
+/// Emitted when a pending upgrade is cancelled by the admin.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUpgradeCancelled {
+    pub cancelled_by: Address,
+}
+

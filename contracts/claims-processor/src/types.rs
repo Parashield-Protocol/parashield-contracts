@@ -286,3 +286,13 @@ pub struct PayoutDelayUpdated {
     pub delay_seconds: u64,
 }
 
+/// Emitted when a per-data-type staleness threshold is set or removed (#494).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StalenessThresholdByTypeUpdated {
+    pub data_type: Symbol,
+    /// The new threshold in seconds. `0` means the per-type override was
+    /// removed and the global threshold applies.
+    pub threshold: u64,
+}
+

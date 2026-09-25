@@ -1,4 +1,4 @@
-﻿//! Parashield Policy Engine
+//! Parashield Policy Engine
 //!
 //! Manages insurance products and policies.
 //!
@@ -447,6 +447,11 @@ impl PolicyEngine {
         // Remove the (category, oracle_key) mapping to allow reuse of the key
         let key = (product.category, product.oracle_key);
         env.storage().persistent().remove(&StorageKey::ProductKey(key));
+
+        env.events().publish(
+            (Symbol::new(&env, "product_deprecated"),),
+            ProductDeprecated { product_id },
+        );
     }
 
     // ── Policy Lifecycle ──────────────────────────────────────────────────────
@@ -517,6 +522,13 @@ impl PolicyEngine {
         let product = Self::load_product(&env, product_id);
         if product.status != ProductStatus::Active {
             panic_with_error!(&env, Error::ProductNotActive);
+        }
+        // Defense-in-depth: reject non-positive coverage before range check
+        // (#501). A zero or negative amount would pass the range check when
+        // coverage_min is zero or negative, creating a free or profit-making
+        // policy that drains the pool.
+        if coverage_amount <= 0 {
+            panic_with_error!(&env, Error::CoverageOutOfRange);
         }
         if coverage_amount < product.coverage_min || coverage_amount > product.coverage_max {
             panic_with_error!(&env, Error::CoverageOutOfRange);
@@ -1115,16 +1127,24 @@ impl PolicyEngine {
              env.storage()
                  .instance()
                  .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
+             env.events().publish(
+                 (Symbol::new(&env, "admin_change_proposed"),),
+                 AdminChangeProposed { new_admin: new_admin.clone(), guardian_required: false },
+             );
              return;
          }
 
          let pending = PendingAdminChange {
-             new_admin,
+             new_admin: new_admin.clone(),
              approvals: Vec::new(&env),
          };
          env.storage()
              .instance()
              .set(&StorageKey::PendingAdminChange, &pending);
+         env.events().publish(
+             (Symbol::new(&env, "admin_change_proposed"),),
+             AdminChangeProposed { new_admin, guardian_required: true },
+         );
      }
 
      /// Guardian approval for a pending admin-change proposal. Once enough
@@ -1162,13 +1182,23 @@ impl PolicyEngine {
                  panic_with_error!(&env, Error::AlreadyApprovedAction);
              }
          }
-         pending.approvals.push_back(guardian);
+         pending.approvals.push_back(guardian.clone());
 
          let threshold: u32 = env
              .storage()
              .instance()
              .get(&StorageKey::GuardianThreshold)
              .unwrap_or(0);
+
+         env.events().publish(
+             (Symbol::new(&env, "admin_change_approved"),),
+             AdminChangeApproved {
+                 new_admin: new_admin.clone(),
+                 approver: guardian,
+                 approvals: pending.approvals.len(),
+                 threshold,
+             },
+         );
 
          if pending.approvals.len() >= threshold {
              env.storage().instance().remove(&StorageKey::PendingAdminChange);
@@ -1306,6 +1336,10 @@ impl PolicyEngine {
              panic_with_error!(&env, Error::NoPendingUpgrade);
          }
          env.storage().instance().remove(&StorageKey::PendingUpgrade);
+         env.events().publish(
+             (Symbol::new(&env, "pending_upgrade_cancelled"),),
+             PendingUpgradeCancelled { cancelled_by: admin },
+         );
      }
 
      /// Accept the proposed admin. Only the proposed admin can call this.

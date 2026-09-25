@@ -129,6 +129,10 @@ enum StorageKey {
     /// Configurable delay in seconds between claim approval and payout (u64).
     /// 0 = immediate payout (default behavior).
     PayoutDelay,
+    /// Per-data-type staleness threshold (Symbol → u64). Allows different
+    /// oracle data types (e.g. "weather" vs "flight") to have different
+    /// freshness requirements (#494).
+    StalenessThresholdByType(Symbol),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -378,6 +382,13 @@ impl ClaimsProcessor {
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
 
+        // A disputed claim must not be processed until the admin resolves
+        // the dispute (#500). Disputed claims are removed from the pending
+        // queue, but process_claim bypasses the queue — this check is the
+        // only guard against racing a dispute resolution.
+        if claim.status == ClaimStatus::Disputed {
+            panic_with_error!(&env, Error::AlreadyProcessed);
+        }
         if claim.status != ClaimStatus::Pending {
             return ClaimResult::AlreadyProcessed;
         }
@@ -1271,6 +1282,55 @@ impl ClaimsProcessor {
             .unwrap_or(0)
     }
 
+    // ── Per-data-type staleness threshold (issue #494) ──────────────────────
+
+    /// Admin-only: set the staleness threshold for a specific oracle data type.
+    ///
+    /// Different data types have different freshness requirements — weather data
+    /// arriving every 15 minutes can tolerate a shorter threshold than on-chain
+    /// data that updates once per ledger. When set, `evaluate_and_settle` uses
+    /// this per-type threshold instead of the global `StalenessThreshold`.
+    ///
+    /// Pass `0` to remove a per-type override and fall back to the global value.
+    pub fn set_staleness_threshold_by_type(
+        env: Env,
+        admin: Address,
+        data_type: Symbol,
+        threshold: u64,
+    ) {
+        Self::require_admin(&env, &admin);
+        if threshold == 0 {
+            env.storage()
+                .instance()
+                .remove(&StorageKey::StalenessThresholdByType(data_type));
+        } else {
+            env.storage()
+                .instance()
+                .set(&StorageKey::StalenessThresholdByType(data_type.clone()), &threshold);
+        }
+        env.events().publish(
+            (Symbol::new(&env, "staleness_threshold_by_type_set"),),
+            StalenessThresholdByTypeUpdated { data_type, threshold },
+        );
+    }
+
+    /// The staleness threshold for a specific data type, falling back to the
+    /// global threshold if no per-type override is configured.
+    fn staleness_threshold_for_type(env: &Env, data_type: &Symbol) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::StalenessThresholdByType(data_type.clone()))
+            .unwrap_or_else(|| Self::global_staleness_threshold(env))
+    }
+
+    /// The global staleness threshold (default 7 days = 604_800 s).
+    fn global_staleness_threshold(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::StalenessThreshold)
+            .unwrap_or(604_800u64)
+    }
+
     /// Claim the payout for an approved claim after the payout delay has elapsed.
     ///
     /// When a payout delay is configured, approved claims enter Paid/PartiallyPaid
@@ -1449,10 +1509,12 @@ impl ClaimsProcessor {
         let risk_pool: Address = env.storage().instance()
             .get(&StorageKey::RiskPool)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
-        // Configurable staleness threshold (default 7 days = 604_800 s if not set)
-        let staleness_threshold: u64 = env.storage().instance()
-            .get(&StorageKey::StalenessThreshold)
-            .unwrap_or(604_800u64);
+        // Per-data-type staleness threshold: uses the data-type-specific value
+        // if configured, otherwise falls back to the global threshold (#494).
+        let staleness_threshold: u64 = Self::staleness_threshold_for_type(
+            env,
+            &policy.oracle_data_type,
+        );
 
         let condition = parashield_oracle_verifier::TriggerCondition {
             data_type:   policy.oracle_data_type.clone(),
