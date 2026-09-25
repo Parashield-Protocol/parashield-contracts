@@ -839,8 +839,14 @@ impl RiskPool {
     /// provider, so the reserved total cannot be inflated past what the LP
     /// actually holds.
     ///
-    /// Panics with `ExitAlreadyQueued` if a request is already outstanding;
-    /// cancel it first to change the amount.
+    /// Issue #458: if a request is already outstanding for this provider,
+    /// the new shares are ADDED to the existing entry rather than rejected.
+    /// The original `requested_at` and `claimable_at` are preserved so a
+    /// second call cannot silently defer the first request's unlock — a
+    /// provider who tops up their exit still has to wait for the timelock
+    /// that started with the initial request. The provider's total shares
+    /// must still cover the summed exit; otherwise the existing entry is
+    /// left untouched and the call reverts with `InsufficientFunds`.
     pub fn request_exit(env: Env, provider: Address, shares: i128) {
         provider.require_auth();
         if shares <= 0 {
@@ -853,24 +859,36 @@ impl RiskPool {
             .persistent()
             .get(&StorageKey::LpPosition(provider.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
-        if position.shares < shares {
-            panic_with_error!(&env, Error::InsufficientFunds);
-        }
 
         let req_key = StorageKey::ExitReq(provider.clone());
-        if env.storage().persistent().has(&req_key) {
-            panic_with_error!(&env, Error::ExitAlreadyQueued);
+        // Issue #458: read any existing entry and treat the write as an
+        // accumulate. `total_shares` is what the provider now expects to
+        // withdraw at claim time; it must not exceed their live share
+        // balance.
+        let existing: Option<ExitRequest> = env.storage().persistent().get(&req_key);
+        let (total_shares, requested_at, claimable_at) = match &existing {
+            Some(prev) => (
+                prev.shares.saturating_add(shares),
+                prev.requested_at,
+                prev.claimable_at,
+            ),
+            None => {
+                let now = env.ledger().timestamp();
+                (shares, now, now.saturating_add(Self::exit_delay(&env)))
+            }
+        };
+        if position.shares < total_shares {
+            // Leave `existing` untouched so a failed top-up cannot corrupt
+            // an already-valid request.
+            panic_with_error!(&env, Error::InsufficientFunds);
         }
-
-        let now = env.ledger().timestamp();
-        let claimable_at = now.saturating_add(Self::exit_delay(&env));
 
         env.storage().persistent().set(
             &req_key,
             &ExitRequest {
                 provider: provider.clone(),
-                shares,
-                requested_at: now,
+                shares: total_shares,
+                requested_at,
                 claimable_at,
             },
         );
@@ -881,6 +899,9 @@ impl RiskPool {
             .instance()
             .get(&StorageKey::QueuedExitShares)
             .unwrap_or(0);
+        // Bump the pool-wide queued counter by the increment only. On a
+        // fresh request the increment equals the total; on a top-up it
+        // equals just the newly queued portion.
         env.storage()
             .instance()
             .set(&StorageKey::QueuedExitShares, &queued.saturating_add(shares));
