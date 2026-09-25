@@ -151,6 +151,23 @@ enum StorageKey {
     CrossValidationTargets(Symbol),
     /// Geographic weighting multiplier in basis points for (data_type, oracle, region).
     GeoWeight(Symbol, Address, Symbol),
+    /// Issue #459: per-(data_type, oracle) count of consecutive stale
+    /// submissions since the last accepted fresh one. Incremented when an
+    /// oracle posts data older than `effective_max_age`, reset when a fresh
+    /// submission from the same oracle succeeds.
+    StaleCount(Symbol, Address),
+    /// Issue #459: number of stale submissions (u32) that triggers a
+    /// slash / reputation penalty. `0` disables the mechanism entirely
+    /// (default).
+    StaleThreshold,
+    /// Issue #459: stake amount (i128) slashed when the threshold is
+    /// reached. Capped by the oracle's current stake at the call site so
+    /// setting a large amount never panics on a low-stake oracle.
+    StaleSlashAmount,
+    /// Issue #459: reputation basis points (u32) subtracted from the
+    /// oracle's `OracleReputation.score` when the threshold is reached,
+    /// clamped to 0.
+    StaleReputationPenalty,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -1517,6 +1534,231 @@ impl OracleVerifier {
         );
     }
 
+    // ── Stale-submission penalty (issue #459) ────────────────────────────────
+
+    /// Configure how many consecutive stale submissions from the same oracle
+    /// trigger the automated stale-path penalty (slash + reputation drop).
+    /// `0` disables the feature entirely so existing deployments keep their
+    /// pre-#459 behaviour until an admin opts in. Admin-only.
+    pub fn set_stale_threshold(env: Env, admin: Address, threshold: u32) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::StaleThreshold, &threshold);
+        env.events().publish(
+            (Symbol::new(&env, "stale_threshold_updated"),),
+            StaleThresholdUpdated { threshold },
+        );
+    }
+
+    /// Current stale-submission threshold (`0` when unset / disabled).
+    pub fn get_stale_threshold(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::StaleThreshold)
+            .unwrap_or(0)
+    }
+
+    /// Stake amount subtracted from an oracle's stake when the stale-
+    /// submission threshold is reached. Capped by the oracle's current stake
+    /// at the call site, so a large amount here never panics on a low-stake
+    /// oracle. Negative values rejected. Admin-only.
+    pub fn set_stale_slash_amount(env: Env, admin: Address, amount: i128) {
+        Self::require_admin(&env, &admin);
+        if amount < 0 {
+            panic_with_error!(&env, Error::InvalidStakeAmount);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::StaleSlashAmount, &amount);
+        env.events().publish(
+            (Symbol::new(&env, "stale_slash_amount_updated"),),
+            StaleSlashAmountUpdated { amount },
+        );
+    }
+
+    /// Currently configured stale-path slash amount (`0` if unset).
+    pub fn get_stale_slash_amount(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::StaleSlashAmount)
+            .unwrap_or(0)
+    }
+
+    /// Reputation basis points subtracted from `OracleReputation.score` when
+    /// the stale-submission threshold is reached. Clamped to 0 on subtract.
+    /// Admin-only.
+    pub fn set_stale_reputation_penalty(env: Env, admin: Address, reputation_lost: u32) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::StaleReputationPenalty, &reputation_lost);
+        env.events().publish(
+            (Symbol::new(&env, "stale_reputation_penalty_updated"),),
+            StaleReputationPenaltyUpdated { reputation_lost },
+        );
+    }
+
+    /// Currently configured reputation basis-point penalty (`0` if unset).
+    pub fn get_stale_reputation_penalty(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::StaleReputationPenalty)
+            .unwrap_or(0)
+    }
+
+    /// Running count of consecutive stale submissions from `oracle` for
+    /// `data_type` since their last accepted fresh submission. Exposed for
+    /// off-chain monitors that want to see how close an oracle is to the
+    /// threshold before the penalty fires.
+    pub fn get_stale_count(env: Env, data_type: Symbol, oracle: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::StaleCount(data_type, oracle))
+            .unwrap_or(0)
+    }
+
+    /// Increment the stale-submission counter for this oracle + data_type
+    /// and, if the threshold is reached, slash stake and drop reputation.
+    /// Always emits `StaleSubmissionDetected`; emits `StalePenaltyApplied`
+    /// only when the penalty is actually applied. Returns after the caller's
+    /// `submit_data*` should stop processing this submission (the stale
+    /// point is not added to `DataPoints`).
+    ///
+    /// This function does NOT panic. Any panic here would revert the counter
+    /// increment we just made, so no penalty could ever accumulate; the
+    /// caller function returns normally after this so the state changes
+    /// persist. Callers surface the rejection through the event stream, not
+    /// the return value.
+    fn handle_stale_submission(
+        env: &Env,
+        oracle: &Address,
+        data_type: &Symbol,
+        submitted_ts: u64,
+        max_age: u64,
+    ) {
+        let count_key = StorageKey::StaleCount(data_type.clone(), oracle.clone());
+        let prev: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        let count = prev.saturating_add(1);
+        env.storage().persistent().set(&count_key, &count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&count_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.events().publish(
+            (Symbol::new(env, "stale_submission_detected"),),
+            StaleSubmissionDetected {
+                oracle: oracle.clone(),
+                data_type: data_type.clone(),
+                submitted_ts,
+                max_age,
+                count,
+            },
+        );
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StaleThreshold)
+            .unwrap_or(0);
+        // `threshold == 0` keeps the feature off entirely — even the count
+        // still ticks (so the read-only `get_stale_count` telemetry works),
+        // but no penalty ever fires.
+        if threshold == 0 || count < threshold {
+            return;
+        }
+
+        let slash_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StaleSlashAmount)
+            .unwrap_or(0);
+        let rep_penalty: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::StaleReputationPenalty)
+            .unwrap_or(0);
+
+        // Slash stake (capped by current balance).
+        let stake_key = StorageKey::OracleStakeAmt(data_type.clone(), oracle.clone());
+        let current_stake: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0);
+        let slashed = if slash_amount > 0 && current_stake > 0 {
+            let s = slash_amount.min(current_stake);
+            env.storage().persistent().set(&stake_key, &(current_stake - s));
+            if let Some(token_addr) = env
+                .storage()
+                .instance()
+                .get::<_, Address>(&StorageKey::StakeToken)
+            {
+                if let Some(treasury) = env
+                    .storage()
+                    .instance()
+                    .get::<_, Address>(&StorageKey::SlashTreasury)
+                {
+                    token::Client::new(env, &token_addr).transfer(
+                        &env.current_contract_address(),
+                        &treasury,
+                        &s,
+                    );
+                }
+            }
+            s
+        } else {
+            0
+        };
+
+        // Drop reputation (clamped to 0).
+        let rep_key = StorageKey::Reputation(data_type.clone(), oracle.clone());
+        let reputation_lost = if rep_penalty > 0 {
+            let mut rep: OracleReputation =
+                env.storage().persistent().get(&rep_key).unwrap_or(OracleReputation {
+                    oracle: oracle.clone(),
+                    data_type: data_type.clone(),
+                    total_submissions: 0,
+                    accurate_submissions: 0,
+                    score: 500,
+                    last_updated: 0,
+                });
+            let applied = rep.score.min(rep_penalty);
+            rep.score = rep.score.saturating_sub(rep_penalty);
+            rep.last_updated = env.ledger().timestamp();
+            env.storage().persistent().set(&rep_key, &rep);
+            env.storage()
+                .persistent()
+                .extend_ttl(&rep_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            applied
+        } else {
+            0
+        };
+
+        // Reset the counter so the next stale submission starts a fresh
+        // window rather than triggering the penalty on every subsequent
+        // stale point. This is analogous to how the existing `slash_oracle`
+        // is one-shot per admin call rather than every-block.
+        env.storage().persistent().set(&count_key, &0u32);
+
+        env.events().publish(
+            (Symbol::new(env, "stale_penalty_applied"),),
+            StalePenaltyApplied {
+                oracle: oracle.clone(),
+                data_type: data_type.clone(),
+                count,
+                slashed,
+                reputation_lost,
+            },
+        );
+    }
+
+    /// Clear the stale-submission counter for this oracle + data_type. Called
+    /// on every successful fresh submission so a well-behaved oracle never
+    /// accumulates a lingering count.
+    fn reset_stale_count(env: &Env, oracle: &Address, data_type: &Symbol) {
+        let key = StorageKey::StaleCount(data_type.clone(), oracle.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().set(&key, &0u32);
+        }
+    }
+
     // ── Guardian Multisig (critical actions) ─────────────────────────────────
 
     /// Configure the guardian set and approval threshold required for
@@ -1719,6 +1961,19 @@ impl OracleVerifier {
 
         Self::enforce_rate_limit(&env, &data_type, &oracle, now);
 
+        // Issue #459: stale-submission gate. If the submitted timestamp is
+        // older than this data_type's `effective_max_age`, fold the point
+        // into the stale-penalty pipeline and return without adding it to
+        // `DataPoints`. `handle_stale_submission` deliberately does not
+        // panic — a panic would revert the counter increment and the
+        // penalty could never accumulate. The rejection is surfaced via the
+        // `StaleSubmissionDetected` event stream.
+        let max_data_age = Self::effective_max_age(&env, &data_type);
+        if now.saturating_sub(timestamp) > max_data_age {
+            Self::handle_stale_submission(&env, &oracle, &data_type, timestamp, max_data_age);
+            return;
+        }
+
         // Load existing submissions for this (data_type, key)
         let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
         let points: Vec<OracleDataPoint> = env
@@ -1734,8 +1989,8 @@ impl OracleVerifier {
             confidence,
             timestamp,
         };
-        // Prune stale or unregistered/inactive oracle entries first
-        let max_data_age = Self::effective_max_age(&env, &data_type);
+        // Prune stale or unregistered/inactive oracle entries first (max
+        // age loaded above for the stale-gate check is reused here).
         let mut pruned_points: Vec<OracleDataPoint> = Vec::new(&env);
         for i in 0..points.len() {
             let p = points.get_unchecked(i);
@@ -1761,6 +2016,12 @@ impl OracleVerifier {
 
         // Check cross-validation rules after storing new data
         Self::check_cross_validation(&env, &data_type, &key);
+
+        // Issue #459: a fresh accepted submission clears any accumulated
+        // stale count for this oracle + data_type, so a well-behaved oracle
+        // recovering from a bad batch does not carry a lingering count into
+        // the next window.
+        Self::reset_stale_count(&env, &oracle, &data_type);
 
         env.events().publish(
             (Symbol::new(&env, "oracle_data_submitted"),),
@@ -1867,6 +2128,13 @@ impl OracleVerifier {
 
         Self::enforce_rate_limit(&env, &data_type, &oracle, now);
 
+        // Issue #459: same stale-submission gate as `submit_data`.
+        let max_data_age = Self::effective_max_age(&env, &data_type);
+        if now.saturating_sub(timestamp) > max_data_age {
+            Self::handle_stale_submission(&env, &oracle, &data_type, timestamp, max_data_age);
+            return;
+        }
+
         let dp_key = StorageKey::EncryptedDataPoints(data_type.clone(), key.clone());
         let mut points: Vec<EncryptedOracleDataPoint> = env
             .storage()
@@ -1898,6 +2166,9 @@ impl OracleVerifier {
 
         env.storage().persistent().set(&dp_key, &points);
         env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        // Issue #459: fresh submission clears any accumulated stale count.
+        Self::reset_stale_count(&env, &oracle, &data_type);
 
         env.events().publish(
             (Symbol::new(&env, "oracle_encrypted_data_submitted"),),
@@ -2510,6 +2781,21 @@ impl OracleVerifier {
             if sub.timestamp < now.saturating_sub(max_timestamp_age) {
                 panic_with_error!(&env, Error::InvalidTimestamp);
             }
+            // Issue #459: per-item stale-submission gate. A stale item in a
+            // batch is skipped (with penalty accounting) rather than failing
+            // the whole batch, so a partial-good batch still lands its
+            // fresh entries.
+            let max_data_age = Self::effective_max_age(&env, &data_type);
+            if now.saturating_sub(sub.timestamp) > max_data_age {
+                Self::handle_stale_submission(
+                    &env,
+                    &oracle,
+                    &data_type,
+                    sub.timestamp,
+                    max_data_age,
+                );
+                continue;
+            }
             let dp_key = StorageKey::DataPoints(data_type.clone(), sub.key.clone());
             let mut points: Vec<OracleDataPoint> = env
                 .storage()
@@ -2548,6 +2834,13 @@ impl OracleVerifier {
                 },
             );
         }
+
+        // Issue #459: at least one fresh submission landed if we reach here
+        // (the loop exit for the all-stale case never runs on a non-empty
+        // batch since every iteration either commits or increments). Reset
+        // the counter, matching the per-oracle window semantics of the
+        // single-submit paths.
+        Self::reset_stale_count(&env, &oracle, &data_type);
     }
 
     /// Upgrade the contract WASM in-place. Only the admin may call this.
