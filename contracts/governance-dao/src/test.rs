@@ -573,6 +573,7 @@ fn test_finalize_refunds_deposit_locked_at_creation_not_live_config() {
         .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
 
     dao.finalize(&pid);
+    dao.withdraw_tokens(&voter1, &pid);
 
     // Must have gotten back the full original deposit (10k SHIELD), not
     // the live (lowered) threshold of 1 stroop.
@@ -1175,7 +1176,7 @@ fn reclaim_deposit_refunds_proposer_after_timeout() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #26)")]
+#[should_panic(expected = "Error(Contract, #33)")]
 fn reclaim_deposit_before_timeout_fails() {
     let (env, dao, _admin, voter1, _v2, target) = setup();
     let args: Vec<Val> = Vec::new(&env);
@@ -1260,7 +1261,7 @@ fn create_proposal_from_template_enforces_structure() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #29)")]
+#[should_panic(expected = "Error(Contract, #36)")]
 fn create_proposal_from_template_rejects_short_title() {
     let (env, dao, admin, voter1, _v2, target) = setup();
     dao.register_template(
@@ -1283,7 +1284,7 @@ fn create_proposal_from_template_rejects_short_title() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #30)")]
+#[should_panic(expected = "Error(Contract, #37)")]
 fn create_proposal_from_template_rejects_wrong_arg_count() {
     let (env, dao, admin, voter1, _v2, target) = setup();
     dao.register_template(
@@ -1536,4 +1537,127 @@ fn escalated_deposit_locked_at_creation_time() {
     dao.set_impact_multipliers(&admin, &10_000u32, &10_000u32, &10_000u32);
     assert_eq!(dao.get_proposal(&pid).deposit, escalated_deposit);
 }
+// ── Issue #492: guardian approval duplicate check ────────────────────────────
 
+/// Admin cannot configure a guardian set with duplicate guardian addresses.
+#[test]
+#[should_panic(expected = "Error(Contract, #41)")]
+fn test_issue_492_set_guardians_rejects_duplicates() {
+    let (env, dao, admin, _v1, _v2, _target) = setup();
+    let g1 = Address::generate(&env);
+    let mut guardians = Vec::new(&env);
+    guardians.push_back(g1.clone());
+    guardians.push_back(g1.clone());
+
+    dao.set_guardians(&admin, &guardians, &2);
+}
+
+/// A guardian cannot approve the same pending upgrade multiple times to inflate approvals.
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_issue_492_guardian_duplicate_approval_rejected() {
+    let (env, dao, admin, _v1, _v2, _target) = setup();
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    let mut guardians = Vec::new(&env);
+    guardians.push_back(g1.clone());
+    guardians.push_back(g2.clone());
+
+    dao.set_guardians(&admin, &guardians, &2);
+
+    let wasm_hash = soroban_sdk::BytesN::from_array(&env, &[7u8; 32]);
+    dao.upgrade(&admin, &wasm_hash, &2);
+
+    // First approval by g1 succeeds
+    dao.approve_upgrade(&g1, &wasm_hash);
+
+    let pending = dao.get_pending_upgrade().unwrap();
+    assert_eq!(pending.approvals.len(), 1);
+    assert_eq!(pending.approvals.get(0).unwrap(), g1);
+
+    // Duplicate approval by same guardian must be rejected with AlreadyApprovedAction (#21)
+    dao.approve_upgrade(&g1, &wasm_hash);
+}
+
+/// Non-guardian caller cannot approve an upgrade.
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_issue_492_non_guardian_approval_rejected() {
+    let (env, dao, admin, voter1, _v2, _target) = setup();
+    let g1 = Address::generate(&env);
+    let mut guardians = Vec::new(&env);
+    guardians.push_back(g1.clone());
+
+    dao.set_guardians(&admin, &guardians, &1);
+
+    let wasm_hash = soroban_sdk::BytesN::from_array(&env, &[7u8; 32]);
+    dao.upgrade(&admin, &wasm_hash, &2);
+
+    // voter1 is not a guardian
+    dao.approve_upgrade(&voter1, &wasm_hash);
+}
+
+/// Multiple distinct guardians can each approve once, tracking approvals accurately.
+#[test]
+fn test_issue_492_distinct_guardians_approval_tracking() {
+    let (env, dao, admin, _v1, _v2, _target) = setup();
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    let g3 = Address::generate(&env);
+    let mut guardians = Vec::new(&env);
+    guardians.push_back(g1.clone());
+    guardians.push_back(g2.clone());
+    guardians.push_back(g3.clone());
+
+    dao.set_guardians(&admin, &guardians, &3);
+    assert_eq!(dao.get_guardian_threshold(), 3);
+    assert_eq!(dao.get_guardians().len(), 3);
+
+    let wasm_hash = soroban_sdk::BytesN::from_array(&env, &[7u8; 32]);
+    dao.upgrade(&admin, &wasm_hash, &2);
+
+    let pending = dao.get_pending_upgrade().unwrap();
+    assert_eq!(pending.approvals.len(), 0);
+
+    dao.approve_upgrade(&g1, &wasm_hash);
+    let pending = dao.get_pending_upgrade().unwrap();
+    assert_eq!(pending.approvals.len(), 1);
+    assert_eq!(pending.approvals.get(0).unwrap(), g1);
+
+    dao.approve_upgrade(&g2, &wasm_hash);
+    let pending = dao.get_pending_upgrade().unwrap();
+    assert_eq!(pending.approvals.len(), 2);
+    assert_eq!(pending.approvals.get(1).unwrap(), g2);
+
+    // Admin can cancel pending upgrade
+    dao.cancel_pending_upgrade(&admin);
+    assert!(dao.get_pending_upgrade().is_none());
+}
+
+/// Duplicate veto on an already-vetoed proposal is rejected.
+#[test]
+#[should_panic(expected = "Error(Contract, #43)")]
+fn test_issue_492_duplicate_veto_rejected() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+    let g1 = Address::generate(&env);
+    let mut guardians = Vec::new(&env);
+    guardians.push_back(g1.clone());
+    dao.set_guardians(&admin, &guardians, &1);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Proposal to be vetoed"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: testing veto duplicate."),
+    );
+
+    dao.veto_proposal(&g1, &pid, &Symbol::new(&env, "malicious"));
+    let p = dao.get_proposal(&pid);
+    assert!(p.is_vetoed);
+
+    // Second veto attempt must be rejected with ProposalVetoed (#43)
+    dao.veto_proposal(&g1, &pid, &Symbol::new(&env, "malicious"));
+}

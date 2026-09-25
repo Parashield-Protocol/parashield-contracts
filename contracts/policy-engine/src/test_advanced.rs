@@ -4,11 +4,11 @@
 
 extern crate std;
 
-use soroban_sdk::{testutils::Address as _, token, Address, Env};
+use soroban_sdk::{testutils::{Address as _, Ledger as _}, token, vec, Address, Env};
 
 use crate::{
-    CreateProductParams, PolicyEngine, PolicyEngineClient, ProductStatus, TriggerComparison,
-    TriggerType,
+    BatchBuyItem, CreateProductParams, PolicyEngine, PolicyEngineClient, ProductStatus,
+    TriggerComparison, TriggerType,
 };
 use soroban_sdk::symbol_short;
 
@@ -422,7 +422,7 @@ fn transfer_policy_rejects_cancelled_policy() {
 // ── #356: admin transfer timelock ────────────────────────────────────────────
 
 #[test]
-#[should_panic(expected = "Error(Contract, #28)")]
+#[should_panic(expected = "Error(Contract, #24)")]
 fn accept_admin_rejected_before_timelock() {
     let (env, pe, admin, _oracle, _user) = setup();
     let new_admin = Address::generate(&env);

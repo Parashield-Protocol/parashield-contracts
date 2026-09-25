@@ -16,8 +16,6 @@
 // message.
 #![deny(clippy::panic)]
 #![no_std]
-extern crate alloc;
-use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
@@ -31,6 +29,7 @@ pub use types::*;
 /// catastrophic risk to. The reinsurer is any contract implementing this
 /// single entry point — how it sources the payout (its own reserves,
 /// retrocession, etc.) is entirely its own concern.
+#[allow(dead_code)]
 #[soroban_sdk::contractclient(name = "ReinsurerClient")]
 trait IReinsurer {
     /// Pay out up to `amount` of the pool's USDC to `caller` (the ceding
@@ -52,7 +51,11 @@ const _: () = assert!(DEFAULT_PREMIUM_LP_BPS + DEFAULT_PREMIUM_TREAS_BPS + DEFAU
 const MAX_TOTAL_DEPOSITED: i128 = 1_000_000_000_000_000;
 
 /// Minimum deposit amount (1_000_000 stroops).
-const MIN_DEPOSIT: i128 = 1_000_000;
+pub const MIN_DEPOSIT: i128 = 1_000_000;
+
+/// Minimum shares that must be minted on deposit (issue #493).
+/// Enforces that calculated shares cannot be 0 or infinitesimal when depositing into large pools.
+pub const MIN_SHARES: i128 = 1;
 
 /// Default ceiling on `total_locked / total_deposited`, in basis points.
 ///
@@ -80,7 +83,7 @@ const PARAMETER_TIMELOCK_SECONDS: u64 = 2 * 24 * 60 * 60;
 use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK};
 
 #[contracttype]
-enum StorageKey {
+pub(crate) enum StorageKey {
     Initialized,
     Admin,
     Treasury,
@@ -340,13 +343,13 @@ impl RiskPool {
                 .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow))
         };
 
-        // Issue #454: `amount * total_shares / total_deposited` truncates
+        // Issue #454 / #493: `amount * total_shares / total_deposited` truncates
         // toward zero, so a deposit that is small relative to the pool can
         // round to 0 shares. MIN_DEPOSIT alone cannot rule this out (the
         // share-to-deposit ratio is not fixed), and without this guard the
         // depositor's tokens would be taken while nothing is minted in
-        // return — an irreversible loss. Reject instead.
-        if new_shares == 0 {
+        // return — an irreversible loss. Enforce minimum share amount and reject.
+        if new_shares < MIN_SHARES {
             panic_with_error!(&env, Error::ZeroAmount);
         }
 
@@ -362,7 +365,7 @@ impl RiskPool {
         let lp_key = StorageKey::LpPosition(provider.clone());
         let mut pending_yield: i128 = 0;
         let mut is_new_lp = false;
-        let mut position: LpPosition = match env.storage().persistent().get::<_, LpPosition>(&lp_key) {
+        let position: LpPosition = match env.storage().persistent().get::<_, LpPosition>(&lp_key) {
             Some(mut pos) => {
                 pending_yield = Self::settle_yield(&env, &mut pos);
                 pos.deposited += amount;
@@ -499,6 +502,100 @@ impl RiskPool {
         amount
     }
 
+    /// Emergency LP withdrawal with explicit admin approval.
+    /// Bypasses pool pause/winding-down status, but still only releases unlocked liquidity.
+    pub fn emergency_withdraw(env: Env, provider: Address, admin: Address, shares: i128) -> i128 {
+        provider.require_auth();
+        Self::require_admin(&env, &admin);
+        if shares <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+
+        let lp_key = StorageKey::LpPosition(provider.clone());
+        let mut position: LpPosition = env
+            .storage()
+            .persistent()
+            .get(&lp_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
+        if position.shares < shares {
+            panic_with_error!(&env, Error::InsufficientFunds);
+        }
+
+        let total_deposited: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TotalDeposited)
+            .unwrap_or(0);
+        let total_shares: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TotalShares)
+            .unwrap_or(0);
+        let total_locked: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TotalLocked)
+            .unwrap_or(0);
+        let available_liquidity = total_deposited.saturating_sub(total_locked);
+        if available_liquidity <= 0 {
+            panic_with_error!(&env, Error::Undercollateralized);
+        }
+
+        let amount = shares
+            .checked_mul(total_deposited)
+            .and_then(|v| v.checked_div(total_shares))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+        if amount == 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+        if amount > available_liquidity {
+            panic_with_error!(&env, Error::Undercollateralized);
+        }
+
+        let pending_yield = Self::settle_yield(&env, &mut position);
+        position.deposited = position.deposited.saturating_sub(amount);
+        position.shares -= shares;
+        position.yield_debt = (env
+            .storage()
+            .instance()
+            .get(&StorageKey::AccumulatedPerShare)
+            .unwrap_or(0)
+            * position.shares)
+            / 1_000_000_000_000;
+        env.storage().persistent().set(&lp_key, &position);
+        Self::extend_to_max(&env, &lp_key);
+        env.storage().instance().set(
+            &StorageKey::TotalDeposited,
+            &total_deposited
+                .checked_sub(amount)
+                .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow)),
+        );
+        env.storage()
+            .instance()
+            .set(&StorageKey::TotalShares, &(total_shares - shares));
+
+        Self::update_lp_nft(&env, &provider, &position);
+
+        let usdc: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::UsdcToken)
+            .unwrap();
+        let total_payout = amount + pending_yield;
+        token::Client::new(&env, &usdc).transfer(
+            &env.current_contract_address(),
+            &provider,
+            &total_payout,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "emergency_withdraw"), provider.clone()),
+            (admin, amount, shares),
+        );
+
+        amount
+    }
+
     /// Transfer `shares` from `from` address to `to` address.
     /// Returns the proportional USDC deposit amount transferred.
     pub fn transfer_position(env: Env, from: Address, to: Address, shares: i128) -> i128 {
@@ -534,7 +631,7 @@ impl RiskPool {
         let now = env.ledger().timestamp();
         let to_key = StorageKey::LpPosition(to.clone());
         let mut is_new_lp = false;
-        let mut to_pos: LpPosition = match env.storage().persistent().get::<_, LpPosition>(&to_key) {
+        let to_pos: LpPosition = match env.storage().persistent().get::<_, LpPosition>(&to_key) {
             Some(mut pos) => {
                 let pending_yield_to = Self::settle_yield(&env, &mut pos);
                 pos.deposited += amount;
@@ -1014,7 +1111,6 @@ impl RiskPool {
     /// Earmark `amount` USDC as collateral for `policy_id`. Only the policy engine or
     /// claims processor may call this. Panics if the pool is under-collateralised or if
     /// a lock for this policy already exists.
-
     pub fn lock_for_policy(env: Env, caller: Address, policy_id: u128, amount: i128) {
         Self::require_protocol_caller(&env, &caller);
         Self::assert_active(&env);
@@ -1469,7 +1565,7 @@ impl RiskPool {
         let util_above_threshold = util_bps.saturating_sub(config.utilization_threshold_bps);
         // Convert basis points (1/100th of 1%) to 1% increments
         let pct_above_threshold = util_above_threshold / 100;
-        let fee_increase = (pct_above_threshold as u32).saturating_mul(config.fee_adjustment_per_1pct_bps);
+        let fee_increase = pct_above_threshold.saturating_mul(config.fee_adjustment_per_1pct_bps);
 
         let adjusted_fee = config.base_fee_bps.saturating_add(fee_increase);
         adjusted_fee.min(config.max_fee_bps).max(config.min_fee_bps)
@@ -1545,7 +1641,7 @@ impl RiskPool {
         }
         env.storage().instance().remove(&key);
 
-        let mut names: Vec<Symbol> = env
+        let names: Vec<Symbol> = env
             .storage()
             .instance()
             .get(&StorageKey::FeeTierList)

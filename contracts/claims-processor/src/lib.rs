@@ -159,9 +159,13 @@ pub enum Error {
     /// Identity verification required for this claim category but not verified.
     IdentityVerificationRequired = 21,
     InvalidInput = 22,
+    /// Fraud detector flagged this claim's submission and the current
+    /// `FraudMode` is `Block` (issue #437). No state was written for the
+    /// rejected claim.
+    FraudSuspected = 23,
     /// An admin transfer was proposed while another one is still pending,
     /// which would reset the transfer timelock (issue #457).
-    AdminTransferPending = 23,
+    AdminTransferPending = 24,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -435,6 +439,14 @@ impl ClaimsProcessor {
     }
 
     /// Process an existing pending claim. Reads oracle data and pays out or rejects.
+    ///
+    /// ## Parametric Payout Design Note
+    /// In parametric insurance, claim payouts are strictly binary or determined by
+    /// objective oracle trigger measurements (e.g., rainfall, wind speed, flight delay)
+    /// rather than traditional indemnity models that require loss adjustments or proof
+    /// of actual financial loss. When an oracle trigger condition is verified, the
+    /// contract pays out the pre-agreed coverage amount (or pre-configured partial
+    /// payout percentage) in full, regardless of the policyholder's actual incurred loss.
     ///
     /// `partial_payout_bps` is an optional payout ratio in basis points (0-10000).
     /// - `None` or `Some(10000)` → full coverage payment (default behavior).
@@ -1783,6 +1795,8 @@ impl ClaimsProcessor {
 
         let result = if trigger_met {
             // Determine payout: full or partial based on partial_payout_bps.
+            // Parametric model design: pays the pre-agreed coverage amount (or pre-set partial bps)
+            // automatically when the oracle condition is verified, without assessing post-hoc actual loss.
             let bps = partial_payout_bps.unwrap_or(10_000);
             let effective_bps = if bps > 10_000 { 10_000 } else { bps };
             let now = env.ledger().timestamp();

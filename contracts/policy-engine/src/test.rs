@@ -916,21 +916,21 @@ fn sequential_create_product_ids_are_unique_and_monotone() {
     let id1 = client.create_product(
         &admin,
         &CreateProductParams {
-            oracle_key: symbol_short!("k1"),
+            oracle_key: symbol_short!("k01"),
             ..params(0)
         },
     );
     let id2 = client.create_product(
         &admin,
         &CreateProductParams {
-            oracle_key: symbol_short!("k2"),
+            oracle_key: symbol_short!("k02"),
             ..params(1)
         },
     );
     let id3 = client.create_product(
         &admin,
         &CreateProductParams {
-            oracle_key: symbol_short!("k3"),
+            oracle_key: symbol_short!("k03"),
             ..params(2)
         },
     );
@@ -977,7 +977,7 @@ fn test_initial_version_is_one() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #23)")]
+#[should_panic(expected = "Error(Contract, #26)")]
 fn test_upgrade_to_same_version_panics() {
     let (env, admin, _oracle, _usdc, contract_id) = setup();
     let client = PolicyEngineClient::new(&env, &contract_id);
@@ -986,7 +986,7 @@ fn test_upgrade_to_same_version_panics() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #23)")]
+#[should_panic(expected = "Error(Contract, #26)")]
 fn test_upgrade_to_lower_version_panics() {
     let (env, admin, _oracle, _usdc, contract_id) = setup();
     let client = PolicyEngineClient::new(&env, &contract_id);
@@ -1090,6 +1090,126 @@ fn test_create_product_single_char_oracle_key_panics() {
             max_duration_days: 365,
         },
     );
+}
+
+/// Leading underscore in oracle_key must be rejected (Issue #491).
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_create_product_leading_underscore_oracle_key_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.create_product(
+        &admin,
+        &CreateProductParams {
+            name: symbol_short!("bad"),
+            category: symbol_short!("crop"),
+            oracle_key: symbol_short!("_crop"),
+            trigger_type: TriggerType::Threshold,
+            oracle_data_type: symbol_short!("weather"),
+            trigger_threshold: 50_000_000,
+            trigger_comparison: TriggerComparison::LessThan,
+            coverage_min: 100_000_000,
+            coverage_max: 10_000_000_000,
+            premium_rate_bps: 500,
+            max_duration_days: 365,
+        },
+    );
+}
+
+/// Trailing underscore in oracle_key must be rejected (Issue #491).
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_create_product_trailing_underscore_oracle_key_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.create_product(
+        &admin,
+        &CreateProductParams {
+            name: symbol_short!("bad"),
+            category: symbol_short!("crop"),
+            oracle_key: symbol_short!("crop_"),
+            trigger_type: TriggerType::Threshold,
+            oracle_data_type: symbol_short!("weather"),
+            trigger_threshold: 50_000_000,
+            trigger_comparison: TriggerComparison::LessThan,
+            coverage_min: 100_000_000,
+            coverage_max: 10_000_000_000,
+            premium_rate_bps: 500,
+            max_duration_days: 365,
+        },
+    );
+}
+
+/// Consecutive underscores in oracle_key must be rejected (Issue #491).
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_create_product_consecutive_underscores_oracle_key_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.create_product(
+        &admin,
+        &CreateProductParams {
+            name: symbol_short!("bad"),
+            category: symbol_short!("crop"),
+            oracle_key: symbol_short!("cr__op"),
+            trigger_type: TriggerType::Threshold,
+            oracle_data_type: symbol_short!("weather"),
+            trigger_threshold: 50_000_000,
+            trigger_comparison: TriggerComparison::LessThan,
+            coverage_min: 100_000_000,
+            coverage_max: 10_000_000_000,
+            premium_rate_bps: 500,
+            max_duration_days: 365,
+        },
+    );
+}
+
+/// oracle_key with no alphabetic characters must be rejected (Issue #491).
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_create_product_no_alphabetic_oracle_key_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.create_product(
+        &admin,
+        &CreateProductParams {
+            name: symbol_short!("bad"),
+            category: symbol_short!("crop"),
+            oracle_key: symbol_short!("12345"),
+            trigger_type: TriggerType::Threshold,
+            oracle_data_type: symbol_short!("weather"),
+            trigger_threshold: 50_000_000,
+            trigger_comparison: TriggerComparison::LessThan,
+            coverage_min: 100_000_000,
+            coverage_max: 10_000_000_000,
+            premium_rate_bps: 500,
+            max_duration_days: 365,
+        },
+    );
+}
+
+/// Valid oracle_key with internal single underscore must be accepted (Issue #491).
+#[test]
+fn test_create_product_valid_underscore_oracle_key_succeeds() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let id = client.create_product(
+        &admin,
+        &CreateProductParams {
+            name: symbol_short!("ok"),
+            category: symbol_short!("crop"),
+            oracle_key: symbol_short!("cr_op_1"),
+            trigger_type: TriggerType::Threshold,
+            oracle_data_type: symbol_short!("weather"),
+            trigger_threshold: 50_000_000,
+            trigger_comparison: TriggerComparison::LessThan,
+            coverage_min: 100_000_000,
+            coverage_max: 10_000_000_000,
+            premium_rate_bps: 500,
+            max_duration_days: 365,
+        },
+    );
+    assert!(id > 0);
 }
 
 // ── Issue #202: buy_policy minimum duration boundary (duration_days == 1) ─────

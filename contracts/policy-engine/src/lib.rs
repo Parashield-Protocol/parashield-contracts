@@ -17,17 +17,12 @@
 //! escrow: it holds USDC and the Claims Processor calls `token.transfer`
 //! to pay the policyholder when the oracle confirms a trigger.
 // Address/state validation must fail with a typed contract error so callers
-// can match on it programmatically, never with a raw panic! and a string
-// message.
 #![deny(clippy::panic)]
 #![no_std]
-extern crate alloc;
 
-#[cfg_attr(feature = "library", allow(unused_imports))]
-use crate::alloc::string::ToString;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, BytesN,
-    Env, Symbol, Vec,
+    Env, Symbol, SymbolStr, TryFromVal, Vec,
 };
 
 pub mod types;
@@ -39,6 +34,9 @@ pub use types::*;
 use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK};
 const DEFAULT_MAX_PRODUCTS_PER_POOL: u32 = 100;
 const CURRENT_STORAGE_VERSION: u32 = 3;
+const MAX_BATCH_BUY: u32 = 20;
+const DEFAULT_EXPIRY_WARNING_WINDOW: u64 = 7 * 24 * 60 * 60;
+const MAX_EXPIRY_SCAN: u32 = 50;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -70,6 +68,8 @@ enum StorageKey {
     PoolProductCount(Symbol),
     /// Contract version (u32) for storage migration tracking
     Version,
+    ExpiryWarningWindow,
+    ExpiryWarned(u128),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -107,6 +107,10 @@ pub enum Error {
     /// An admin transfer was proposed while another one is still pending,
     /// which would reset the transfer timelock (issue #457).
     AdminTransferPending = 27,
+    EmptyBatch = 29,
+    BatchTooLarge = 30,
+    NotExpiringSoon = 31,
+    InvalidWarningWindow = 32,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -244,15 +248,46 @@ impl PolicyEngine {
         if params.max_duration_days == 0 || params.max_duration_days > 3650 {
             panic_with_error!(&env, Error::InvalidDurationRange);
         }
-        // oracle_key must be at least 3 characters — defense-in-depth against
-        // trivially unresolvable keys that the oracle-verifier can never match.
-        // Soroban Symbol only accepts [a-zA-Z0-9_], so character-set is already
-        // enforced by the type; this adds a minimum-length semantic guard.
+        // Validate oracle_key format and length (Issue #491).
+        // Must be 3..=32 chars, cannot start or end with '_', no consecutive '__',
+        // and must contain at least one alphabetic character.
         {
-            const MIN_LEN: usize = 3;
-            let key_repr = params.oracle_key.to_string();
-            if key_repr.len() < MIN_LEN {
-                panic_with_error!(&env, Error::InvalidOracleKey);
+            let sym_val = params.oracle_key.to_symbol_val();
+            let sym_str: Result<SymbolStr, _> = SymbolStr::try_from_val(&env, &sym_val);
+            match sym_str {
+                Ok(s) => {
+                    let s_str: &str = s.as_ref();
+                    let bytes: &[u8] = s_str.as_bytes();
+                    if bytes.len() < 3 || bytes.len() > 32 {
+                        panic_with_error!(&env, Error::InvalidOracleKey);
+                    }
+                    if bytes[0] == b'_' || bytes[bytes.len() - 1] == b'_' {
+                        panic_with_error!(&env, Error::InvalidOracleKey);
+                    }
+                    let mut has_alpha = false;
+                    let mut prev_underscore = false;
+                    for &b in bytes {
+                        if b == b'_' {
+                            if prev_underscore {
+                                panic_with_error!(&env, Error::InvalidOracleKey);
+                            }
+                            prev_underscore = true;
+                        } else {
+                            prev_underscore = false;
+                            if (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z') {
+                                has_alpha = true;
+                            } else if !(b >= b'0' && b <= b'9') {
+                                panic_with_error!(&env, Error::InvalidOracleKey);
+                            }
+                        }
+                    }
+                    if !has_alpha {
+                        panic_with_error!(&env, Error::InvalidOracleKey);
+                    }
+                }
+                Err(_) => {
+                    panic_with_error!(&env, Error::InvalidOracleKey);
+                }
             }
         }
 
@@ -443,55 +478,85 @@ impl PolicyEngine {
         oracle_key: Symbol,
     ) -> u128 {
         buyer.require_auth();
-        if env
-            .storage()
-            .instance()
-            .get::<_, bool>(&StorageKey::Paused)
-            .unwrap_or(false)
-        {
-            panic_with_error!(&env, Error::Unauthorized);
+        Self::ensure_not_paused(&env);
+        Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key)
+    }
+
+    /// Buy multiple policies in a single atomic transaction.
+    ///
+    /// Up to `MAX_BATCH_BUY` policies may be purchased at once. If any single
+    /// purchase fails (e.g. invalid duration, paused product), the entire batch
+    /// reverts.
+    pub fn batch_buy_policy(env: Env, buyer: Address, items: Vec<BatchBuyItem>) -> Vec<u128> {
+        buyer.require_auth();
+        Self::ensure_not_paused(&env);
+
+        let n = items.len();
+        if n == 0 {
+            panic_with_error!(&env, Error::EmptyBatch);
         }
-        let product = Self::load_product(&env, product_id);
-        if product.status != ProductStatus::Active {
-            panic_with_error!(&env, Error::ProductNotActive);
-        }
-        if coverage_amount < product.coverage_min || coverage_amount > product.coverage_max {
-            panic_with_error!(&env, Error::CoverageOutOfRange);
-        }
-        if duration_days == 0 || duration_days > product.max_duration_days {
-            panic_with_error!(&env, Error::DurationTooLong);
+        if n > MAX_BATCH_BUY {
+            panic_with_error!(&env, Error::BatchTooLarge);
         }
 
-        // Premium calculation: premium = coverage * rate * duration_days / 365 / 10_000
-        // where coverage and premium are in USDC stroops (7 decimal places),
-        // premium_rate_bps is in basis points (e.g., 500 = 5%).
-        // Use checked operations to prevent overflow on large coverage amounts
+        let mut ids = Vec::new(&env);
+        for item in items.iter() {
+            ids.push_back(Self::buy_policy_inner(
+                &env,
+                &buyer,
+                item.product_id,
+                item.coverage_amount,
+                item.duration_days,
+                item.oracle_key,
+            ));
+        }
+        ids
+    }
+
+    fn buy_policy_inner(
+        env: &Env,
+        buyer: &Address,
+        product_id: u128,
+        coverage_amount: i128,
+        duration_days: u32,
+        oracle_key: Symbol,
+    ) -> u128 {
+        let product = Self::load_product(env, product_id);
+        if product.status != ProductStatus::Active {
+            panic_with_error!(env, Error::ProductNotActive);
+        }
+        if coverage_amount < product.coverage_min || coverage_amount > product.coverage_max {
+            panic_with_error!(env, Error::CoverageOutOfRange);
+        }
+        if duration_days == 0 || duration_days > product.max_duration_days {
+            panic_with_error!(env, Error::DurationTooLong);
+        }
+
         if coverage_amount > 1_000_000_000_000 {
-            panic_with_error!(&env, Error::CoverageOutOfRange);
+            panic_with_error!(env, Error::CoverageOutOfRange);
         }
         let premium = coverage_amount
             .checked_mul(product.premium_rate_bps as i128)
             .and_then(|v| v.checked_mul(duration_days as i128))
             .and_then(|v| v.checked_div(365))
             .and_then(|v| v.checked_div(10_000))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::CoverageOutOfRange));
+            .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
         let usdc: Address = env
             .storage()
             .instance()
             .get(&StorageKey::UsdcToken)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
 
-        // Pull premium from buyer into this contract
-        token::Client::new(&env, &usdc).transfer(&buyer, &env.current_contract_address(), &premium);
+        token::Client::new(env, &usdc).transfer(buyer, &env.current_contract_address(), &premium);
 
         let now = env.ledger().timestamp();
         let duration_secs = (duration_days as u64)
             .checked_mul(86_400)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::CoverageOutOfRange));
+            .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
         let end_time = now
             .checked_add(duration_secs)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::CoverageOutOfRange));
-        let policy_id = Self::next_policy_id(&env);
+            .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
+        let policy_id = Self::next_policy_id(env);
 
         let policy = Policy {
             id: policy_id,
@@ -517,13 +582,12 @@ impl PolicyEngine {
             TTL_EXTEND_TO,
         );
 
-        // Append to user's policy list
         let user_key = StorageKey::UserPolicies(buyer.clone());
         let mut user_policies: Vec<u128> = env
             .storage()
             .persistent()
             .get(&user_key)
-            .unwrap_or_else(|| Vec::new(&env));
+            .unwrap_or_else(|| Vec::new(env));
         user_policies.push_back(policy_id);
         env.storage().persistent().set(&user_key, &user_policies);
         env.storage()
@@ -531,7 +595,7 @@ impl PolicyEngine {
             .extend_ttl(&user_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         env.events().publish(
-            (Symbol::new(&env, "buy_policy"), buyer),
+            (Symbol::new(env, "buy_policy"), buyer.clone()),
             (policy_id, product_id, coverage_amount, premium),
         );
 
@@ -555,8 +619,6 @@ impl PolicyEngine {
             .set(&StorageKey::Policy(policy_id), &policy);
         Self::remove_policy_from_user(&env, &policyholder, policy_id);
 
-        // Pro-rate the refund: only return the unearned portion of the premium.
-        // Earned = premium_paid * elapsed / total_duration; refund = premium_paid - earned.
         let now = env.ledger().timestamp();
         let elapsed = now.saturating_sub(policy.start_time);
         let total_duration = policy.end_time.saturating_sub(policy.start_time);
@@ -594,6 +656,66 @@ impl PolicyEngine {
             },
         );
         refund
+    }
+
+    /// Move an active policy to a new policyholder. Requires auth from both parties.
+    pub fn transfer_policy(env: Env, from: Address, to: Address, policy_id: u128) {
+        from.require_auth();
+        to.require_auth();
+        Self::ensure_not_paused(&env);
+
+        let to_str = to.to_string();
+        if to_str.len() != 56 {
+            panic_with_error!(&env, Error::InvalidAddress);
+        }
+        let mut to_buf = [0u8; 56];
+        to_str.copy_into_slice(&mut to_buf);
+        if to_buf[0] != b'G' && to_buf[0] != b'C' {
+            panic_with_error!(&env, Error::InvalidAddress);
+        }
+
+        let mut policy: Policy = Self::load_policy(&env, policy_id);
+        if policy.policyholder != from {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if policy.status != PolicyStatus::Active {
+            panic_with_error!(&env, Error::PolicyNotActive);
+        }
+        if from == to {
+            return;
+        }
+
+        policy.policyholder = to.clone();
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Policy(policy_id), &policy);
+        env.storage().persistent().extend_ttl(
+            &StorageKey::Policy(policy_id),
+            TTL_THRESHOLD,
+            TTL_EXTEND_TO,
+        );
+
+        Self::remove_policy_from_user(&env, &from, policy_id);
+        let to_key = StorageKey::UserPolicies(to.clone());
+        let mut to_policies: Vec<u128> = env
+            .storage()
+            .persistent()
+            .get(&to_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        to_policies.push_back(policy_id);
+        env.storage().persistent().set(&to_key, &to_policies);
+        env.storage()
+            .persistent()
+            .extend_ttl(&to_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.events().publish(
+            (Symbol::new(&env, "policy_transferred"),),
+            PolicyTransferred {
+                policy_id,
+                from,
+                to,
+            },
+        );
     }
 
     // ── Status updates (called by Claims Processor) ──────────────────────────
@@ -672,6 +794,65 @@ impl PolicyEngine {
         Self::load_policy(&env, policy_id)
     }
 
+    /// Return aggregated statistics for a product: total policies, active count,
+    /// total coverage, and total premiums collected. Returns zeros if the product
+    /// does not exist or has no policies.
+    pub fn get_product_stats(env: Env, product_id: u128) -> ProductStats {
+        let _product = match env
+            .storage()
+            .persistent()
+            .get::<_, InsuranceProduct>(&StorageKey::Product(product_id))
+        {
+            Some(p) => p,
+            None => {
+                return ProductStats {
+                    product_id,
+                    total_policies: 0,
+                    active_policies: 0,
+                    total_coverage: 0,
+                    total_premium_collected: 0,
+                }
+            }
+        };
+
+        let mut total_policies: u32 = 0;
+        let mut active_policies: u32 = 0;
+        let mut total_coverage: i128 = 0;
+        let mut total_premium_collected: i128 = 0;
+
+        let next_id: u128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::NextPolicyId)
+            .unwrap_or(1);
+
+        for pid in 1..next_id {
+            if let Some(policy) = env
+                .storage()
+                .persistent()
+                .get::<_, Policy>(&StorageKey::Policy(pid))
+            {
+                if policy.product_id == product_id {
+                    total_policies += 1;
+                    if policy.status == PolicyStatus::Active {
+                        active_policies += 1;
+                    }
+                    total_coverage = total_coverage.saturating_add(policy.coverage_amount);
+                    total_premium_collected =
+                        total_premium_collected.saturating_add(policy.premium_paid);
+                }
+            }
+        }
+
+        ProductStats {
+            product_id,
+            total_policies,
+            active_policies,
+            total_coverage,
+            total_premium_collected,
+        }
+    }
+
     /// Return a paginated slice of policy IDs owned by `user`. `offset` is the zero-based
     /// start index; `limit` caps the number of IDs returned.
     pub fn get_user_policies(env: Env, user: Address, offset: u32, limit: u32) -> Vec<u128> {
@@ -717,6 +898,13 @@ impl PolicyEngine {
             .instance()
             .get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
+    }
+
+    pub fn get_pending_admin_since(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::PendingAdminSince)
+            .unwrap_or(0)
     }
 
     /// Return the configured oracle verifier contract address.
@@ -842,6 +1030,189 @@ impl PolicyEngine {
             .publish((Symbol::new(&env, "max_products_updated"),), max_products);
     }
 
+    /// Set how long before `end_time` a policy counts as expiring soon.
+    ///
+    /// The window must be non-zero: a zero window would make the warning fire
+    /// at the same instant cover lapses, which is the situation this mechanism
+    /// exists to avoid.
+    pub fn set_expiry_warning_window(env: Env, admin: Address, window: u64) {
+        Self::require_admin(&env, &admin);
+        if window == 0 {
+            panic_with_error!(&env, Error::InvalidWarningWindow);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::ExpiryWarningWindow, &window);
+        env.events().publish(
+            (Symbol::new(&env, "expiry_window_updated"),),
+            ExpiryWarningWindowUpdated { window },
+        );
+    }
+
+    /// The configured expiry warning window in seconds (default: 7 days).
+    pub fn get_expiry_warning_window(env: Env) -> u64 {
+        Self::expiry_warning_window(&env)
+    }
+
+    /// Report where a policy sits relative to its own expiry, without panicking
+    /// on state and without emitting anything.
+    ///
+    /// A caller deciding whether to renew, or a keeper deciding whether a
+    /// notification is worth paying for, needs this as a value rather than as
+    /// a transaction that might abort.
+    pub fn get_policy_expiry_info(env: Env, policy_id: u128) -> PolicyExpiryInfo {
+        let policy: Policy = Self::load_policy(&env, policy_id);
+        let now = env.ledger().timestamp();
+        let window = Self::expiry_warning_window(&env);
+
+        let seconds_remaining = policy.end_time.saturating_sub(now);
+        let state = if policy.status != PolicyStatus::Active {
+            ExpiryState::NotActive
+        } else if now >= policy.end_time {
+            ExpiryState::Lapsed
+        } else if seconds_remaining <= window {
+            ExpiryState::ExpiringSoon
+        } else {
+            ExpiryState::Active
+        };
+
+        PolicyExpiryInfo {
+            policy_id,
+            state,
+            end_time: policy.end_time,
+            seconds_remaining,
+            warned: env
+                .storage()
+                .persistent()
+                .has(&StorageKey::ExpiryWarned(policy_id)),
+        }
+    }
+
+    /// Emit `PolicyExpiringSoon` for a policy that has entered its warning
+    /// window, so off-chain infrastructure can notify the holder.
+    ///
+    /// Permissionless on purpose. The party who most needs the reminder is the
+    /// holder, and requiring the admin to trigger it would make coverage
+    /// continuity depend on the admin running a keeper — exactly the kind of
+    /// silent dependency that leaves users uncovered.
+    ///
+    /// Emits at most once per policy: the first successful call records a flag
+    /// and later calls panic with `NotExpiringSoon`, so a permissionless entry
+    /// point cannot be used to flood the event log.
+    ///
+    /// Panics with `NotExpiringSoon` when the policy is not Active, has not
+    /// yet entered the window, has already lapsed, or has already been warned.
+    pub fn notify_policy_expiring(env: Env, policy_id: u128) {
+        let policy: Policy = Self::load_policy(&env, policy_id);
+
+        if policy.status != PolicyStatus::Active {
+            panic_with_error!(&env, Error::PolicyNotActive);
+        }
+
+        let now = env.ledger().timestamp();
+        let window = Self::expiry_warning_window(&env);
+
+        // Already lapsed is `expire_policy`'s job, not a warning.
+        if now >= policy.end_time {
+            panic_with_error!(&env, Error::NotExpiringSoon);
+        }
+
+        let seconds_remaining = policy.end_time - now;
+        if seconds_remaining > window {
+            panic_with_error!(&env, Error::NotExpiringSoon);
+        }
+
+        let warned_key = StorageKey::ExpiryWarned(policy_id);
+        if env.storage().persistent().has(&warned_key) {
+            panic_with_error!(&env, Error::NotExpiringSoon);
+        }
+
+        env.storage().persistent().set(&warned_key, &true);
+        Self::extend_to_max(&env, &warned_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "policy_expiring_soon"),),
+            PolicyExpiringSoon {
+                policy_id,
+                policyholder: policy.policyholder,
+                product_id: policy.product_id,
+                coverage_amount: policy.coverage_amount,
+                end_time: policy.end_time,
+                seconds_remaining,
+            },
+        );
+    }
+
+    /// Scan one user's policies and emit `PolicyExpiringSoon` for each that has
+    /// entered its warning window and has not been warned yet.
+    ///
+    /// Returns the number of events emitted. Policies that are ineligible are
+    /// skipped rather than aborting the call — a keeper sweeping a user's book
+    /// should not lose the whole batch because one policy was already warned.
+    ///
+    /// Scans at most `MAX_EXPIRY_SCAN` policies per call to bound the
+    /// instruction budget of a permissionless entry point.
+    pub fn notify_expiring_policies(env: Env, user: Address, offset: u32) -> u32 {
+        let ids: Vec<u128> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::UserPolicies(user))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let now = env.ledger().timestamp();
+        let window = Self::expiry_warning_window(&env);
+        let mut emitted = 0u32;
+        let mut scanned = 0u32;
+
+        let mut i = offset;
+        while i < ids.len() && scanned < MAX_EXPIRY_SCAN {
+            scanned += 1;
+            let policy_id = ids.get_unchecked(i);
+            i += 1;
+
+            let policy: Policy = match env
+                .storage()
+                .persistent()
+                .get(&StorageKey::Policy(policy_id))
+            {
+                Some(p) => p,
+                None => continue,
+            };
+
+            if policy.status != PolicyStatus::Active || now >= policy.end_time {
+                continue;
+            }
+
+            let seconds_remaining = policy.end_time - now;
+            if seconds_remaining > window {
+                continue;
+            }
+
+            let warned_key = StorageKey::ExpiryWarned(policy_id);
+            if env.storage().persistent().has(&warned_key) {
+                continue;
+            }
+
+            env.storage().persistent().set(&warned_key, &true);
+            Self::extend_to_max(&env, &warned_key);
+
+            env.events().publish(
+                (Symbol::new(&env, "policy_expiring_soon"),),
+                PolicyExpiringSoon {
+                    policy_id,
+                    policyholder: policy.policyholder,
+                    product_id: policy.product_id,
+                    coverage_amount: policy.coverage_amount,
+                    end_time: policy.end_time,
+                    seconds_remaining,
+                },
+            );
+            emitted += 1;
+        }
+
+        emitted
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     fn require_admin(env: &Env, caller: &Address) {
@@ -868,6 +1239,17 @@ impl PolicyEngine {
         caller.require_auth();
     }
 
+    fn ensure_not_paused(env: &Env) {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&StorageKey::Paused)
+            .unwrap_or(false)
+        {
+            panic_with_error!(env, Error::Unauthorized);
+        }
+    }
+
     fn remove_policy_from_user(env: &Env, user: &Address, policy_id: u128) {
         let key = StorageKey::UserPolicies(user.clone());
         let mut user_policies: Vec<u128> = env
@@ -885,7 +1267,20 @@ impl PolicyEngine {
         if let Some(i) = pos {
             user_policies.remove(i);
             env.storage().persistent().set(&key, &user_policies);
+            Self::extend_to_max(env, &key);
         }
+    }
+
+    fn expiry_warning_window(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::ExpiryWarningWindow)
+            .unwrap_or(DEFAULT_EXPIRY_WARNING_WINDOW)
+    }
+
+    fn extend_to_max(env: &Env, key: &StorageKey) {
+        let max_ttl = env.storage().max_ttl();
+        env.storage().persistent().extend_ttl(key, max_ttl, max_ttl);
     }
 
     fn load_product(env: &Env, id: u128) -> InsuranceProduct {
