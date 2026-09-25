@@ -92,6 +92,7 @@ fn abstain_contributes_to_quorum_but_not_majority() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     dao.vote(&voter, &pid, &VoteChoice::Abstain);
 
@@ -103,6 +104,78 @@ fn abstain_contributes_to_quorum_but_not_majority() {
     assert_eq!(p.status, ProposalStatus::Failed);
     assert_eq!(p.votes_abstain, 990_000_0000000i128);
     assert_eq!(p.votes_for, 0);
+}
+
+#[test]
+fn large_abstain_bloc_does_not_sink_a_partisan_majority() {
+    // Regression test for issue #385: majority must be decided by the
+    // For/Against split alone. Computing it against total_votes (including
+    // Abstain) would let a large abstaining bloc dilute the For share below
+    // majority_bps even when every partisan voter backed the proposal.
+    let (env, dao, admin, voter1, voter2, target) = setup();
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Large abstain bloc"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+
+    // voter1 abstains with 990,000 (their 1,000,000 balance minus the
+    // 10,000 proposal_threshold deposit locked when they created this very
+    // proposal); voter2 (500,000) votes For; admin (100,000) votes Against.
+    // Partisan split is 500k For / 100k Against = 83.3% For, comfortably
+    // above the 51% majority_bps. Naively dividing by total_votes
+    // (1,590,000, including the abstain bloc) would instead give ~31.4%,
+    // well under majority_bps, and wrongly fail the proposal.
+    dao.vote(&voter1, &pid, &VoteChoice::Abstain);
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    dao.vote(&admin, &pid, &VoteChoice::Against);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+    dao.finalize(&pid);
+
+    let p = dao.get_proposal(&pid);
+    assert_eq!(p.status, ProposalStatus::Passed);
+    assert_eq!(p.votes_abstain, 990_000_0000000i128);
+    assert_eq!(p.votes_for, 500_000_0000000i128);
+    assert_eq!(p.votes_against, 100_000_0000000i128);
+}
+
+#[test]
+fn abstain_still_counts_toward_quorum() {
+    // Quorum is decided by total_votes, which does include Abstain — an
+    // abstain-only turnout is still turnout, even though it can never pass.
+    let (env, dao, _admin, voter1, _voter2, target) = setup();
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Abstain quorum test"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+
+    // voter1 alone (990,000 of 1,600,000 total_supply after their 10,000
+    // proposal_threshold deposit — still 61.9%) clears the 10% quorum_bps
+    // configured in setup() purely via Abstain.
+    dao.vote(&voter1, &pid, &VoteChoice::Abstain);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+    dao.finalize(&pid);
+
+    // Quorum was met, but with zero partisan votes there is no majority to
+    // speak of, so the proposal still fails.
+    let p = dao.get_proposal(&pid);
+    assert_eq!(p.status, ProposalStatus::Failed);
+    assert_eq!(p.votes_abstain, 990_000_0000000i128);
 }
 
 // ── proposal_count ────────────────────────────────────────────────────────────
@@ -121,6 +194,7 @@ fn proposal_count_increments_per_proposal() {
         &target,
         &Symbol::new(&env, "fn1"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     ); // <--- Added args
     assert_eq!(dao.proposal_count(), 1);
     dao.create_proposal(
@@ -129,6 +203,7 @@ fn proposal_count_increments_per_proposal() {
         &target,
         &Symbol::new(&env, "fn2"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     ); // <--- Added args
     assert_eq!(dao.proposal_count(), 2);
 }
@@ -149,6 +224,7 @@ fn execute_twice_fails() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
     dao.vote(&voter, &pid, &VoteChoice::For);
 
@@ -181,6 +257,7 @@ fn test_double_voting_attack_prevention() {
         &target,
         &Symbol::new(&env, "drain"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     // 1. Attacker (voter1) votes FOR
@@ -224,6 +301,7 @@ fn test_successful_token_withdrawal_post_finalize() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     dao.vote(&voter1, &pid, &VoteChoice::For);
@@ -258,6 +336,7 @@ fn admin_cannot_manipulate_total_supply_during_active_vote() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     // Voter has 1,000,000 tokens, votes FOR (after 10k threshold lock)
@@ -312,6 +391,7 @@ fn test_proposal_id_overflow_panics_with_limit_reached() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 }
 
@@ -357,6 +437,7 @@ fn finalize_fails_proposal_with_zero_votes() {
         &target,
         &Symbol::new(&env, "update"),
         &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
     );
 
     // Nobody votes.

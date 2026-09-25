@@ -1,0 +1,18 @@
+[package]
+name        = "parashield-common"
+version     = "0.1.0"
+edition     = "2021"
+description = "Shared constants and utilities for Parashield Protocol contracts"
+authors     = ["Parashield Protocol <contracts@parashield.xyz>"]
+keywords    = ["soroban", "stellar", "insurance", "defi"]
+categories  = ["cryptography::cryptocurrencies"]
+license     = "MIT"
+publish     = false
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+testutils = []
+
+[dependencies]

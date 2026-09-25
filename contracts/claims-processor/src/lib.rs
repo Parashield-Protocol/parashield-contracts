@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
 // Address/state validation must fail with a typed contract error so callers
 // can match on it programmatically, never with a raw panic! and a string
 // message.
@@ -25,7 +23,7 @@ use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    Address, BytesN, Env, Vec, Symbol,
+    Address, BytesN, Env, Vec, Symbol, IntoVal,
 };
 
 pub mod types;
@@ -59,22 +57,8 @@ trait IOracleVerifier {
 
 // ─── Storage TTL ──────────────────────────────────────────────────────────────
 
-/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
-/// (at ~5s/ledger).
-// Issue #342: kept in sync by hand across all 5 contracts (governance-dao,
-// risk-pool, policy-engine, oracle-verifier, claims-processor) — extracting
-// to a shared crate is a real follow-up, not done here to avoid touching
-// every contract's Cargo.toml in one pass.
-const TTL_THRESHOLD: u32 = 518_400;
-/// Extend persistent entries out to ~1 year (at ~5s/ledger) so pending claims
-/// survive long enough to be processed.
-const TTL_EXTEND_TO: u32 = 6_312_000;
-
-/// Grace period between an admin transfer being fully proposed/approved and the
-/// proposed admin being able to `accept_admin` (issue #356). Hand-synced across
-/// the 4 contracts that expose admin rotation (policy-engine, risk-pool,
-/// oracle-verifier, claims-processor).
-const ADMIN_TRANSFER_TIMELOCK: u64 = 48 * 60 * 60;
+// Shared protocol constants — single source of truth in parashield-common (issue #342).
+use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK};
 
 // ─── Batch processing ─────────────────────────────────────────────────────────
 
@@ -129,10 +113,18 @@ enum StorageKey {
     /// Configurable delay in seconds between claim approval and payout (u64).
     /// 0 = immediate payout (default behavior).
     PayoutDelay,
-    /// Per-data-type staleness threshold (Symbol → u64). Allows different
-    /// oracle data types (e.g. "weather" vs "flight") to have different
-    /// freshness requirements (#494).
-    StalenessThresholdByType(Symbol),
+    /// Identity attestation requirement: product_id → Symbol (id_type required).
+    IdentityRequirement(u128),
+    /// Fraud detector configuration (issue #437). Absent = detector disabled
+    /// entirely; every claim proceeds unchecked.
+    FraudConfig,
+    /// Compact aggregate of a claimant's recent submission behaviour
+    /// (issue #437). Keyed by claimant so the fraud detector never has to
+    /// scan the full claim table on a new submission.
+    ClaimantHistory(Address),
+    /// A frozen snapshot of the fraud detector's judgement on one claim
+    /// (issue #437). Written only when the detector flagged something.
+    FraudRecord(u128),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -164,6 +156,16 @@ pub enum Error {
     ClaimDeadlinePassed  = 19,
     /// Payout delay has not yet elapsed — the claim cannot be settled now.
     PayoutDelayNotElapsed = 20,
+    /// Identity verification required for this claim category but not verified.
+    IdentityVerificationRequired = 21,
+    InvalidInput = 22,
+    /// Fraud detector flagged this claim's submission and the current
+    /// `FraudMode` is `Block` (issue #437). No state was written for the
+    /// rejected claim.
+    FraudSuspected = 23,
+    /// An admin transfer was proposed while another one is still pending,
+    /// which would reset the transfer timelock (issue #457).
+    AdminTransferPending = 24,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -197,6 +199,19 @@ const MIN_ESCALATION_THRESHOLD: u64 = 60 * 60;
 /// while still putting a firm upper bound on how long a claim can be filed
 /// after the event it relates to (issue #386).
 const DEFAULT_CLAIM_DEADLINE: u64 = 30 * 24 * 60 * 60;
+
+// ─── Fraud detection (issue #437) ────────────────────────────────────────────
+
+/// Ceiling for `FraudConfig.fraud_threshold_score`. Scores above 100 could
+/// never be reached because the three rules sum to at most 90, and even a
+/// future fourth rule should not push a single claim over 100.
+const MAX_FRAUD_SCORE: u32 = 100;
+
+/// Bitmask constants matching the `FraudRecord.flags` documentation. Kept
+/// as `u32` because the field is `u32`.
+const FRAUD_FLAG_RATE: u32 = 1 << 0;
+const FRAUD_FLAG_BURST: u32 = 1 << 1;
+const FRAUD_FLAG_COVERAGE: u32 = 1 << 2;
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
@@ -240,6 +255,7 @@ impl ClaimsProcessor {
         env.storage().instance().set(&StorageKey::PendingClaims, &Vec::<u128>::new(&env));
         env.storage().instance().set(&StorageKey::Paused, &false);
         env.storage().instance().set(&StorageKey::ClaimDeadline, &DEFAULT_CLAIM_DEADLINE);
+        env.storage().instance().set(&StorageKey::EscalationThreshold, &DEFAULT_ESCALATION_THRESHOLD);
 
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
@@ -326,6 +342,15 @@ impl ClaimsProcessor {
         }
 
         let claim_id   = Self::next_claim_id(&env);
+
+        // Issue #437: score this submission against the configured fraud
+        // rules. In `Block` mode a high enough score panics here, before any
+        // claim state is written — the caller gets FraudSuspected and the
+        // world looks exactly as it did before the call. In `FlagOnly` mode
+        // a FraudRecord is persisted and the claim proceeds. When no config
+        // is set, this is a no-op.
+        Self::evaluate_fraud(&env, claim_id, &claimant, policy.coverage_amount);
+
         let claim = Claim {
             id: claim_id,
             policy_id,
@@ -339,8 +364,11 @@ impl ClaimsProcessor {
             dispute_reason: None,
             paid_amount: None,
             partial_payout_bps: None,
-            installments: None,
+            installments: Vec::new(&env),
             payout_ready_at: None,
+            identity_verified: false,
+            verification_type: None,
+            verification_time: None,
         };
         env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
         env.storage().persistent().extend_ttl(&StorageKey::Claim(claim_id), TTL_THRESHOLD, TTL_EXTEND_TO);
@@ -357,15 +385,68 @@ impl ClaimsProcessor {
             ClaimSubmitted {
                 claim_id,
                 policy_id,
-                claimant,
+                claimant: claimant.clone(),
                 coverage_amount: policy.coverage_amount,
             },
+        );
+
+        // Issue #437: fold this submission into the claimant's aggregate
+        // history for the next call's fraud check. Only meaningful when the
+        // detector is on, but cheap enough to always maintain; keeping the
+        // aggregate up to date lets an admin turn the detector on later
+        // without every claimant looking like a first-time submitter.
+        let burst_window = Self::fraud_config(&env)
+            .map(|c| c.burst_window_secs)
+            .unwrap_or(0);
+        Self::update_claimant_history(
+            &env,
+            &claimant,
+            now,
+            policy.coverage_amount,
+            burst_window,
         );
 
         claim_id
     }
 
+    /// Submit multiple claims in a single transaction up to MAX_BATCH_SIZE.
+    pub fn batch_submit_claims(env: Env, claimant: Address, policy_ids: Vec<u128>) -> Vec<u128> {
+        claimant.require_auth();
+        Self::require_not_paused(&env);
+
+        let mut claim_ids = Vec::new(&env);
+        let count = if policy_ids.len() > MAX_BATCH_SIZE {
+            MAX_BATCH_SIZE
+        } else {
+            policy_ids.len()
+        };
+
+        for i in 0..count {
+            let pid = policy_ids.get_unchecked(i);
+            let cid = Self::submit_claim(env.clone(), claimant.clone(), pid);
+            claim_ids.push_back(cid);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_claims_submitted"),),
+            BatchClaimsSubmitted {
+                claimant,
+                count,
+            },
+        );
+
+        claim_ids
+    }
+
     /// Process an existing pending claim. Reads oracle data and pays out or rejects.
+    ///
+    /// ## Parametric Payout Design Note
+    /// In parametric insurance, claim payouts are strictly binary or determined by
+    /// objective oracle trigger measurements (e.g., rainfall, wind speed, flight delay)
+    /// rather than traditional indemnity models that require loss adjustments or proof
+    /// of actual financial loss. When an oracle trigger condition is verified, the
+    /// contract pays out the pre-agreed coverage amount (or pre-configured partial
+    /// payout percentage) in full, regardless of the policyholder's actual incurred loss.
     ///
     /// `partial_payout_bps` is an optional payout ratio in basis points (0-10000).
     /// - `None` or `Some(10000)` → full coverage payment (default behavior).
@@ -382,13 +463,6 @@ impl ClaimsProcessor {
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
 
-        // A disputed claim must not be processed until the admin resolves
-        // the dispute (#500). Disputed claims are removed from the pending
-        // queue, but process_claim bypasses the queue — this check is the
-        // only guard against racing a dispute resolution.
-        if claim.status == ClaimStatus::Disputed {
-            panic_with_error!(&env, Error::AlreadyProcessed);
-        }
         if claim.status != ClaimStatus::Pending {
             return ClaimResult::AlreadyProcessed;
         }
@@ -401,6 +475,41 @@ impl ClaimsProcessor {
 
         Self::evaluate_and_settle(&env, &mut claim, &policy, partial_payout_bps)
     }
+
+    /// Process multiple existing claims in a single transaction up to MAX_BATCH_SIZE.
+    pub fn batch_process_claims(
+        env: Env,
+        keeper: Address,
+        claim_ids: Vec<u128>,
+        partial_payout_bps: Option<u32>,
+    ) -> Vec<(u128, ClaimResult)> {
+        Self::require_keeper(&env, &keeper);
+        Self::require_not_paused(&env);
+
+        let mut results = Vec::new(&env);
+        let count = if claim_ids.len() > MAX_BATCH_SIZE {
+            MAX_BATCH_SIZE
+        } else {
+            claim_ids.len()
+        };
+
+        for i in 0..count {
+            let cid = claim_ids.get_unchecked(i);
+            let res = Self::process_claim(env.clone(), keeper.clone(), cid, partial_payout_bps);
+            results.push_back((cid, res));
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_claims_processed"),),
+            BatchClaimsProcessed {
+                keeper,
+                count,
+            },
+        );
+
+        results
+    }
+
 
     /// Keeper-triggered automatic processing — no prior `submit_claim` needed.
     /// This is the primary flow for parametric insurance.
@@ -479,8 +588,11 @@ impl ClaimsProcessor {
                 dispute_reason: None,
                 paid_amount: None,
                 partial_payout_bps: None,
-                installments: None,
+                installments: Vec::new(&env),
                 payout_ready_at: None,
+                identity_verified: false,
+                verification_type: None,
+                verification_time: None,
             };
             env.storage().persistent().set(&StorageKey::Claim(cid), &claim);
             env.storage().persistent().extend_ttl(&StorageKey::Claim(cid), TTL_THRESHOLD, TTL_EXTEND_TO);
@@ -523,6 +635,13 @@ impl ClaimsProcessor {
     /// `u32::MAX`) is not an error — it simply settles the first
     /// `MAX_BATCH_SIZE` pending claims, keeping the transaction inside
     /// Soroban's instruction budget. Call again to drain the rest of the queue.
+    ///
+    /// Failure isolation: each claim is evaluated via a sub-invocation of
+    /// `auto_process` on this contract using `env.try_invoke_contract`. If
+    /// any individual claim's cross-contract calls panic (e.g. stale oracle
+    /// data, policy engine rejection, risk-pool error), that sub-invocation
+    /// returns `Err` and the claim is skipped — the batch itself never
+    /// aborts, so all other claims in the queue are still processed.
     pub fn batch_auto_process(env: Env, caller: Address, limit: u32) -> Vec<(u128, ClaimResult)> {
         Self::require_keeper(&env, &caller);
         Self::require_not_paused(&env);
@@ -538,24 +657,69 @@ impl ClaimsProcessor {
             effective_limit
         };
 
-        let policy_engine: Address = env.storage().instance()
-            .get(&StorageKey::PolicyEngine)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        let this = env.current_contract_address();
+        let fn_name = Symbol::new(&env, "auto_process");
 
         for i in 0..process_count {
             let claim_id = pending.get_unchecked(i);
-            let mut claim: Claim = match env.storage().persistent()
-                .get(&StorageKey::Claim(claim_id)) {
-                Some(c) => c,
-                None    => continue,
-            };
-            if claim.status != ClaimStatus::Pending { continue; }
-            if claim.processed_at.is_some() { continue; }
 
-            let policy = PolicyEngineClient::new(&env, &policy_engine)
-                .get_policy(&claim.policy_id);
-            let result = Self::evaluate_and_settle(&env, &mut claim, &policy, None);
-            results.push_back((claim_id, result));
+            // Pre-check: skip claims that are no longer Pending without
+            // spending a sub-invocation on them (fast path, no isolation cost).
+            let claim_opt: Option<Claim> = env.storage().persistent()
+                .get(&StorageKey::Claim(claim_id));
+            let policy_id = match &claim_opt {
+                None => continue,
+                Some(c) if c.status != ClaimStatus::Pending => continue,
+                Some(c) if c.processed_at.is_some() => continue,
+                Some(c) => c.policy_id,
+            };
+
+            // Each claim is evaluated in its own sub-invocation so that a
+            // panic inside (stale oracle, cross-contract failure, etc.) only
+            // rolls back that single claim, not the entire batch.
+            //
+            // auto_process(caller, policy_id, partial_payout_bps: None)
+            // None is encoded as the void Val in the args vector.
+            let none_val: soroban_sdk::Val = Option::<u32>::None.into_val(&env);
+            let args = soroban_sdk::vec![
+                &env,
+                caller.to_val(),
+                policy_id.into_val(&env),
+                none_val,
+            ];
+            match env.try_invoke_contract::<ClaimResult, soroban_sdk::Error>(
+                &this,
+                &fn_name,
+                args,
+            ) {
+                Ok(Ok(result)) => {
+                    results.push_back((claim_id, result.clone()));
+                    
+                    // Emit individual claim processed event for tracking specific outcomes
+                    let claim: Option<Claim> = env.storage().persistent()
+                        .get(&StorageKey::Claim(claim_id));
+                    if let Some(c) = claim {
+                        let trigger_met = match &result {
+                            ClaimResult::Approved(_) => true,
+                            ClaimResult::Rejected => false,
+                            ClaimResult::PartiallyPaid(_) => true,
+                            ClaimResult::AlreadyProcessed => false,
+                        };
+                        env.events().publish(
+                            (Symbol::new(&env, "claim_processed"),),
+                            ClaimProcessed {
+                                claim_id,
+                                policy_id,
+                                trigger_met,
+                                status: c.status,
+                            },
+                        );
+                    }
+                }
+                // Sub-invocation failed or returned a contract error — skip
+                // this claim and continue processing the rest of the batch.
+                Ok(Err(_)) | Err(_) => continue,
+            }
         }
         results
     }
@@ -680,7 +844,7 @@ impl ClaimsProcessor {
         Self::require_keeper(&env, &caller);
         Self::require_not_paused(&env);
 
-        let mut claim = Self::get_claim(&env, claim_id);
+        let mut claim = Self::get_claim(env.clone(), claim_id);
         
         // Only schedule installments for approved claims
         if claim.status != ClaimStatus::Paid && claim.status != ClaimStatus::PartiallyPaid {
@@ -703,7 +867,7 @@ impl ClaimsProcessor {
             paid_count: 0,
         };
 
-        claim.installments = Some(schedule.clone());
+        claim.installments = Vec::from_array(&env, [schedule.clone()]);
         env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
         env.storage().persistent().extend_ttl(&StorageKey::Claim(claim_id), TTL_THRESHOLD, TTL_EXTEND_TO);
 
@@ -727,13 +891,13 @@ impl ClaimsProcessor {
         claimant.require_auth();
         Self::require_not_paused(&env);
 
-        let mut claim = Self::get_claim(&env, claim_id);
+        let mut claim = Self::get_claim(env.clone(), claim_id);
         
         if claim.claimant != claimant {
             panic_with_error!(&env, Error::Unauthorized);
         }
 
-        let schedule = claim.installments.as_ref()
+        let schedule = claim.installments.first()
             .unwrap_or_else(|| panic_with_error!(&env, Error::InvalidInput));
 
         // Check if there are remaining installments
@@ -759,17 +923,20 @@ impl ClaimsProcessor {
         let amount_to_pay = schedule.amount_per_installment
             .saturating_mul((installments_available - schedule.paid_count) as i128);
 
+        let total_installments = schedule.num_installments;
+
         // Transfer funds from risk pool
         let risk_pool: Address = env.storage().instance()
             .get(&StorageKey::RiskPool)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-        
+
         let pool_client = RiskPoolClient::new(&env, &risk_pool);
         pool_client.release_for_claim(&env.current_contract_address(), &claim.policy_id);
 
         // Update installment schedule
-        if let Some(ref mut sched) = claim.installments {
+        if let Some(mut sched) = claim.installments.first() {
             sched.paid_count = installments_available;
+            claim.installments.set(0, sched);
         }
 
         env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
@@ -782,7 +949,7 @@ impl ClaimsProcessor {
                 claimant,
                 amount: amount_to_pay,
                 paid_count: installments_available,
-                total_installments: schedule.num_installments,
+                total_installments,
             },
         );
 
@@ -1019,11 +1186,25 @@ impl ClaimsProcessor {
     /// proposal is not armed until `threshold` guardians call
     /// `approve_admin_change`. Once armed, `new_admin` must call `accept_admin`
     /// — and that only succeeds after `ADMIN_TRANSFER_TIMELOCK` has elapsed, so
-    /// a hostile or mistaken rotation has a 48h window to be noticed and
-    /// countered with a fresh `propose_new_admin`.
+    /// a hostile or mistaken rotation has a 48h window to be noticed.
+    ///
+    /// Panics with `AdminTransferPending` while a transfer is already armed:
+    /// re-proposing over an armed transfer would rewrite `PendingAdminSince`
+    /// and reset the `ADMIN_TRANSFER_TIMELOCK`, letting the current admin
+    /// keep a transfer perpetually un-acceptable (issue #457).
     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
         Self::validate_stellar_address(&env, &new_admin);
+
+        // Issue #457: reject a fresh proposal while one is already pending —
+        // the armed transfer must complete (be accepted) before another can
+        // be made, so the timelock clock can never be reset by re-proposing.
+        let pending: Option<Address> = env.storage().instance()
+            .get(&StorageKey::PendingAdmin)
+            .unwrap_or(None);
+        if pending.is_some() {
+            panic_with_error!(&env, Error::AdminTransferPending);
+        }
 
         let threshold: u32 = env
             .storage()
@@ -1094,9 +1275,14 @@ impl ClaimsProcessor {
         if pending.approvals.len() >= threshold {
             env.storage().instance().remove(&StorageKey::PendingAdminChange);
             env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
-            env.storage()
-                .instance()
-                .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
+            // Issue #457: arm the timelock at most once per transfer — never
+            // overwrite an already-armed `PendingAdminSince`, or the
+            // `ADMIN_TRANSFER_TIMELOCK` would restart from this later moment.
+            if !env.storage().instance().has(&StorageKey::PendingAdminSince) {
+                env.storage()
+                    .instance()
+                    .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
+            }
         } else {
             env.storage()
                 .instance()
@@ -1274,61 +1460,69 @@ impl ClaimsProcessor {
         Self::payout_delay(&env)
     }
 
+    /// Configure the fraud detector (issue #437). Admin-only. Absent
+    /// configuration means the detector is fully disabled; calling this
+    /// once with any `FraudConfig` turns it on for every subsequent
+    /// `submit_claim`.
+    ///
+    /// Bounds enforced:
+    /// - `fraud_threshold_score <= MAX_FRAUD_SCORE`
+    ///
+    /// Rule score fields are bounded implicitly by their `u32` type; a
+    /// pathological admin can still make a single rule fire the threshold
+    /// alone. That is intentional, so `Rule 3 alone = suspicious enough`
+    /// remains configurable.
+    pub fn set_fraud_config(env: Env, admin: Address, config: FraudConfig) {
+        Self::require_admin(&env, &admin);
+        if config.fraud_threshold_score > MAX_FRAUD_SCORE {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::FraudConfig, &config);
+        env.events().publish(
+            (Symbol::new(&env, "fraud_config_updated"),),
+            FraudConfigUpdated {
+                rate_window_secs: config.rate_window_secs,
+                rate_score: config.rate_score,
+                burst_window_secs: config.burst_window_secs,
+                burst_count: config.burst_count,
+                burst_score: config.burst_score,
+                coverage_anomaly_multiplier: config.coverage_anomaly_multiplier,
+                coverage_score: config.coverage_score,
+                fraud_threshold_score: config.fraud_threshold_score,
+                mode: config.mode,
+            },
+        );
+    }
+
+    /// The fraud detector configuration currently in force, or `None` when
+    /// the detector is disabled (issue #437).
+    pub fn get_fraud_config(env: Env) -> Option<FraudConfig> {
+        Self::fraud_config(&env)
+    }
+
+    /// The frozen fraud snapshot for a claim (issue #437). `None` when the
+    /// claim was never flagged (either the detector is off, the score was
+    /// below threshold, or the mode was Block and no state was written).
+    pub fn get_fraud_record(env: Env, claim_id: u128) -> Option<FraudRecord> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::FraudRecord(claim_id))
+    }
+
+    /// The claimant's aggregate history the detector uses. Returns the
+    /// empty aggregate when the claimant has never submitted (issue #437).
+    pub fn get_claimant_history(env: Env, claimant: Address) -> ClaimantHistory {
+        Self::claimant_history(&env, &claimant)
+    }
+
     /// The configured payout delay, or the default.
     fn payout_delay(env: &Env) -> u64 {
         env.storage()
             .instance()
             .get(&StorageKey::PayoutDelay)
             .unwrap_or(0)
-    }
-
-    // ── Per-data-type staleness threshold (issue #494) ──────────────────────
-
-    /// Admin-only: set the staleness threshold for a specific oracle data type.
-    ///
-    /// Different data types have different freshness requirements — weather data
-    /// arriving every 15 minutes can tolerate a shorter threshold than on-chain
-    /// data that updates once per ledger. When set, `evaluate_and_settle` uses
-    /// this per-type threshold instead of the global `StalenessThreshold`.
-    ///
-    /// Pass `0` to remove a per-type override and fall back to the global value.
-    pub fn set_staleness_threshold_by_type(
-        env: Env,
-        admin: Address,
-        data_type: Symbol,
-        threshold: u64,
-    ) {
-        Self::require_admin(&env, &admin);
-        if threshold == 0 {
-            env.storage()
-                .instance()
-                .remove(&StorageKey::StalenessThresholdByType(data_type));
-        } else {
-            env.storage()
-                .instance()
-                .set(&StorageKey::StalenessThresholdByType(data_type.clone()), &threshold);
-        }
-        env.events().publish(
-            (Symbol::new(&env, "staleness_threshold_by_type_set"),),
-            StalenessThresholdByTypeUpdated { data_type, threshold },
-        );
-    }
-
-    /// The staleness threshold for a specific data type, falling back to the
-    /// global threshold if no per-type override is configured.
-    fn staleness_threshold_for_type(env: &Env, data_type: &Symbol) -> u64 {
-        env.storage()
-            .instance()
-            .get(&StorageKey::StalenessThresholdByType(data_type.clone()))
-            .unwrap_or_else(|| Self::global_staleness_threshold(env))
-    }
-
-    /// The global staleness threshold (default 7 days = 604_800 s).
-    fn global_staleness_threshold(env: &Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&StorageKey::StalenessThreshold)
-            .unwrap_or(604_800u64)
     }
 
     /// Claim the payout for an approved claim after the payout delay has elapsed.
@@ -1473,6 +1667,89 @@ impl ClaimsProcessor {
         overdue
     }
 
+    // ── Identity Verification ───────────────────────────────────────────────
+
+    /// Admin-only: mark a product/category as requiring identity verification.
+    /// Claimants must have verified identity (via oracle-verifier attestation)
+    /// to claim payouts for this product.
+    pub fn require_identity_for_category(
+        env: Env,
+        admin: Address,
+        product_id: u128,
+        id_type: Symbol,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        let key = StorageKey::IdentityRequirement(product_id);
+        env.storage().instance().set(&key, &id_type);
+
+        env.events().publish(
+            (Symbol::new(&env, "identity_requirement_set"),),
+            (product_id, id_type),
+        );
+    }
+
+    /// Admin-only: remove identity verification requirement for a product.
+    pub fn remove_identity_requirement(env: Env, admin: Address, product_id: u128) {
+        Self::require_admin(&env, &admin);
+
+        let key = StorageKey::IdentityRequirement(product_id);
+        env.storage().instance().remove(&key);
+
+        env.events().publish(
+            (Symbol::new(&env, "identity_requirement_removed"),),
+            product_id,
+        );
+    }
+
+    /// Admin-only: manually verify a claimant's identity for a claim.
+    /// Used when off-chain identity verification is completed or approved by DAO.
+    pub fn verify_claimant_identity(
+        env: Env,
+        admin: Address,
+        claim_id: u128,
+        id_type: Symbol,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        let mut claim: Claim = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+
+        let now = env.ledger().timestamp();
+        claim.identity_verified = true;
+        claim.verification_type = Some(id_type.clone());
+        claim.verification_time = Some(now);
+
+        let key = StorageKey::Claim(claim_id);
+        env.storage().persistent().set(&key, &claim);
+        Self::extend_claim_ttl(&env, &key);
+
+        env.events().publish(
+            (Symbol::new(&env, "identity_verified"),),
+            (claim_id, id_type, now),
+        );
+    }
+
+    /// Get the identity requirement for a product (if set).
+    pub fn get_identity_requirement(env: Env, product_id: u128) -> Option<Symbol> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::IdentityRequirement(product_id))
+    }
+
+    /// Check if a claimant's identity is verified for a particular ID type.
+    /// This is a utility for off-chain systems to verify attestation status.
+    pub fn is_identity_verified(env: Env, claim_id: u128) -> bool {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .map(|claim: Claim| claim.identity_verified)
+            .unwrap_or(false)
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     /// Evaluate a pending claim and settle it against the configured oracle trigger.
@@ -1509,12 +1786,10 @@ impl ClaimsProcessor {
         let risk_pool: Address = env.storage().instance()
             .get(&StorageKey::RiskPool)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
-        // Per-data-type staleness threshold: uses the data-type-specific value
-        // if configured, otherwise falls back to the global threshold (#494).
-        let staleness_threshold: u64 = Self::staleness_threshold_for_type(
-            env,
-            &policy.oracle_data_type,
-        );
+        // Configurable staleness threshold (default 7 days = 604_800 s if not set)
+        let staleness_threshold: u64 = env.storage().instance()
+            .get(&StorageKey::StalenessThreshold)
+            .unwrap_or(604_800u64);
 
         let condition = parashield_oracle_verifier::TriggerCondition {
             data_type:   policy.oracle_data_type.clone(),
@@ -1541,6 +1816,8 @@ impl ClaimsProcessor {
 
         let result = if trigger_met {
             // Determine payout: full or partial based on partial_payout_bps.
+            // Parametric model design: pays the pre-agreed coverage amount (or pre-set partial bps)
+            // automatically when the oracle condition is verified, without assessing post-hoc actual loss.
             let bps = partial_payout_bps.unwrap_or(10_000);
             let effective_bps = if bps > 10_000 { 10_000 } else { bps };
             let now = env.ledger().timestamp();
@@ -1693,19 +1970,198 @@ impl ClaimsProcessor {
 
     fn validate_stellar_address(env: &Env, address: &Address) {
         let addr_str = address.to_string();
-        
+
         // Check length: Stellar public keys are exactly 56 characters
         if addr_str.len() != 56 {
             panic_with_error!(env, Error::InvalidAddress);
         }
-        
+
         let mut buf = [0u8; 56];
         addr_str.copy_into_slice(&mut buf);
-        
+
         // Check prefix: G (Stellar account) or C (Stellar contract)
         if buf[0] != b'G' && buf[0] != b'C' {
             panic_with_error!(env, Error::InvalidAddress);
         }
+    }
+
+    // ── Fraud detection helpers (issue #437) ──────────────────────────────
+
+    /// Fraud detector configuration if the admin has set one, else `None`.
+    /// `None` means the detector is disabled and every submission proceeds
+    /// unchecked (pre-issue-437 behaviour).
+    fn fraud_config(env: &Env) -> Option<FraudConfig> {
+        env.storage().instance().get(&StorageKey::FraudConfig)
+    }
+
+    /// A claimant's aggregate history, or an empty one for a first-time
+    /// submitter. `unwrap_or_else` ensures fresh submitters do not pay a
+    /// storage read that could fail.
+    fn claimant_history(env: &Env, claimant: &Address) -> ClaimantHistory {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::ClaimantHistory(claimant.clone()))
+            .unwrap_or(ClaimantHistory {
+                last_submission_at: 0,
+                burst_bucket_start: 0,
+                burst_count: 0,
+                max_coverage_ever: 0,
+                total_submissions: 0,
+            })
+    }
+
+    /// Score this submission against the configured rules. Returns
+    /// `(score, flags)`, both zero when the detector is disabled or when
+    /// no rule fires.
+    ///
+    /// Pure function over the passed-in `now` / `history` / `coverage` so it
+    /// can be tested without spinning up the full cross-contract world.
+    fn score_submission(
+        cfg: &FraudConfig,
+        now: u64,
+        history: &ClaimantHistory,
+        coverage_amount: i128,
+    ) -> (u32, u32) {
+        let mut score: u32 = 0;
+        let mut flags: u32 = 0;
+
+        // Rule 1: rapid resubmission. Only fires once a claimant has any
+        // prior submission on record; a first-ever claim never trips it.
+        if cfg.rate_window_secs > 0
+            && cfg.rate_score > 0
+            && history.last_submission_at > 0
+            && now.saturating_sub(history.last_submission_at) < cfg.rate_window_secs
+        {
+            score = score.saturating_add(cfg.rate_score);
+            flags |= FRAUD_FLAG_RATE;
+        }
+
+        // Rule 2: multi-policy burst. Fires when *this* submission would
+        // be the `burst_count`-th inside the active window bucket. The
+        // caller updates the bucket after admission; here we compute the
+        // hypothetical post-increment count using the stored bucket.
+        if cfg.burst_window_secs > 0 && cfg.burst_count > 0 && cfg.burst_score > 0 {
+            let bucket_alive = history.burst_bucket_start > 0
+                && now.saturating_sub(history.burst_bucket_start) < cfg.burst_window_secs;
+            let projected = if bucket_alive {
+                history.burst_count.saturating_add(1)
+            } else {
+                1
+            };
+            if projected >= cfg.burst_count {
+                score = score.saturating_add(cfg.burst_score);
+                flags |= FRAUD_FLAG_BURST;
+            }
+        }
+
+        // Rule 3: coverage anomaly. Requires prior coverage on record —
+        // a first-ever claim cannot be an anomaly relative to nothing.
+        if cfg.coverage_anomaly_multiplier > 0
+            && cfg.coverage_score > 0
+            && history.max_coverage_ever > 0
+        {
+            let threshold = history
+                .max_coverage_ever
+                .saturating_mul(cfg.coverage_anomaly_multiplier as i128);
+            if coverage_amount > threshold {
+                score = score.saturating_add(cfg.coverage_score);
+                flags |= FRAUD_FLAG_COVERAGE;
+            }
+        }
+
+        (score, flags)
+    }
+
+    /// Fold a just-admitted submission into the claimant's history. Bumps
+    /// `total_submissions` and `max_coverage_ever` on every call; resets or
+    /// extends the burst bucket based on how much time has passed since the
+    /// previous submission. Called by `submit_claim` after the fraud gate.
+    fn update_claimant_history(
+        env: &Env,
+        claimant: &Address,
+        now: u64,
+        coverage_amount: i128,
+        burst_window_secs: u64,
+    ) {
+        let prev = Self::claimant_history(env, claimant);
+        let (bucket_start, bucket_count) = if burst_window_secs == 0 {
+            // Feature effectively off — do not carry a stale bucket forward.
+            (0, 0)
+        } else if prev.burst_bucket_start == 0
+            || now.saturating_sub(prev.burst_bucket_start) >= burst_window_secs
+        {
+            (now, 1)
+        } else {
+            (prev.burst_bucket_start, prev.burst_count.saturating_add(1))
+        };
+
+        let next = ClaimantHistory {
+            last_submission_at: now,
+            burst_bucket_start: bucket_start,
+            burst_count: bucket_count,
+            max_coverage_ever: prev.max_coverage_ever.max(coverage_amount),
+            total_submissions: prev.total_submissions.saturating_add(1),
+        };
+        let key = StorageKey::ClaimantHistory(claimant.clone());
+        env.storage().persistent().set(&key, &next);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Run the configured fraud detector against a hypothetical submission.
+    /// If the detector is off (no `FraudConfig`) this returns immediately
+    /// with `(0, 0)` and does nothing else.
+    ///
+    /// If the score meets or exceeds the configured threshold and mode is
+    /// `Block`, the function panics with `FraudSuspected` after emitting
+    /// `FraudFlagged`. If mode is `FlagOnly`, it emits the event, persists a
+    /// `FraudRecord`, and returns so the caller can continue writing the
+    /// claim.
+    ///
+    /// Called from `submit_claim` after all existing gates so a rejection at
+    /// this point does not leak partial state.
+    fn evaluate_fraud(
+        env: &Env,
+        claim_id: u128,
+        claimant: &Address,
+        coverage_amount: i128,
+    ) -> (u32, u32) {
+        let Some(cfg) = Self::fraud_config(env) else {
+            return (0, 0);
+        };
+        let now = env.ledger().timestamp();
+        let history = Self::claimant_history(env, claimant);
+        let (score, flags) = Self::score_submission(&cfg, now, &history, coverage_amount);
+        if score >= cfg.fraud_threshold_score && cfg.fraud_threshold_score > 0 {
+            env.events().publish(
+                (Symbol::new(env, "fraud_flagged"),),
+                FraudFlagged {
+                    claim_id,
+                    claimant: claimant.clone(),
+                    score,
+                    flags,
+                    mode: cfg.mode.clone(),
+                },
+            );
+            match cfg.mode {
+                FraudMode::Block => panic_with_error!(env, Error::FraudSuspected),
+                FraudMode::FlagOnly => {
+                    let record = FraudRecord {
+                        claim_id,
+                        score,
+                        flags,
+                        checked_at: now,
+                    };
+                    let key = StorageKey::FraudRecord(claim_id);
+                    env.storage().persistent().set(&key, &record);
+                    env.storage()
+                        .persistent()
+                        .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+                }
+            }
+        }
+        (score, flags)
     }
 }
 
