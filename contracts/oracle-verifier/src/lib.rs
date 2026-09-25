@@ -146,6 +146,7 @@ pub enum Error {
     InvalidThreshold = 22,
     AdminTimelockNotExpired = 23,
     InvalidMaxAge = 24,
+    InvalidSymbolLength = 25,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -191,6 +192,12 @@ impl OracleVerifier {
         Self::validate_stellar_address(&env, &oracle);
         if weight == 0 || weight > 100 {
             panic_with_error!(&env, Error::InvalidWeight);
+        }
+        // Validate data_type Symbol length (#502)
+        const MAX_SYMBOL_LEN: usize = 32;
+        let dt_len = data_type.to_string().len();
+        if dt_len == 0 || dt_len > MAX_SYMBOL_LEN {
+            panic_with_error!(&env, Error::InvalidSymbolLength);
         }
         let key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         if env.storage().persistent().has(&key) {
@@ -1026,6 +1033,22 @@ impl OracleVerifier {
         oracle.require_auth();
         if confidence == 0 || confidence > 100 {
             panic_with_error!(&env, Error::InvalidConfidence);
+        }
+
+        // Validate Symbol lengths to prevent storage overflow from extremely
+        // long Symbols (#502). Soroban Symbols can hold up to 32 bytes, but
+        // excessively long identifiers waste storage and are almost certainly
+        // mistakes.
+        const MAX_SYMBOL_LEN: usize = 32;
+        {
+            let dt_len = data_type.to_string().len();
+            if dt_len == 0 || dt_len > MAX_SYMBOL_LEN {
+                panic_with_error!(&env, Error::InvalidSymbolLength);
+            }
+            let k_len = key.to_string().len();
+            if k_len == 0 || k_len > MAX_SYMBOL_LEN {
+                panic_with_error!(&env, Error::InvalidSymbolLength);
+            }
         }
 
         let now = env.ledger().timestamp();

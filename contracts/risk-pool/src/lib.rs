@@ -1,4 +1,4 @@
-﻿//! Parashield Risk Pool
+//! Parashield Risk Pool
 //!
 //! Liquidity providers deposit USDC into category-specific risk pools.
 //! Pool-share tokens represent proportional ownership.
@@ -580,6 +580,9 @@ impl RiskPool {
     /// ### Capital Effect
     /// This reduces `total_locked` in the pool, reflecting that the coverage lock is now removed.
     /// Since the claim was paid, the underwriting capital has been disbursed to the policyholder.
+    /// The utilization rate (total_locked / total_deposited) is computed on-the-fly by
+    /// `get_utilization_rate()`, so it is always consistent with the latest `total_locked`
+    /// value — no separate recalculation is needed (#505).
     ///
     /// ### Design Rationale
     /// Having separate functions (`release_for_claim` and `release_for_expiry`) instead of a single
@@ -595,16 +598,20 @@ impl RiskPool {
         let mut lock: CapitalLock = env.storage().persistent()
             .get(&StorageKey::Lock(policy_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::LockNotFound));
-        
+
         // Guard: check for zero or negative amount before processing release metrics
         if lock.amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if lock.released { panic_with_error!(&env, Error::AlreadyReleased); }
-        
+
         lock.released = true;
         env.storage().persistent().set(&StorageKey::Lock(policy_id), &lock);
         env.storage().persistent().extend_ttl(&StorageKey::Lock(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
         let total_locked: i128 = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
-        env.storage().instance().set(&StorageKey::TotalLocked, &(total_locked.saturating_sub(lock.amount)));
+        let new_total_locked = total_locked.saturating_sub(lock.amount);
+        env.storage().instance().set(&StorageKey::TotalLocked, &new_total_locked);
+
+        // Utilization is computed on-the-fly from total_locked/total_deposited,
+        // so it is always consistent with the latest total_locked value (#505).
 
         env.events().publish(
             (Symbol::new(&env, "capital_released"),),

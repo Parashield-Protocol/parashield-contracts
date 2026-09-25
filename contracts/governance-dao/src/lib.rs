@@ -1,4 +1,4 @@
-﻿//! Parashield Governance DAO
+//! Parashield Governance DAO
 //!
 //! Token-weighted governance over protocol parameters:
 //!   - Add/remove insurance products
@@ -264,6 +264,10 @@ impl GovernanceDao {
     /// Shares the same threshold/deposit/vote/finalize/timelock lifecycle as
     /// `create_proposal`; only the proposal `kind` and pre-built
     /// target/function/args differ.
+    ///
+    /// #503 — Validates that the target contract responds to a `get_version`
+    /// probe call before creating the proposal, preventing upgrades to
+    /// contracts that don't implement the expected interface.
     pub fn propose_upgrade(
         env: Env,
         proposer: Address,
@@ -273,6 +277,26 @@ impl GovernanceDao {
     ) -> u64 {
         proposer.require_auth();
         Self::validate_stellar_address(&env, &target);
+
+        // Validate target contract implements expected interface (#503).
+        // Probe with get_version — a contract without this function will fail,
+        // preventing proposals targeting non-parashield contracts.
+        let probe_result: Result<u32, soroban_sdk::Error> = env.try_invoke_contract(
+            &target,
+            &Symbol::new(&env, "get_version"),
+            soroban_sdk::vec![&env],
+        );
+        match probe_result {
+            Ok(Ok(_)) => {} // target responds to get_version — proceed
+            _ => {
+                // Target doesn't implement get_version or returned an error.
+                // This is a soft rejection — the upgrade would fail at
+                // execution time anyway, but rejecting early saves the
+                // proposer's deposit and voting effort.
+                panic_with_error!(&env, Error::InvalidAddress);
+            }
+        }
+
         let config: DaoConfig = env
             .storage()
             .instance()

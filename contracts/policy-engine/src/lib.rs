@@ -1,4 +1,4 @@
-﻿//! Parashield Policy Engine
+//! Parashield Policy Engine
 //!
 //! Manages insurance products and policies.
 //!
@@ -288,8 +288,12 @@ impl PolicyEngine {
         }
         // trigger_threshold must be positive and within the 7-decimal fixed-point
         // range used across the protocol (1 unit = 0.0000001; max ≈ 1 quadrillion).
+        // The upper bound is set to 10^18 (1e18) to match the oracle's maximum
+        // deliverable value at 7-decimal precision — thresholds beyond this
+        // could never be reached by oracle data (#506).
+        const MAX_TRIGGER_THRESHOLD: i128 = 1_000_000_000_000_000_000; // 10^18
         if params.trigger_threshold <= 0
-            || params.trigger_threshold > 1_000_000_000_000_000_000_000i128
+            || params.trigger_threshold > MAX_TRIGGER_THRESHOLD
         {
             panic_with_error!(&env, Error::InvalidTriggerThreshold);
         }
