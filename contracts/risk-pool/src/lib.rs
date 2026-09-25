@@ -1256,6 +1256,24 @@ impl RiskPool {
         if attachment_point < 0 || coverage_limit < 0 {
             panic_with_error!(&env, Error::InvalidReinsuranceConfig);
         }
+        
+        // Validate that the reinsurer address implements the IReinsurer interface
+        // by attempting to call its recover method with test parameters.
+        let recovery_result = env.try_invoke_contract::<i128, soroban_sdk::Error>(
+            &reinsurer,
+            &Symbol::new(&env, "recover"),
+            soroban_sdk::vec![
+                &env,
+                env.current_contract_address().to_val(),
+                0u128.into_val(&env),
+                0i128.into_val(&env),
+            ],
+        );
+        
+        if recovery_result.is_err() {
+            panic_with_error!(&env, Error::InvalidReinsuranceConfig);
+        }
+        
         let config = ReinsuranceConfig {
             reinsurer: reinsurer.clone(),
             attachment_point,
