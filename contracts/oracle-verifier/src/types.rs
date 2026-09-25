@@ -591,3 +591,57 @@ pub struct AggregatedDataWeighted {
     /// Total decay factor applied (0-10000 basis points).
     pub decay_factor_bps: u32,
 }
+
+// ── Issue #459: stale-submission penalty events ─────────────────────────────
+
+/// Emitted every time an oracle submission is rejected as stale on
+/// `submit_data` / `submit_encrypted_data` / `submit_data_batch`. Carries the
+/// running count so off-chain monitors can see how close an oracle is to the
+/// slashing threshold.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StaleSubmissionDetected {
+    pub oracle: Address,
+    pub data_type: Symbol,
+    /// Timestamp the oracle submitted.
+    pub submitted_ts: u64,
+    /// The `max_data_age` in effect for this data_type at rejection time.
+    pub max_age: u64,
+    /// Running count of consecutive stale submissions from this oracle.
+    pub count: u32,
+}
+
+/// Emitted when a stale-submission count reaches the configured threshold and
+/// the penalty (stake slash + reputation drop) is applied. Complements the
+/// existing `OracleSlashed` event, which is only emitted for admin-driven
+/// slashes; this one covers the automated stale-path penalty.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StalePenaltyApplied {
+    pub oracle: Address,
+    pub data_type: Symbol,
+    pub count: u32,
+    /// Actual amount slashed from stake (bounded by the oracle's balance).
+    pub slashed: i128,
+    /// Reputation basis points actually subtracted from
+    /// `OracleReputation.score` (clamped to 0).
+    pub reputation_lost: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StaleThresholdUpdated {
+    pub threshold: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StaleSlashAmountUpdated {
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StaleReputationPenaltyUpdated {
+    pub reputation_lost: u32,
+}
