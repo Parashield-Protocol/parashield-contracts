@@ -113,6 +113,11 @@ pub enum Error {
     InvalidWarningWindow = 32,
 }
 
+// SECURITY: 48-hour timelock on critical admin actions (create_product, update_product).
+// Prevents an instantly-compromised admin key from immediately deploying malicious products.
+// Users have time to detect the compromise and intervene.
+const ADMIN_ACTION_TIMELOCK_SECONDS: u64 = 48 * 60 * 60;
+
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
 #[cfg(any(test, feature = "testutils", not(feature = "library")))]

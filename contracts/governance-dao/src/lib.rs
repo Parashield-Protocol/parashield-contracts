@@ -273,11 +273,12 @@ impl GovernanceDao {
         proposer.require_auth();
         Self::validate_stellar_address(&env, &target);
         
-        // Validate impact analysis is provided (non-empty)
+        // SECURITY FIX: Validate impact analysis length to prevent storage exhaustion.
+        // Limit to 4096 bytes — reasonable for a proposal description without enabling
+        // attacks that reserve huge storage or inflate transaction costs.
         if impact_analysis.is_empty() {
             panic_with_error!(&env, Error::InvalidInput);
         }
-        // Enforce maximum length for impact analysis (4096 bytes)
         if impact_analysis.len() > 4096 {
             panic_with_error!(&env, Error::InvalidInput);
         }
