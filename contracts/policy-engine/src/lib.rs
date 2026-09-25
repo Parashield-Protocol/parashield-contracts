@@ -530,6 +530,13 @@ impl PolicyEngine {
         if product.status != ProductStatus::Active {
             panic_with_error!(env, Error::ProductNotActive);
         }
+        // Defense-in-depth: reject non-positive coverage before range check
+        // (#501). A zero or negative amount would pass the range check when
+        // coverage_min is zero or negative, creating a free or profit-making
+        // policy that drains the pool.
+        if coverage_amount <= 0 {
+            panic_with_error!(&env, Error::CoverageOutOfRange);
+        }
         if coverage_amount < product.coverage_min || coverage_amount > product.coverage_max {
             panic_with_error!(env, Error::CoverageOutOfRange);
         }
