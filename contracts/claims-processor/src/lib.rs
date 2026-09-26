@@ -173,6 +173,8 @@ pub enum Error {
     AdminTransferPending = 24,
     /// SECURITY FIX: Rate limiting - auto_process called too frequently for this policy.
     RateLimitExceeded = 25,
+    /// A payout larger than the policy's coverage amount was attempted (issue #550).
+    PayoutExceedsCoverage = 26,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -1587,6 +1589,12 @@ impl ClaimsProcessor {
         let paid_amount = claim.paid_amount
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
 
+        // Re-check the cap at release time: the payout may never exceed the
+        // policy's coverage amount (issue #550).
+        if paid_amount > claim.coverage_amount {
+            panic_with_error!(&env, Error::PayoutExceedsCoverage);
+        }
+
         // Clear payout_ready_at so this cannot be called again
         claim.payout_ready_at = None;
         env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
@@ -1888,6 +1896,10 @@ impl ClaimsProcessor {
             } else {
                 // Partial payment: calculate proportional payout
                 let paid = claim.coverage_amount * (effective_bps as i128) / 10_000;
+                // A payout can never exceed the policy's coverage (issue #550).
+                if paid > claim.coverage_amount {
+                    panic_with_error!(env, Error::PayoutExceedsCoverage);
+                }
                 claim.status = ClaimStatus::PartiallyPaid;
                 claim.paid_amount = Some(paid);
                 claim.partial_payout_bps = Some(effective_bps);

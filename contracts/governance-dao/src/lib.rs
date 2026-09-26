@@ -1795,6 +1795,36 @@ impl GovernanceDao {
         );
     }
 
+    /// Admin-only: change the minimum governance-token balance needed to create
+    /// a proposal, without replacing the rest of the DAO configuration
+    /// (issue #551). Like `update_config`, it only affects proposals created
+    /// after this call; in-flight proposals keep the deposit snapshotted at
+    /// creation. The threshold must be positive.
+    pub fn set_proposal_threshold(env: Env, admin: Address, new_threshold: i128) {
+        Self::require_admin(&env, &admin);
+        if new_threshold <= 0 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        let mut config: DaoConfig = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        config.proposal_threshold = new_threshold;
+        env.storage().instance().set(&StorageKey::Config, &config);
+
+        env.events().publish(
+            (Symbol::new(&env, "dao_config_updated"),),
+            DaoConfigUpdated {
+                gov_token: config.gov_token.clone(),
+                proposal_threshold: config.proposal_threshold,
+                total_supply: config.total_supply,
+                voting_period: config.voting_period,
+                proposal_timelock: config.proposal_timelock,
+            },
+        );
+    }
+
     /// Upgrade the contract WASM in-place. Only the admin may call this.
     /// Storage is preserved across upgrades; only the execution code changes.
     /// Runs storage migrations if the new version requires them.

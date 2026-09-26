@@ -393,8 +393,21 @@ impl RiskPool {
         }
 
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
-        token::Client::new(&env, &usdc)
-            .transfer(&provider, &env.current_contract_address(), &amount);
+        let token_client = token::Client::new(&env, &usdc);
+        let this_pool = env.current_contract_address();
+        let balance_before = token_client.balance(&this_pool);
+        token_client.transfer(&provider, &this_pool, &amount);
+        // The pool only ever takes the token it was configured with. Confirm
+        // that token actually delivered the full amount, so a token that
+        // under-delivers cannot mint shares against funds that never arrived
+        // (issue #552).
+        let received = token_client
+            .balance(&this_pool)
+            .checked_sub(balance_before)
+            .unwrap_or(0);
+        if received != amount {
+            panic_with_error!(&env, Error::InvalidToken);
+        }
 
         let now = env.ledger().timestamp();
         let lp_key = StorageKey::LpPosition(provider.clone());
