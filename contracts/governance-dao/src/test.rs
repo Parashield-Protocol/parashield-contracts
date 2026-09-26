@@ -125,6 +125,48 @@ fn create_proposal_increments_counter() {
     assert_eq!(dao.proposal_count(), 1);
 }
 
+/// Issue #519: the deposit is locked exactly once, alongside the proposal.
+#[test]
+fn create_proposal_locks_deposit_with_proposal() {
+    let (env, dao, _, voter1, _, target) = setup();
+    let gov = token::Client::new(&env, &dao.get_config().gov_token);
+    let before = gov.balance(&voter1);
+    let args: Vec<Val> = Vec::new(&env);
+    let id = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Lower quorum to 5%"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+    let deposit = dao.get_proposal(&id).deposit;
+    assert!(deposit > 0);
+    assert_eq!(gov.balance(&voter1), before - deposit);
+    assert_eq!(gov.balance(&dao.address), deposit);
+}
+
+/// Issue #519: a failed creation must not leave any deposit behind.
+#[test]
+fn failed_create_proposal_leaves_deposit_untouched() {
+    let (env, dao, _, voter1, _, target) = setup();
+    let gov = token::Client::new(&env, &dao.get_config().gov_token);
+    let before = gov.balance(&voter1);
+    let args: Vec<Val> = Vec::new(&env);
+    let res = dao.try_create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Bad proposal"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::new(&env), // empty impact analysis -> InvalidInput
+    );
+    assert!(res.is_err());
+    assert_eq!(gov.balance(&voter1), before);
+    assert_eq!(gov.balance(&dao.address), 0);
+    assert_eq!(dao.proposal_count(), 0);
+}
+
 #[test]
 #[should_panic(expected = "Error(Contract, #4)")]
 fn create_proposal_below_threshold_fails() {

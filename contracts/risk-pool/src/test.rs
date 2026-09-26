@@ -109,6 +109,31 @@ fn test_initialize_with_non_token_usdc() {
     );
 }
 
+/// Issue #520: an empty category Symbol is rejected at initialization.
+#[test]
+#[should_panic(expected = "Error(Contract, #41)")]
+fn test_initialize_rejects_empty_category() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let usdc_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let backstop_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let pool = RiskPoolClient::new(&env, &env.register(RiskPool, ()));
+    pool.initialize(
+        &admin,
+        &usdc_id,
+        &Address::generate(&env),
+        &backstop_id,
+        &Symbol::new(&env, ""),
+        &Address::generate(&env),
+        &Address::generate(&env),
+    );
+}
+
 // ── deposits ──────────────────────────────────────────────────────────────────
 
 #[test]

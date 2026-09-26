@@ -273,6 +273,28 @@ fn test_buy_policy_records_correct_fields() {
     );
 }
 
+/// Issue #522: `buy_policy` takes no start time; a policy always starts at the
+/// current ledger time and can never be backdated.
+#[test]
+fn test_buy_policy_start_time_is_current_ledger_time() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_748_736_000);
+    let first = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+    env.ledger().with_mut(|l| l.timestamp = 1_748_736_000 + 86_400);
+    let second = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+
+    let p1 = client.get_policy(&first);
+    let p2 = client.get_policy(&second);
+    assert_eq!(p1.start_time, 1_748_736_000);
+    assert_eq!(p2.start_time, 1_748_736_000 + 86_400);
+    assert!(p2.start_time >= p1.start_time);
+}
+
 #[test]
 fn test_buy_policy_appears_in_user_list() {
     let (env, admin, _oracle, usdc, contract_id) = setup();

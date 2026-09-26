@@ -207,10 +207,9 @@ fn batch_skips_non_pending_claims() {
 
 // ── Oracle staleness rejection (Issue #3) ─────────────────────────────────────
 
-/// auto_process must panic when oracle data is older than the staleness threshold.
-/// Verifies that verify_trigger_fresh rejects stale data before any state write.
+/// auto_process must not settle when oracle data is older than the staleness
+/// threshold. The claim is queued for retry (issue #521) instead of reverting.
 #[test]
-#[should_panic]
 fn test_stale_oracle_data_rejected() {
     let te = full_setup();
     let claims_client = ClaimsProcessorClient::new(&te.env, &te.claims);
@@ -248,8 +247,56 @@ fn test_stale_oracle_data_rejected() {
     let stale_now = data_ts + 604_800 + 1;
     te.env.ledger().with_mut(|l| l.timestamp = stale_now);
 
-    // auto_process must panic — StaleData error from oracle-verifier
-    claims_client.auto_process(&te.admin, &pol_id, &None);
+    // Stale data is refused by oracle-verifier; the claim is queued, not settled.
+    let result = claims_client.auto_process(&te.admin, &pol_id, &None);
+    assert_eq!(result, ClaimResult::OracleUnavailable);
+    let pending = claims_client.get_pending_claims();
+    assert_eq!(pending.len(), 1);
+    let claim = claims_client.get_claim(&pending.get(0).unwrap());
+    assert_eq!(claim.status, crate::ClaimStatus::Pending);
+    assert!(claim.processed_at.is_none());
+}
+
+/// Issue #521: with no oracle data available at all, processing does not revert;
+/// the claim stays pending and settles once the oracle has fresh data.
+#[test]
+fn test_oracle_unavailable_queues_claim_then_retries() {
+    let te = full_setup();
+    let claims_client = ClaimsProcessorClient::new(&te.env, &te.claims);
+    let policy_client = PolicyEngineClient::new(&te.env, &te.policy);
+    let oracle_client = OracleVerifierClient::new(&te.env, &te.oracle);
+
+    let prod_id = create_drought_product(&te);
+    oracle_client.add_oracle(&te.admin, &te.oracle_node, &weather(), &90u32);
+
+    let farmer = Address::generate(&te.env);
+    token::StellarAssetClient::new(&te.env, &te.usdc).mint(&farmer, &10_000_0000000i128);
+    token::StellarAssetClient::new(&te.env, &te.usdc).mint(&te.policy, &1_000_000_0000000i128);
+    let pol_id = policy_client.buy_policy(
+        &farmer,
+        &prod_id,
+        &1_000_0000000i128,
+        &30u32,
+        &symbol_short!("kis2606"),
+    );
+
+    // Oracle has never received data: verification errors, claim is queued.
+    let first = claims_client.auto_process(&te.admin, &pol_id, &None);
+    assert_eq!(first, ClaimResult::OracleUnavailable);
+    assert_eq!(claims_client.get_pending_claims().len(), 1);
+
+    // Oracle recovers: the same claim is retried and settled.
+    oracle_client.submit_data(
+        &te.oracle_node,
+        &weather(),
+        &symbol_short!("kis2606"),
+        &30_000_000i128,
+        &95u32,
+        &te.env.ledger().timestamp(),
+    );
+    let second = claims_client.auto_process(&te.admin, &pol_id, &None);
+    assert_ne!(second, ClaimResult::OracleUnavailable);
+    assert_eq!(claims_client.get_pending_claims().len(), 0);
 }
 
 /// auto_process succeeds when oracle data is within the staleness threshold.
