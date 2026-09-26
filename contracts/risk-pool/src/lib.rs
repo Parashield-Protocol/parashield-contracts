@@ -2858,6 +2858,14 @@ impl RiskPool {
         minted_at: u64,
         position: &LpPosition,
     ) {
+        // SECURITY FIX: Prevent multiple NFTs per provider
+        // If a provider already has an NFT, we should not mint another one.
+        // This prevents providers from bypassing position limits or gaining
+        // disproportionate governance weight.
+        if env.storage().persistent().has(&StorageKey::ProviderNft(provider.clone())) {
+            panic_with_error!(env, Error::ProviderAlreadyHasNft);
+        }
+
         let token_id: u64 = env.storage().instance()
             .get(&StorageKey::NextNftId).unwrap_or(1);
         env.storage().instance().set(&StorageKey::NextNftId, &(token_id + 1));

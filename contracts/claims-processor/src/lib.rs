@@ -125,6 +125,11 @@ enum StorageKey {
     /// A frozen snapshot of the fraud detector's judgement on one claim
     /// (issue #437). Written only when the detector flagged something.
     FraudRecord(u128),
+    /// SECURITY FIX: Rate limiting for auto_process function
+    /// Maps policy_id to the last timestamp it was processed to prevent spam.
+    AutoProcessLastTime(u128),
+    /// SECURITY FIX: Minimum cooldown in seconds between auto_process calls for the same policy.
+    AutoProcessCooldown,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -166,6 +171,8 @@ pub enum Error {
     /// An admin transfer was proposed while another one is still pending,
     /// which would reset the transfer timelock (issue #457).
     AdminTransferPending = 24,
+    /// SECURITY FIX: Rate limiting - auto_process called too frequently for this policy.
+    RateLimitExceeded = 25,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -530,6 +537,24 @@ impl ClaimsProcessor {
         Self::require_keeper(&env, &keeper);
         Self::require_not_paused(&env);
 
+        // SECURITY FIX: Rate limiting to prevent spam attacks on auto_process
+        // Check if this policy was recently processed and reject if within cooldown window
+        let now = env.ledger().timestamp();
+        let cooldown_secs: u64 = env.storage().instance()
+            .get(&StorageKey::AutoProcessCooldown)
+            .unwrap_or(300); // Default: 5 minutes between calls
+        
+        if let Some(last_processed) = env.storage().persistent()
+            .get::<_, u64>(&StorageKey::AutoProcessLastTime(policy_id)) {
+            if now < last_processed.saturating_add(cooldown_secs) {
+                panic_with_error!(&env, Error::RateLimitExceeded);
+            }
+        }
+        
+        // Update the last processed timestamp for this policy
+        env.storage().persistent()
+            .set(&StorageKey::AutoProcessLastTime(policy_id), &now);
+
         // ─── IDEMPOTENCY GUARD ───
         // Check if an evaluation record already exists for this policy in our storage
         if env.storage().persistent().has(&StorageKey::PolicyClaim(policy_id)) {
@@ -558,7 +583,6 @@ impl ClaimsProcessor {
         }
 
         // Check if policy has expired with no trigger
-        let now = env.ledger().timestamp();
         if now > policy.end_time {
             let risk_pool: Address = env.storage().instance()
                 .get(&StorageKey::RiskPool)
