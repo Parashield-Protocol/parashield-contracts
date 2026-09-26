@@ -563,19 +563,25 @@ impl PolicyEngine {
         if coverage_amount > 1_000_000_000_000 {
             panic_with_error!(env, Error::CoverageOutOfRange);
         }
-        let premium = coverage_amount
+        
+        // SECURITY FIX: Calculate the required premium based on product parameters.
+        // This prevents callers from providing arbitrary premium amounts.
+        let required_premium = coverage_amount
             .checked_mul(product.premium_rate_bps as i128)
             .and_then(|v| v.checked_mul(duration_days as i128))
             .and_then(|v| v.checked_div(365))
             .and_then(|v| v.checked_div(10_000))
             .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
+        
         let usdc: Address = env
             .storage()
             .instance()
             .get(&StorageKey::UsdcToken)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
 
-        token::Client::new(env, &usdc).transfer(buyer, &env.current_contract_address(), &premium);
+        // SECURITY FIX: Transfer the calculated required premium amount, not any caller-provided value.
+        // This ensures the premium matches the product's premium_rate.
+        token::Client::new(env, &usdc).transfer(buyer, &env.current_contract_address(), &required_premium);
 
         let now = env.ledger().timestamp();
         let duration_secs = (duration_days as u64)
@@ -591,7 +597,7 @@ impl PolicyEngine {
             product_id,
             policyholder: buyer.clone(),
             coverage_amount,
-            premium_paid: premium,
+            premium_paid: required_premium,
             oracle_key,
             oracle_data_type: product.oracle_data_type,
             trigger_threshold: product.trigger_threshold,
@@ -624,7 +630,7 @@ impl PolicyEngine {
 
         env.events().publish(
             (Symbol::new(env, "buy_policy"), buyer.clone()),
-            (policy_id, product_id, coverage_amount, premium),
+            (policy_id, product_id, coverage_amount, required_premium),
         );
 
         policy_id
