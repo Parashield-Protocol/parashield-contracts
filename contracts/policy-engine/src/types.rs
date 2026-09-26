@@ -36,17 +36,6 @@ pub enum PolicyStatus {
     Cancelled,
 }
 
-/// A time-locked admin action awaiting execution.
-/// SECURITY FIX: Prevent instant admin key compromise from immediately deploying malicious products.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingAdminAction {
-    pub action: Symbol,
-    pub product_params: Option<CreateProductParams>,
-    pub product_id: Option<u128>,
-    pub proposed_at: u64,
-    pub executable_after: u64,
-}
 
 /// An insurance product template.
 #[contracttype]

@@ -1594,6 +1594,18 @@ fn test_issue_492_set_guardians_rejects_duplicates() {
     dao.set_guardians(&admin, &guardians, &2);
 }
 
+/// Setting guardian threshold to 0 is rejected to prevent disabling multisig security (issue #523).
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_issue_523_set_guardians_zero_threshold_rejected() {
+    let (env, dao, admin, _v1, _v2, _target) = setup();
+    let g1 = Address::generate(&env);
+    let mut guardians = Vec::new(&env);
+    guardians.push_back(g1);
+
+    dao.set_guardians(&admin, &guardians, &0);
+}
+
 /// A guardian cannot approve the same pending upgrade multiple times to inflate approvals.
 #[test]
 #[should_panic(expected = "Error(Contract, #21)")]

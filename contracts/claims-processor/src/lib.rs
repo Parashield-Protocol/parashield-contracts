@@ -705,10 +705,10 @@ impl ClaimsProcessor {
                         .get(&StorageKey::Claim(claim_id));
                     if let Some(c) = claim {
                         let trigger_met = match &result {
-                            ClaimResult::Approved(_) => true,
+                            ClaimResult::Paid => true,
                             ClaimResult::Rejected => false,
-                            ClaimResult::PartiallyPaid(_) => true,
-                            ClaimResult::AlreadyProcessed => false,
+                            ClaimResult::PartiallyPaid => true,
+                            _ => false,
                         };
                         env.events().publish(
                             (Symbol::new(&env, "claim_processed"),),
