@@ -151,6 +151,14 @@ fn test_deposit_1_stroop_panics() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #42)")]
+fn test_deposit_not_multiple_of_minimum_unit_panics() {
+    let (_, pool, _, _, _, lp1) = setup();
+    // 1_000_001 is above MIN_DEPOSIT (1_000_000) but not a multiple of the unit
+    pool.deposit(&lp1, &1_000_001i128, &0i128, &false);
+}
+
+#[test]
 fn first_deposit_mints_one_to_one_shares() {
     let (_, pool, _, _, _, lp1) = setup();
     let shares = pool.deposit(&lp1, &500_000_0000000i128, &0i128, &false);

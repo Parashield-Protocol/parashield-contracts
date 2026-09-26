@@ -470,7 +470,7 @@ fn test_cancel_policy_refunds_premium() {
     let buyer_before = TokenClient::new(&env, &usdc).balance(&buyer);
 
     let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
-    client.cancel_policy(&buyer, &policy_id);
+    client.cancel_policy(&buyer, &policy_id, &soroban_sdk::Bytes::new(&env));
 
     let buyer_after = TokenClient::new(&env, &usdc).balance(&buyer);
     assert_eq!(buyer_after, buyer_before); // premium returned in full
@@ -507,7 +507,7 @@ fn test_cancel_expired_policy_after_end_time() {
     let buyer_before = TokenClient::new(&env, &usdc).balance(&buyer);
     
     // Cancel the expired policy
-    let refund = client.cancel_policy(&buyer, &policy_id);
+    let refund = client.cancel_policy(&buyer, &policy_id, &soroban_sdk::Bytes::new(&env));
     assert_eq!(refund, 0, "fully-elapsed policy must refund nothing");
     assert_eq!(
         client.get_policy(&policy_id).status,
@@ -525,7 +525,7 @@ fn test_non_policyholder_cannot_cancel() {
     let impostor = Address::generate(&env);
     StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
     let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
-    client.cancel_policy(&impostor, &policy_id);
+    client.cancel_policy(&impostor, &policy_id, &soroban_sdk::Bytes::new(&env));
 }
 
 // ── Re-entrancy / double-processing guard (Issue #1) ─────────────────────────
@@ -1275,6 +1275,35 @@ fn test_buy_policy_minimum_duration_one_day() {
     assert_eq!(buyer_before - buyer_after, expected_premium);
 }
 
+/// Issue #526: buy_policy must reject zero duration with InvalidDurationRange (#19).
+#[test]
+#[should_panic(expected = "Error(Contract, #19)")]
+fn test_buy_policy_zero_duration_rejected() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid    = create_crop_product(&env, &client, &admin);
+
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    client.buy_policy(&buyer, &pid, &COVERAGE, &0u32, &symbol_short!("kis2606"));
+}
+
+/// Issue #526: purchased policy must always satisfy end_time > start_time.
+#[test]
+fn test_buy_policy_end_time_exceeds_start_time() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid    = create_crop_product(&env, &client, &admin);
+
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &7u32, &symbol_short!("kis2606"));
+    let policy = client.get_policy(&policy_id);
+    assert!(policy.end_time > policy.start_time);
+}
+
 // ── Issue #203: cancel_policy zero-elapsed and zero-total-duration paths ──────
 
 #[test]
@@ -1306,7 +1335,7 @@ fn test_cancel_policy_zero_total_duration_refunds_full_premium() {
             .set(&StorageKey::Policy(policy_id), &policy);
     });
 
-    let refund = client.cancel_policy(&buyer, &policy_id);
+    let refund = client.cancel_policy(&buyer, &policy_id, &soroban_sdk::Bytes::new(&env));
     assert_eq!(
         refund, premium_paid,
         "total_duration == 0 must refund the full premium via the explicit branch"

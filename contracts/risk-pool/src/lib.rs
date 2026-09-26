@@ -213,8 +213,8 @@ pub enum Error {
     AdminTransferPending      = 40,
     /// The pool category `Symbol` is empty (issue #520).
     InvalidCategory           = 41,
-    /// A provider already has an LP NFT and cannot mint another one (SECURITY FIX).
-    ProviderAlreadyHasNft     = 42,
+    /// The deposit amount is not a multiple of the minimum deposit unit (issue #524).
+    InvalidAmount             = 42,
 }
 
 #[contract]
@@ -342,6 +342,7 @@ impl RiskPool {
         provider.require_auth();
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if amount < MIN_DEPOSIT { panic_with_error!(&env, Error::DepositTooSmall); }
+        if amount % MIN_DEPOSIT != 0 { panic_with_error!(&env, Error::InvalidAmount); }
         Self::assert_active(&env);
         Self::sweep_expired_exits(&env, MAX_AUTO_EXIT_SCAN, Some(&provider));
 
