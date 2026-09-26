@@ -300,15 +300,6 @@ impl GovernanceDao {
         if weight < deposit {
             panic_with_error!(&env, Error::InsufficientWeight);
         }
-        // Lock the exact amount that gated this proposal; finalize() refunds
-        // it verbatim from the Proposal record, so a later change to the
-        // base threshold or the multipliers does not distort refunds already
-        // in flight.
-        gov_token.transfer(
-            &proposer,
-            &env.current_contract_address(),
-            &deposit,
-        );
 
         let proposal_id: u64 = env
             .storage()
@@ -354,6 +345,19 @@ impl GovernanceDao {
         env.storage()
             .instance()
             .set(&StorageKey::NextProposalId, &(proposal_id.checked_add(1).unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))));
+
+        // Issue #519: pull the deposit only after every check and state write
+        // above has succeeded, so a failure in proposal creation can never
+        // leave the proposer's tokens locked without a matching proposal.
+        // Lock the exact amount that gated this proposal; finalize() refunds
+        // it verbatim from the Proposal record, so a later change to the
+        // base threshold or the multipliers does not distort refunds already
+        // in flight.
+        gov_token.transfer(
+            &proposer,
+            &env.current_contract_address(),
+            &deposit,
+        );
 
         // Note: You can append `args` to your event payload if necessary
         env.events().publish(
@@ -414,7 +418,6 @@ impl GovernanceDao {
         if weight < deposit {
             panic_with_error!(&env, Error::InsufficientWeight);
         }
-        gov_token.transfer(&proposer, &env.current_contract_address(), &deposit);
 
         let proposal_id: u64 = env
             .storage()
@@ -467,6 +470,11 @@ impl GovernanceDao {
                 .checked_add(1)
                 .unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))),
         );
+
+        // Issue #519: pull the deposit only after every check and state write
+        // above has succeeded, so a failure in proposal creation can never
+        // leave the proposer's tokens locked without a matching proposal.
+        gov_token.transfer(&proposer, &env.current_contract_address(), &deposit);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_created"),),
