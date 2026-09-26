@@ -1715,3 +1715,180 @@ fn test_issue_492_duplicate_veto_rejected() {
     // Second veto attempt must be rejected with ProposalVetoed (#43)
     dao.veto_proposal(&g1, &pid, &Symbol::new(&env, "malicious"));
 }
+
+// ── time-weighted voting power (issue #515) ──────────────────────────────────
+
+const RAMP: u64 = 30 * 24 * 3600;
+
+fn new_proposal(env: &Env, dao: &GovernanceDaoClient, proposer: &Address, target: &Address) -> u64 {
+    let args: Vec<Val> = Vec::new(env);
+    dao.create_proposal(
+        proposer,
+        &Bytes::from_slice(env, b"Time weight proposal"),
+        target,
+        &Symbol::new(env, "update"),
+        &args,
+        &Bytes::from_slice(env, b"Impact analysis: no material risk identified."),
+    )
+}
+
+#[test]
+fn time_weight_is_off_by_default() {
+    let (_env, dao, _, _, _, _) = setup();
+    let cfg = dao.get_time_weight();
+    assert!(!cfg.enabled);
+    assert_eq!(cfg.min_bps, 10_000);
+}
+
+#[test]
+fn time_weight_disabled_keeps_full_balance_weight() {
+    let (env, dao, _, voter1, _, target) = setup();
+    let pid = new_proposal(&env, &dao, &voter1, &target);
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+    assert_eq!(dao.get_vote(&pid, &voter1).unwrap().weight, 990_000_0000000i128);
+}
+
+#[test]
+fn fresh_balance_counts_at_min_bps() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+    let pid = new_proposal(&env, &dao, &voter1, &target);
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    // voter2 never checkpointed: 10% of 500k.
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    assert_eq!(dao.get_vote(&pid, &voter2).unwrap().weight, 50_000_0000000i128);
+}
+
+#[test]
+fn checkpointed_balance_ramps_to_full_weight() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    dao.checkpoint_voting_power(&voter2);
+    env.ledger().with_mut(|l| l.timestamp += RAMP / 2);
+    let pid = new_proposal(&env, &dao, &voter1, &target);
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    // Halfway: 10% + 90% * 50% = 55% of 500k.
+    assert_eq!(dao.get_vote(&pid, &voter2).unwrap().weight, 275_000_0000000i128);
+}
+
+#[test]
+fn weight_is_capped_at_full_after_ramp() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    dao.checkpoint_voting_power(&voter2);
+    env.ledger().with_mut(|l| l.timestamp += RAMP * 3);
+    let pid = new_proposal(&env, &dao, &voter1, &target);
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    assert_eq!(dao.get_vote(&pid, &voter2).unwrap().weight, 500_000_0000000i128);
+}
+
+#[test]
+fn balance_added_after_checkpoint_counts_at_min_bps() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    dao.checkpoint_voting_power(&voter2);
+    env.ledger().with_mut(|l| l.timestamp += RAMP);
+    let gov = token::StellarAssetClient::new(&env, &dao.get_config().gov_token);
+    gov.mint(&voter2, &500_000_0000000i128);
+    let pid = new_proposal(&env, &dao, &voter1, &target);
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    // 500k fully aged + 500k fresh at 10%.
+    assert_eq!(dao.get_vote(&pid, &voter2).unwrap().weight, 550_000_0000000i128);
+}
+
+#[test]
+fn larger_balance_restarts_checkpoint_clock() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    dao.checkpoint_voting_power(&voter2);
+    env.ledger().with_mut(|l| l.timestamp += RAMP);
+    let gov = token::StellarAssetClient::new(&env, &dao.get_config().gov_token);
+    gov.mint(&voter2, &500_000_0000000i128);
+    dao.checkpoint_voting_power(&voter2); // bigger balance: clock restarts
+    let pid = new_proposal(&env, &dao, &voter1, &target);
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    // The old age is not inherited: all 1M counts at 10%.
+    assert_eq!(dao.get_vote(&pid, &voter2).unwrap().weight, 100_000_0000000i128);
+}
+
+#[test]
+fn selling_after_checkpoint_lowers_aged_amount() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    dao.checkpoint_voting_power(&voter2);
+    env.ledger().with_mut(|l| l.timestamp += RAMP);
+    let gov = token::Client::new(&env, &dao.get_config().gov_token);
+    gov.transfer(&voter2, &voter1, &400_000_0000000i128);
+    dao.checkpoint_voting_power(&voter2); // lowers amount, keeps start
+    let pid = new_proposal(&env, &dao, &voter1, &target);
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    assert_eq!(dao.get_vote(&pid, &voter2).unwrap().weight, 100_000_0000000i128);
+}
+
+#[test]
+fn locked_tokens_are_refunded_in_full_under_time_weighting() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    let pid = new_proposal(&env, &dao, &voter1, &target);
+    let gov = token::Client::new(&env, &dao.get_config().gov_token);
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    assert_eq!(gov.balance(&voter2), 0);
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+    dao.finalize(&pid);
+    dao.withdraw_tokens(&voter2, &pid);
+    assert_eq!(gov.balance(&voter2), 500_000_0000000i128);
+}
+
+#[test]
+fn vote_batch_uses_time_weighted_power() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+    let p1 = new_proposal(&env, &dao, &voter1, &target);
+    let p2 = new_proposal(&env, &dao, &voter1, &target);
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    let ids = soroban_sdk::vec![&env, p1, p2];
+    dao.vote_batch(&voter2, &ids, &VoteChoice::For);
+    assert_eq!(dao.get_vote(&p1, &voter2).unwrap().weight, 50_000_0000000i128);
+    assert_eq!(dao.get_vote(&p2, &voter2).unwrap().weight, 50_000_0000000i128);
+}
+
+#[test]
+fn delegated_weight_is_time_weighted() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    dao.delegate(&voter2, &voter1);
+    let pid = new_proposal(&env, &dao, &voter1, &target);
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+    // voter1 own 990k at 10% + voter2 500k at 10%.
+    assert_eq!(dao.get_vote(&pid, &voter1).unwrap().weight, 149_000_0000000i128);
+}
+
+#[test]
+fn set_time_weight_can_be_disabled_again() {
+    let (_env, dao, admin, _, _, _) = setup();
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    assert!(dao.get_time_weight().enabled);
+    dao.set_time_weight(&admin, &false, &0u64, &10_000u32);
+    assert!(!dao.get_time_weight().enabled);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #45)")]
+fn set_time_weight_rejects_zero_ramp() {
+    let (_env, dao, admin, _, _, _) = setup();
+    dao.set_time_weight(&admin, &true, &0u64, &1_000u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #45)")]
+fn set_time_weight_rejects_min_bps_above_full() {
+    let (_env, dao, admin, _, _, _) = setup();
+    dao.set_time_weight(&admin, &true, &RAMP, &10_001u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn set_time_weight_requires_admin() {
+    let (env, dao, _, _, _, _) = setup();
+    let impostor = Address::generate(&env);
+    dao.set_time_weight(&impostor, &true, &RAMP, &1_000u32);
+}
