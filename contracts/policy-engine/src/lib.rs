@@ -788,6 +788,16 @@ impl PolicyEngine {
             .persistent()
             .set(&StorageKey::Policy(policy_id), &policy);
         Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
+        
+        // SECURITY FIX: Return the premium to the risk pool on expiry
+        // This prevents premiums from being locked in the policy engine
+        let risk_pool: Address = env.storage().instance().get(&StorageKey::RiskPool)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::RiskPoolNotSet));
+        
+        // Call risk pool's release_for_expiry to return the premium
+        let risk_pool_client = IRiskPool::Client::new(&env, &risk_pool);
+        risk_pool_client.release_for_expiry(&env.current_contract_address(), &policy_id);
+        
         env.events().publish(
             (Symbol::new(&env, "policy_expired"),),
             PolicyExpired { policy_id },
