@@ -808,6 +808,32 @@ fn escalating_an_overdue_claim_marks_it_escalated() {
     assert_eq!(cp.get_claim(&claim_id).status, ClaimStatus::Escalated);
 }
 
+/// Emits ClaimEscalated event when a claim is escalated for off-chain monitoring (issue #525).
+#[test]
+fn test_issue_525_escalate_claim_emits_event() {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::TryFromVal;
+    let (w, claim_id, buyer) = pending_claim();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    let now = w.env.ledger().timestamp();
+    w.env.ledger().with_mut(|l| l.timestamp = now + 7 * 24 * 60 * 60 + 1);
+
+    cp.escalate_claim(&buyer, &claim_id);
+
+    let events = w.env.events().all();
+    let topic_sym = Symbol::new(&w.env, "claim_escalated");
+    let event_found = events.iter().any(|e| {
+        e.0 == w.claims_id
+            && e.1
+                .iter()
+                .any(|t| Symbol::try_from_val(&w.env, &t) == Ok(topic_sym.clone()))
+    });
+    assert!(event_found, "ClaimEscalated event must be emitted on escalation");
+
+    assert_eq!(cp.get_claim(&claim_id).status, ClaimStatus::Escalated);
+}
+
 #[test]
 fn escalation_is_permissionless() {
     let (w, claim_id, _buyer) = pending_claim();
