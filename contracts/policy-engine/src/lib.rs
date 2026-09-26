@@ -117,6 +117,8 @@ pub enum Error {
     /// A product with this name already exists (issue #514).
     DuplicateProductName = 34,
     InvalidTriggerCombination = 35,
+    /// The product category is not one of the supported categories (issue #549).
+    InvalidCategory = 36,
 }
 
 // SECURITY: 48-hour timelock on critical admin actions (create_product, update_product).
@@ -256,6 +258,17 @@ impl PolicyEngine {
     /// `params.premium_rate_bps` must be 1-10000; `params.coverage_amount` must be positive.
     pub fn create_product(env: Env, admin: Address, params: CreateProductParams) -> u128 {
         Self::require_admin(&env, &admin);
+
+        // Only the supported product categories are accepted (issue #549).
+        let category = &params.category;
+        if *category != symbol_short!("crop")
+            && *category != symbol_short!("flight")
+            && *category != symbol_short!("disaster")
+            && *category != symbol_short!("health")
+            && *category != symbol_short!("defi")
+        {
+            panic_with_error!(&env, Error::InvalidCategory);
+        }
 
         match params.trigger_type {
             TriggerType::Binary => {
@@ -1483,3 +1496,5 @@ mod test;
 mod test_advanced;
 #[cfg(test)]
 mod test_product_names;
+#[cfg(test)]
+mod test_category_validation;

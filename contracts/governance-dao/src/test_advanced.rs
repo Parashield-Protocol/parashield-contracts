@@ -447,3 +447,34 @@ fn finalize_fails_proposal_with_zero_votes() {
 
     assert_eq!(dao.get_proposal(&pid).status, ProposalStatus::Failed);
 }
+
+#[test]
+fn admin_can_change_the_proposal_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (dao, admin, _, _) = make_dao(&env);
+
+    dao.set_proposal_threshold(&admin, &2_000_0000000i128);
+
+    assert_eq!(dao.get_config().proposal_threshold, 2_000_0000000i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #41)")]
+fn proposal_threshold_must_be_positive() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (dao, admin, _, _) = make_dao(&env);
+
+    dao.set_proposal_threshold(&admin, &0i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn only_the_admin_can_change_the_proposal_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (dao, _admin, voter, _) = make_dao(&env);
+
+    dao.set_proposal_threshold(&voter, &1_000i128);
+}
