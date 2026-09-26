@@ -360,9 +360,18 @@ impl RiskPool {
         // Both branches use checked arithmetic: a share calculation that
         // cannot be represented traps as a typed `Overflow` rather than
         // silently wrapping or truncating (issue #454).
-        let new_shares = if total_deposited == 0 {
-            amount.checked_mul(1_000_000_000)  // 1 share = 1 USDC * 1e9 precision
-                .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow))
+        let mut burn_shares = 0i128;
+        let new_shares = if total_shares == 0 {
+            let minted = amount.checked_mul(1_000_000_000)  // 1 share = 1 USDC * 1e9 precision
+                .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+            // SECURITY FIX: first-depositor attack mitigation
+            // Permanently lock the first 1,000 shares to prevent a first depositor
+            // from manipulating the share price to steal from subsequent depositors.
+            burn_shares = 1_000;
+            if minted <= burn_shares {
+                panic_with_error!(&env, Error::DepositTooSmall);
+            }
+            minted - burn_shares
         } else {
             amount.checked_mul(total_shares)
                 .and_then(|v| v.checked_div(total_deposited))
@@ -426,7 +435,7 @@ impl RiskPool {
         env.storage().persistent().set(&lp_key, &position);
         Self::extend_to_max(&env, &lp_key);
         env.storage().instance().set(&StorageKey::TotalDeposited, &(total_deposited + amount));
-        env.storage().instance().set(&StorageKey::TotalShares,    &(total_shares + new_shares));
+        env.storage().instance().set(&StorageKey::TotalShares,    &(total_shares + new_shares + burn_shares));
 
         env.events().publish(
             (Symbol::new(&env, "liquidity_deposited"),),

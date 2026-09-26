@@ -294,7 +294,7 @@ fn test_non_policyholder_cannot_submit_claim() {
 
 /// submit_claim on an expired policy must panic with PolicyExpired error.
 #[test]
-#[should_panic(expected = "Error(Contract, #10)")]
+#[should_panic(expected = "Error(Contract, #25)")]
 fn test_submit_claim_on_expired_policy_fails() {
     let w      = deploy();
     let pid    = create_crop_product(&w);
@@ -303,6 +303,45 @@ fn test_submit_claim_on_expired_policy_fails() {
     
     // Advance time past the 30-day policy duration
     w.env.ledger().with_mut(|l| l.timestamp += 31 * 86_400);
+    
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    cp.submit_claim(&buyer, &pol_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #25)")]
+fn test_submit_claim_before_start_time_fails() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    
+    w.env.ledger().with_mut(|l| l.timestamp -= 100);
+    
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    cp.submit_claim(&buyer, &pol_id);
+}
+
+#[test]
+fn test_submit_claim_exactly_at_start_time_succeeds() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    cp.submit_claim(&buyer, &pol_id);
+}
+
+#[test]
+fn test_submit_claim_exactly_at_end_time_succeeds() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    
+    w.env.ledger().with_mut(|l| l.timestamp += 30 * 86_400);
     
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     cp.submit_claim(&buyer, &pol_id);
