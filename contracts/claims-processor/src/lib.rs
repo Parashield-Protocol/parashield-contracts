@@ -681,6 +681,9 @@ impl ClaimsProcessor {
     pub fn batch_auto_process(env: Env, caller: Address, limit: u32) -> Vec<(u128, ClaimResult)> {
         Self::require_keeper(&env, &caller);
         Self::require_not_paused(&env);
+        if limit == 0 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
         let pending: Vec<u128> = env.storage().instance()
             .get(&StorageKey::PendingClaims)
             .unwrap_or_else(|| Vec::new(&env));

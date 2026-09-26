@@ -351,6 +351,40 @@ pub struct QuorumDecayConfigUpdated {
 }
 
 /// Emitted at finalize when the applied quorum differed from the configured one.
+/// Settings for time-weighted voting power (issue #515).
+///
+/// Vote weight is normally the raw token balance, so tokens acquired minutes
+/// before a vote count the same as tokens held for a year. When enabled,
+/// weight ramps linearly from `min_bps` of the balance to the full balance
+/// over `ramp_period` seconds of holding, measured from the holder's
+/// `WeightCheckpoint`. Off by default, so an existing DAO's behaviour does
+/// not change until it opts in.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimeWeightConfig {
+    pub enabled: bool,
+    /// Seconds of holding needed to reach full weight.
+    pub ramp_period: u64,
+    /// Share of the balance that counts immediately, in basis points.
+    pub min_bps: u32,
+}
+
+/// A holder's recorded balance and the time it has been held since.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WeightCheckpoint {
+    pub amount: i128,
+    pub since: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimeWeightConfigUpdated {
+    pub enabled: bool,
+    pub ramp_period: u64,
+    pub min_bps: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QuorumDecayApplied {

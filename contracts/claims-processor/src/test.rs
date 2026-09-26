@@ -672,6 +672,15 @@ fn test_batch_auto_process_empty_pending_list() {
     assert_eq!(cp.get_pending_claims().len(), 0);
 }
 
+/// A zero `limit` is a wasted call and must be rejected with InvalidInput (#517).
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")]
+fn test_batch_auto_process_zero_limit_rejected() {
+    let w = deploy();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    cp.batch_auto_process(&w.keeper, &0u32);
+}
+
 // ── Dispute negative cases (Issue #338) ──────────────────────────────────────
 
 /// Disputing a claim id that was never submitted must fail with ClaimNotFound.

@@ -74,6 +74,9 @@ const MAX_DELEGATORS: u32 = 50;
 /// would lower the deposit / weight requirement below the configured base,
 /// which is not what an escalation feature should ever do (issue #438).
 const MIN_MULTIPLIER_BPS: u32 = 10_000;
+
+/// Basis-point denominator for time-weighted voting power.
+const FULL_WEIGHT_BPS: u32 = 10_000;
 /// Impact-multiplier basis points ceiling: 100_000 = 10x. A single stray
 /// keystroke could otherwise brick proposal creation entirely by demanding
 /// more tokens than exist. Ten times the base is already an aggressive
@@ -107,6 +110,10 @@ enum StorageKey {
     PendingUpgrade,
     /// Adaptive-quorum settings (`QuorumDecayConfig`).
     QuorumDecay,
+    /// Time-weighted voting settings (`TimeWeightConfig`).
+    TimeWeight,
+    /// A holder's `WeightCheckpoint` — Address → WeightCheckpoint.
+    WeightCheckpoint(Address),
     /// Rolling turnout history used to compute adaptive quorum.
     Participation,
     /// Who an address has delegated its voting power to — Address → Address.
@@ -189,6 +196,9 @@ pub enum Error {
     /// `MIN_MULTIPLIER_BPS` (would de-escalate) or above `MAX_MULTIPLIER_BPS`
     /// (would brick proposal creation). Issue #438.
     InvalidImpactMultiplier = 44,
+    /// `set_time_weight` was called with a zero ramp period or a `min_bps`
+    /// above 10_000. Issue #515.
+    InvalidTimeWeight = 45,
 }
 
 #[contract]
@@ -739,6 +749,7 @@ impl GovernanceDao {
         } else {
             own_weight
         };
+        let own_tally_weight = Self::time_weighted(&env, &voter, capped_own_weight);
 
         // 2. Lock tokens in the DAO contract to prevent token cycling / double-voting
         //
@@ -750,7 +761,7 @@ impl GovernanceDao {
         // 3. Add any weight delegated to this voter, recording each delegator
         //    so they cannot also vote this proposal themselves.
         let delegated_weight = Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
-        let weight = capped_own_weight.saturating_add(delegated_weight);
+        let weight = own_tally_weight.saturating_add(delegated_weight);
 
         // Save the tracked locked balance for later retrieval
         // Only the voter's own tokens were transferred in, so only that amount
@@ -878,6 +889,7 @@ impl GovernanceDao {
         } else {
             own_weight
         };
+        let own_tally_weight = Self::time_weighted(&env, &voter, capped_own_weight);
         gov_token.transfer(&voter, &env.current_contract_address(), &capped_own_weight);
 
         for i in 0..proposal_ids.len() {
@@ -886,7 +898,7 @@ impl GovernanceDao {
 
             let delegated_weight =
                 Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
-            let weight = capped_own_weight.saturating_add(delegated_weight);
+            let weight = own_tally_weight.saturating_add(delegated_weight);
 
             match choice {
                 VoteChoice::For => proposal.votes_for += weight,
@@ -1587,6 +1599,54 @@ impl GovernanceDao {
         );
     }
 
+    /// Enable or tune time-weighted voting power (issue #515). Admin-only.
+    ///
+    /// `ramp_period` is the seconds of holding needed for full weight and
+    /// `min_bps` the share of a balance that counts from the start.
+    pub fn set_time_weight(env: Env, admin: Address, enabled: bool, ramp_period: u64, min_bps: u32) {
+        Self::require_admin(&env, &admin);
+        if enabled && (ramp_period == 0 || min_bps > FULL_WEIGHT_BPS) {
+            panic_with_error!(&env, Error::InvalidTimeWeight);
+        }
+        env.storage().instance().set(
+            &StorageKey::TimeWeight,
+            &TimeWeightConfig { enabled, ramp_period, min_bps },
+        );
+        env.events().publish(
+            (Symbol::new(&env, "time_weight_updated"),),
+            TimeWeightConfigUpdated { enabled, ramp_period, min_bps },
+        );
+    }
+
+    /// The current time-weighted voting settings.
+    pub fn get_time_weight(env: Env) -> TimeWeightConfig {
+        Self::time_weight_config(&env)
+    }
+
+    /// Record the caller's current balance as held from now, starting (or
+    /// continuing) the ramp toward full voting weight.
+    ///
+    /// A balance at or below the recorded amount keeps its original start
+    /// time and lowers the recorded amount. A larger balance restarts the
+    /// clock, so tokens bought just before a vote cannot borrow the age of
+    /// tokens held earlier.
+    pub fn checkpoint_voting_power(env: Env, holder: Address) {
+        holder.require_auth();
+        let config: DaoConfig = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        let balance = token::Client::new(&env, &config.gov_token).balance(&holder);
+        let key = StorageKey::WeightCheckpoint(holder);
+        let now = env.ledger().timestamp();
+        let cp = match env.storage().persistent().get::<_, WeightCheckpoint>(&key) {
+            Some(prev) if balance <= prev.amount => WeightCheckpoint { amount: balance, since: prev.since },
+            _ => WeightCheckpoint { amount: balance, since: now },
+        };
+        env.storage().persistent().set(&key, &cp);
+    }
+
     /// The current adaptive-quorum settings.
     pub fn get_quorum_decay(env: Env) -> QuorumDecayConfig {
         Self::quorum_decay_config(&env)
@@ -2233,6 +2293,38 @@ impl GovernanceDao {
             .saturating_div(MIN_MULTIPLIER_BPS as i128)
     }
 
+    fn time_weight_config(env: &Env) -> TimeWeightConfig {
+        env.storage()
+            .instance()
+            .get(&StorageKey::TimeWeight)
+            .unwrap_or(TimeWeightConfig { enabled: false, ramp_period: 0, min_bps: FULL_WEIGHT_BPS })
+    }
+
+    /// Voting weight for `balance` held by `holder`. Identity when time
+    /// weighting is off. Otherwise the checkpointed part of the balance ramps
+    /// from `min_bps` to full over `ramp_period`, and anything above the
+    /// checkpoint counts at `min_bps`.
+    fn time_weighted(env: &Env, holder: &Address, balance: i128) -> i128 {
+        let cfg = Self::time_weight_config(env);
+        if !cfg.enabled || balance <= 0 {
+            return balance;
+        }
+        let full = FULL_WEIGHT_BPS as i128;
+        let min = cfg.min_bps as i128;
+        let now = env.ledger().timestamp();
+        let (aged, since) = match env
+            .storage()
+            .persistent()
+            .get::<_, WeightCheckpoint>(&StorageKey::WeightCheckpoint(holder.clone()))
+        {
+            Some(cp) => (core::cmp::min(cp.amount, balance), cp.since),
+            None => (0, now),
+        };
+        let elapsed = core::cmp::min(now.saturating_sub(since), cfg.ramp_period) as i128;
+        let factor = min + (full - min) * elapsed / cfg.ramp_period as i128;
+        aged.saturating_mul(factor) / full + (balance - aged).saturating_mul(min) / full
+    }
+
     /// Adaptive-quorum settings, or the disabled default.
     fn quorum_decay_config(env: &Env) -> QuorumDecayConfig {
         env.storage()
@@ -2420,7 +2512,8 @@ impl GovernanceDao {
             }
             env.storage().persistent().set(&marker, &true);
 
-            total = total.saturating_add(balance);
+            let counted = Self::time_weighted(env, &delegator, balance);
+            total = total.saturating_add(counted);
 
             // Track delegation usage for off-chain indexing
             env.events().publish(
@@ -2429,7 +2522,7 @@ impl GovernanceDao {
                     proposal_id,
                     delegate: voter.clone(),
                     delegator,
-                    weight: balance,
+                    weight: counted,
                 },
             );
         }
