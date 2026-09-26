@@ -337,6 +337,59 @@ fn test_buy_policy_start_time_is_current_ledger_time() {
     assert!(p2.start_time >= p1.start_time);
 }
 
+/// Issue #522: a scheduled policy starts at the requested future time.
+#[test]
+fn test_buy_policy_scheduled_future_start() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_748_736_000);
+    let start = 1_748_736_000 + 7 * 86_400;
+    let id = client.buy_policy_scheduled(
+        &buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"), &start,
+    );
+    let p = client.get_policy(&id);
+    assert_eq!(p.start_time, start);
+    assert_eq!(p.end_time, start + 30 * 86_400);
+    assert_eq!(p.created_at, 1_748_736_000);
+}
+
+/// Issue #522: a start equal to the current ledger time is accepted.
+#[test]
+fn test_buy_policy_scheduled_start_now_ok() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_748_736_000);
+    let id = client.buy_policy_scheduled(
+        &buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"), &1_748_736_000u64,
+    );
+    assert_eq!(client.get_policy(&id).start_time, 1_748_736_000);
+}
+
+/// Issue #522: a backdated start is rejected and no premium is taken.
+#[test]
+fn test_buy_policy_scheduled_past_start_rejected() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_748_736_000);
+    let res = client.try_buy_policy_scheduled(
+        &buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"), &1_748_735_999u64,
+    );
+    assert_eq!(res.unwrap_err().unwrap(), soroban_sdk::Error::from_contract_error(Error::InvalidStartTime as u32));
+    assert_eq!(TokenClient::new(&env, &usdc).balance(&buyer), 1_000_000_000i128);
+}
+
 #[test]
 fn test_buy_policy_appears_in_user_list() {
     let (env, admin, _oracle, usdc, contract_id) = setup();

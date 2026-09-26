@@ -119,6 +119,8 @@ pub enum Error {
     InvalidTriggerCombination = 35,
     /// The product category is not one of the supported categories (issue #549).
     InvalidCategory = 36,
+    /// A scheduled policy start time is earlier than the current ledger time (issue #522).
+    InvalidStartTime = 37,
 }
 
 // SECURITY: 48-hour timelock on critical admin actions (create_product, update_product).
@@ -545,7 +547,28 @@ impl PolicyEngine {
     ) -> u128 {
         buyer.require_auth();
         Self::ensure_not_paused(&env);
-        Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key)
+        let now = env.ledger().timestamp();
+        Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key, now)
+    }
+
+    /// Buy an insurance policy that starts at `start_time` instead of now.
+    ///
+    /// `start_time` must be `>= ` the current ledger timestamp; a start in the
+    /// past would let a buyer purchase cover for a period that has already
+    /// happened (issue #522). The policy runs from `start_time` for
+    /// `duration_days`. Claims cannot be filed before `start_time`.
+    pub fn buy_policy_scheduled(
+        env: Env,
+        buyer: Address,
+        product_id: u128,
+        coverage_amount: i128,
+        duration_days: u32,
+        oracle_key: Symbol,
+        start_time: u64,
+    ) -> u128 {
+        buyer.require_auth();
+        Self::ensure_not_paused(&env);
+        Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key, start_time)
     }
 
     /// Buy multiple policies in a single atomic transaction.
@@ -565,6 +588,7 @@ impl PolicyEngine {
             panic_with_error!(&env, Error::BatchTooLarge);
         }
 
+        let now = env.ledger().timestamp();
         let mut ids = Vec::new(&env);
         for item in items.iter() {
             ids.push_back(Self::buy_policy_inner(
@@ -574,6 +598,7 @@ impl PolicyEngine {
                 item.coverage_amount,
                 item.duration_days,
                 item.oracle_key,
+                now,
             ));
         }
         ids
@@ -586,7 +611,12 @@ impl PolicyEngine {
         coverage_amount: i128,
         duration_days: u32,
         oracle_key: Symbol,
+        start_time: u64,
     ) -> u128 {
+        // Issue #522: never allow a backdated start.
+        if start_time < env.ledger().timestamp() {
+            panic_with_error!(env, Error::InvalidStartTime);
+        }
         let product = Self::load_product(env, product_id);
         if product.status != ProductStatus::Active {
             panic_with_error!(env, Error::ProductNotActive);
@@ -632,7 +662,6 @@ impl PolicyEngine {
         token::Client::new(env, &usdc).transfer(buyer, &env.current_contract_address(), &required_premium);
 
         let now = env.ledger().timestamp();
-        let start_time = now;
         let duration_secs = (duration_days as u64)
             .checked_mul(86_400)
             .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
@@ -654,7 +683,7 @@ impl PolicyEngine {
             oracle_data_type: product.oracle_data_type,
             trigger_threshold: product.trigger_threshold,
             trigger_comparison: product.trigger_comparison,
-            start_time: now,
+            start_time,
             end_time,
             status: PolicyStatus::Active,
             created_at: now,
