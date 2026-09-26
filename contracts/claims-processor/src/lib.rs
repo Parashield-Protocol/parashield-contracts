@@ -704,10 +704,12 @@ impl ClaimsProcessor {
                     let claim: Option<Claim> = env.storage().persistent()
                         .get(&StorageKey::Claim(claim_id));
                     if let Some(c) = claim {
-                        let trigger_met = matches!(
-                            result,
-                            ClaimResult::Paid | ClaimResult::PartiallyPaid
-                        );
+                        let trigger_met = match &result {
+                            ClaimResult::Approved(_) => true,
+                            ClaimResult::Rejected => false,
+                            ClaimResult::PartiallyPaid(_) => true,
+                            ClaimResult::AlreadyProcessed => false,
+                        };
                         env.events().publish(
                             (Symbol::new(&env, "claim_processed"),),
                             ClaimProcessed {
@@ -1809,27 +1811,13 @@ impl ClaimsProcessor {
 
         // verify_trigger_fresh re-queries the oracle and rejects stale data
         // in the same atomic call, preventing stale-data and TOCTOU issues.
-        //
-        // Issue #521: if the oracle cannot answer (paused, broken, or only
-        // stale data available) do not revert. Nothing has been written yet,
-        // so the claim simply stays `Pending` in the queue for a later retry
-        // and a `claim_retry_queued` event tells keepers why.
-        let trigger_met = match OracleVerifierClient::new(env, &oracle_verifier)
-            .try_verify_trigger_fresh(
+        let trigger_met = OracleVerifierClient::new(env, &oracle_verifier)
+            .verify_trigger_fresh(
                 &policy.oracle_data_type,
                 &policy.oracle_key,
                 &condition,
                 &staleness_threshold,
-            ) {
-            Ok(Ok(met)) => met,
-            _ => {
-                env.events().publish(
-                    (Symbol::new(env, "claim_retry_queued"),),
-                    (claim.id, claim.policy_id, Symbol::new(env, "oracle_unavailable")),
-                );
-                return ClaimResult::OracleUnavailable;
-            }
-        };
+            );
 
         claim.trigger_met  = trigger_met;
         claim.processed_at = Some(env.ledger().timestamp());
