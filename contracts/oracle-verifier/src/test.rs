@@ -355,7 +355,7 @@ fn admin_can_pause_and_resume_one_data_type() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #12)")]
+#[should_panic(expected = "Error(Contract, #32)")]
 fn paused_data_type_rejects_submission() {
     let (env, admin, contract_id) = setup();
     let client = OracleVerifierClient::new(&env, &contract_id);
@@ -373,7 +373,7 @@ fn paused_data_type_rejects_submission() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #12)")]
+#[should_panic(expected = "Error(Contract, #32)")]
 fn paused_data_type_rejects_trigger_verification() {
     let (env, admin, contract_id) = setup();
     let client = OracleVerifierClient::new(&env, &contract_id);

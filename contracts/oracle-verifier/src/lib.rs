@@ -21,7 +21,7 @@ extern crate alloc;
 
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
+    xdr::ToXdr, contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
     BytesN, Env, Symbol, Vec,
 };
 
@@ -157,6 +157,8 @@ enum StorageKey {
     CrossValidationTargets(Symbol),
     /// Geographic weighting multiplier in basis points for (data_type, oracle, region).
     GeoWeight(Symbol, Address, Symbol),
+    /// Whether a data_type is paused (bool). Unset = active.
+    DataTypePaused(Symbol),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -197,6 +199,10 @@ pub enum Error {
     /// An admin transfer was proposed while another one is still pending,
     /// which would reset the transfer timelock (issue #457).
     AdminTransferPending = 30,
+    /// A data_type or key Symbol was empty or longer than 32 bytes (#502).
+    InvalidSymbolLength = 31,
+    /// The data_type is paused: submissions and trigger checks are refused.
+    DataTypePaused = 32,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -244,11 +250,7 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::InvalidWeight);
         }
         // Validate data_type Symbol length (#502)
-        const MAX_SYMBOL_LEN: usize = 32;
-        let dt_len = data_type.to_string().len();
-        if dt_len == 0 || dt_len > MAX_SYMBOL_LEN {
-            panic_with_error!(&env, Error::InvalidSymbolLength);
-        }
+        Self::validate_symbol_len(&env, &data_type);
         let key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         if env.storage().persistent().has(&key) {
             panic_with_error!(&env, Error::OracleAlreadyExists);
@@ -393,6 +395,34 @@ impl OracleVerifier {
             (Symbol::new(&env, "oracle_removed"),),
             OracleRemoved { oracle, data_type },
         );
+    }
+
+    /// Admin-only: refuse submissions and trigger checks for one data_type.
+    pub fn pause_data_type(env: Env, admin: Address, data_type: Symbol) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::DataTypePaused(data_type.clone()), &true);
+        env.events()
+            .publish((Symbol::new(&env, "data_type_paused"),), data_type);
+    }
+
+    /// Admin-only: lift a `pause_data_type`.
+    pub fn resume_data_type(env: Env, admin: Address, data_type: Symbol) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::DataTypePaused(data_type.clone()), &false);
+        env.events()
+            .publish((Symbol::new(&env, "data_type_resumed"),), data_type);
+    }
+
+    /// Whether `data_type` is currently paused.
+    pub fn is_data_type_paused(env: Env, data_type: Symbol) -> bool {
+        env.storage()
+            .instance()
+            .get(&StorageKey::DataTypePaused(data_type))
+            .unwrap_or(false)
     }
 
     // ── Contract Settings (admin only) ───────────────────────────────────────
@@ -1719,6 +1749,7 @@ impl OracleVerifier {
         timestamp: u64,
     ) {
         oracle.require_auth();
+        Self::require_data_type_active(&env, &data_type);
         if Self::encryption_required(&env, &data_type) {
             panic_with_error!(&env, Error::EncryptionRequiredForType);
         }
@@ -1887,25 +1918,14 @@ impl OracleVerifier {
         timestamp: u64,
     ) {
         oracle.require_auth();
+        Self::require_data_type_active(&env, &data_type);
         if confidence == 0 || confidence > 100 {
             panic_with_error!(&env, Error::InvalidConfidence);
         }
 
-        // Validate Symbol lengths to prevent storage overflow from extremely
-        // long Symbols (#502). Soroban Symbols can hold up to 32 bytes, but
-        // excessively long identifiers waste storage and are almost certainly
-        // mistakes.
-        const MAX_SYMBOL_LEN: usize = 32;
-        {
-            let dt_len = data_type.to_string().len();
-            if dt_len == 0 || dt_len > MAX_SYMBOL_LEN {
-                panic_with_error!(&env, Error::InvalidSymbolLength);
-            }
-            let k_len = key.to_string().len();
-            if k_len == 0 || k_len > MAX_SYMBOL_LEN {
-                panic_with_error!(&env, Error::InvalidSymbolLength);
-            }
-        }
+        // Validate Symbol lengths (#502).
+        Self::validate_symbol_len(&env, &data_type);
+        Self::validate_symbol_len(&env, &key);
 
         let now = env.ledger().timestamp();
         if timestamp > now {
@@ -2009,6 +2029,7 @@ impl OracleVerifier {
         key: Symbol,
         condition: TriggerCondition,
     ) -> bool {
+        Self::require_data_type_active(&env, &data_type);
         // Reject evaluation when EncryptionRequired is enabled — plaintext
         // DataPoints from before the flag was set must not be used (#463).
         if Self::encryption_required(&env, &data_type) {
@@ -2102,6 +2123,7 @@ impl OracleVerifier {
         key: Symbol,
         condition: TriggerCondition,
     ) -> (bool, AggregatedData) {
+        Self::require_data_type_active(&env, &data_type);
         let agg = Self::get_aggregated(env.clone(), data_type.clone(), key.clone());
         let median = agg.median_value;
         let result = match condition.comparison {
@@ -2331,6 +2353,7 @@ impl OracleVerifier {
         condition: TriggerCondition,
         max_age_seconds: u64,
     ) -> bool {
+        Self::require_data_type_active(&env, &data_type);
         // Reject evaluation when EncryptionRequired is enabled — plaintext
         // DataPoints from before the flag was set must not be used for
         // trigger evaluation (#463).
@@ -2437,6 +2460,7 @@ impl OracleVerifier {
         submissions: Vec<(Symbol, i128, u32, u64)>,
     ) {
         oracle.require_auth();
+        Self::require_data_type_active(&env, &data_type);
         if Self::encryption_required(&env, &data_type) {
             panic_with_error!(&env, Error::EncryptionRequiredForType);
         }
@@ -2537,6 +2561,7 @@ impl OracleVerifier {
         submissions: Vec<OracleDataSubmission>,
     ) {
         oracle.require_auth();
+        Self::require_data_type_active(&env, &data_type);
         if Self::encryption_required(&env, &data_type) {
             panic_with_error!(&env, Error::EncryptionRequiredForType);
         }
@@ -2768,6 +2793,27 @@ impl OracleVerifier {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Symbols are capped at 32 bytes by the host; the check that matters is
+    /// that an oracle identifier is never empty (#502).
+    fn validate_symbol_len(env: &Env, symbol: &Symbol) {
+        let xdr_len = ToXdr::to_xdr(symbol.clone(), env).len();
+        // XDR: 4-byte type tag + 4-byte length + bytes padded to a multiple of 4.
+        if xdr_len <= 8 || xdr_len > 8 + 32 {
+            panic_with_error!(env, Error::InvalidSymbolLength);
+        }
+    }
+
+    fn require_data_type_active(env: &Env, data_type: &Symbol) {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&StorageKey::DataTypePaused(data_type.clone()))
+            .unwrap_or(false);
+        if paused {
+            panic_with_error!(env, Error::DataTypePaused);
+        }
     }
 
     fn require_admin(env: &Env, caller: &Address) {
