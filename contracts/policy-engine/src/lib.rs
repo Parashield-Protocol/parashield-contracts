@@ -111,6 +111,7 @@ pub enum Error {
     BatchTooLarge = 30,
     NotExpiringSoon = 31,
     InvalidWarningWindow = 32,
+    ReasonTooLong = 33,
 }
 
 // SECURITY: 48-hour timelock on critical admin actions (create_product, update_product).
@@ -616,8 +617,16 @@ impl PolicyEngine {
 
     /// Cancel an active policy and refund the premium to the policyholder.
     /// Only the policyholder may cancel, and only while the policy is Active.
-    pub fn cancel_policy(env: Env, policyholder: Address, policy_id: u128) -> i128 {
+    /// `reason` is validated to be at most 256 bytes to prevent storage exhaustion.
+    pub fn cancel_policy(env: Env, policyholder: Address, policy_id: u128, reason: soroban_sdk::Bytes) -> i128 {
         policyholder.require_auth();
+
+        // Validate reason length to prevent storage exhaustion from extremely long reasons
+        const MAX_REASON_LENGTH: u32 = 256;
+        if reason.len() > MAX_REASON_LENGTH {
+            panic_with_error!(&env, Error::ReasonTooLong);
+        }
+
         let mut policy: Policy = Self::load_policy(&env, policy_id);
         if policy.policyholder != policyholder {
             panic_with_error!(&env, Error::Unauthorized);

@@ -48,6 +48,12 @@ const MAX_DATA_POINTS: u32 = 100;
 /// constant: 3.5 / 0.6745 ≈ 5.19, rounded down for a slightly more
 /// conservative default that keeps borderline genuine variation in).
 const DEFAULT_OUTLIER_THRESHOLD_BPS: u32 = 50_000;
+
+/// Maximum absolute value for oracle data submissions. Extreme values (e.g.
+/// i128::MAX) could overflow downstream median/aggregation calculations.
+/// This bound is generous enough for any realistic physical measurement
+/// while preventing arithmetic overflow in the aggregation pipeline.
+const MAX_DATA_VALUE: i128 = 1_000_000_000_000_000_000_000_000_000i128; // 10^27
 /// Outlier filtering is skipped below this many eligible submissions —
 /// with too few points neither the median nor the MAD used to judge
 /// deviation is a meaningful reference, so filtering would be as likely to
@@ -1713,6 +1719,11 @@ impl OracleVerifier {
         if confidence == 0 || confidence > 100 {
             panic_with_error!(&env, Error::InvalidConfidence);
         }
+        // Validate data_value is within a reasonable range to prevent overflow
+        // in downstream aggregation calculations (median, weighted average, etc.)
+        if value > MAX_DATA_VALUE || value < -MAX_DATA_VALUE {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
 
         let now = env.ledger().timestamp();
         let future_buffer: u64 = env
@@ -2443,6 +2454,11 @@ impl OracleVerifier {
             let (key, value, confidence, timestamp) = submissions.get_unchecked(i);
             if confidence == 0 || confidence > 100 {
                 panic_with_error!(&env, Error::InvalidConfidence);
+            }
+            // Validate data_value is within a reasonable range to prevent overflow
+            // in downstream aggregation calculations (median, weighted average, etc.)
+            if value > MAX_DATA_VALUE || value < -MAX_DATA_VALUE {
+                panic_with_error!(&env, Error::InvalidInput);
             }
 
             let now = env.ledger().timestamp();
