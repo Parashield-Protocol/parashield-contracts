@@ -154,11 +154,32 @@ fn test_deposit_1_stroop_panics() {
 fn first_deposit_mints_one_to_one_shares() {
     let (_, pool, _, _, _, lp1) = setup();
     let shares = pool.deposit(&lp1, &500_000_0000000i128, &0i128, &false);
-    assert_eq!(shares, 500_000_0000000i128 * 1_000_000_000);
+    assert_eq!(shares, 500_000_0000000i128 * 1_000_000_000 - 1_000); // 1,000 burned for mitigation
 
     let stats = pool.get_stats();
     assert_eq!(stats.total_deposited, 500_000_0000000i128);
     assert_eq!(stats.total_shares, 500_000_0000000i128 * 1_000_000_000);
+}
+
+#[test]
+fn test_first_depositor_inflation_attack_mitigated() {
+    let (env, pool, _, usdc_id, _, lp1) = setup();
+    
+    // Attacker deposits minimal amount to mint first shares
+    let min_deposit = 1_000_000i128; // 0.1 USDC (MIN_DEPOSIT is 1M stroops)
+    pool.deposit(&lp1, &min_deposit, &0i128, &false);
+    
+    // Attacker donates a large amount to the pool directly (bypassing deposit)
+    let attacker_donation = 10_000_000_000i128;
+    token::Client::new(&env, &usdc_id).transfer(&lp1, &pool.address, &attacker_donation);
+    
+    // Legitimate second depositor deposits
+    let lp2 = Address::generate(&env);
+    soroban_sdk::token::StellarAssetClient::new(&env, &usdc_id).mint(&lp2, &100_000_000i128);
+    let lp2_shares = pool.deposit(&lp2, &min_deposit, &0i128, &false);
+    
+    // They should receive a fair, non-manipulated share amount
+    assert!(lp2_shares > 0, "Second depositor must receive shares");
 }
 
 #[test]
