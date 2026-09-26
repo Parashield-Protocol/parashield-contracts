@@ -1349,3 +1349,60 @@ fn flag_only_mode_records_but_admits_submission() {
     assert!(record.score >= cfg.fraud_threshold_score);
     assert_eq!(record.flags & 1u32, 1u32); // rate rule fired
 }
+
+// ── Claimant must match policy holder (issue #512) ───────────────────────────
+
+/// A claim filed by the holder cannot be settled once the policy has moved to
+/// someone else: payout must never reach a party the claim was not filed by.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_settlement_rejects_claim_when_policyholder_changed() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let new_holder = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    PolicyEngineClient::new(&w.env, &w.policy_id)
+        .transfer_policy(&buyer, &new_holder, &pol_id);
+
+    cp.process_claim(&w.keeper, &claim_id, &None);
+}
+
+/// The guard leaves the claim pending and unpaid, so nothing is lost.
+#[test]
+fn test_mismatched_claim_stays_pending_and_unpaid() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let new_holder = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    PolicyEngineClient::new(&w.env, &w.policy_id)
+        .transfer_policy(&buyer, &new_holder, &pol_id);
+
+    assert!(cp.try_process_claim(&w.keeper, &claim_id, &None).is_err());
+    assert_eq!(cp.get_claim(&claim_id).status, ClaimStatus::Pending);
+    let usdc = soroban_sdk::token::Client::new(&w.env, &w.usdc);
+    assert_eq!(usdc.balance(&new_holder), 0);
+}
+
+/// Unchanged holder: settlement still pays out as before.
+#[test]
+fn test_matching_claimant_still_settles() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    assert_eq!(cp.process_claim(&w.keeper, &claim_id, &None), ClaimResult::Paid);
+}

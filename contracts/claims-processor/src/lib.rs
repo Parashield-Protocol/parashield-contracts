@@ -1787,6 +1787,13 @@ impl ClaimsProcessor {
         if claim.status != ClaimStatus::Pending {
             panic_with_error!(env, Error::AlreadyProcessed);
         }
+        // Payout goes to the policy's holder, so the claim must still belong to
+        // them. `submit_claim` checks this at filing time; re-checking here
+        // closes the window where the policy changes hands (or a claim record
+        // otherwise disagrees with the policy) before settlement (issue #512).
+        if claim.claimant != policy.policyholder {
+            panic_with_error!(env, Error::Unauthorized);
+        }
         let oracle_verifier: Address = env.storage().instance()
             .get(&StorageKey::OracleVerifier)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
