@@ -1,4 +1,4 @@
-﻿//! Parashield Governance DAO
+//! Parashield Governance DAO
 //!
 //! Token-weighted governance over protocol parameters:
 //!   - Add/remove insurance products
@@ -93,6 +93,8 @@ pub enum Error {
     NoPendingUpgrade = 22,
     InvalidThreshold = 23,
     QuorumTooLow = 24,
+    /// Proposal title exceeds maximum allowed length (#528).
+    TitleTooLong = 25,
 }
 
 #[contract]
@@ -177,6 +179,11 @@ impl GovernanceDao {
     ) -> u64 {
         proposer.require_auth();
         Self::validate_stellar_address(&env, &target);
+        // Validate proposal title length to prevent storage bloat (#528).
+        const MAX_TITLE_LENGTH: u32 = 256;
+        if title.len() > MAX_TITLE_LENGTH {
+            panic_with_error!(&env, Error::TitleTooLong);
+        }
         let config: DaoConfig = env
             .storage()
             .instance()
@@ -263,6 +270,11 @@ impl GovernanceDao {
     ) -> u64 {
         proposer.require_auth();
         Self::validate_stellar_address(&env, &target);
+        // Validate proposal title length to prevent storage bloat (#528).
+        const MAX_TITLE_LENGTH: u32 = 256;
+        if title.len() > MAX_TITLE_LENGTH {
+            panic_with_error!(&env, Error::TitleTooLong);
+        }
         let config: DaoConfig = env
             .storage()
             .instance()

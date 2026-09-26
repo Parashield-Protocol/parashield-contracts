@@ -144,6 +144,8 @@ pub enum Error {
     NoPendingUpgrade     = 14,
     InvalidThreshold     = 15,
     AdminTimelockNotExpired = 16,
+    /// Claim coverage does not match policy coverage (#530).
+    InvalidAmount = 17,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -922,6 +924,11 @@ impl ClaimsProcessor {
         // Validate claim is in Pending state before transitioning (atomic state guard)  
         if claim.status != ClaimStatus::Pending {
             panic_with_error!(env, Error::AlreadyProcessed);
+        }
+        // Validate claim coverage matches policy coverage to prevent
+        // payout mismatches (#530).
+        if claim.coverage_amount != policy.coverage_amount {
+            panic_with_error!(env, Error::InvalidAmount);
         }
         let oracle_verifier: Address = env.storage().instance()
             .get(&StorageKey::OracleVerifier)
