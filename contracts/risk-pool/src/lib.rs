@@ -72,6 +72,13 @@ const DEFAULT_MAX_UTILIZATION_BPS: u32 = 10_000;
 /// ceiling is part of what makes the queue safe to hand to an admin at all.
 const MAX_EXIT_DELAY: u64 = 30 * 24 * 60 * 60;
 
+/// Most LP slots inspected by one auto-processing pass (issue #511).
+///
+/// Every scanned slot costs storage reads, so the sweep is capped to keep
+/// `deposit`/`withdraw`/`request_exit` cheap. The cursor rotates, so repeated
+/// pool interactions cover every provider over time.
+const MAX_AUTO_EXIT_SCAN: u32 = 5;
+
 /// Timelock duration for admin withdrawals: 7 days in seconds.
 const TIMELOCK_SECONDS: u64 = 7 * 24 * 60 * 60;
 
@@ -140,6 +147,9 @@ pub(crate) enum StorageKey {
     /// Total shares currently reserved by queued exits (i128), so the pool can
     /// see committed outflow before it happens.
     QueuedExitShares,
+    /// Next `LpAddress` index (u32) the expired-exit sweep will inspect, so
+    /// successive sweeps rotate through all providers.
+    ExitCursor,
     /// Dynamic fee adjustment configuration (DynamicFeeConfig).
     /// Allows pool fees to automatically adjust based on market conditions and utilization.
     DynamicFeeConfig,
@@ -331,6 +341,7 @@ impl RiskPool {
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if amount < MIN_DEPOSIT { panic_with_error!(&env, Error::DepositTooSmall); }
         Self::assert_active(&env);
+        Self::sweep_expired_exits(&env, MAX_AUTO_EXIT_SCAN, Some(&provider));
 
         let total_deposited: i128 = env.storage().instance()
             .get(&StorageKey::TotalDeposited).unwrap_or(0);
@@ -449,6 +460,7 @@ impl RiskPool {
     /// is insufficient to cover the redemption.
     pub fn withdraw(env: Env, provider: Address, shares: i128) -> i128 {
         provider.require_auth();
+        Self::sweep_expired_exits(&env, MAX_AUTO_EXIT_SCAN, Some(&provider));
         Self::withdraw_inner(env, provider, shares)
     }
 
@@ -964,6 +976,7 @@ impl RiskPool {
             panic_with_error!(&env, Error::ZeroAmount);
         }
         Self::assert_withdrawable(&env);
+        Self::sweep_expired_exits(&env, MAX_AUTO_EXIT_SCAN, Some(&provider));
 
         let position: LpPosition = env
             .storage()
@@ -1051,6 +1064,17 @@ impl RiskPool {
         );
 
         amount
+    }
+
+    /// Settle expired exit requests on behalf of their providers, so LP funds
+    /// are not stuck waiting for someone to call `claim_exit` (issue #511).
+    ///
+    /// Permissionless: proceeds always go to the provider, never the caller.
+    /// Inspects at most `max_scan` LP slots (capped at `MAX_AUTO_EXIT_SCAN`)
+    /// starting from a rotating cursor and returns how many exits were settled.
+    /// Requests the pool cannot currently afford stay queued for a later pass.
+    pub fn process_expired_exits(env: Env, max_scan: u32) -> u32 {
+        Self::sweep_expired_exits(&env, max_scan.min(MAX_AUTO_EXIT_SCAN), None)
     }
 
     /// Cancel an outstanding exit request and release its reservation.
@@ -2479,6 +2503,82 @@ impl RiskPool {
         bps.clamp(0, 10_000) as u32
     }
 
+    /// Settle expired exit requests among the next `max_scan` LP slots.
+    ///
+    /// `skip` is the caller of the enclosing pool interaction: their own
+    /// request is left alone so a direct `withdraw` of the same shares still
+    /// works. A request is only settled when the withdrawal is guaranteed to
+    /// succeed (liquidity available, position intact), because a panic here
+    /// would revert the unrelated interaction that triggered the sweep.
+    fn sweep_expired_exits(env: &Env, max_scan: u32, skip: Option<&Address>) -> u32 {
+        let lp_count: u32 = env.storage().instance().get(&StorageKey::LpCount).unwrap_or(0);
+        let status: PoolStatus = env.storage().instance()
+            .get(&StorageKey::Status).unwrap_or(PoolStatus::Active);
+        if max_scan == 0 || lp_count == 0 || status == PoolStatus::Paused {
+            return 0;
+        }
+
+        let scan = max_scan.min(lp_count);
+        let start: u32 = env.storage().instance().get(&StorageKey::ExitCursor).unwrap_or(0);
+        let now = env.ledger().timestamp();
+        let mut settled = 0u32;
+
+        for step in 0..scan {
+            let idx = (start % lp_count + step) % lp_count;
+            let Some(provider) = env.storage().persistent()
+                .get::<_, Address>(&StorageKey::LpAddress(idx)) else { continue };
+            if skip == Some(&provider) {
+                continue;
+            }
+            let Some(request) = env.storage().persistent()
+                .get::<_, ExitRequest>(&StorageKey::ExitReq(provider.clone())) else { continue };
+            if now < request.claimable_at {
+                continue;
+            }
+
+            let position: Option<LpPosition> = env.storage().persistent()
+                .get(&StorageKey::LpPosition(provider.clone()));
+            let held = position.map(|p| p.shares).unwrap_or(0);
+            let shares = request.shares.min(held);
+            if shares <= 0 {
+                // Nothing left to exit; drop the stale reservation.
+                Self::clear_exit_reservation(env, &provider, request.shares);
+                continue;
+            }
+
+            let total_deposited: i128 = env.storage().instance()
+                .get(&StorageKey::TotalDeposited).unwrap_or(0);
+            let total_shares: i128 = env.storage().instance()
+                .get(&StorageKey::TotalShares).unwrap_or(0);
+            let total_locked: i128 = env.storage().instance()
+                .get(&StorageKey::TotalLocked).unwrap_or(0);
+            let available = total_deposited.saturating_sub(total_locked);
+            let amount = match shares.checked_mul(total_deposited) {
+                Some(v) if total_shares > 0 => v / total_shares,
+                _ => 0,
+            };
+            if amount <= 0 || amount > available {
+                continue;
+            }
+
+            Self::clear_exit_reservation(env, &provider, request.shares);
+            let returned = Self::withdraw_inner(env.clone(), provider.clone(), shares);
+            env.events().publish(
+                (Symbol::new(env, "exit_claimed"),),
+                ExitClaimed {
+                    provider,
+                    shares_burned: shares,
+                    amount_returned: returned,
+                    waited: now.saturating_sub(request.requested_at),
+                },
+            );
+            settled += 1;
+        }
+
+        env.storage().instance().set(&StorageKey::ExitCursor, &((start % lp_count + scan) % lp_count));
+        settled
+    }
+
     /// Remove a provider's exit request and release its share reservation.
     fn clear_exit_reservation(env: &Env, provider: &Address, shares: i128) {
         env.storage()
@@ -2838,5 +2938,7 @@ mod test;
 mod test_advanced;
 #[cfg(test)]
 mod test_edge;
+#[cfg(test)]
+mod test_exit_queue;
 #[cfg(test)]
 mod test_reinsurance;

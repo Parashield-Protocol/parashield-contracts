@@ -938,6 +938,7 @@ fn sequential_create_product_ids_are_unique_and_monotone() {
     let id1 = client.create_product(
         &admin,
         &CreateProductParams {
+            name: symbol_short!("prod_1"),
             oracle_key: symbol_short!("k01"),
             ..params(0)
         },
@@ -945,6 +946,7 @@ fn sequential_create_product_ids_are_unique_and_monotone() {
     let id2 = client.create_product(
         &admin,
         &CreateProductParams {
+            name: symbol_short!("prod_2"),
             oracle_key: symbol_short!("k02"),
             ..params(1)
         },
@@ -952,6 +954,7 @@ fn sequential_create_product_ids_are_unique_and_monotone() {
     let id3 = client.create_product(
         &admin,
         &CreateProductParams {
+            name: symbol_short!("prod_3"),
             oracle_key: symbol_short!("k03"),
             ..params(2)
         },

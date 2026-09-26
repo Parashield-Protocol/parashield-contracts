@@ -21,7 +21,7 @@ extern crate alloc;
 
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
+    xdr::ToXdr, contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
     BytesN, Env, Symbol, Vec,
 };
 
@@ -157,6 +157,11 @@ enum StorageKey {
     CrossValidationTargets(Symbol),
     /// Geographic weighting multiplier in basis points for (data_type, oracle, region).
     GeoWeight(Symbol, Address, Symbol),
+    /// Whether a data_type is paused (bool). Unset = active.
+    DataTypePaused(Symbol),
+    /// Seconds an oracle may go without submitting before it is treated as
+    /// offline (u64). 0 or unset = offline detection disabled.
+    OracleInactivityLimit,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -197,6 +202,10 @@ pub enum Error {
     /// An admin transfer was proposed while another one is still pending,
     /// which would reset the transfer timelock (issue #457).
     AdminTransferPending = 30,
+    /// A data_type or key Symbol was empty or longer than 32 bytes (#502).
+    InvalidSymbolLength = 31,
+    /// The data_type is paused: submissions and trigger checks are refused.
+    DataTypePaused = 32,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -244,11 +253,7 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::InvalidWeight);
         }
         // Validate data_type Symbol length (#502)
-        const MAX_SYMBOL_LEN: usize = 32;
-        let dt_len = data_type.to_string().len();
-        if dt_len == 0 || dt_len > MAX_SYMBOL_LEN {
-            panic_with_error!(&env, Error::InvalidSymbolLength);
-        }
+        Self::validate_symbol_len(&env, &data_type);
         let key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         if env.storage().persistent().has(&key) {
             panic_with_error!(&env, Error::OracleAlreadyExists);
@@ -366,33 +371,99 @@ impl OracleVerifier {
     /// Deactivate an oracle (soft delete — historical data is retained).
     pub fn remove_oracle(env: Env, admin: Address, oracle: Address, data_type: Symbol) {
         Self::require_admin(&env, &admin);
-        let key = StorageKey::Oracle(data_type.clone(), oracle.clone());
-        let mut entry: OracleEntry = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
-        entry.active = false;
-        env.storage().persistent().set(&key, &entry);
-        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
-
-        let list: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&StorageKey::OracleList(data_type.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut pruned: Vec<Address> = Vec::new(&env);
-        for addr in list.iter() {
-            if addr != oracle {
-                pruned.push_back(addr);
-            }
-        }
-        env.storage().instance().set(&StorageKey::OracleList(data_type.clone()), &pruned);
+        Self::deactivate_oracle(&env, &data_type, &oracle);
 
         env.events().publish(
             (Symbol::new(&env, "oracle_removed"),),
             OracleRemoved { oracle, data_type },
         );
+    }
+
+    /// Admin-only: refuse submissions and trigger checks for one data_type.
+    pub fn pause_data_type(env: Env, admin: Address, data_type: Symbol) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::DataTypePaused(data_type.clone()), &true);
+        env.events()
+            .publish((Symbol::new(&env, "data_type_paused"),), data_type);
+    }
+
+    /// Admin-only: lift a `pause_data_type`.
+    pub fn resume_data_type(env: Env, admin: Address, data_type: Symbol) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::DataTypePaused(data_type.clone()), &false);
+        env.events()
+            .publish((Symbol::new(&env, "data_type_resumed"),), data_type);
+    }
+
+    /// Whether `data_type` is currently paused.
+    pub fn is_data_type_paused(env: Env, data_type: Symbol) -> bool {
+        env.storage()
+            .instance()
+            .get(&StorageKey::DataTypePaused(data_type))
+            .unwrap_or(false)
+    }
+
+    // ── Offline detection (issue #513) ───────────────────────────────────────
+
+    /// Admin-only: set how long (seconds) an oracle may go without submitting
+    /// before it is treated as offline. 0 disables offline detection, which is
+    /// the default so existing deployments keep their behaviour until opted in.
+    ///
+    /// An offline oracle is ignored by every aggregation and trigger check,
+    /// and `deactivate_inactive_oracles` persists the deactivation.
+    pub fn set_oracle_inactivity_limit(env: Env, admin: Address, seconds: u64) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::OracleInactivityLimit, &seconds);
+        env.events().publish(
+            (Symbol::new(&env, "oracle_inactivity_limit_updated"),),
+            seconds,
+        );
+    }
+
+    /// Configured inactivity limit in seconds (0 = disabled).
+    pub fn get_oracle_inactivity_limit(env: Env) -> u64 {
+        Self::inactivity_limit(&env)
+    }
+
+    /// Whether `oracle` has gone silent for longer than the inactivity limit.
+    /// An oracle that has never submitted, or any oracle while the limit is
+    /// disabled, is not considered offline.
+    pub fn is_oracle_offline(env: Env, oracle: Address, data_type: Symbol) -> bool {
+        Self::oracle_offline(&env, &data_type, &oracle)
+    }
+
+    /// Permissionless: deactivate every oracle of `data_type` that has been
+    /// offline longer than the inactivity limit, and return their addresses.
+    ///
+    /// Deactivated oracles are removed from the data_type's oracle list like
+    /// `remove_oracle`; the admin can re-register them with `add_oracle`.
+    pub fn deactivate_inactive_oracles(env: Env, data_type: Symbol) -> Vec<Address> {
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::OracleList(data_type.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut deactivated: Vec<Address> = Vec::new(&env);
+        for oracle in list.iter() {
+            if Self::oracle_offline(&env, &data_type, &oracle) {
+                Self::deactivate_oracle(&env, &data_type, &oracle);
+                env.events().publish(
+                    (Symbol::new(&env, "oracle_auto_deactivated"),),
+                    OracleRemoved {
+                        oracle: oracle.clone(),
+                        data_type: data_type.clone(),
+                    },
+                );
+                deactivated.push_back(oracle);
+            }
+        }
+        deactivated
     }
 
     // ── Contract Settings (admin only) ───────────────────────────────────────
@@ -1719,6 +1790,7 @@ impl OracleVerifier {
         timestamp: u64,
     ) {
         oracle.require_auth();
+        Self::require_data_type_active(&env, &data_type);
         if Self::encryption_required(&env, &data_type) {
             panic_with_error!(&env, Error::EncryptionRequiredForType);
         }
@@ -1887,25 +1959,14 @@ impl OracleVerifier {
         timestamp: u64,
     ) {
         oracle.require_auth();
+        Self::require_data_type_active(&env, &data_type);
         if confidence == 0 || confidence > 100 {
             panic_with_error!(&env, Error::InvalidConfidence);
         }
 
-        // Validate Symbol lengths to prevent storage overflow from extremely
-        // long Symbols (#502). Soroban Symbols can hold up to 32 bytes, but
-        // excessively long identifiers waste storage and are almost certainly
-        // mistakes.
-        const MAX_SYMBOL_LEN: usize = 32;
-        {
-            let dt_len = data_type.to_string().len();
-            if dt_len == 0 || dt_len > MAX_SYMBOL_LEN {
-                panic_with_error!(&env, Error::InvalidSymbolLength);
-            }
-            let k_len = key.to_string().len();
-            if k_len == 0 || k_len > MAX_SYMBOL_LEN {
-                panic_with_error!(&env, Error::InvalidSymbolLength);
-            }
-        }
+        // Validate Symbol lengths (#502).
+        Self::validate_symbol_len(&env, &data_type);
+        Self::validate_symbol_len(&env, &key);
 
         let now = env.ledger().timestamp();
         if timestamp > now {
@@ -2009,6 +2070,7 @@ impl OracleVerifier {
         key: Symbol,
         condition: TriggerCondition,
     ) -> bool {
+        Self::require_data_type_active(&env, &data_type);
         // Reject evaluation when EncryptionRequired is enabled — plaintext
         // DataPoints from before the flag was set must not be used (#463).
         if Self::encryption_required(&env, &data_type) {
@@ -2036,7 +2098,7 @@ impl OracleVerifier {
             if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence {
                 let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
                 if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
-                    if entry.active {
+                    if entry.active && !Self::oracle_offline(&env, &data_type, &p.oracle) {
                         eligible_count += 1;
                     }
                 }
@@ -2102,6 +2164,7 @@ impl OracleVerifier {
         key: Symbol,
         condition: TriggerCondition,
     ) -> (bool, AggregatedData) {
+        Self::require_data_type_active(&env, &data_type);
         let agg = Self::get_aggregated(env.clone(), data_type.clone(), key.clone());
         let median = agg.median_value;
         let result = match condition.comparison {
@@ -2153,7 +2216,7 @@ impl OracleVerifier {
                     .persistent()
                     .get::<_, OracleEntry>(&oracle_key)
                 {
-                    if entry.active {
+                    if entry.active && !Self::oracle_offline(&env, &data_type, &p.oracle) {
                         // Use effective weight which factors in oracle reputation
                         let effective_weight = Self::get_effective_weight(env.clone(), p.oracle.clone(), data_type.clone());
                         weighted_sum = weighted_sum.saturating_add((p.confidence as u64) * (effective_weight as u64));
@@ -2245,7 +2308,7 @@ impl OracleVerifier {
                 .persistent()
                 .get::<_, OracleEntry>(&oracle_key)
             {
-                if entry.active {
+                if entry.active && !Self::oracle_offline(&env, &data_type, &p.oracle) {
                     oracle_count += 1;
                     min_confidence_val = min_confidence_val.min(p.confidence);
                     last_updated = last_updated.max(p.timestamp);
@@ -2331,6 +2394,7 @@ impl OracleVerifier {
         condition: TriggerCondition,
         max_age_seconds: u64,
     ) -> bool {
+        Self::require_data_type_active(&env, &data_type);
         // Reject evaluation when EncryptionRequired is enabled — plaintext
         // DataPoints from before the flag was set must not be used for
         // trigger evaluation (#463).
@@ -2364,7 +2428,7 @@ impl OracleVerifier {
             if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence_val {
                 let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
                 if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
-                    if entry.active {
+                    if entry.active && !Self::oracle_offline(&env, &data_type, &p.oracle) {
                         eligible_count += 1;
                     }
                 }
@@ -2437,6 +2501,7 @@ impl OracleVerifier {
         submissions: Vec<(Symbol, i128, u32, u64)>,
     ) {
         oracle.require_auth();
+        Self::require_data_type_active(&env, &data_type);
         if Self::encryption_required(&env, &data_type) {
             panic_with_error!(&env, Error::EncryptionRequiredForType);
         }
@@ -2537,6 +2602,7 @@ impl OracleVerifier {
         submissions: Vec<OracleDataSubmission>,
     ) {
         oracle.require_auth();
+        Self::require_data_type_active(&env, &data_type);
         if Self::encryption_required(&env, &data_type) {
             panic_with_error!(&env, Error::EncryptionRequiredForType);
         }
@@ -2770,6 +2836,81 @@ impl OracleVerifier {
             .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
+    /// Mark an oracle inactive and drop it from its data_type's oracle list.
+    /// Historical data is retained. Panics if the oracle was never registered.
+    fn deactivate_oracle(env: &Env, data_type: &Symbol, oracle: &Address) {
+        let env = env.clone();
+        let data_type = data_type.clone();
+        let oracle = oracle.clone();
+        let key = StorageKey::Oracle(data_type.clone(), oracle.clone());
+        let mut entry: OracleEntry = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
+        entry.active = false;
+        env.storage().persistent().set(&key, &entry);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::OracleList(data_type.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut pruned: Vec<Address> = Vec::new(&env);
+        for addr in list.iter() {
+            if addr != oracle {
+                pruned.push_back(addr);
+            }
+        }
+        env.storage().instance().set(&StorageKey::OracleList(data_type.clone()), &pruned);
+    }
+
+    fn inactivity_limit(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::OracleInactivityLimit)
+            .unwrap_or(0)
+    }
+
+    /// True when offline detection is on and the oracle's last accepted
+    /// submission is older than the limit.
+    fn oracle_offline(env: &Env, data_type: &Symbol, oracle: &Address) -> bool {
+        let limit = Self::inactivity_limit(env);
+        if limit == 0 {
+            return false;
+        }
+        match env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&StorageKey::LastSubmission(data_type.clone(), oracle.clone()))
+        {
+            Some(last) => env.ledger().timestamp().saturating_sub(last) > limit,
+            None => false,
+        }
+    }
+
+    /// Symbols are capped at 32 bytes by the host; the check that matters is
+    /// that an oracle identifier is never empty (#502).
+    fn validate_symbol_len(env: &Env, symbol: &Symbol) {
+        let xdr_len = ToXdr::to_xdr(symbol.clone(), env).len();
+        // XDR: 4-byte type tag + 4-byte length + bytes padded to a multiple of 4.
+        if xdr_len <= 8 || xdr_len > 8 + 32 {
+            panic_with_error!(env, Error::InvalidSymbolLength);
+        }
+    }
+
+    fn require_data_type_active(env: &Env, data_type: &Symbol) {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&StorageKey::DataTypePaused(data_type.clone()))
+            .unwrap_or(false);
+        if paused {
+            panic_with_error!(env, Error::DataTypePaused);
+        }
+    }
+
     fn require_admin(env: &Env, caller: &Address) {
         let admin: Address = env
             .storage()
@@ -2990,7 +3131,7 @@ impl OracleVerifier {
                     .persistent()
                     .get::<_, OracleEntry>(&oracle_key)
                 {
-                    if entry.active {
+                    if entry.active && !Self::oracle_offline(env, &data_type, &p.oracle) {
                         if n >= 100 {
                             panic_with_error!(env, Error::TooManyOracles);
                         }
@@ -3216,3 +3357,5 @@ impl OracleVerifier {
 mod test;
 #[cfg(test)]
 mod test_advanced;
+#[cfg(test)]
+mod test_offline;

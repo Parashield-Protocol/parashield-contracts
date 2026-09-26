@@ -70,6 +70,8 @@ enum StorageKey {
     Version,
     ExpiryWarningWindow,
     ExpiryWarned(u128),
+    /// Maps product name -> product_id, so names stay unique (issue #514).
+    ProductName(Symbol),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -112,6 +114,8 @@ pub enum Error {
     NotExpiringSoon = 31,
     InvalidWarningWindow = 32,
     ReasonTooLong = 33,
+    /// A product with this name already exists (issue #514).
+    DuplicateProductName = 34,
 }
 
 // SECURITY: 48-hour timelock on critical admin actions (create_product, update_product).
@@ -307,6 +311,12 @@ impl PolicyEngine {
             panic_with_error!(&env, Error::DuplicateProductKey);
         }
 
+        // Product names must be unique so users can tell products apart (#514).
+        let name_key = StorageKey::ProductName(params.name.clone());
+        if env.storage().persistent().has(&name_key) {
+            panic_with_error!(&env, Error::DuplicateProductName);
+        }
+
         let pool_count_key = StorageKey::PoolProductCount(params.category.clone());
         let pool_count: u32 = env.storage().persistent().get(&pool_count_key).unwrap_or(0);
         let max_products: u32 = env
@@ -353,6 +363,11 @@ impl PolicyEngine {
             TTL_THRESHOLD,
             TTL_EXTEND_TO,
         );
+
+        env.storage().persistent().set(&name_key, &id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&name_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         let mut products: Vec<u128> = env
             .storage()
@@ -1430,3 +1445,5 @@ impl PolicyEngine {
 mod test;
 #[cfg(test)]
 mod test_advanced;
+#[cfg(test)]
+mod test_product_names;
