@@ -1007,6 +1007,10 @@ impl GovernanceDao {
 
         let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
         let total_supply = proposal.total_supply;
+        
+        // SECURITY FIX: Only count For + Against votes toward quorum, not Abstain
+        // This prevents a proposal from passing with only abstain votes
+        let partisan_votes = proposal.votes_for + proposal.votes_against;
         let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
 
         // Adaptive quorum: after a run of low-turnout votes the requirement
@@ -1031,24 +1035,21 @@ impl GovernanceDao {
             .and_then(|v| v.checked_div(10_000))
             .unwrap_or(i128::MAX);
 
-        if total_votes == 0 {
-            // No participation at all — always fails, even for a legacy
-            // proposal that snapshotted total_supply == 0 (quorum_needed == 0).
+        if partisan_votes == 0 {
+            // No partisan votes (For or Against) — always fails, even with high abstain turnout.
+            // An all-Abstain proposal has no clear mandate.
             proposal.status = ProposalStatus::Failed;
-        } else if total_votes < quorum_needed {
+        } else if partisan_votes < quorum_needed {
             proposal.status = ProposalStatus::Failed;
         } else {
             // Majority is decided by the partisan (For/Against) split only —
-            // Abstain already did its job by counting toward quorum above and
-            // must not also dilute the For share here, otherwise a large
+            // Abstain already did its job by counting toward total participation for history
+            // and must not also dilute the For share here, otherwise a large
             // abstaining bloc could sink a proposal that every partisan voter
             // supported (issue #385).
-            let partisan_votes = proposal.votes_for + proposal.votes_against;
             let for_bps = if partisan_votes > 0 {
                 proposal.votes_for.checked_mul(10_000).map(|v| v / partisan_votes).unwrap_or(0)
             } else {
-                // Nobody voted For or Against — an all-Abstain proposal has no
-                // majority to speak of, regardless of quorum.
                 0
             };
             if for_bps >= config.majority_bps as i128 {
@@ -1060,8 +1061,7 @@ impl GovernanceDao {
         }
 
         // Record this vote's turnout so it feeds the next proposal's adaptive
-        // quorum. Recorded for every finalized proposal, pass or fail, so the
-        // history reflects actual participation rather than only successes.
+        // quorum. Use total_votes (including abstain) to represent actual participation.
         Self::record_participation(&env, total_votes, total_supply);
 
         let gov_token = token::Client::new(&env, &config.gov_token);

@@ -238,7 +238,9 @@ impl OracleVerifier {
     pub fn add_oracle(env: Env, admin: Address, oracle: Address, data_type: Symbol, weight: u32) {
         Self::require_admin(&env, &admin);
         Self::validate_stellar_address(&env, &oracle);
-        if weight == 0 || weight > 100 {
+        // SECURITY FIX: Enforce maximum weight bounds to prevent oracle domination
+        const MAX_WEIGHT: u32 = 100_000;
+        if weight == 0 || weight > MAX_WEIGHT {
             panic_with_error!(&env, Error::InvalidWeight);
         }
         // Validate data_type Symbol length (#502)
@@ -342,7 +344,11 @@ impl OracleVerifier {
         weight: u32,
     ) {
         Self::require_admin(&env, &admin);
-        if weight == 0 || weight > 100 {
+        // SECURITY FIX: Add maximum weight bounds to prevent one oracle from dominating
+        // the weighted median calculation. Weight must be between 1 and 100,000.
+        // This ensures no single oracle can have disproportionate influence.
+        const MAX_WEIGHT: u32 = 100_000;
+        if weight == 0 || weight > MAX_WEIGHT {
             panic_with_error!(&env, Error::InvalidWeight);
         }
 

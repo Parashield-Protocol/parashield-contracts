@@ -315,6 +315,10 @@ impl RiskPool {
         min_shares: i128,
         compound_enabled: bool,
     ) -> i128 {
+        // SECURITY FIX: Validate address format before processing to prevent
+        // deposits from being locked at invalid addresses
+        Self::validate_stellar_address(&env, &provider);
+        
         provider.require_auth();
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if amount < MIN_DEPOSIT { panic_with_error!(&env, Error::DepositTooSmall); }
