@@ -1841,9 +1841,8 @@ impl GovernanceDao {
 
     /// Configure the guardian set and approval threshold required for
     /// critical actions (currently: contract upgrades). Admin-only.
-    /// `threshold == 0` disables the guardian requirement (default), so the
-    /// admin alone can act — preserves existing single-admin behavior until
-    /// guardians are explicitly configured.
+    /// `threshold` must be at least 1 and at most `guardians.len()`. Setting
+    /// threshold to 0 is rejected to prevent disabling multisig security (issue #523).
     pub fn set_guardians(env: Env, admin: Address, guardians: Vec<Address>, threshold: u32) {
         Self::require_admin(&env, &admin);
         for i in 0..guardians.len() {
@@ -1853,7 +1852,7 @@ impl GovernanceDao {
                 }
             }
         }
-        if threshold > guardians.len() {
+        if threshold == 0 || threshold > guardians.len() {
             panic_with_error!(&env, Error::InvalidThreshold);
         }
         env.storage().instance().set(&StorageKey::Guardians, &guardians);
