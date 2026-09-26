@@ -179,6 +179,11 @@ const LEDGER_SECONDS: u64 = 5;
 /// max TTL at call time so `extend_ttl` never panics.
 const CLAIM_RETENTION_SECONDS: u64 = 365 * 24 * 60 * 60;
 
+/// Maximum number of installments allowed per claim. An excessive number
+/// of installments could exhaust storage and gas. 12 monthly installments
+/// (one year) is a reasonable upper bound for parametric insurance payouts.
+const MAX_INSTALLMENTS: u32 = 12;
+
 /// How long a claim may sit Pending before anyone can escalate it, when the
 /// admin has not configured a threshold.
 ///
@@ -831,7 +836,7 @@ impl ClaimsProcessor {
     /// Parameters:
     /// - `claim_id`: The claim to schedule installments for
     /// - `amount_per_installment`: Amount to pay per installment
-    /// - `num_installments`: Total number of installments
+    /// - `num_installments`: Total number of installments (max 12)
     /// - `interval_seconds`: Seconds between each installment
     pub fn schedule_installments(
         env: Env,
@@ -843,6 +848,11 @@ impl ClaimsProcessor {
     ) {
         Self::require_keeper(&env, &caller);
         Self::require_not_paused(&env);
+
+        // Validate installment count to prevent storage/gas exhaustion
+        if num_installments == 0 || num_installments > MAX_INSTALLMENTS {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
 
         let mut claim = Self::get_claim(env.clone(), claim_id);
         
