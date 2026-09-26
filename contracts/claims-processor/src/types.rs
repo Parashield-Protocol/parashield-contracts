@@ -34,6 +34,10 @@ pub enum ClaimResult {
     AlreadyProcessed,
     /// Trigger was met but payout was proportional (partial payment).
     PartiallyPaid,
+    /// The oracle verifier could not answer (paused, broken, or its data is
+    /// stale). The claim stays `Pending` in the queue and is retried on the
+    /// next `process_claim` / `auto_process` / `batch_auto_process` call.
+    OracleUnavailable,
 }
 
 /// A claim record stored on-chain.
