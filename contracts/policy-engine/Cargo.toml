@@ -17,7 +17,8 @@ testutils = ["soroban-sdk/testutils"]
 library = []
 
 [dependencies]
-soroban-sdk = { workspace = true }
+soroban-sdk       = { workspace = true }
+parashield-common = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

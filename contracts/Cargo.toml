@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "parashield-common",
     "oracle-verifier",
     "policy-engine",
     "claims-processor",
@@ -9,7 +10,8 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-soroban-sdk = { version = "22" }
+soroban-sdk     = { version = "22" }
+parashield-common = { path = "parashield-common" }
 
 [workspace.metadata.parashield]
 protocol-version = "2"
