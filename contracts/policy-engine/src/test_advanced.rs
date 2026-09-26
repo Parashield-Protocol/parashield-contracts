@@ -110,7 +110,7 @@ fn pause_product_removes_from_active_list() {
 
 #[test]
 fn cancel_policy_returns_premium_to_holder() {
-    let (_env, pe, admin, _, user) = setup();
+    let (env, pe, admin, _, user) = setup();
     let prod_id = pe.create_product(&admin, &basic_params());
     let policy_id = pe.buy_policy(
         &user,
@@ -119,7 +119,7 @@ fn cancel_policy_returns_premium_to_holder() {
         &30u32,
         &symbol_short!("kis2606"),
     );
-    pe.cancel_policy(&user, &policy_id);
+    pe.cancel_policy(&user, &policy_id, &soroban_sdk::Bytes::new(&env));
     let policy = pe.get_policy(&policy_id);
     assert_eq!(policy.status, crate::PolicyStatus::Cancelled);
 }
@@ -187,7 +187,7 @@ fn cancel_policy_prorates_refund_by_elapsed_time() {
     let midpoint = policy.start_time + (policy.end_time - policy.start_time) / 2;
     env.ledger().with_mut(|l| l.timestamp = midpoint);
 
-    let refund = pe.cancel_policy(&user, &policy_id);
+    let refund = pe.cancel_policy(&user, &policy_id, &soroban_sdk::Bytes::new(&env));
 
     // Refund must be strictly partial: roughly half the premium (allow ±1 stroop
     // rounding), and never the full amount.
@@ -228,7 +228,7 @@ fn cancel_policy_refund_matches_hand_calculated_value_at_known_elapsed() {
     // Advance 10 of the 30 days (864_000 of 2_592_000 seconds elapsed).
     env.ledger().with_mut(|l| l.timestamp = 864_000);
 
-    let refund = pe.cancel_policy(&user, &policy_id);
+    let refund = pe.cancel_policy(&user, &policy_id, &soroban_sdk::Bytes::new(&env));
 
     // earned = premium_paid * elapsed_capped / total_duration
     //        = 24_657_534 * 864_000 / 2_592_000 = 8_219_178
@@ -415,7 +415,7 @@ fn transfer_policy_rejects_cancelled_policy() {
     let policy_id = pe.buy_policy(
         &user, &prod_id, &500_0000000i128, &30u32, &symbol_short!("kis2606"),
     );
-    pe.cancel_policy(&user, &policy_id);
+    pe.cancel_policy(&user, &policy_id, &soroban_sdk::Bytes::new(&env));
     pe.transfer_policy(&user, &to, &policy_id);
 }
 

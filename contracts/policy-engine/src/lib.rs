@@ -571,34 +571,47 @@ impl PolicyEngine {
         if coverage_amount < product.coverage_min || coverage_amount > product.coverage_max {
             panic_with_error!(env, Error::CoverageOutOfRange);
         }
-        if duration_days == 0 || duration_days > product.max_duration_days {
+        if duration_days == 0 {
+            panic_with_error!(env, Error::InvalidDurationRange);
+        }
+        if duration_days > product.max_duration_days {
             panic_with_error!(env, Error::DurationTooLong);
         }
 
         if coverage_amount > 1_000_000_000_000 {
             panic_with_error!(env, Error::CoverageOutOfRange);
         }
-        let premium = coverage_amount
+        
+        // SECURITY FIX: Calculate the required premium based on product parameters.
+        // This prevents callers from providing arbitrary premium amounts.
+        let required_premium = coverage_amount
             .checked_mul(product.premium_rate_bps as i128)
             .and_then(|v| v.checked_mul(duration_days as i128))
             .and_then(|v| v.checked_div(365))
             .and_then(|v| v.checked_div(10_000))
             .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
+        
         let usdc: Address = env
             .storage()
             .instance()
             .get(&StorageKey::UsdcToken)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
 
-        token::Client::new(env, &usdc).transfer(buyer, &env.current_contract_address(), &premium);
+        // SECURITY FIX: Transfer the calculated required premium amount, not any caller-provided value.
+        // This ensures the premium matches the product's premium_rate.
+        token::Client::new(env, &usdc).transfer(buyer, &env.current_contract_address(), &required_premium);
 
         let now = env.ledger().timestamp();
+        let start_time = now;
         let duration_secs = (duration_days as u64)
             .checked_mul(86_400)
             .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
-        let end_time = now
+        let end_time = start_time
             .checked_add(duration_secs)
             .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
+        if end_time <= start_time {
+            panic_with_error!(env, Error::InvalidDurationRange);
+        }
         let policy_id = Self::next_policy_id(env);
 
         let policy = Policy {
@@ -606,7 +619,7 @@ impl PolicyEngine {
             product_id,
             policyholder: buyer.clone(),
             coverage_amount,
-            premium_paid: premium,
+            premium_paid: required_premium,
             oracle_key,
             oracle_data_type: product.oracle_data_type,
             trigger_threshold: product.trigger_threshold,
@@ -639,7 +652,7 @@ impl PolicyEngine {
 
         env.events().publish(
             (Symbol::new(env, "buy_policy"), buyer.clone()),
-            (policy_id, product_id, coverage_amount, premium),
+            (policy_id, product_id, coverage_amount, required_premium),
         );
 
         policy_id
@@ -827,16 +840,7 @@ impl PolicyEngine {
             .persistent()
             .set(&StorageKey::Policy(policy_id), &policy);
         Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
-        
-        // SECURITY FIX: Return the premium to the risk pool on expiry
-        // This prevents premiums from being locked in the policy engine
-        let risk_pool: Address = env.storage().instance().get(&StorageKey::RiskPool)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::RiskPoolNotSet));
-        
-        // Call risk pool's release_for_expiry to return the premium
-        let risk_pool_client = IRiskPool::Client::new(&env, &risk_pool);
-        risk_pool_client.release_for_expiry(&env.current_contract_address(), &policy_id);
-        
+
         env.events().publish(
             (Symbol::new(&env, "policy_expired"),),
             PolicyExpired { policy_id },

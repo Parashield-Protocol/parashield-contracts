@@ -213,6 +213,8 @@ pub enum Error {
     AdminTransferPending      = 40,
     /// The pool category `Symbol` is empty (issue #520).
     InvalidCategory           = 41,
+    /// The deposit amount is not a multiple of the minimum deposit unit (issue #524).
+    InvalidAmount             = 42,
 }
 
 #[contract]
@@ -340,6 +342,7 @@ impl RiskPool {
         provider.require_auth();
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if amount < MIN_DEPOSIT { panic_with_error!(&env, Error::DepositTooSmall); }
+        if amount % MIN_DEPOSIT != 0 { panic_with_error!(&env, Error::InvalidAmount); }
         Self::assert_active(&env);
         Self::sweep_expired_exits(&env, MAX_AUTO_EXIT_SCAN, Some(&provider));
 
@@ -2864,6 +2867,14 @@ impl RiskPool {
         minted_at: u64,
         position: &LpPosition,
     ) {
+        // SECURITY FIX: Prevent multiple NFTs per provider
+        // If a provider already has an NFT, we should not mint another one.
+        // This prevents providers from bypassing position limits or gaining
+        // disproportionate governance weight.
+        if env.storage().persistent().has(&StorageKey::ProviderNft(provider.clone())) {
+            panic_with_error!(env, Error::ProviderAlreadyHasNft);
+        }
+
         let token_id: u64 = env.storage().instance()
             .get(&StorageKey::NextNftId).unwrap_or(1);
         env.storage().instance().set(&StorageKey::NextNftId, &(token_id + 1));
