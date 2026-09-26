@@ -201,6 +201,8 @@ pub enum Error {
     /// An admin transfer was proposed while another transfer is still
     /// pending, which would reset the transfer timelock (issue #457).
     AdminTransferPending      = 40,
+    /// The pool category `Symbol` is empty (issue #520).
+    InvalidCategory           = 41,
 }
 
 #[contract]
@@ -211,7 +213,8 @@ impl RiskPool {
 
     /// One-time initialisation. Sets up the USDC token, treasury, backstop, and linked
     /// protocol contracts. `category` is the coverage category this pool serves (e.g.
-    /// `"weather"`). Panics with `AlreadyInitialized` on a second call.
+    /// `"weather"`) and must be non-empty, otherwise `InvalidCategory` is raised.
+    /// Panics with `AlreadyInitialized` on a second call.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -224,6 +227,11 @@ impl RiskPool {
     ) {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
+        }
+        // An empty category would make the pool's accounting and LP NFT
+        // metadata ambiguous, so reject it up front (issue #520).
+        if category == Symbol::new(&env, "") {
+            panic_with_error!(&env, Error::InvalidCategory);
         }
         // Address validation is deferred to require_auth() calls which
         // verify the address on the Soroban network layer.
