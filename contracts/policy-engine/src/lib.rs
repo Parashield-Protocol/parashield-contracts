@@ -22,7 +22,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, BytesN,
-    Env, Symbol, SymbolStr, TryFromVal, Vec,
+    Env, IntoVal, Symbol, SymbolStr, TryFromVal, Vec,
 };
 
 pub mod types;
@@ -179,6 +179,23 @@ impl PolicyEngine {
             soroban_sdk::vec![&env, env.current_contract_address().to_val()],
         );
         if balance_res.is_err() {
+            panic_with_error!(&env, Error::InvalidToken);
+        }
+
+        // Verify the token implements transfer — required for premium collection,
+        // claim payouts, and refunds. A contract with balance but no transfer
+        // would fail silently on buy_policy or pay_claim.
+        let transfer_res = env.try_invoke_contract::<soroban_sdk::Bytes, soroban_sdk::Error>(
+            &usdc_token,
+            &Symbol::new(&env, "transfer"),
+            soroban_sdk::vec![
+                &env,
+                env.current_contract_address().into_val(&env),
+                env.current_contract_address().into_val(&env),
+                0i128.into_val(&env),
+            ],
+        );
+        if transfer_res.is_err() {
             panic_with_error!(&env, Error::InvalidToken);
         }
 

@@ -183,6 +183,8 @@ pub enum Error {
     ExecutionDeadlineExpired = 42,
     /// Proposal has been vetoed by a guardian and can never be executed.
     ProposalVetoed = 43,
+    /// `finalize_batch` was called with more proposals than allowed.
+    BatchTooLarge = 45,
     /// `set_impact_multipliers` was called with a multiplier below
     /// `MIN_MULTIPLIER_BPS` (would de-escalate) or above `MAX_MULTIPLIER_BPS`
     /// (would brick proposal creation). Issue #438.
@@ -1092,6 +1094,109 @@ impl GovernanceDao {
                 status: proposal.status.clone(),
             },
         );
+    }
+
+    /// Finalize multiple proposals atomically in a single transaction.
+    ///
+    /// When multiple proposals end at the same ledger, calling `finalize`
+    /// individually can yield inconsistent state because each call sees a
+    /// slightly different view. This batch variant processes all proposals
+    /// in one shot: each is validated and settled sequentially, but the
+    /// entire batch either succeeds or reverts as a unit.
+    ///
+    /// Panics if any single proposal in the batch fails its finalization
+    /// checks (e.g. not Active, finalize delay not met), reverting the
+    /// whole batch. Permissionless — same rules as `finalize`.
+    pub fn finalize_batch(env: Env, proposal_ids: Vec<u64>) {
+        if proposal_ids.is_empty() {
+            panic_with_error!(&env, Error::NoProposals);
+        }
+
+        // Cap batch size to bound instruction budget.
+        const MAX_BATCH_FINALIZE: u32 = 20;
+        if proposal_ids.len() > MAX_BATCH_FINALIZE {
+            panic_with_error!(&env, Error::BatchTooLarge);
+        }
+
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let gov_token = token::Client::new(&env, &config.gov_token);
+
+        for i in 0..proposal_ids.len() {
+            let pid = proposal_ids.get_unchecked(i);
+            let mut proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&StorageKey::Proposal(pid))
+                .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+            if proposal.status != ProposalStatus::Active {
+                panic_with_error!(&env, Error::ProposalNotActive);
+            }
+
+            if env.ledger().timestamp() <= proposal.vote_end + FINALIZE_DELAY {
+                panic_with_error!(&env, Error::FinalizeDelayNotMet);
+            }
+
+            let total_supply = proposal.total_supply;
+            let partisan_votes = proposal.votes_for + proposal.votes_against;
+
+            let effective = Self::effective_quorum(&env, &config);
+            if effective.decayed {
+                env.events().publish(
+                    (Symbol::new(&env, "quorum_decay_applied"),),
+                    QuorumDecayApplied {
+                        proposal_id: pid,
+                        base_bps: effective.base_bps,
+                        effective_bps: effective.quorum_bps,
+                        avg_participation_bps: effective.avg_participation_bps,
+                    },
+                );
+            }
+
+            let quorum_needed = total_supply
+                .checked_mul(effective.quorum_bps as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap_or(i128::MAX);
+
+            if partisan_votes == 0 {
+                proposal.status = ProposalStatus::Failed;
+            } else if partisan_votes < quorum_needed {
+                proposal.status = ProposalStatus::Failed;
+            } else {
+                let for_bps = if partisan_votes > 0 {
+                    proposal.votes_for.checked_mul(10_000).map(|v| v / partisan_votes).unwrap_or(0)
+                } else {
+                    0
+                };
+                if for_bps >= config.majority_bps as i128 {
+                    proposal.status = ProposalStatus::Passed;
+                    proposal.execution_time = env.ledger().timestamp() + config.proposal_timelock;
+                } else {
+                    proposal.status = ProposalStatus::Failed;
+                }
+            }
+
+            let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
+            Self::record_participation(&env, total_votes, total_supply);
+
+            gov_token.transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &proposal.deposit,
+            );
+
+            env.storage()
+                .persistent()
+                .set(&StorageKey::Proposal(pid), &proposal);
+
+            env.events().publish(
+                (Symbol::new(&env, "proposal_finalized"),),
+                ProposalFinalized {
+                    proposal_id: pid,
+                    status: proposal.status.clone(),
+                },
+            );
+        }
     }
 
     /// Reclaim a proposer's deposit on a proposal that was never finalized.
