@@ -1317,6 +1317,46 @@ fn test_buy_policy_minimum_duration_one_day() {
     assert_eq!(buyer_before - buyer_after, expected_premium);
 }
 
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_buy_policy_duration_exceeds_max_panics() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin); // max_duration_days is 365
+
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    client.buy_policy(&buyer, &pid, &COVERAGE, &366u32, &symbol_short!("kis2606"));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_buy_policy_duration_zero_panics() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    client.buy_policy(&buyer, &pid, &COVERAGE, &0u32, &symbol_short!("kis2606"));
+}
+
+#[test]
+fn test_buy_policy_duration_exactly_max_succeeds() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin); // max_duration_days is 365
+
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &365u32, &symbol_short!("kis2606"));
+    let policy = client.get_policy(&policy_id);
+    assert_eq!(policy.end_time - policy.start_time, 365 * 86_400);
+}
+
 // ── Issue #203: cancel_policy zero-elapsed and zero-total-duration paths ──────
 
 #[test]
