@@ -98,6 +98,48 @@ fn test_double_initialize_panics() {
     PolicyEngineClient::new(&env, &contract_id).initialize(&admin, &usdc, &oracle);
 }
 
+#[test]
+#[should_panic(expected = "Error(Contract, #35)")]
+fn test_create_product_binary_invalid_comparison_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let params = CreateProductParams {
+        name: symbol_short!("flight_1"),
+        category: symbol_short!("flight"),
+        oracle_key: symbol_short!("f123"),
+        trigger_type: TriggerType::Binary,
+        oracle_data_type: symbol_short!("flight"),
+        trigger_threshold: 1_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min: 100_000_000,
+        coverage_max: 10_000_000_000,
+        premium_rate_bps: 500,
+        max_duration_days: 365,
+    };
+    client.create_product(&admin, &params);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #35)")]
+fn test_create_product_threshold_invalid_comparison_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let params = CreateProductParams {
+        name: symbol_short!("crop_1"),
+        category: symbol_short!("crop"),
+        oracle_key: symbol_short!("c123"),
+        trigger_type: TriggerType::Threshold,
+        oracle_data_type: symbol_short!("weather"),
+        trigger_threshold: 50_000_000,
+        trigger_comparison: TriggerComparison::Equal,
+        coverage_min: 100_000_000,
+        coverage_max: 10_000_000_000,
+        premium_rate_bps: 500,
+        max_duration_days: 365,
+    };
+    client.create_product(&admin, &params);
+}
+
 // ── Product management ────────────────────────────────────────────────────────
 
 #[test]

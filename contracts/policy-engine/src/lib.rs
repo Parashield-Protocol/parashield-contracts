@@ -116,6 +116,7 @@ pub enum Error {
     ReasonTooLong = 33,
     /// A product with this name already exists (issue #514).
     DuplicateProductName = 34,
+    InvalidTriggerCombination = 35,
 }
 
 // SECURITY: 48-hour timelock on critical admin actions (create_product, update_product).
@@ -238,6 +239,20 @@ impl PolicyEngine {
     /// `params.premium_rate_bps` must be 1-10000; `params.coverage_amount` must be positive.
     pub fn create_product(env: Env, admin: Address, params: CreateProductParams) -> u128 {
         Self::require_admin(&env, &admin);
+
+        match params.trigger_type {
+            TriggerType::Binary => {
+                if params.trigger_comparison != TriggerComparison::Equal {
+                    panic_with_error!(&env, Error::InvalidTriggerCombination);
+                }
+            }
+            TriggerType::Threshold | TriggerType::Parametric => {
+                if params.trigger_comparison == TriggerComparison::Equal {
+                    panic_with_error!(&env, Error::InvalidTriggerCombination);
+                }
+            }
+        }
+
         if params.premium_rate_bps == 0 || params.premium_rate_bps > 10_000 {
             panic_with_error!(&env, Error::InvalidPremiumRate);
         }
