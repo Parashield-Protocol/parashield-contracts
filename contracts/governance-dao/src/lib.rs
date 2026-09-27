@@ -757,17 +757,20 @@ impl GovernanceDao {
         };
         let own_tally_weight = Self::time_weighted(&env, &voter, capped_own_weight);
 
-        // 2. Lock tokens in the DAO contract to prevent token cycling / double-voting
+        // 2. Add any weight delegated to this voter, recording each delegator
+        //    so they cannot also vote this proposal themselves.
+        let delegated_weight = Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
+        let weight = own_tally_weight.saturating_add(delegated_weight);
+        if weight <= 0 {
+            panic_with_error!(&env, Error::InsufficientWeight);
+        }
+
+        // 3. Lock tokens in the DAO contract to prevent token cycling / double-voting
         //
         // Only the voter's own tokens are locked. Delegated weight is counted,
         // never custodied — the DAO has no authority to move a delegator's
         // balance, and taking it would turn delegation into a custody decision.
         gov_token.transfer(&voter, &env.current_contract_address(), &capped_own_weight);
-
-        // 3. Add any weight delegated to this voter, recording each delegator
-        //    so they cannot also vote this proposal themselves.
-        let delegated_weight = Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
-        let weight = own_tally_weight.saturating_add(delegated_weight);
 
         // Save the tracked locked balance for later retrieval
         // Only the voter's own tokens were transferred in, so only that amount
