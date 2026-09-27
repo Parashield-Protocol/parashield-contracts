@@ -110,6 +110,23 @@ fn cannot_initialize_twice() {
 // ── proposal creation ─────────────────────────────────────────────────────────
 
 #[test]
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #47)")]
+fn create_proposal_empty_description_fails() {
+    let (env, dao, admin) = setup_dao();
+    let proposer = generate_address(&env);
+    fund_account(&env, &admin, &proposer, 1_000_000_000);
+    
+    dao.create_proposal(
+        &proposer,
+        &Bytes::new(&env), // Empty description
+        &dao.address,
+        &Symbol::new(&env, "some_func"),
+        &soroban_sdk::vec![&env],
+        &Bytes::from_slice(&env, b"impact"),
+    );
+}
+
 fn create_proposal_increments_counter() {
     let (env, dao, _, voter1, _, target) = setup();
     let args: Vec<Val> = Vec::new(&env);

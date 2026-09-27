@@ -199,6 +199,8 @@ pub enum Error {
     /// `set_time_weight` was called with a zero ramp period or a `min_bps`
     /// above 10_000. Issue #515.
     InvalidTimeWeight = 45,
+    /// Proposal description (title) cannot be empty. (issue #561)
+    EmptyDescription = 47,
 }
 
 #[contract]
@@ -284,6 +286,10 @@ impl GovernanceDao {
     ) -> u64 {
         proposer.require_auth();
         Self::validate_stellar_address(&env, &target);
+        
+        if title.is_empty() {
+            panic_with_error!(&env, Error::EmptyDescription);
+        }
         
         // SECURITY FIX: Validate impact analysis length to prevent storage exhaustion.
         // Limit to 4096 bytes — reasonable for a proposal description without enabling
