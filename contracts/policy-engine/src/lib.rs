@@ -642,6 +642,11 @@ impl PolicyEngine {
         if duration_days == 0 {
             panic_with_error!(env, Error::InvalidDurationRange);
         }
+        // Issue #623: validate duration_days against the product ceiling
+        // explicitly.  The computed (end_time - start_time) must never
+        // exceed max_duration_days * 86_400 seconds.  Checking the
+        // parameter here (before any arithmetic) ensures this holds even
+        // for scheduled-start policies where start_time != now.
         if duration_days > product.max_duration_days {
             panic_with_error!(env, Error::DurationTooLong);
         }
@@ -678,6 +683,15 @@ impl PolicyEngine {
             .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
         if end_time <= start_time {
             panic_with_error!(env, Error::InvalidDurationRange);
+        }
+        // Issue #623: defense-in-depth -- confirm the computed span does
+        // not exceed max_duration_days * 86_400 seconds.  This catches any
+        // future code path that might compute duration_secs independently.
+        let max_duration_secs = (product.max_duration_days as u64)
+            .checked_mul(86_400)
+            .unwrap_or(u64::MAX);
+        if end_time.saturating_sub(start_time) > max_duration_secs {
+            panic_with_error!(env, Error::DurationTooLong);
         }
         let policy_id = Self::next_policy_id(env);
 

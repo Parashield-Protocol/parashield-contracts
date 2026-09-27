@@ -1530,6 +1530,17 @@ impl ClaimsProcessor {
     /// before funds leave the pool. `0` restores immediate payout behavior.
     pub fn set_payout_delay(env: Env, admin: Address, delay_seconds: u64) {
         Self::require_admin(&env, &admin);
+        // Issue #622: although delay_seconds is u64 (cannot be negative at
+        // the type level), explicitly validate that a non-zero delay is at
+        // least 1 second.  0 is the documented "disable" sentinel and is
+        // always valid; any positive value is a real delay and must be
+        // positive by definition.
+        // We also cap the maximum delay to 90 days so an admin cannot lock
+        // claim payouts indefinitely.
+        const MAX_PAYOUT_DELAY: u64 = 90 * 24 * 60 * 60; // 90 days
+        if delay_seconds > MAX_PAYOUT_DELAY {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
         env.storage().instance().set(&StorageKey::PayoutDelay, &delay_seconds);
         env.events().publish(
             (Symbol::new(&env, "payout_delay_set"),),

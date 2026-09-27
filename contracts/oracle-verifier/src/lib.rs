@@ -1277,6 +1277,11 @@ impl OracleVerifier {
     /// consume storage/instruction budget (griefing).
     pub fn set_min_submit_interval(env: Env, admin: Address, seconds: u64) {
         Self::require_admin(&env, &admin);
+        // Issue #624: reject zero -- a zero interval removes the per-oracle
+        // rate-limit guard and allows unlimited oracle submissions per block.
+        if seconds == 0 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
         env.storage()
             .instance()
             .set(&StorageKey::MinSubmitInterval, &seconds);
