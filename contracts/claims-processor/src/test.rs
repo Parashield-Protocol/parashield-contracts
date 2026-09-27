@@ -1547,6 +1547,39 @@ fn test_admin_claim_attempt_writes_nothing() {
 }
 
 /// An ordinary policyholder is unaffected — the guard is scoped to the
+// ── Claimant may not be the zero address (issue #586) ──────────────────────────
+
+/// The all-zero Stellar account address has no private key, so a claim
+/// filed for it would settle a payout nobody can ever collect. The guard
+/// runs before the policy is even looked up, so an invalid `policy_id`
+/// doesn't mask which check actually rejected the call.
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_zero_address_cannot_file_claim() {
+    let w = deploy();
+    let zero = Address::from_string(&soroban_sdk::String::from_str(
+        &w.env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
+
+    ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .submit_claim(&zero, &1u128);
+}
+
+/// The batch entry point must not be a way around the zero-address guard.
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_zero_address_cannot_file_claim_through_batch() {
+    let w = deploy();
+    let zero = Address::from_string(&soroban_sdk::String::from_str(
+        &w.env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
+
+    ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .batch_submit_claims(&zero, &soroban_sdk::vec![&w.env, 1u128]);
+}
+
 /// admin address, not to "whoever holds the policy".
 #[test]
 fn test_non_admin_policyholder_still_files_claim() {

@@ -364,6 +364,9 @@ impl ClaimsProcessor {
         // The admin may not be the claimant, whoever the policyholder is.
         // Checked before any state is read so a rejected call costs nothing.
         Self::require_not_admin(&env, &claimant);
+        // The zero address cannot hold or move funds; a claim filed for it
+        // would settle a payout nobody can ever collect (issue #586).
+        Self::require_not_zero_address(&env, &claimant);
 
         Self::file_claim(&env, &claimant, policy_id)
     }
@@ -493,6 +496,7 @@ impl ClaimsProcessor {
         claimant.require_auth();
         Self::require_not_paused(&env);
         Self::require_not_admin(&env, &claimant);
+        Self::require_not_zero_address(&env, &claimant);
 
         let mut claim_ids = Vec::new(&env);
         let count = if policy_ids.len() > MAX_BATCH_SIZE {
@@ -2216,6 +2220,20 @@ impl ClaimsProcessor {
         let admin: Option<Address> = env.storage().instance().get(&StorageKey::Admin);
         if admin.as_ref() == Some(caller) {
             panic_with_error!(env, Error::AdminCannotBeClaimant);
+        }
+    }
+
+    /// Reject the all-zero Stellar account address. Nobody holds its
+    /// private key, so a claim filed for it would settle a payout that can
+    /// never be collected and would leave the policy permanently stuck in
+    /// `Claimed` state (issue #586).
+    fn require_not_zero_address(env: &Env, caller: &Address) {
+        let zero = Address::from_string(&soroban_sdk::String::from_str(
+            env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+        if *caller == zero {
+            panic_with_error!(env, Error::InvalidAddress);
         }
     }
 
