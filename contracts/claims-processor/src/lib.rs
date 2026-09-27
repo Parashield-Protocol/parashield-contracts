@@ -106,6 +106,8 @@ enum StorageKey {
     PendingUpgrade,
     /// Seconds a claim may sit Pending before it can be escalated (u64).
     EscalationThreshold,
+    /// Per-category escalation threshold (Symbol -> u64).
+    CategoryEscalationThreshold(Symbol),
     /// Maximum seconds after a policy's `end_time` during which a claim may
     /// still be submitted for the triggering event (u64). `0` means a claim
     /// can only be filed while the policy is Active (behaves as before).
@@ -186,8 +188,8 @@ pub enum Error {
     /// resolves disputes and controls payout configuration; letting them
     /// also be the claimant is self-dealing (issue #566).
     AdminCannotBeClaimant = 29,
-    /// A policy supplied a non-positive amount for a claim (issue #575).
-    InvalidClaimAmount = 30,
+    /// Payout delay exceeds the maximum allowed 365 days.
+    PayoutDelayTooLong = 30,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -300,8 +302,17 @@ impl ClaimsProcessor {
 
     /// Admin-only: authorize `keeper` to call process_claim / auto_process /
     /// batch_auto_process. Without this, no address can settle claims.
+    ///
+    /// `keeper` must be a well-formed Stellar address (issue #572). A keeper
+    /// entry is a settlement authority: whatever holds it can move coverage
+    /// USDC out of the pool. Admitting an address whose StrKey encoding is
+    /// malformed writes a permanent registry entry that can never be
+    /// legitimately exercised and that off-chain indexers will silently fail
+    /// to resolve when reconciling `keeper_added` events, so the format is
+    /// checked up front and the write is refused.
     pub fn add_keeper(env: Env, admin: Address, keeper: Address) {
         Self::require_admin(&env, &admin);
+        Self::validate_stellar_address(&env, &keeper);
         env.storage().persistent().set(&StorageKey::Keeper(keeper.clone()), &true);
         env.storage().persistent().extend_ttl(&StorageKey::Keeper(keeper.clone()), TTL_THRESHOLD, TTL_EXTEND_TO);
         env.events().publish(
@@ -311,6 +322,12 @@ impl ClaimsProcessor {
     }
 
     /// Admin-only: revoke a keeper's settlement authority.
+    ///
+    /// Deliberately does *not* re-run the format check that `add_keeper`
+    /// applies. This is the remediation path for a bad registry entry: an
+    /// admin must be able to evict a keeper that was admitted before the
+    /// check existed, or a malformed entry would be unremovable. Removing an
+    /// unknown address is a no-op either way.
     pub fn remove_keeper(env: Env, admin: Address, keeper: Address) {
         Self::require_admin(&env, &admin);
         env.storage().persistent().remove(&StorageKey::Keeper(keeper.clone()));
@@ -830,6 +847,9 @@ impl ClaimsProcessor {
             && claim.status != ClaimStatus::PartiallyPaid
         {
             panic_with_error!(&env, Error::AlreadyProcessed);
+        }
+        if reason == soroban_sdk::Symbol::new(&env, "") {
+            panic_with_error!(&env, Error::EmptyDisputeReason);
         }
         claim.status = ClaimStatus::Disputed;
         claim.dispute_reason = Some(reason.clone());
@@ -1458,9 +1478,31 @@ impl ClaimsProcessor {
         );
     }
 
-    /// The escalation threshold in seconds (default: 7 days).
+    pub fn set_category_escalation_threshold(env: Env, admin: Address, category: Symbol, threshold: u64) {
+        Self::require_admin(&env, &admin);
+
+        if threshold < MIN_ESCALATION_THRESHOLD {
+            panic_with_error!(&env, Error::InvalidThresholdValue);
+        }
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::CategoryEscalationThreshold(category.clone()), &threshold);
+
+        env.events().publish(
+            (Symbol::new(&env, "category_escalation_threshold_set"), category),
+            EscalationThresholdUpdated { threshold },
+        );
+    }
+
     pub fn get_escalation_threshold(env: Env) -> u64 {
-        Self::escalation_threshold(&env)
+        Self::escalation_threshold(&env, None)
+    }
+
+    pub fn get_category_escalation_threshold(env: Env, category: Symbol) -> Option<u64> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::CategoryEscalationThreshold(category))
     }
 
     /// How long a claim has been waiting, and whether it can be escalated yet.
@@ -1474,7 +1516,10 @@ impl ClaimsProcessor {
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
 
-        let threshold = Self::escalation_threshold(&env);
+        let policy_engine_id = Self::policy_engine(&env);
+        let policy = parashield_policy_engine::PolicyEngineClient::new(&env, &policy_engine_id).get_policy(&claim.policy_id);
+        let product = parashield_policy_engine::PolicyEngineClient::new(&env, &policy_engine_id).get_product(&policy.product_id);
+        let threshold = Self::escalation_threshold(&env, Some(product.category));
         let now = env.ledger().timestamp();
         let is_pending = claim.status == ClaimStatus::Pending;
         let pending_for = if is_pending {
@@ -1540,6 +1585,10 @@ impl ClaimsProcessor {
     /// before funds leave the pool. `0` restores immediate payout behavior.
     pub fn set_payout_delay(env: Env, admin: Address, delay_seconds: u64) {
         Self::require_admin(&env, &admin);
+        const MAX_PAYOUT_DELAY: u64 = 365 * 24 * 60 * 60; // 365 days
+        if delay_seconds > MAX_PAYOUT_DELAY {
+            panic_with_error!(&env, Error::PayoutDelayTooLong);
+        }
         env.storage().instance().set(&StorageKey::PayoutDelay, &delay_seconds);
         env.events().publish(
             (Symbol::new(&env, "payout_delay_set"),),
@@ -1703,7 +1752,12 @@ impl ClaimsProcessor {
 
         let now = env.ledger().timestamp();
         let pending_for = now.saturating_sub(claim.submitted_at);
-        if pending_for < Self::escalation_threshold(&env) {
+        let policy_engine_id = Self::policy_engine(&env);
+        let policy = parashield_policy_engine::PolicyEngineClient::new(&env, &policy_engine_id).get_policy(&claim.policy_id);
+        let product = parashield_policy_engine::PolicyEngineClient::new(&env, &policy_engine_id).get_product(&policy.product_id);
+        let threshold = Self::escalation_threshold(&env, Some(product.category));
+
+        if pending_for < threshold {
             panic_with_error!(&env, Error::NotEscalatable);
         }
 
@@ -1743,9 +1797,10 @@ impl ClaimsProcessor {
             .get(&StorageKey::PendingClaims)
             .unwrap_or_else(|| Vec::new(&env));
 
-        let threshold = Self::escalation_threshold(&env);
         let now = env.ledger().timestamp();
         let mut overdue: Vec<u128> = Vec::new(&env);
+        let policy_engine_id = Self::policy_engine(&env);
+        let pe_client = parashield_policy_engine::PolicyEngineClient::new(&env, &policy_engine_id);
 
         for i in 0..pending.len() {
             let cid = pending.get_unchecked(i);
@@ -1754,10 +1809,14 @@ impl ClaimsProcessor {
                 .persistent()
                 .get::<_, Claim>(&StorageKey::Claim(cid))
             {
-                if claim.status == ClaimStatus::Pending
-                    && now.saturating_sub(claim.submitted_at) >= threshold
-                {
-                    overdue.push_back(cid);
+                if claim.status == ClaimStatus::Pending {
+                    let policy = pe_client.get_policy(&claim.policy_id);
+                    let product = pe_client.get_product(&policy.product_id);
+                    let threshold = Self::escalation_threshold(&env, Some(product.category));
+                    
+                    if now.saturating_sub(claim.submitted_at) >= threshold {
+                        overdue.push_back(cid);
+                    }
                 }
             }
         }
@@ -2061,8 +2120,13 @@ impl ClaimsProcessor {
 
     /// Remove a claim id from the pending queue, if present.
 
-    /// The configured escalation threshold, or the default.
-    fn escalation_threshold(env: &Env) -> u64 {
+    /// The configured escalation threshold for a category, or the global default.
+    fn escalation_threshold(env: &Env, category: Option<Symbol>) -> u64 {
+        if let Some(cat) = category {
+            if let Some(val) = env.storage().instance().get(&StorageKey::CategoryEscalationThreshold(cat)) {
+                return val;
+            }
+        }
         env.storage()
             .instance()
             .get(&StorageKey::EscalationThreshold)
@@ -2172,19 +2236,19 @@ impl ClaimsProcessor {
         id
     }
 
+    /// Panic unless `address` is a well-formed Stellar address.
+    ///
+    /// Delegates the actual format decision to [`is_well_formed_strkey`] so
+    /// the rule lives in one pure, directly testable function instead of
+    /// being spread across the call sites that need it (issue #572).
     fn validate_stellar_address(env: &Env, address: &Address) {
         let addr_str = address.to_string();
-
-        // Check length: Stellar public keys are exactly 56 characters
-        if addr_str.len() != 56 {
+        let mut buf = [0u8; STRKEY_LEN];
+        if addr_str.len() as usize != STRKEY_LEN {
             panic_with_error!(env, Error::InvalidAddress);
         }
-
-        let mut buf = [0u8; 56];
         addr_str.copy_into_slice(&mut buf);
-
-        // Check prefix: G (Stellar account) or C (Stellar contract)
-        if buf[0] != b'G' && buf[0] != b'C' {
+        if !is_well_formed_strkey(&buf) {
             panic_with_error!(env, Error::InvalidAddress);
         }
     }
@@ -2383,9 +2447,49 @@ fn map_comparison(
     }
 }
 
+/// Length of a Stellar `StrKey` (a `G…` account id or a `C…` contract id):
+/// one version character plus 55 base32 characters encoding the 33-byte
+/// (version + 32-byte payload) key, rounded up to a whole 5-bit group.
+const STRKEY_LEN: usize = 56;
+
+/// Whether `bytes` is a syntactically well-formed Stellar address string
+/// (issue #572).
+///
+/// A `StrKey` is 56 bytes long and encodes the 33-byte
+/// `version || payload` buffer in unpadded base32 (RFC 4648). Two version
+/// characters are meaningful on the network: `G` for a classic account and
+/// `C` for a contract. Everything after the version byte must therefore be a
+/// base32 symbol — `A`–`Z` or `2`–`7` — which is what makes this a real format
+/// check rather than the prefix test it replaced. Note that the StrKey
+/// checksum is intentionally *not* verified: the host already guarantees a
+/// canonical encoding for any `Address` it hands us, so a checksum failure is
+/// not reachable from here, and re-deriving one on-chain would cost a CRC16
+/// for no additional guarantee.
+///
+/// Takes bytes rather than `&str` because `soroban_sdk::String` (what
+/// `Address::to_string` returns) cannot be borrowed as `str`. Pure and
+/// infallible, so it can be exercised directly against byte strings that no
+/// `Address` could ever be constructed from.
+fn is_well_formed_strkey(bytes: &[u8]) -> bool {
+    if bytes.len() != STRKEY_LEN {
+        return false;
+    }
+    // Version byte: G (account) or C (contract).
+    if bytes[0] != b'G' && bytes[0] != b'C' {
+        return false;
+    }
+    bytes[1..]
+        .iter()
+        .all(|&b| (b >= b'A' && b <= b'Z') || (b >= b'2' && b <= b'7'))
+}
+
 #[cfg(test)]
 mod test;
 #[cfg(test)]
 mod test_integration;
 #[cfg(test)]
 mod test_advanced;
+#[cfg(test)]
+mod test_keeper_registry;
+#[cfg(test)]
+mod test_claim_uniqueness;

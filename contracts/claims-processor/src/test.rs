@@ -705,6 +705,14 @@ fn test_dispute_nonexistent_claim_fails() {
 /// AlreadyProcessed — a settled claim cannot be reopened.
 #[test]
 #[should_panic(expected = "Error(Contract, #7)")]
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #30)")]
+fn test_dispute_empty_reason_panics() {
+    let (w, claim_id, buyer) = pending_claim();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    cp.dispute_claim(&buyer, &claim_id, &soroban_sdk::Symbol::new(&w.env, ""));
+}
+
 fn test_dispute_paid_claim_fails() {
     let w      = deploy();
     let pid    = create_crop_product(&w);
@@ -1551,4 +1559,37 @@ fn test_non_admin_policyholder_still_files_claim() {
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let claim_id = cp.submit_claim(&buyer, &pol_id);
     assert_eq!(cp.process_claim(&w.keeper, &claim_id, &None), ClaimResult::Paid);
+}
+
+#[test]
+fn test_payout_delay_within_bounds() {
+    let w = deploy();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let delay = 365 * 24 * 60 * 60; // Exact max
+    cp.set_payout_delay(&w.admin, &delay);
+    assert_eq!(cp.get_payout_delay(), delay);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #30)")]
+fn test_payout_delay_exceeds_max() {
+    let w = deploy();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let delay = (365 * 24 * 60 * 60) + 1;
+    cp.set_payout_delay(&w.admin, &delay);
+}
+
+#[test]
+fn test_per_category_escalation_threshold() {
+    let w = deploy();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let crop = symbol_short!("crop");
+    let threshold = 3600; // 1 hour
+    
+    // Default is none
+    assert_eq!(cp.get_category_escalation_threshold(&crop), None);
+    
+    // Set category threshold
+    cp.set_category_escalation_threshold(&w.admin, &crop, &threshold);
+    assert_eq!(cp.get_category_escalation_threshold(&crop), Some(threshold));
 }

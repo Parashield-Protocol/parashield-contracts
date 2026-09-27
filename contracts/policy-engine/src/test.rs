@@ -33,7 +33,7 @@ fn create_crop_product(_env: &Env, client: &PolicyEngineClient, admin: &Address)
         &CreateProductParams {
             name: symbol_short!("crop_kism"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -161,7 +161,7 @@ fn max_products_per_pool_blocks_unbounded_category_growth() {
     let mut params = CreateProductParams {
         name: symbol_short!("crop_a"),
         category: symbol_short!("crop"),
-        oracle_key: symbol_short!("kis2606"),
+        oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
         trigger_type: TriggerType::Threshold,
         oracle_data_type: symbol_short!("weather"),
         trigger_threshold: 50_000_000,
@@ -193,7 +193,7 @@ fn deprecating_product_releases_pool_product_slot() {
     let mut params = CreateProductParams {
         name: symbol_short!("crop_a"),
         category: symbol_short!("crop"),
-        oracle_key: symbol_short!("kis2606"),
+        oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
         trigger_type: TriggerType::Threshold,
         oracle_data_type: symbol_short!("weather"),
         trigger_threshold: 50_000_000,
@@ -487,7 +487,7 @@ fn test_create_product_zero_duration_panics() {
         &CreateProductParams {
             name: symbol_short!("bad"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -511,7 +511,7 @@ fn test_create_product_duration_too_long_panics() {
         &CreateProductParams {
             name: symbol_short!("bad"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -536,7 +536,7 @@ fn test_create_product_valid_duration_succeeds() {
         &CreateProductParams {
             name: symbol_short!("min"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -755,7 +755,7 @@ fn test_create_product_zero_threshold_panics() {
         &CreateProductParams {
             name: symbol_short!("bad"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 0i128, // ← invalid: zero
@@ -779,7 +779,7 @@ fn test_create_product_negative_threshold_panics() {
         &CreateProductParams {
             name: symbol_short!("bad"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: -1i128, // ← invalid: negative
@@ -803,7 +803,7 @@ fn test_create_product_overflow_threshold_panics() {
         &CreateProductParams {
             name: symbol_short!("bad"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: i128::MAX, // ← invalid: overflows protocol range
@@ -831,7 +831,7 @@ fn test_duplicate_category_oracle_key_panics() {
         &CreateProductParams {
             name: symbol_short!("crop_k_a"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -849,7 +849,7 @@ fn test_duplicate_category_oracle_key_panics() {
         &CreateProductParams {
             name: symbol_short!("crop_k_b"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"), // ← duplicate key
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(), // ← duplicate key
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 60_000_000,
@@ -874,7 +874,7 @@ fn test_different_oracle_keys_same_category_succeeds() {
         &CreateProductParams {
             name: symbol_short!("crop_kis"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -919,7 +919,7 @@ fn test_deprecated_product_key_can_be_reused() {
         &CreateProductParams {
             name: symbol_short!("crop_k_v1"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -940,7 +940,7 @@ fn test_deprecated_product_key_can_be_reused() {
         &CreateProductParams {
             name: symbol_short!("crop_k_v2"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"), // ← reused key
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(), // ← reused key
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 60_000_000,
@@ -1002,7 +1002,7 @@ fn test_premium_matches_formula() {
 /// a positive rate to produce a non-zero transfer, and `create_product`
 /// validates this at creation time.
 #[test]
-#[should_panic(expected = "Error(Contract, #13)")]
+#[should_panic(expected = "Error(Contract, #38)")]
 fn test_create_product_zero_premium_rate_panics() {
     let (env, admin, _oracle, _usdc, contract_id) = setup();
     let client = PolicyEngineClient::new(&env, &contract_id);
@@ -1011,7 +1011,7 @@ fn test_create_product_zero_premium_rate_panics() {
         &CreateProductParams {
             name: symbol_short!("free_pol"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -1854,7 +1854,7 @@ fn params_with_coverage(min: i128, max: i128) -> CreateProductParams {
     CreateProductParams {
         name: symbol_short!("cov_rng"),
         category: symbol_short!("crop"),
-        oracle_key: symbol_short!("kis2606"),
+        oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
         trigger_type: TriggerType::Threshold,
         oracle_data_type: symbol_short!("weather"),
         trigger_threshold: 50_000_000,
@@ -1938,4 +1938,51 @@ fn rejected_coverage_range_writes_nothing() {
         .is_err());
     assert_eq!(client.get_active_products().len(), 0);
     assert_eq!(client.create_product(&admin, &params_with_coverage(1_000, 2_000)), 1);
+}
+
+#[test]
+fn test_buy_policy_correct_token() {
+    let w = deploy();
+    let product_id = w.pe.create_product(&w.admin, &CreateProductParams {
+        name: symbol_short!("test"),
+        category: symbol_short!("crop"),
+        oracle_key: symbol_short!("kis2606"),
+        expected_token: w.usdc.address.clone(),
+        trigger_type: TriggerType::Threshold,
+        oracle_data_type: symbol_short!("weather"),
+        trigger_threshold: 50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min: 100_000_000,
+        coverage_max: 500_000_000,
+        premium_rate_bps: 500,
+        max_duration_days: 90,
+    });
+    
+    // Succeeds
+    let policy_id = w.pe.buy_policy(&w.buyer, &product_id, &100_000_000, &30, &symbol_short!("kis2606"), &w.usdc.address);
+    assert_eq!(policy_id, 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_buy_policy_incorrect_token() {
+    let w = deploy();
+    let product_id = w.pe.create_product(&w.admin, &CreateProductParams {
+        name: symbol_short!("test"),
+        category: symbol_short!("crop"),
+        oracle_key: symbol_short!("kis2606"),
+        expected_token: w.usdc.address.clone(),
+        trigger_type: TriggerType::Threshold,
+        oracle_data_type: symbol_short!("weather"),
+        trigger_threshold: 50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min: 100_000_000,
+        coverage_max: 500_000_000,
+        premium_rate_bps: 500,
+        max_duration_days: 90,
+    });
+    
+    let wrong_token = Address::generate(&w.env);
+    
+    w.pe.buy_policy(&w.buyer, &product_id, &100_000_000, &30, &symbol_short!("kis2606"), &wrong_token);
 }
