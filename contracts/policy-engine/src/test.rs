@@ -390,6 +390,23 @@ fn test_buy_policy_scheduled_past_start_rejected() {
     assert_eq!(TokenClient::new(&env, &usdc).balance(&buyer), 1_000_000_000i128);
 }
 
+/// Issue #576: the admin cannot buy a policy on a product they control.
+#[test]
+fn test_admin_cannot_buy_policy() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    StellarAssetClient::new(&env, &usdc).mint(&admin, &1_000_000_000i128);
+
+    let result = client.try_buy_policy(
+        &admin, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"),
+    );
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        soroban_sdk::Error::from_contract_error(Error::AdminCannotBuyPolicy as u32)
+    );
+}
+
 #[test]
 fn test_buy_policy_appears_in_user_list() {
     let (env, admin, _oracle, usdc, contract_id) = setup();

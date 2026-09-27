@@ -121,6 +121,8 @@ pub enum Error {
     InvalidCategory = 36,
     /// A scheduled policy start time is earlier than the current ledger time (issue #522).
     InvalidStartTime = 37,
+    /// The contract admin may not buy a policy on any product (issue #576).
+    AdminCannotBuyPolicy = 38,
 }
 
 // SECURITY: 48-hour timelock on critical admin actions (create_product, update_product).
@@ -624,6 +626,17 @@ impl PolicyEngine {
         // Issue #522: never allow a backdated start.
         if start_time < env.ledger().timestamp() {
             panic_with_error!(env, Error::InvalidStartTime);
+        }
+        // The admin controls product configuration and policy settlement
+        // wiring, so allowing them to be a policyholder creates a direct
+        // self-dealing path.
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        if *buyer == admin {
+            panic_with_error!(env, Error::AdminCannotBuyPolicy);
         }
         let product = Self::load_product(env, product_id);
         if product.status != ProductStatus::Active {

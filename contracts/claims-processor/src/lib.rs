@@ -186,6 +186,8 @@ pub enum Error {
     /// resolves disputes and controls payout configuration; letting them
     /// also be the claimant is self-dealing (issue #566).
     AdminCannotBeClaimant = 29,
+    /// A policy supplied a non-positive amount for a claim (issue #575).
+    InvalidClaimAmount = 30,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -370,6 +372,10 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         let policy = PolicyEngineClient::new(env, &policy_engine)
             .get_policy(&policy_id);
+
+        if policy.coverage_amount <= 0 {
+            panic_with_error!(env, Error::InvalidClaimAmount);
+        }
 
         if policy.policyholder != *claimant {
             panic_with_error!(env, Error::Unauthorized);
@@ -618,6 +624,10 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         let policy = PolicyEngineClient::new(&env, &policy_engine)
             .get_policy(&policy_id);
+
+        if policy.coverage_amount <= 0 {
+            panic_with_error!(&env, Error::InvalidClaimAmount);
+        }
 
         // Idempotency: check current policy status from down-stream contract
         match policy.status {
