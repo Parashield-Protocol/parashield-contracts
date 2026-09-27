@@ -318,9 +318,7 @@ impl PolicyEngine {
         if params.max_duration_days == 0 || params.max_duration_days > 3650 {
             panic_with_error!(&env, Error::InvalidDurationRange);
         }
-        // Validate oracle_key format and length (Issue #491).
-        // Must be 3..=32 chars, cannot start or end with '_', no consecutive '__',
-        // and must contain at least one alphabetic character.
+        // Oracle keys follow the documented 3..=9 alphanumeric format.
         {
             let sym_val = params.oracle_key.to_symbol_val();
             let sym_str: Result<SymbolStr, _> = SymbolStr::try_from_val(&env, &sym_val);
@@ -328,27 +326,15 @@ impl PolicyEngine {
                 Ok(s) => {
                     let s_str: &str = s.as_ref();
                     let bytes: &[u8] = s_str.as_bytes();
-                    if bytes.len() < 3 || bytes.len() > 32 {
-                        panic_with_error!(&env, Error::InvalidOracleKey);
-                    }
-                    if bytes[0] == b'_' || bytes[bytes.len() - 1] == b'_' {
+                    if bytes.len() < 3 || bytes.len() > 9 {
                         panic_with_error!(&env, Error::InvalidOracleKey);
                     }
                     let mut has_alpha = false;
-                    let mut prev_underscore = false;
                     for &b in bytes {
-                        if b == b'_' {
-                            if prev_underscore {
-                                panic_with_error!(&env, Error::InvalidOracleKey);
-                            }
-                            prev_underscore = true;
-                        } else {
-                            prev_underscore = false;
-                            if (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z') {
-                                has_alpha = true;
-                            } else if !(b >= b'0' && b <= b'9') {
-                                panic_with_error!(&env, Error::InvalidOracleKey);
-                            }
+                        if (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z') {
+                            has_alpha = true;
+                        } else if !(b >= b'0' && b <= b'9') {
+                            panic_with_error!(&env, Error::InvalidOracleKey);
                         }
                     }
                     if !has_alpha {
