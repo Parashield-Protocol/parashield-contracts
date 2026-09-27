@@ -985,7 +985,7 @@ fn test_premium_matches_formula() {
 /// a positive rate to produce a non-zero transfer, and `create_product`
 /// validates this at creation time.
 #[test]
-#[should_panic(expected = "Error(Contract, #13)")]
+#[should_panic(expected = "Error(Contract, #38)")]
 fn test_create_product_zero_premium_rate_panics() {
     let (env, admin, _oracle, _usdc, contract_id) = setup();
     let client = PolicyEngineClient::new(&env, &contract_id);

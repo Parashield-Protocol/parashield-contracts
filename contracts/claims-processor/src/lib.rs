@@ -840,6 +840,9 @@ impl ClaimsProcessor {
         {
             panic_with_error!(&env, Error::AlreadyProcessed);
         }
+        if reason == soroban_sdk::Symbol::new(&env, "") {
+            panic_with_error!(&env, Error::EmptyDisputeReason);
+        }
         claim.status = ClaimStatus::Disputed;
         claim.dispute_reason = Some(reason.clone());
         let claim_key = StorageKey::Claim(claim_id);

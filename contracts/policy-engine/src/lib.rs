@@ -121,6 +121,8 @@ pub enum Error {
     InvalidCategory = 36,
     /// A scheduled policy start time is earlier than the current ledger time (issue #522).
     InvalidStartTime = 37,
+    /// Premium rate cannot be zero. (issue #564)
+    ZeroPremiumRate = 38,
 }
 
 // SECURITY: 48-hour timelock on critical admin actions (create_product, update_product).
@@ -290,7 +292,10 @@ impl PolicyEngine {
             }
         }
 
-        if params.premium_rate_bps == 0 || params.premium_rate_bps > 10_000 {
+        if params.premium_rate_bps == 0 {
+            panic_with_error!(&env, Error::ZeroPremiumRate);
+        }
+        if params.premium_rate_bps > 10_000 {
             panic_with_error!(&env, Error::InvalidPremiumRate);
         }
         // trigger_threshold must be positive and within the 7-decimal fixed-point
