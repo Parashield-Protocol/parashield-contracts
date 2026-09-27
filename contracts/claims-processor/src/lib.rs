@@ -390,6 +390,10 @@ impl ClaimsProcessor {
         let policy = PolicyEngineClient::new(env, &policy_engine)
             .get_policy(&policy_id);
 
+        if policy.coverage_amount <= 0 {
+            panic_with_error!(env, Error::InvalidClaimAmount);
+        }
+
         if policy.policyholder != *claimant {
             panic_with_error!(env, Error::Unauthorized);
         }
@@ -637,6 +641,10 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         let policy = PolicyEngineClient::new(&env, &policy_engine)
             .get_policy(&policy_id);
+
+        if policy.coverage_amount <= 0 {
+            panic_with_error!(&env, Error::InvalidClaimAmount);
+        }
 
         // Idempotency: check current policy status from down-stream contract
         match policy.status {

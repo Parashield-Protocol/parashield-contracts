@@ -656,6 +656,17 @@ impl PolicyEngine {
         if start_time < env.ledger().timestamp() {
             panic_with_error!(env, Error::InvalidStartTime);
         }
+        // The admin controls product configuration and policy settlement
+        // wiring, so allowing them to be a policyholder creates a direct
+        // self-dealing path.
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        if *buyer == admin {
+            panic_with_error!(env, Error::AdminCannotBuyPolicy);
+        }
         let product = Self::load_product(env, product_id);
         if product.status != ProductStatus::Active {
             panic_with_error!(env, Error::ProductNotActive);
