@@ -186,6 +186,8 @@ pub enum Error {
     /// resolves disputes and controls payout configuration; letting them
     /// also be the claimant is self-dealing (issue #566).
     AdminCannotBeClaimant = 29,
+    /// Dispute reason cannot be empty. (issue #563)
+    EmptyDisputeReason = 30,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -820,6 +822,9 @@ impl ClaimsProcessor {
             && claim.status != ClaimStatus::PartiallyPaid
         {
             panic_with_error!(&env, Error::AlreadyProcessed);
+        }
+        if reason == soroban_sdk::Symbol::new(&env, "") {
+            panic_with_error!(&env, Error::EmptyDisputeReason);
         }
         claim.status = ClaimStatus::Disputed;
         claim.dispute_reason = Some(reason.clone());

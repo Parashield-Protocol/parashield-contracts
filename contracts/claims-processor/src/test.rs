@@ -705,6 +705,14 @@ fn test_dispute_nonexistent_claim_fails() {
 /// AlreadyProcessed — a settled claim cannot be reopened.
 #[test]
 #[should_panic(expected = "Error(Contract, #7)")]
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #30)")]
+fn test_dispute_empty_reason_panics() {
+    let (w, claim_id, buyer) = pending_claim();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    cp.dispute_claim(&buyer, &claim_id, &soroban_sdk::Symbol::new(&w.env, ""));
+}
+
 fn test_dispute_paid_claim_fails() {
     let w      = deploy();
     let pid    = create_crop_product(&w);
