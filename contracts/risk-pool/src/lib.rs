@@ -222,6 +222,8 @@ pub enum Error {
     /// pool's risk parameters and can authorise emergency withdrawals, so it
     /// must not also be exposed to them (issue #568).
     AdminCannotBeLp           = 44,
+    /// Delay exceeds the maximum allowed exit delay (issue #562)
+    ExitDelayTooLong          = 45,
 }
 
 #[contract]
@@ -989,7 +991,7 @@ impl RiskPool {
         Self::require_admin(&env, &admin);
 
         if delay_seconds > MAX_EXIT_DELAY {
-            panic_with_error!(&env, Error::InvalidCapacity);
+            panic_with_error!(&env, Error::ExitDelayTooLong);
         }
 
         env.storage()

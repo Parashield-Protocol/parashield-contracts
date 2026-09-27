@@ -47,6 +47,22 @@ fn setup() -> World {
     World { env, pool, admin, usdc }
 }
 
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #45)")]
+fn exit_delay_exceeds_maximum_panics() {
+    let w = setup();
+    let max_plus_one = 30 * 24 * 60 * 60 + 1;
+    w.pool.set_exit_delay(&w.admin, &max_plus_one);
+}
+
+#[test]
+fn exit_delay_at_maximum_succeeds() {
+    let w = setup();
+    let max_delay = 30 * 24 * 60 * 60;
+    w.pool.set_exit_delay(&w.admin, &max_delay);
+    assert_eq!(w.pool.get_exit_delay(), max_delay);
+}
+
 fn lp(w: &World) -> Address {
     let lp = Address::generate(&w.env);
     token::StellarAssetClient::new(&w.env, &w.usdc).mint(&lp, &(10 * AMOUNT));
