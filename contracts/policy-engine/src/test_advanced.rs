@@ -16,7 +16,7 @@ fn basic_params() -> CreateProductParams {
     CreateProductParams {
         name: symbol_short!("crop"),
         category: symbol_short!("crop"),
-        oracle_key: symbol_short!("kis2606"),
+        oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
         trigger_type: TriggerType::Threshold,
         oracle_data_type: symbol_short!("weather"),
         trigger_threshold: 500_000_000i128,
@@ -305,13 +305,13 @@ fn batch_buy_policy_creates_all_policies_and_pulls_premium() {
             product_id: prod_id,
             coverage_amount: 200_0000000i128,
             duration_days: 30,
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
         },
         BatchBuyItem {
             product_id: prod_id,
             coverage_amount: 300_0000000i128,
             duration_days: 45,
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
         },
     ];
 
@@ -343,7 +343,7 @@ fn batch_buy_policy_rejects_oversized_batch() {
             product_id: prod_id,
             coverage_amount: 100_0000000i128,
             duration_days: 1,
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
         });
     }
     pe.batch_buy_policy(&user, &items);
@@ -361,13 +361,13 @@ fn batch_buy_policy_is_atomic_on_bad_item() {
             product_id: prod_id,
             coverage_amount: 200_0000000i128,
             duration_days: 30,
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
         },
         BatchBuyItem {
             product_id: 9_999u128,
             coverage_amount: 200_0000000i128,
             duration_days: 30,
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
         },
     ];
     pe.batch_buy_policy(&user, &items);

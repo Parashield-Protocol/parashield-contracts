@@ -392,6 +392,8 @@ impl RiskPool {
             }
             minted - burn_shares
         } else {
+            // Issue #621: integer division truncates toward zero; the
+            // MIN_SHARES guard below catches the resulting 0 case.
             amount.checked_mul(total_shares)
                 .and_then(|v| v.checked_div(total_deposited))
                 .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow))
@@ -541,6 +543,11 @@ impl RiskPool {
 
         let available_liquidity = total_deposited.saturating_sub(total_locked);
         if available_liquidity <= 0 { panic_with_error!(&env, Error::Undercollateralized); }
+        // Issue #621: shares * total_deposited / total_shares truncates
+        // toward zero; if the pool has absorbed losses total_deposited
+        // may be tiny relative to total_shares and a small redemption
+        // rounds to 0.  The ZeroAmount guard below rejects such cases so
+        // no shares are ever burned without returning capital.
         let amount = shares.checked_mul(total_deposited)
             .and_then(|v| v.checked_div(total_shares))
             .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
@@ -694,9 +701,14 @@ impl RiskPool {
             panic_with_error!(&env, Error::InsufficientShares);
         }
 
+        // Issue #621: share-to-amount calculation can underflow to 0 when
+        // from_pos.deposited has been eroded by losses while shares stayed
+        // constant.  A zero-amount transfer burns the shares without moving
+        // any capital, so reject it explicitly.
         let amount = shares.checked_mul(from_pos.deposited)
             .and_then(|v| v.checked_div(from_pos.shares))
             .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+        if amount == 0 { panic_with_error!(&env, Error::ZeroAmount); }
 
         let pending_yield_from = Self::settle_yield(&env, &mut from_pos);
         from_pos.deposited = from_pos.deposited.saturating_sub(amount);

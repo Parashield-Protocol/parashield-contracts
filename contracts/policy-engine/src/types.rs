@@ -48,6 +48,8 @@ pub struct InsuranceProduct {
     pub category: Symbol,
     /// Specific oracle measurement key, e.g. symbol_short!("kis2606")
     pub oracle_key: Symbol,
+    /// Token address expected for premium payments
+    pub expected_token: Address,
     pub trigger_type: TriggerType,
     /// Oracle data category: "weather" | "flight" | "onchain"
     pub oracle_data_type: Symbol,
@@ -72,6 +74,7 @@ pub struct BatchBuyItem {
     pub coverage_amount: i128,
     pub duration_days: u32,
     pub oracle_key: Symbol,
+    pub payment_token: Address,
 }
 
 /// Input struct for creating a new insurance product (avoids >10 param limit).
@@ -81,6 +84,7 @@ pub struct CreateProductParams {
     pub name: Symbol,
     pub category: Symbol,
     pub oracle_key: Symbol,
+    pub expected_token: Address,
     pub trigger_type: TriggerType,
     pub oracle_data_type: Symbol,
     pub trigger_threshold: i128,

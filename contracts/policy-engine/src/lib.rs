@@ -394,6 +394,7 @@ impl PolicyEngine {
             name: params.name,
             category: params.category,
             oracle_key: params.oracle_key,
+            expected_token: params.expected_token,
             trigger_type: params.trigger_type,
             oracle_data_type: params.oracle_data_type,
             trigger_threshold: params.trigger_threshold,
@@ -494,6 +495,18 @@ impl PolicyEngine {
 
     /// Admin-only: permanently retire a product. It is removed from the active list and its
     /// `(category, oracle_key)` slot is freed so another product may reuse it.
+    ///
+    /// The name index is released too (issue #570). Freeing the name matters
+    /// as much as freeing the oracle key: `create_product` rejects a name that
+    /// is still mapped, so leaving the uniqueness index behind would outlive
+    /// the product it describes and the admin could never re-launch the same
+    /// product line under the same name. It would also silently reserve a
+    /// name that no live product answers to, which is the behaviour users see
+    /// as "that name is taken" for a product that no longer exists.
+    ///
+    /// The `(category, oracle_key)` slot and the pool's product count keep
+    /// their existing decrement behaviour, so retiring a product never leaves
+    /// the pool's accounting or a live product's key untouched.
     pub fn deprecate_product(env: Env, admin: Address, product_id: u128) {
         Self::require_admin(&env, &admin);
         let mut product: InsuranceProduct = Self::load_product(&env, product_id);
@@ -534,6 +547,15 @@ impl PolicyEngine {
                 .extend_ttl(&pool_count_key, TTL_THRESHOLD, TTL_EXTEND_TO);
         }
 
+        // Release the name so a successor product can take it (issue #570).
+        // Only remove the index entry when it still points at *this* product:
+        // a stale mapping left by an earlier product must not be dropped just
+        // because a different product happened to share the name.
+        let name_key = StorageKey::ProductName(product.name.clone());
+        if env.storage().persistent().get::<_, u128>(&name_key) == Some(product_id) {
+            env.storage().persistent().remove(&name_key);
+        }
+
         let key = (product.category, product.oracle_key);
         env.storage()
             .persistent()
@@ -557,11 +579,12 @@ impl PolicyEngine {
         coverage_amount: i128,
         duration_days: u32,
         oracle_key: Symbol,
+        payment_token: Address,
     ) -> u128 {
         buyer.require_auth();
         Self::ensure_not_paused(&env);
         let now = env.ledger().timestamp();
-        Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key, now)
+        Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key, now, &payment_token)
     }
 
     /// Buy an insurance policy that starts at `start_time` instead of now.
@@ -578,10 +601,11 @@ impl PolicyEngine {
         duration_days: u32,
         oracle_key: Symbol,
         start_time: u64,
+        payment_token: Address,
     ) -> u128 {
         buyer.require_auth();
         Self::ensure_not_paused(&env);
-        Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key, start_time)
+        Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key, start_time, &payment_token)
     }
 
     /// Buy multiple policies in a single atomic transaction.
@@ -612,6 +636,7 @@ impl PolicyEngine {
                 item.duration_days,
                 item.oracle_key,
                 now,
+                &item.payment_token,
             ));
         }
         ids
@@ -625,6 +650,7 @@ impl PolicyEngine {
         duration_days: u32,
         oracle_key: Symbol,
         start_time: u64,
+        payment_token: &Address,
     ) -> u128 {
         // Issue #522: never allow a backdated start.
         if start_time < env.ledger().timestamp() {
@@ -647,6 +673,11 @@ impl PolicyEngine {
         if duration_days == 0 {
             panic_with_error!(env, Error::InvalidDurationRange);
         }
+        // Issue #623: validate duration_days against the product ceiling
+        // explicitly.  The computed (end_time - start_time) must never
+        // exceed max_duration_days * 86_400 seconds.  Checking the
+        // parameter here (before any arithmetic) ensures this holds even
+        // for scheduled-start policies where start_time != now.
         if duration_days > product.max_duration_days {
             panic_with_error!(env, Error::DurationTooLong);
         }
@@ -664,15 +695,14 @@ impl PolicyEngine {
             .and_then(|v| v.checked_div(10_000))
             .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
         
-        let usdc: Address = env
-            .storage()
-            .instance()
-            .get(&StorageKey::UsdcToken)
-            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        // SECURITY FIX: reject payment if token does not match the product's expected token
+        if payment_token != &product.expected_token {
+            panic_with_error!(&env, Error::InvalidToken);
+        }
 
         // SECURITY FIX: Transfer the calculated required premium amount, not any caller-provided value.
         // This ensures the premium matches the product's premium_rate.
-        token::Client::new(env, &usdc).transfer(buyer, &env.current_contract_address(), &required_premium);
+        token::Client::new(env, payment_token).transfer(buyer, &env.current_contract_address(), &required_premium);
 
         let now = env.ledger().timestamp();
         let duration_secs = (duration_days as u64)
@@ -683,6 +713,15 @@ impl PolicyEngine {
             .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
         if end_time <= start_time {
             panic_with_error!(env, Error::InvalidDurationRange);
+        }
+        // Issue #623: defense-in-depth -- confirm the computed span does
+        // not exceed max_duration_days * 86_400 seconds.  This catches any
+        // future code path that might compute duration_secs independently.
+        let max_duration_secs = (product.max_duration_days as u64)
+            .checked_mul(86_400)
+            .unwrap_or(u64::MAX);
+        if end_time.saturating_sub(start_time) > max_duration_secs {
+            panic_with_error!(env, Error::DurationTooLong);
         }
         let policy_id = Self::next_policy_id(env);
 
