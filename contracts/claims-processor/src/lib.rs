@@ -106,6 +106,8 @@ enum StorageKey {
     PendingUpgrade,
     /// Seconds a claim may sit Pending before it can be escalated (u64).
     EscalationThreshold,
+    /// Per-category escalation threshold (Symbol -> u64).
+    CategoryEscalationThreshold(Symbol),
     /// Maximum seconds after a policy's `end_time` during which a claim may
     /// still be submitted for the triggering event (u64). `0` means a claim
     /// can only be filed while the policy is Active (behaves as before).
@@ -186,6 +188,8 @@ pub enum Error {
     /// resolves disputes and controls payout configuration; letting them
     /// also be the claimant is self-dealing (issue #566).
     AdminCannotBeClaimant = 29,
+    /// Payout delay exceeds the maximum allowed 365 days.
+    PayoutDelayTooLong = 30,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -1448,9 +1452,31 @@ impl ClaimsProcessor {
         );
     }
 
-    /// The escalation threshold in seconds (default: 7 days).
+    pub fn set_category_escalation_threshold(env: Env, admin: Address, category: Symbol, threshold: u64) {
+        Self::require_admin(&env, &admin);
+
+        if threshold < MIN_ESCALATION_THRESHOLD {
+            panic_with_error!(&env, Error::InvalidThresholdValue);
+        }
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::CategoryEscalationThreshold(category.clone()), &threshold);
+
+        env.events().publish(
+            (Symbol::new(&env, "category_escalation_threshold_set"), category),
+            EscalationThresholdUpdated { threshold },
+        );
+    }
+
     pub fn get_escalation_threshold(env: Env) -> u64 {
-        Self::escalation_threshold(&env)
+        Self::escalation_threshold(&env, None)
+    }
+
+    pub fn get_category_escalation_threshold(env: Env, category: Symbol) -> Option<u64> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::CategoryEscalationThreshold(category))
     }
 
     /// How long a claim has been waiting, and whether it can be escalated yet.
@@ -1464,7 +1490,10 @@ impl ClaimsProcessor {
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
 
-        let threshold = Self::escalation_threshold(&env);
+        let policy_engine_id = Self::policy_engine(&env);
+        let policy = parashield_policy_engine::PolicyEngineClient::new(&env, &policy_engine_id).get_policy(&claim.policy_id);
+        let product = parashield_policy_engine::PolicyEngineClient::new(&env, &policy_engine_id).get_product(&policy.product_id);
+        let threshold = Self::escalation_threshold(&env, Some(product.category));
         let now = env.ledger().timestamp();
         let is_pending = claim.status == ClaimStatus::Pending;
         let pending_for = if is_pending {
@@ -1530,16 +1559,9 @@ impl ClaimsProcessor {
     /// before funds leave the pool. `0` restores immediate payout behavior.
     pub fn set_payout_delay(env: Env, admin: Address, delay_seconds: u64) {
         Self::require_admin(&env, &admin);
-        // Issue #622: although delay_seconds is u64 (cannot be negative at
-        // the type level), explicitly validate that a non-zero delay is at
-        // least 1 second.  0 is the documented "disable" sentinel and is
-        // always valid; any positive value is a real delay and must be
-        // positive by definition.
-        // We also cap the maximum delay to 90 days so an admin cannot lock
-        // claim payouts indefinitely.
-        const MAX_PAYOUT_DELAY: u64 = 90 * 24 * 60 * 60; // 90 days
+        const MAX_PAYOUT_DELAY: u64 = 365 * 24 * 60 * 60; // 365 days
         if delay_seconds > MAX_PAYOUT_DELAY {
-            panic_with_error!(&env, Error::InvalidInput);
+            panic_with_error!(&env, Error::PayoutDelayTooLong);
         }
         env.storage().instance().set(&StorageKey::PayoutDelay, &delay_seconds);
         env.events().publish(
@@ -1704,7 +1726,12 @@ impl ClaimsProcessor {
 
         let now = env.ledger().timestamp();
         let pending_for = now.saturating_sub(claim.submitted_at);
-        if pending_for < Self::escalation_threshold(&env) {
+        let policy_engine_id = Self::policy_engine(&env);
+        let policy = parashield_policy_engine::PolicyEngineClient::new(&env, &policy_engine_id).get_policy(&claim.policy_id);
+        let product = parashield_policy_engine::PolicyEngineClient::new(&env, &policy_engine_id).get_product(&policy.product_id);
+        let threshold = Self::escalation_threshold(&env, Some(product.category));
+
+        if pending_for < threshold {
             panic_with_error!(&env, Error::NotEscalatable);
         }
 
@@ -1744,9 +1771,10 @@ impl ClaimsProcessor {
             .get(&StorageKey::PendingClaims)
             .unwrap_or_else(|| Vec::new(&env));
 
-        let threshold = Self::escalation_threshold(&env);
         let now = env.ledger().timestamp();
         let mut overdue: Vec<u128> = Vec::new(&env);
+        let policy_engine_id = Self::policy_engine(&env);
+        let pe_client = parashield_policy_engine::PolicyEngineClient::new(&env, &policy_engine_id);
 
         for i in 0..pending.len() {
             let cid = pending.get_unchecked(i);
@@ -1755,10 +1783,14 @@ impl ClaimsProcessor {
                 .persistent()
                 .get::<_, Claim>(&StorageKey::Claim(cid))
             {
-                if claim.status == ClaimStatus::Pending
-                    && now.saturating_sub(claim.submitted_at) >= threshold
-                {
-                    overdue.push_back(cid);
+                if claim.status == ClaimStatus::Pending {
+                    let policy = pe_client.get_policy(&claim.policy_id);
+                    let product = pe_client.get_product(&policy.product_id);
+                    let threshold = Self::escalation_threshold(&env, Some(product.category));
+                    
+                    if now.saturating_sub(claim.submitted_at) >= threshold {
+                        overdue.push_back(cid);
+                    }
                 }
             }
         }
@@ -2062,8 +2094,13 @@ impl ClaimsProcessor {
 
     /// Remove a claim id from the pending queue, if present.
 
-    /// The configured escalation threshold, or the default.
-    fn escalation_threshold(env: &Env) -> u64 {
+    /// The configured escalation threshold for a category, or the global default.
+    fn escalation_threshold(env: &Env, category: Option<Symbol>) -> u64 {
+        if let Some(cat) = category {
+            if let Some(val) = env.storage().instance().get(&StorageKey::CategoryEscalationThreshold(cat)) {
+                return val;
+            }
+        }
         env.storage()
             .instance()
             .get(&StorageKey::EscalationThreshold)

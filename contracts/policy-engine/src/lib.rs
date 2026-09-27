@@ -389,6 +389,7 @@ impl PolicyEngine {
             name: params.name,
             category: params.category,
             oracle_key: params.oracle_key,
+            expected_token: params.expected_token,
             trigger_type: params.trigger_type,
             oracle_data_type: params.oracle_data_type,
             trigger_threshold: params.trigger_threshold,
@@ -552,11 +553,12 @@ impl PolicyEngine {
         coverage_amount: i128,
         duration_days: u32,
         oracle_key: Symbol,
+        payment_token: Address,
     ) -> u128 {
         buyer.require_auth();
         Self::ensure_not_paused(&env);
         let now = env.ledger().timestamp();
-        Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key, now)
+        Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key, now, &payment_token)
     }
 
     /// Buy an insurance policy that starts at `start_time` instead of now.
@@ -573,10 +575,11 @@ impl PolicyEngine {
         duration_days: u32,
         oracle_key: Symbol,
         start_time: u64,
+        payment_token: Address,
     ) -> u128 {
         buyer.require_auth();
         Self::ensure_not_paused(&env);
-        Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key, start_time)
+        Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key, start_time, &payment_token)
     }
 
     /// Buy multiple policies in a single atomic transaction.
@@ -607,6 +610,7 @@ impl PolicyEngine {
                 item.duration_days,
                 item.oracle_key,
                 now,
+                &item.payment_token,
             ));
         }
         ids
@@ -620,6 +624,7 @@ impl PolicyEngine {
         duration_days: u32,
         oracle_key: Symbol,
         start_time: u64,
+        payment_token: &Address,
     ) -> u128 {
         // Issue #522: never allow a backdated start.
         if start_time < env.ledger().timestamp() {
@@ -664,15 +669,14 @@ impl PolicyEngine {
             .and_then(|v| v.checked_div(10_000))
             .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
         
-        let usdc: Address = env
-            .storage()
-            .instance()
-            .get(&StorageKey::UsdcToken)
-            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        // SECURITY FIX: reject payment if token does not match the product's expected token
+        if payment_token != &product.expected_token {
+            panic_with_error!(&env, Error::InvalidToken);
+        }
 
         // SECURITY FIX: Transfer the calculated required premium amount, not any caller-provided value.
         // This ensures the premium matches the product's premium_rate.
-        token::Client::new(env, &usdc).transfer(buyer, &env.current_contract_address(), &required_premium);
+        token::Client::new(env, payment_token).transfer(buyer, &env.current_contract_address(), &required_premium);
 
         let now = env.ledger().timestamp();
         let duration_secs = (duration_days as u64)
