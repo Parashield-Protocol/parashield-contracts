@@ -490,6 +490,18 @@ impl PolicyEngine {
 
     /// Admin-only: permanently retire a product. It is removed from the active list and its
     /// `(category, oracle_key)` slot is freed so another product may reuse it.
+    ///
+    /// The name index is released too (issue #570). Freeing the name matters
+    /// as much as freeing the oracle key: `create_product` rejects a name that
+    /// is still mapped, so leaving the uniqueness index behind would outlive
+    /// the product it describes and the admin could never re-launch the same
+    /// product line under the same name. It would also silently reserve a
+    /// name that no live product answers to, which is the behaviour users see
+    /// as "that name is taken" for a product that no longer exists.
+    ///
+    /// The `(category, oracle_key)` slot and the pool's product count keep
+    /// their existing decrement behaviour, so retiring a product never leaves
+    /// the pool's accounting or a live product's key untouched.
     pub fn deprecate_product(env: Env, admin: Address, product_id: u128) {
         Self::require_admin(&env, &admin);
         let mut product: InsuranceProduct = Self::load_product(&env, product_id);
@@ -528,6 +540,15 @@ impl PolicyEngine {
             env.storage()
                 .persistent()
                 .extend_ttl(&pool_count_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+
+        // Release the name so a successor product can take it (issue #570).
+        // Only remove the index entry when it still points at *this* product:
+        // a stale mapping left by an earlier product must not be dropped just
+        // because a different product happened to share the name.
+        let name_key = StorageKey::ProductName(product.name.clone());
+        if env.storage().persistent().get::<_, u128>(&name_key) == Some(product_id) {
+            env.storage().persistent().remove(&name_key);
         }
 
         let key = (product.category, product.oracle_key);
