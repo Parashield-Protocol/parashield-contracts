@@ -23,7 +23,7 @@ use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    Address, BytesN, Env, Vec, Symbol, IntoVal,
+    Address, BytesN, Env, Vec, Symbol, SymbolStr, TryFromVal, IntoVal,
 };
 
 pub mod types;
@@ -190,6 +190,10 @@ pub enum Error {
     AdminCannotBeClaimant = 29,
     /// Payout delay exceeds the maximum allowed 365 days.
     PayoutDelayTooLong = 30,
+    /// Dispute reason cannot be empty (issue #582).
+    EmptyDisputeReason = 31,
+    /// Dispute reason exceeds maximum allowed length (issue #642).
+    DisputeReasonTooLong = 32,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -207,6 +211,9 @@ const CLAIM_RETENTION_SECONDS: u64 = 365 * 24 * 60 * 60;
 /// of installments could exhaust storage and gas. 12 monthly installments
 /// (one year) is a reasonable upper bound for parametric insurance payouts.
 const MAX_INSTALLMENTS: u32 = 12;
+
+/// Maximum length of a dispute reason symbol (issue #642).
+const MAX_DISPUTE_REASON_LEN: u32 = 32;
 
 /// How long a claim may sit Pending before anyone can escalate it, when the
 /// admin has not configured a threshold.
@@ -852,8 +859,16 @@ impl ClaimsProcessor {
         {
             panic_with_error!(&env, Error::AlreadyProcessed);
         }
-        if reason == soroban_sdk::Symbol::new(&env, "") {
+        let reason_str: Result<SymbolStr, _> = SymbolStr::try_from_val(&env, &reason.to_symbol_val());
+        let len = match reason_str {
+            Ok(s) => s.len(),
+            Err(_) => panic_with_error!(&env, Error::DisputeReasonTooLong),
+        };
+        if len == 0 {
             panic_with_error!(&env, Error::EmptyDisputeReason);
+        }
+        if len > MAX_DISPUTE_REASON_LEN {
+            panic_with_error!(&env, Error::DisputeReasonTooLong);
         }
         claim.status = ClaimStatus::Disputed;
         claim.dispute_reason = Some(reason.clone());
