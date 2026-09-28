@@ -549,6 +549,24 @@ fn test_cannot_redispute_disputed_claim() {
     cp.dispute_claim(&buyer, &claim_id, &symbol_short!("again"));
 }
 
+// ── Dispute reason validation (Issue #582) ────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #31)")]
+fn test_dispute_claim_empty_reason_fails() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 72_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    cp.process_claim(&w.keeper, &claim_id, &None);
+
+    cp.dispute_claim(&buyer, &claim_id, &Symbol::new(&w.env, ""));
+}
+
 // ── Address validation (Issue #12) ───────────────────────────────────────────────
 
 /// Test that initialize accepts valid Stellar addresses (generated addresses are always valid)

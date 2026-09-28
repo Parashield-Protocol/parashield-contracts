@@ -299,6 +299,13 @@ fn test_withdraw_negative_shares_panics() {
 
 #[test]
 #[should_panic(expected = "Error(Contract, #5)")]
+fn test_withdraw_zero_shares_panics() {
+    let (_, pool, _, _, _, lp1) = setup();
+    pool.withdraw(&lp1, &0i128); // zero amount must trigger Error::ZeroAmount (#5)
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
 fn test_lock_negative_coverage_panics() {
     let (_, pool, _, admin, _, _) = setup();
     pool.lock_for_policy(&admin, &1u128, &-500i128); // negative entries must trigger Error::ZeroAmount (#5)

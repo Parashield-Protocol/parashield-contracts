@@ -90,6 +90,10 @@ const MAX_MULTIPLIER_BPS: u32 = 100_000;
 // defaults" flag — so introducing named constants only for the doc
 // comment would leave `dead_code` in the crate.
 
+/// Maximum byte length for a proposal title (issue #584). Long titles waste
+/// storage and inflate transaction costs without adding governance value.
+const MAX_TITLE_LEN: u32 = 256;
+
 #[contracttype]
 enum StorageKey {
     Initialized,
@@ -201,6 +205,8 @@ pub enum Error {
     InvalidTimeWeight = 45,
     /// Proposal description (title) cannot be empty. (issue #561)
     EmptyDescription = 47,
+    /// Proposal title exceeds the maximum allowed length. (issue #584)
+    TitleTooLong = 48,
 }
 
 #[contract]
@@ -289,6 +295,9 @@ impl GovernanceDao {
         
         if title.is_empty() {
             panic_with_error!(&env, Error::EmptyDescription);
+        }
+        if title.len() > MAX_TITLE_LEN {
+            panic_with_error!(&env, Error::TitleTooLong);
         }
         
         // SECURITY FIX: Validate impact analysis length to prevent storage exhaustion.

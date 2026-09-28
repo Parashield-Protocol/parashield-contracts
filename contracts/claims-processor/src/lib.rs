@@ -190,6 +190,8 @@ pub enum Error {
     AdminCannotBeClaimant = 29,
     /// Payout delay exceeds the maximum allowed 365 days.
     PayoutDelayTooLong = 30,
+    /// Dispute reason cannot be empty (issue #582).
+    EmptyDisputeReason = 31,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
