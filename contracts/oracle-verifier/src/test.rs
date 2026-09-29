@@ -220,6 +220,24 @@ fn test_remove_oracle_deactivates() {
     assert_eq!(agg_after.median_value, 50_000_000i128);
 }
 
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_submit_data_empty_key_fails() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle, &weather(), &80u32);
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &Symbol::new(&env, ""),
+        &50_000_000i128,
+        &90u32,
+        &1748736000u64,
+    );
+}
+
 // ── Issue #135: OracleList must not retain soft-deleted addresses ─────────────
 
 #[test]

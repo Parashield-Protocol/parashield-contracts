@@ -437,9 +437,14 @@ impl RiskPool {
         let position: LpPosition = match env.storage().persistent().get::<_, LpPosition>(&lp_key) {
             Some(mut pos) => {
                 pending_yield = Self::settle_yield(&env, &mut pos);
-                pos.deposited += amount;
-                pos.shares    += new_shares;
-                pos.yield_debt = (env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0) * pos.shares) / 1_000_000_000_000;
+                pos.deposited = pos.deposited.checked_add(amount)
+                    .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+                pos.shares = pos.shares.checked_add(new_shares)
+                    .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+                let acc_per_share: i128 = env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0);
+                pos.yield_debt = acc_per_share.checked_mul(pos.shares)
+                    .and_then(|v| v.checked_div(1_000_000_000_000))
+                    .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
                 pos.compound_enabled = compound_enabled;
                 pos
             }
@@ -452,12 +457,15 @@ impl RiskPool {
                 Self::extend_to_max(&env, &lp_address_key);
                 env.storage().instance().set(&StorageKey::LpCount, &(count + 1));
                 let acc_per_share: i128 = env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0);
+                let yield_debt = acc_per_share.checked_mul(new_shares)
+                    .and_then(|v| v.checked_div(1_000_000_000_000))
+                    .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
                 LpPosition {
                     provider:         provider.clone(),
                     deposited:        amount,
                     shares:           new_shares,
                     yield_claimed:    0,
-                    yield_debt:        (acc_per_share * new_shares) / 1_000_000_000_000,
+                    yield_debt,
                     deposited_at:     now,
                     last_yield_claim: now,
                     compound_enabled,
@@ -468,8 +476,13 @@ impl RiskPool {
         };
         env.storage().persistent().set(&lp_key, &position);
         Self::extend_to_max(&env, &lp_key);
-        env.storage().instance().set(&StorageKey::TotalDeposited, &(total_deposited + amount));
-        env.storage().instance().set(&StorageKey::TotalShares,    &(total_shares + new_shares + burn_shares));
+        let new_total_deposited = total_deposited.checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+        let new_total_shares = total_shares.checked_add(new_shares)
+            .and_then(|s| s.checked_add(burn_shares))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+        env.storage().instance().set(&StorageKey::TotalDeposited, &new_total_deposited);
+        env.storage().instance().set(&StorageKey::TotalShares, &new_total_shares);
 
         env.events().publish(
             (Symbol::new(&env, "liquidity_deposited"),),
