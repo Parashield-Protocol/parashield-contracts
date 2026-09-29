@@ -642,6 +642,27 @@ impl PolicyEngine {
         if start_time < env.ledger().timestamp() {
             panic_with_error!(env, Error::InvalidStartTime);
         }
+        
+        // SECURITY FIX: Validate oracle_key length to prevent excessively long keys
+        // that could cause issues with oracle lookups. Backend validates max 32 chars,
+        // but direct contract calls could bypass that. Enforce the same limit on-chain.
+        {
+            let sym_val = oracle_key.to_symbol_val();
+            let sym_str: Result<soroban_sdk::SymbolStr, _> = soroban_sdk::SymbolStr::try_from_val(env, &sym_val);
+            match sym_str {
+                Ok(s) => {
+                    let s_str: &str = s.as_ref();
+                    let bytes: &[u8] = s_str.as_bytes();
+                    // Reject oracle keys longer than 32 characters
+                    if bytes.len() > 32 {
+                        panic_with_error!(env, Error::InvalidOracleKey);
+                    }
+                }
+                Err(_) => {
+                    panic_with_error!(env, Error::InvalidOracleKey);
+                }
+            }
+        }
         // The admin controls product configuration and policy settlement
         // wiring, so allowing them to be a policyholder creates a direct
         // self-dealing path.

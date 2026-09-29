@@ -192,8 +192,6 @@ pub enum Error {
     PayoutDelayTooLong = 30,
     /// Dispute reason cannot be empty (issue #582).
     EmptyDisputeReason = 31,
-    /// Dispute reason exceeds maximum allowed length (issue #642).
-    DisputeReasonTooLong = 32,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert

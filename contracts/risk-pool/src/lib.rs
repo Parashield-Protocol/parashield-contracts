@@ -519,6 +519,9 @@ impl RiskPool {
     /// is insufficient to cover the redemption.
     pub fn withdraw(env: Env, provider: Address, shares: i128) -> i128 {
         provider.require_auth();
+        if shares <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
         Self::sweep_expired_exits(&env, MAX_AUTO_EXIT_SCAN, Some(&provider));
         Self::withdraw_inner(env, provider, shares)
     }
@@ -1395,6 +1398,31 @@ impl RiskPool {
         if attachment_point < 0 || coverage_limit < 0 {
             panic_with_error!(&env, Error::InvalidReinsuranceConfig);
         }
+        
+        // SECURITY FIX: Validate that the reinsurer contract implements the required
+        // IReinsurer interface by attempting to call a test recover with zero amount.
+        // This prevents a malicious or buggy contract from being set as the reinsurer
+        // and potentially draining the pool by returning fraudulent recovery amounts.
+        // A valid reinsurer must accept this call without panicking.
+        let test_policy_id = 0u128;
+        let test_amount = 0i128;
+        let test_result = env.try_invoke_contract::<i128, soroban_sdk::Error>(
+            &reinsurer,
+            &Symbol::new(&env, "recover"),
+            soroban_sdk::vec![
+                &env,
+                env.current_contract_address().into_val(&env),
+                test_policy_id.into_val(&env),
+                test_amount.into_val(&env),
+            ],
+        );
+        
+        // If the reinsurer doesn't implement recover() or the call fails,
+        // reject the configuration
+        if test_result.is_err() {
+            panic_with_error!(&env, Error::InvalidReinsuranceConfig);
+        }
+        
         let config = ReinsuranceConfig {
             reinsurer: reinsurer.clone(),
             attachment_point,

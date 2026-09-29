@@ -110,23 +110,36 @@ fn cannot_initialize_twice() {
 // ── proposal creation ─────────────────────────────────────────────────────────
 
 #[test]
-#[test]
-#[should_panic(expected = "HostError: Error(Contract, #47)")]
+#[should_panic(expected = "Error(Contract, #47)")]
 fn create_proposal_empty_description_fails() {
-    let (env, dao, admin) = setup_dao();
-    let proposer = generate_address(&env);
-    fund_account(&env, &admin, &proposer, 1_000_000_000);
-    
+    let (env, dao, _, voter1, _, target) = setup();
     dao.create_proposal(
-        &proposer,
-        &Bytes::new(&env), // Empty description
-        &dao.address,
-        &Symbol::new(&env, "some_func"),
-        &soroban_sdk::vec![&env],
+        &voter1,
+        &Bytes::new(&env),
+        &target,
+        &Symbol::new(&env, "update"),
+        &Vec::new(&env),
         &Bytes::from_slice(&env, b"impact"),
     );
 }
 
+#[test]
+#[should_panic(expected = "Error(Contract, #48)")]
+fn create_proposal_title_too_long_fails() {
+    let (env, dao, _, voter1, _, target) = setup();
+    let long_title = Bytes::from_slice(&env, &[b'x'; 257]);
+    dao.create_proposal(
+        &voter1,
+        &long_title,
+        &target,
+        &Symbol::new(&env, "update"),
+        &Vec::new(&env),
+        &Bytes::from_slice(&env, b"impact analysis"),
+    );
+}
+
+
+#[test]
 fn create_proposal_increments_counter() {
     let (env, dao, _, voter1, _, target) = setup();
     let args: Vec<Val> = Vec::new(&env);
