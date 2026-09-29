@@ -2390,6 +2390,9 @@ impl GovernanceDao {
 
         let avg_bps = avg.unwrap_or(0);
 
+        // SECURITY FIX: When participation history is empty (no recent proposals),
+        // fall back to base quorum. This prevents division by zero and ensures
+        // the DAO works correctly before any proposals have been finalized.
         if !decay.enabled || avg.is_none() {
             return EffectiveQuorum {
                 quorum_bps: base_bps,
