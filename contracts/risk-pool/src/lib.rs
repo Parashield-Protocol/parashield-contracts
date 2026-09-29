@@ -506,6 +506,9 @@ impl RiskPool {
     /// is insufficient to cover the redemption.
     pub fn withdraw(env: Env, provider: Address, shares: i128) -> i128 {
         provider.require_auth();
+        if shares <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
         Self::sweep_expired_exits(&env, MAX_AUTO_EXIT_SCAN, Some(&provider));
         Self::withdraw_inner(env, provider, shares)
     }
