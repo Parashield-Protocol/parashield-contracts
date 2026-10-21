@@ -154,6 +154,9 @@ enum StorageKey {
     /// Discussion). Cleared when the proposal resolves so the same action can
     /// be re-proposed after the previous one closes. Issue #630.
     ActiveProposalHash(BytesN<32>),
+    /// Proposal content hash at creation time: proposal_id -> BytesN<32>.
+    /// Verified at execution time to ensure payload integrity (issue #771).
+    ProposalHash(u64),
 }
 
 
@@ -169,7 +172,8 @@ pub enum Error {
     ProposalNotActive = 6,
     AlreadyVoted = 7,
     VotingClosed = 8,
-    VotingStillOpen = 9,
+    /// Proposal payload content hash does not match stored hash on execution (issue #771).
+    HashMismatch = 9,
     ProposalNotPassed = 10,
     AlreadyExecuted = 11,
     AlreadyCancelled = 12,
@@ -205,8 +209,6 @@ pub enum Error {
     ExecutionDeadlineExpired = 42,
     /// Proposal has been vetoed by a guardian and can never be executed.
     ProposalVetoed = 43,
-    /// `finalize_batch` was called with more proposals than allowed.
-    BatchTooLarge = 46,
     /// `set_impact_multipliers` was called with a multiplier below
     /// `MIN_MULTIPLIER_BPS` (would de-escalate) or above `MAX_MULTIPLIER_BPS`
     /// (would brick proposal creation). Issue #438.
@@ -420,6 +422,9 @@ impl GovernanceDao {
 
         let proposal_key = StorageKey::Proposal(proposal_id);
         env.storage().persistent().set(&proposal_key, &proposal);
+        let proposal_hash_key = StorageKey::ProposalHash(proposal_id);
+        env.storage().persistent().set(&proposal_hash_key, &content_hash);
+        Self::extend_proposal_ttl(&env, &proposal_hash_key, &config);
         env.storage()
             .instance()
             .set(&StorageKey::NextProposalId, &(proposal_id.checked_add(1).unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))));
@@ -568,6 +573,9 @@ impl GovernanceDao {
 
         let proposal_key = StorageKey::Proposal(proposal_id);
         env.storage().persistent().set(&proposal_key, &proposal);
+        let proposal_hash_key = StorageKey::ProposalHash(proposal_id);
+        env.storage().persistent().set(&proposal_hash_key, &upgrade_content_hash);
+        Self::extend_proposal_ttl(&env, &proposal_hash_key, &config);
         env.storage().instance().set(
             &StorageKey::NextProposalId,
             &(proposal_id
@@ -1273,7 +1281,7 @@ impl GovernanceDao {
         // Cap batch size to bound instruction budget.
         const MAX_BATCH_FINALIZE: u32 = 20;
         if proposal_ids.len() > MAX_BATCH_FINALIZE {
-            panic_with_error!(&env, Error::BatchTooLarge);
+            panic_with_error!(&env, Error::LimitReached);
         }
 
         let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
@@ -1468,6 +1476,26 @@ impl GovernanceDao {
         // Validate target address is a valid Stellar address before execution
         // This is a defense-in-depth check to prevent targeting invalid contracts
         Self::validate_stellar_address(&env, &proposal.target);
+
+        // SECURITY FIX (issue #771): Verify proposal content hash matches stored hash on execution.
+        // Prevents execution of tampered proposal payloads.
+        let payload_hash = Self::proposal_content_hash(
+            &env,
+            &proposal.target,
+            &proposal.function,
+            &proposal.args,
+        );
+        if let Some(stored_hash) = env
+            .storage()
+            .persistent()
+            .get::<_, BytesN<32>>(&StorageKey::ProposalHash(proposal_id))
+        {
+            if payload_hash != stored_hash {
+                panic_with_error!(&env, Error::HashMismatch);
+            }
+        } else {
+            panic_with_error!(&env, Error::HashMismatch);
+        }
 
         // A target may return u32 basis points (0..=10,000) to report
         // proportional completion. Existing unit/non-u32 returns remain
@@ -1966,7 +1994,7 @@ impl GovernanceDao {
 
         // Validate template payload structure (#694)
         if min_title_len == 0 || min_title_len > 256 || required_arg_count > 64 {
-            panic_with_error!(&env, Error::InvalidParameter);
+            panic_with_error!(&env, Error::InvalidInput);
         }
 
         if env.storage().instance().has(&StorageKey::Template(name.clone())) {
@@ -2091,6 +2119,14 @@ impl GovernanceDao {
         env.storage()
             .persistent()
             .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound))
+    }
+
+    /// Return the stored content hash for a proposal (issue #771).
+    pub fn get_proposal_hash(env: Env, proposal_id: u64) -> BytesN<32> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::ProposalHash(proposal_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound))
     }
 
@@ -2838,3 +2874,5 @@ impl GovernanceDao {
 mod test;
 #[cfg(test)]
 mod test_advanced;
+#[cfg(test)]
+mod test_proposal_hash;

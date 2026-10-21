@@ -57,6 +57,9 @@ pub const MIN_DEPOSIT: i128 = 1_000_000;
 /// Enforces that calculated shares cannot be 0 or infinitesimal when depositing into large pools.
 pub const MIN_SHARES: i128 = 1;
 
+/// Scaling factor for share price calculation (1e9 = 1_000_000_000) (issue #770).
+pub const SHARE_PRICE_SCALE: i128 = 1_000_000_000;
+
 /// Default ceiling on `total_locked / total_deposited`, in basis points.
 ///
 /// 10_000 (100%) preserves the historical behaviour exactly: before this was
@@ -484,9 +487,13 @@ impl RiskPool {
             }
             minted - burn_shares
         } else {
-            // Issue #621: integer division truncates toward zero; the
-            // MIN_SHARES guard below catches the resulting 0 case.
-            amount.checked_mul(total_shares)
+            // Issue #621, #770: Use precise arithmetic with consistent round-half-up
+            // rounding to prevent precision loss and value leakage on small deposits.
+            // Formula: (amount * total_shares + total_deposited / 2) / total_deposited
+            let prod = amount.checked_mul(total_shares)
+                .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+            let half = total_deposited / 2;
+            prod.checked_add(half)
                 .and_then(|v| v.checked_div(total_deposited))
                 .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow))
         };
@@ -1732,6 +1739,52 @@ impl RiskPool {
     /// Return the LP position for `provider`, or `None` if they have never deposited.
     pub fn get_position(env: Env, provider: Address) -> Option<LpPosition> {
         env.storage().persistent().get(&StorageKey::LpPosition(provider))
+    }
+
+    /// Return the per-share price scaled by `SHARE_PRICE_SCALE` (1e9) (issue #770).
+    ///
+    /// Computes `(total_deposited * 1e9 * SHARE_PRICE_SCALE + total_shares / 2) / total_shares`.
+    /// Uses 128-bit precise arithmetic with consistent round-half-up rounding to prevent
+    /// precision loss on small deposits. Returns `SHARE_PRICE_SCALE` if no shares exist.
+    pub fn get_share_price(env: Env) -> i128 {
+        let total_deposited: i128 = env.storage().instance().get(&StorageKey::TotalDeposited).unwrap_or(0);
+        let total_shares: i128 = env.storage().instance().get(&StorageKey::TotalShares).unwrap_or(0);
+        if total_shares == 0 {
+            return SHARE_PRICE_SCALE;
+        }
+        let prod = total_deposited
+            .checked_mul(1_000_000_000)
+            .and_then(|v| v.checked_mul(SHARE_PRICE_SCALE))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+        let half = total_shares / 2;
+        prod.checked_add(half)
+            .and_then(|v| v.checked_div(total_shares))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow))
+    }
+
+    /// Calculate the shares minted for a given deposit amount using precise arithmetic
+    /// and consistent round-half-up rounding (issue #770).
+    pub fn calculate_deposit_shares(env: Env, amount: i128) -> i128 {
+        if amount <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+        let total_deposited: i128 = env.storage().instance().get(&StorageKey::TotalDeposited).unwrap_or(0);
+        let total_shares: i128 = env.storage().instance().get(&StorageKey::TotalShares).unwrap_or(0);
+        if total_shares == 0 {
+            let minted = amount.checked_mul(SHARE_PRICE_SCALE)
+                .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+            if minted <= 1_000 {
+                panic_with_error!(&env, Error::DepositTooSmall);
+            }
+            minted - 1_000
+        } else {
+            let prod = amount.checked_mul(total_shares)
+                .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+            let half = total_deposited / 2;
+            prod.checked_add(half)
+                .and_then(|v| v.checked_div(total_deposited))
+                .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow))
+        }
     }
 
     /// Return the pool utilisation rate in basis points ((locked + queued_exits) / deposited × 10,000).
@@ -3539,3 +3592,6 @@ mod test_reentrancy;
 
 #[cfg(test)]
 mod test_guardians;
+
+#[cfg(test)]
+mod test_precision;

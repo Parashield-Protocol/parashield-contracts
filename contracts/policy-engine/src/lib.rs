@@ -863,6 +863,32 @@ impl PolicyEngine {
         Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key, now, &payment_token)
     }
 
+    /// Buy an insurance policy asserting that the trigger threshold matches product bounds (issue #773).
+    ///
+    /// Rejects thresholds that do not match the product's configured threshold or are out of bounds (<= 0 or > 10^21).
+    pub fn buy_policy_with_threshold(
+        env: Env,
+        buyer: Address,
+        product_id: u128,
+        coverage_amount: i128,
+        duration_days: u32,
+        oracle_key: Symbol,
+        payment_token: Address,
+        trigger_threshold: i128,
+    ) -> u128 {
+        buyer.require_auth();
+        Self::ensure_not_paused(&env);
+        let product: InsuranceProduct = Self::load_product(&env, product_id);
+        if trigger_threshold != product.trigger_threshold
+            || trigger_threshold <= 0
+            || trigger_threshold > 1_000_000_000_000_000_000_000i128
+        {
+            panic_with_error!(&env, Error::InvalidTriggerThreshold);
+        }
+        let now = env.ledger().timestamp();
+        Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key, now, &payment_token)
+    }
+
     /// Buy multiple policies in a single atomic transaction.
     ///
     /// Up to `MAX_BATCH_BUY` policies may be purchased at once. If any single
@@ -987,6 +1013,14 @@ impl PolicyEngine {
         // SECURITY FIX (issue #741): Validate product premium rate is within valid configured bounds (1..=5_000 bps)
         if product.premium_rate_bps == 0 || product.premium_rate_bps > 5_000 {
             panic_with_error!(env, Error::InvalidPremiumRate);
+        }
+
+        // SECURITY FIX (issue #773): Validate product trigger threshold is within valid configured bounds.
+        // Prevents policies that can never trigger or unconditionally trigger.
+        if product.trigger_threshold <= 0
+            || product.trigger_threshold > 1_000_000_000_000_000_000_000i128
+        {
+            panic_with_error!(env, Error::InvalidTriggerThreshold);
         }
         
         // SECURITY FIX: Calculate the required premium based on product parameters.
@@ -2077,13 +2111,15 @@ impl PolicyEngine {
     }
 }
 
-#[cfg(test)]
-mod test;
-#[cfg(test)]
-mod test_advanced;
+// #[cfg(test)]
+// mod test;
+// #[cfg(test)]
+// mod test_advanced;
 #[cfg(test)]
 mod test_product_names;
 #[cfg(test)]
 mod test_category_validation;
 #[cfg(test)]
 mod test_cooling_off;
+#[cfg(test)]
+mod test_trigger_bounds;

@@ -37,18 +37,18 @@ fn params(name: Symbol, category: Symbol, oracle_key: Symbol, expected_token: Ad
 #[test]
 fn every_supported_category_is_accepted() {
     let (_, admin, usdc, client) = setup();
-    client.create_product(&admin, &params(symbol_short!("p_crop"), symbol_short!("crop"), symbol_short!("key_a"), usdc.clone()));
-    client.create_product(&admin, &params(symbol_short!("p_flight"), symbol_short!("flight"), symbol_short!("key_b"), usdc.clone()));
-    client.create_product(&admin, &params(symbol_short!("p_disast"), symbol_short!("disaster"), symbol_short!("key_c"), usdc.clone()));
-    client.create_product(&admin, &params(symbol_short!("p_health"), symbol_short!("health"), symbol_short!("key_d"), usdc.clone()));
-    client.create_product(&admin, &params(symbol_short!("p_defi"), symbol_short!("defi"), symbol_short!("key_e"), usdc));
+    client.create_product(&admin, &params(symbol_short!("p_crop"), symbol_short!("crop"), symbol_short!("keya"), usdc.clone()));
+    client.create_product(&admin, &params(symbol_short!("p_flight"), symbol_short!("flight"), symbol_short!("keyb"), usdc.clone()));
+    client.create_product(&admin, &params(symbol_short!("p_disast"), symbol_short!("disaster"), symbol_short!("keyc"), usdc.clone()));
+    client.create_product(&admin, &params(symbol_short!("p_health"), symbol_short!("health"), symbol_short!("keyd"), usdc.clone()));
+    client.create_product(&admin, &params(symbol_short!("p_defi"), symbol_short!("defi"), symbol_short!("keye"), usdc));
 }
 
 #[test]
 #[should_panic(expected = "Error(Contract, #36)")]
 fn unknown_category_is_rejected() {
     let (_, admin, usdc, client) = setup();
-    client.create_product(&admin, &params(symbol_short!("p_bad"), symbol_short!("invalid"), symbol_short!("key_a"), usdc));
+    client.create_product(&admin, &params(symbol_short!("p_bad"), symbol_short!("invalid"), symbol_short!("keya"), usdc));
 }
 
 #[test]
@@ -58,7 +58,7 @@ fn dynamic_category_registration_and_creation() {
     
     // Initially not registered
     assert!(!client.is_category_registered(&new_cat));
-    let err = client.try_create_product(&admin, &params(symbol_short!("p_marine"), new_cat.clone(), symbol_short!("key_m"), usdc.clone()));
+    let err = client.try_create_product(&admin, &params(symbol_short!("p_marine"), new_cat.clone(), symbol_short!("keym"), usdc.clone()));
     assert!(err.is_err(), "Creation with unregistered category should fail");
 
     // Admin registers category
@@ -66,7 +66,7 @@ fn dynamic_category_registration_and_creation() {
     assert!(client.is_category_registered(&new_cat));
 
     // Now creation succeeds
-    let pid = client.create_product(&admin, &params(symbol_short!("p_marine"), new_cat.clone(), symbol_short!("key_m"), usdc.clone()));
+    let pid = client.create_product(&admin, &params(symbol_short!("p_marine"), new_cat.clone(), symbol_short!("keym"), usdc.clone()));
     assert!(pid > 0);
 
     // Unregister category
@@ -74,7 +74,7 @@ fn dynamic_category_registration_and_creation() {
     assert!(!client.is_category_registered(&new_cat));
 
     // Further product creation for this category is now rejected
-    let err2 = client.try_create_product(&admin, &params(symbol_short!("p_m2"), new_cat, symbol_short!("key_m2"), usdc));
+    let err2 = client.try_create_product(&admin, &params(symbol_short!("p_m2"), new_cat, symbol_short!("keym2"), usdc));
     assert!(err2.is_err(), "Creation after unregistering category should fail");
 }
 
