@@ -50,10 +50,13 @@ fn expect_rejected<T>(
 }
 
 fn params(name: Symbol, category: Symbol, oracle_key: Symbol) -> CreateProductParams {
+    let env = Env::default();
+    let expected_token = Address::generate(&env);
     CreateProductParams {
         name,
         category,
         oracle_key,
+        expected_token,
         trigger_type: TriggerType::Threshold,
         oracle_data_type: symbol_short!("weather"),
         trigger_threshold: 50_000_000,
@@ -68,8 +71,8 @@ fn params(name: Symbol, category: Symbol, oracle_key: Symbol) -> CreateProductPa
 #[test]
 fn distinct_names_are_accepted() {
     let (_, admin, client) = setup();
-    let a = client.create_product(&admin, &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("key_a")));
-    let b = client.create_product(&admin, &params(symbol_short!("drought"), symbol_short!("crop"), symbol_short!("key_b")));
+    let a = client.create_product(&admin, &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("keya")));
+    let b = client.create_product(&admin, &params(symbol_short!("drought"), symbol_short!("crop"), symbol_short!("keyb")));
     assert_ne!(a, b);
 }
 
@@ -77,26 +80,26 @@ fn distinct_names_are_accepted() {
 #[should_panic(expected = "Error(Contract, #34)")]
 fn duplicate_name_same_category_is_rejected() {
     let (_, admin, client) = setup();
-    client.create_product(&admin, &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("key_a")));
-    client.create_product(&admin, &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("key_b")));
+    client.create_product(&admin, &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("keya")));
+    client.create_product(&admin, &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("keyb")));
 }
 
 #[test]
 #[should_panic(expected = "Error(Contract, #34)")]
 fn duplicate_name_across_categories_is_rejected() {
     let (_, admin, client) = setup();
-    client.create_product(&admin, &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("key_a")));
-    client.create_product(&admin, &params(symbol_short!("rain"), symbol_short!("flight"), symbol_short!("key_b")));
+    client.create_product(&admin, &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("keya")));
+    client.create_product(&admin, &params(symbol_short!("rain"), symbol_short!("flight"), symbol_short!("keyb")));
 }
 
 #[test]
 fn rejected_duplicate_does_not_consume_a_slot_or_id() {
     let (_, admin, client) = setup();
-    let first = client.create_product(&admin, &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("key_a")));
-    let dup = client.try_create_product(&admin, &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("key_b")));
+    let first = client.create_product(&admin, &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("keya")));
+    let dup = client.try_create_product(&admin, &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("keyb")));
     assert!(dup.is_err());
     // The failed attempt must not have reserved the oracle key or an id.
-    let next = client.create_product(&admin, &params(symbol_short!("hail"), symbol_short!("crop"), symbol_short!("key_b")));
+    let next = client.create_product(&admin, &params(symbol_short!("hail"), symbol_short!("crop"), symbol_short!("keyb")));
     assert_eq!(next, first + 1);
 }
 
@@ -110,13 +113,13 @@ fn deprecating_a_product_frees_its_name() {
     let (_, admin, client) = setup();
     let original = client.create_product(
         &admin,
-        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("key_a")),
+        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("keya")),
     );
     client.deprecate_product(&admin, &original);
 
     let successor = expect_ok(client.try_create_product(
         &admin,
-        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("key_a")),
+        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("keya")),
     ));
     assert_ne!(successor, original, "a successor must be a new product id");
 }
@@ -129,14 +132,14 @@ fn deprecating_a_product_frees_name_and_oracle_key() {
     let (_, admin, client) = setup();
     let original = client.create_product(
         &admin,
-        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("key_a")),
+        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("keya")),
     );
     client.deprecate_product(&admin, &original);
 
     // Same name *and* same (category, oracle_key): the slot is free again.
     let successor = expect_ok(client.try_create_product(
         &admin,
-        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("key_a")),
+        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("keya")),
     ));
     assert_ne!(successor, original);
 }
@@ -149,11 +152,11 @@ fn deprecating_one_product_does_not_clear_another_products_name() {
     let (_, admin, client) = setup();
     let rain = client.create_product(
         &admin,
-        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("key_a")),
+        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("keya")),
     );
     let hail = client.create_product(
         &admin,
-        &params(symbol_short!("hail"), symbol_short!("crop"), symbol_short!("key_b")),
+        &params(symbol_short!("hail"), symbol_short!("crop"), symbol_short!("keyb")),
     );
 
     client.deprecate_product(&admin, &rain);
@@ -161,12 +164,12 @@ fn deprecating_one_product_does_not_clear_another_products_name() {
     // `hail` is untouched and still holds its name, so the name is refused.
     expect_rejected(client.try_create_product(
         &admin,
-        &params(symbol_short!("hail"), symbol_short!("crop"), symbol_short!("key_c")),
+        &params(symbol_short!("hail"), symbol_short!("crop"), symbol_short!("keyc")),
     ));
     // And the live product is still addressable under its own name.
     let replacement = expect_ok(client.try_create_product(
         &admin,
-        &params(symbol_short!("drought"), symbol_short!("crop"), symbol_short!("key_c")),
+        &params(symbol_short!("drought"), symbol_short!("crop"), symbol_short!("keyc")),
     ));
     assert!(replacement > hail);
 }
@@ -179,20 +182,20 @@ fn name_is_reusable_exactly_once_after_deprecation() {
     let (_, admin, client) = setup();
     let original = client.create_product(
         &admin,
-        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("key_a")),
+        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("keya")),
     );
     client.deprecate_product(&admin, &original);
 
     let successor = expect_ok(client.try_create_product(
         &admin,
-        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("key_a")),
+        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("keya")),
     ));
 
     // The name now belongs to the successor, so a third claim on it fails and
     // the successor keeps it.
     expect_rejected(client.try_create_product(
         &admin,
-        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("key_z")),
+        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("keyz")),
     ));
     let live = client.get_product(&successor);
     assert_eq!(
@@ -210,12 +213,12 @@ fn pausing_a_product_keeps_its_name_reserved() {
     let (_, admin, client) = setup();
     let original = client.create_product(
         &admin,
-        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("key_a")),
+        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("keya")),
     );
     client.pause_product(&admin, &original);
 
     expect_rejected(client.try_create_product(
         &admin,
-        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("key_b")),
+        &params(symbol_short!("rain"), symbol_short!("crop"), symbol_short!("keyb")),
     ));
 }

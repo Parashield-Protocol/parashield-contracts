@@ -120,6 +120,7 @@ fn create_crop_product(w: &World) -> u128 {
             name: symbol_short!("uniq_cism"),
             category: symbol_short!("crop"),
             oracle_key: symbol_short!("kis2606"),
+            expected_token: w.usdc.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -167,6 +168,7 @@ fn buy_policies(w: &mut World, buyer: &Address, n: usize) -> std::vec::Vec<u128>
             &COVERAGE,
             &30u32,
             &oracle_key,
+            &w.usdc,
         );
         RiskPoolClient::new(&w.env, &w.pool_id).lock_for_policy(&w.admin, &policy_id, &COVERAGE);
         out.push(policy_id);

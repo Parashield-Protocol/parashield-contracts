@@ -101,6 +101,7 @@ fn create_drought_product(te: &TestEnv) -> u128 {
             name: symbol_short!("drght"),
             category: symbol_short!("crop"),
             oracle_key: symbol_short!("kis2606"),
+            expected_token: te.usdc.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: weather(),
             trigger_threshold: 500_000_000i128,
@@ -146,6 +147,7 @@ fn batch_processes_multiple_pending_claims() {
         &1_000_0000000i128,
         &30u32,
         &symbol_short!("kis2606"),
+        &te.usdc,
     );
     let p2 = policy_client.buy_policy(
         &farmer2,
@@ -153,6 +155,7 @@ fn batch_processes_multiple_pending_claims() {
         &2_000_0000000i128,
         &30u32,
         &symbol_short!("kis2606"),
+        &te.usdc,
     );
 
     claims_client.submit_claim(&farmer1, &p1);
@@ -196,6 +199,7 @@ fn batch_skips_non_pending_claims() {
         &1_000_0000000i128,
         &30u32,
         &symbol_short!("kis2606"),
+        &te.usdc,
     );
     let _claim_id = claims_client.submit_claim(&farmer, &p1);
     // Process it once
@@ -241,6 +245,7 @@ fn test_stale_oracle_data_rejected() {
         &1_000_0000000i128,
         &30u32,
         &symbol_short!("kis2606"),
+        &te.usdc,
     );
 
     // Advance ledger to more than staleness_threshold (604_800 s) past the data timestamp
@@ -278,6 +283,7 @@ fn test_oracle_unavailable_queues_claim_then_retries() {
         &1_000_0000000i128,
         &30u32,
         &symbol_short!("kis2606"),
+        &te.usdc,
     );
 
     // Oracle has never received data: verification errors, claim is queued.
@@ -333,6 +339,7 @@ fn test_fresh_oracle_data_accepted() {
         &1_000_0000000i128,
         &30u32,
         &symbol_short!("kis2606"),
+        &te.usdc,
     );
 
     // Set ledger to within the staleness threshold (data is fresh)
@@ -357,6 +364,7 @@ fn test_equal_comparison() {
             name: symbol_short!("equal"),
             category: symbol_short!("flight"),
             oracle_key: symbol_short!("flight1"),
+            expected_token: te.usdc.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: weather(),
             trigger_threshold: 100_000_000i128,
@@ -390,6 +398,7 @@ fn test_equal_comparison() {
         &1_000_0000000i128,
         &30u32,
         &symbol_short!("flight1"),
+        &te.usdc,
     );
 
     let fresh_now = data_ts + 3_600;
@@ -419,6 +428,7 @@ fn dispute_removes_claim_from_pending_queue() {
         &1_000_0000000i128,
         &30u32,
         &symbol_short!("kis2606"),
+        &te.usdc,
     );
 
     // Submit enqueues the claim.

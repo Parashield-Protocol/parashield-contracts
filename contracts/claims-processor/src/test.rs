@@ -96,6 +96,7 @@ fn create_crop_product(w: &World) -> u128 {
             name:               symbol_short!("crop_kism"),
             category:           symbol_short!("crop"),
             oracle_key:         symbol_short!("kis2606"),
+            expected_token:     w.usdc.clone(),
             trigger_type:       TriggerType::Threshold,
             oracle_data_type:   symbol_short!("weather"),
             trigger_threshold:  50_000_000,
@@ -118,7 +119,7 @@ fn buy_crop_policy(w: &World, buyer: &Address, product_id: u128) -> u128 {
     StellarAssetClient::new(&w.env, &w.usdc).mint(&w.policy_id, &10_000_000_000i128);
     
     let policy_id = PolicyEngineClient::new(&w.env, &w.policy_id)
-        .buy_policy(buyer, &product_id, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+        .buy_policy(buyer, &product_id, &COVERAGE, &30u32, &symbol_short!("kis2606"), &w.usdc);
     
     // Lock coverage in the pool for this policy
     RiskPoolClient::new(&w.env, &w.pool_id).lock_for_policy(&w.admin, &policy_id, &COVERAGE);
@@ -1711,7 +1712,7 @@ fn test_payout_delay_within_bounds() {
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let delay = 365 * 24 * 60 * 60; // Exact max
     cp.set_payout_delay(&w.admin, &delay);
-    assert_eq!(cp.get_payout_delay(), delay);
+    assert_eq!(cp.get_payout_delay(), delay as u64);
 }
 
 #[test]

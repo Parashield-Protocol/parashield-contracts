@@ -1670,6 +1670,22 @@ impl ClaimsProcessor {
         if guardians.is_empty() && threshold > 0 {
             panic_with_error!(&env, Error::InvalidThreshold);
         }
+
+        let current_guardians: Vec<Address> = env.storage().instance().get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        let current_threshold: u32 = env.storage().instance().get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0);
+
+        if !current_guardians.is_empty() && current_threshold > 0 {
+            let pending = PendingGuardianConfig {
+                guardians,
+                threshold,
+                approvals: Vec::new(&env),
+            };
+            env.storage().instance().set(&StorageKey::PendingGuardianConfig, &pending);
+            return;
+        }
+
         env.storage().instance().set(&StorageKey::Guardians, &guardians);
         env.storage()
             .instance()
@@ -1678,6 +1694,46 @@ impl ClaimsProcessor {
             (Symbol::new(&env, "guardians_updated"),),
             GuardiansUpdated { guardians, threshold },
         );
+    }
+
+    /// Issue approval from a current guardian for a pending guardian configuration change.
+    pub fn approve_guardian_config(env: Env, guardian: Address) {
+        guardian.require_auth();
+        let guardians: Vec<Address> = env.storage().instance().get(&StorageKey::Guardians)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotGuardian));
+        let mut is_guardian = false;
+        for g in guardians.iter() {
+            if g == guardian {
+                is_guardian = true;
+                break;
+            }
+        }
+        if !is_guardian {
+            panic_with_error!(&env, Error::NotGuardian);
+        }
+
+        let mut pending: PendingGuardianConfig = env.storage().instance().get(&StorageKey::PendingGuardianConfig)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingUpgrade));
+
+        for a in pending.approvals.iter() {
+            if a == guardian {
+                panic_with_error!(&env, Error::AlreadyApprovedAction);
+            }
+        }
+        pending.approvals.push_back(guardian);
+
+        let threshold: u32 = env.storage().instance().get(&StorageKey::GuardianThreshold).unwrap_or(0);
+        if pending.approvals.len() >= threshold {
+            env.storage().instance().remove(&StorageKey::PendingGuardianConfig);
+            env.storage().instance().set(&StorageKey::Guardians, &pending.guardians);
+            env.storage().instance().set(&StorageKey::GuardianThreshold, &pending.threshold);
+            env.events().publish(
+                (Symbol::new(&env, "guardians_updated"),),
+                GuardiansUpdated { guardians: pending.guardians, threshold: pending.threshold },
+            );
+        } else {
+            env.storage().instance().set(&StorageKey::PendingGuardianConfig, &pending);
+        }
     }
 
     /// Update guardian threshold independently, validating threshold <= registered guardian count (issue #744).
@@ -1715,6 +1771,13 @@ impl ClaimsProcessor {
             .instance()
             .get(&StorageKey::GuardianThreshold)
             .unwrap_or(0)
+    }
+
+    /// Return the pending guardian configuration awaiting approval, if any.
+    pub fn get_pending_guardian_config(env: Env) -> Option<PendingGuardianConfig> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::PendingGuardianConfig)
     }
 
     /// Return the pending upgrade awaiting guardian approvals, if any.
@@ -2325,6 +2388,61 @@ impl ClaimsProcessor {
         );
 
         paid_amount
+    }
+
+    /// Calculate multi-recipient payout distribution according to the protocol dust policy (issue #772).
+    ///
+    /// Multi-recipient payouts truncate upon integer division. To prevent dust from accumulating
+    /// in escrow, the remainder is distributed in full to the last recipient, guaranteeing
+    /// zero dust after payout.
+    pub fn calculate_multi_recipient_payout(env: Env, total_amount: i128, num_recipients: u32) -> Vec<i128> {
+        if num_recipients == 0 || total_amount < 0 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        let count = num_recipients as i128;
+        let base_amount = total_amount / count;
+        let remainder = total_amount % count;
+
+        let mut distribution = Vec::new(&env);
+        for i in 0..num_recipients {
+            let amount = if i == num_recipients - 1 {
+                base_amount + remainder
+            } else {
+                base_amount
+            };
+            distribution.push_back(amount);
+        }
+        distribution
+    }
+
+    /// Distribute claim payout across multiple recipients with zero escrow dust (issue #772).
+    ///
+    /// Truncation remainder is fully distributed to the last recipient in `recipients`,
+    /// leaving zero unaccounted dust in escrow.
+    pub fn claim_payout_multi_recipient(env: Env, claim_id: u128, recipients: Vec<Address>) -> Vec<i128> {
+        if recipients.is_empty() {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        for i in 0..recipients.len() {
+            let r = recipients.get_unchecked(i);
+            Self::validate_stellar_address(&env, &r);
+        }
+
+        let total_payout = Self::claim_payout(env.clone(), claim_id);
+        let distribution = Self::calculate_multi_recipient_payout(env.clone(), total_payout, recipients.len());
+
+        let remainder = total_payout % (recipients.len() as i128);
+        env.events().publish(
+            (Symbol::new(&env, "multi_payout_distributed"),),
+            (claim_id, total_payout, remainder),
+        );
+
+        distribution
+    }
+
+    /// Alias for `claim_payout_multi_recipient` (issue #772).
+    pub fn payout_multi_recipient(env: Env, claim_id: u128, recipients: Vec<Address>) -> Vec<i128> {
+        Self::claim_payout_multi_recipient(env, claim_id, recipients)
     }
 
     /// Escalate a claim that has been Pending past the threshold.
@@ -3146,3 +3264,5 @@ mod test_advanced;
 mod test_keeper_registry;
 #[cfg(test)]
 mod test_claim_uniqueness;
+#[cfg(test)]
+mod test_dust;

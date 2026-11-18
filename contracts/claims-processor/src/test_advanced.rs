@@ -115,6 +115,7 @@ fn create_crop_product(w: &World) -> u128 {
             name: symbol_short!("crop_kism"),
             category: symbol_short!("crop"),
             oracle_key: symbol_short!("kis2606"),
+            expected_token: w.usdc.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -140,6 +141,7 @@ fn buy_crop_policy(w: &World, buyer: &Address, product_id: u128) -> u128 {
         &COVERAGE,
         &30u32,
         &symbol_short!("kis2606"),
+        &w.usdc,
     );
 
     // Lock coverage in the pool for this policy
@@ -297,6 +299,7 @@ fn test_staleness_threshold_boundary() {
             name: symbol_short!("crop"),
             category: symbol_short!("crop"),
             oracle_key: symbol_short!("kis2606"),
+            expected_token: usdc.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -319,6 +322,7 @@ fn test_staleness_threshold_boundary() {
         &COVERAGE,
         &30u32,
         &symbol_short!("kis2606"),
+        &usdc,
     );
     RiskPoolClient::new(&env, &pool_id).lock_for_policy(&admin, &pol_id, &COVERAGE);
 
@@ -414,6 +418,7 @@ fn test_maximum_coverage_boundary() {
             name: symbol_short!("max_cov"),
             category: symbol_short!("crop"),
             oracle_key: symbol_short!("kis2606"),
+            expected_token: w.usdc.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -437,6 +442,7 @@ fn test_maximum_coverage_boundary() {
         &10_000_000_000i128,
         &30u32,
         &symbol_short!("kis2606"),
+        &w.usdc,
     );
     RiskPoolClient::new(&w.env, &w.pool_id).lock_for_policy(&w.admin, &pol_id, &10_000_000_000i128);
 
@@ -466,6 +472,7 @@ fn test_minimum_coverage_boundary() {
         &100_000_000i128,
         &30u32,
         &symbol_short!("kis2606"),
+        &w.usdc,
     );
     RiskPoolClient::new(&w.env, &w.pool_id).lock_for_policy(&w.admin, &pol_id, &100_000_000i128);
 
