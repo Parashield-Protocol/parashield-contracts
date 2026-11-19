@@ -31,7 +31,7 @@ pub use types::*;
 // ─── Storage TTL ──────────────────────────────────────────────────────────────
 
 // Shared protocol constants — single source of truth in parashield-common (issue #342).
-use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK};
+use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK, ZERO_ADDRESS};
 const DEFAULT_MAX_PRODUCTS_PER_POOL: u32 = 100;
 const CURRENT_STORAGE_VERSION: u32 = 3;
 const MAX_BATCH_BUY: u32 = 20;
@@ -540,8 +540,8 @@ impl PolicyEngine {
         if params.premium_rate_bps > 5_000 {
             panic_with_error!(&env, Error::InvalidPremiumRate);
         }
-        // trigger_threshold must be strictly positive (issue #619) and within
-        // the 7-decimal fixed-point range used across the protocol
+        // trigger_threshold must be strictly positive (issue #619) and within the
+        // 7-decimal fixed-point range used across the protocol
         // (1 unit = 0.0000001; max ≈ 1 quadrillion). Zero or negative
         // thresholds would make every policy unconditionally payable.
         if params.trigger_threshold <= 0
@@ -2067,10 +2067,7 @@ impl PolicyEngine {
 
     /// Require that an address is not the zero address (issue #730).
     fn require_not_zero_address(env: &Env, address: &Address) {
-        let zero = Address::from_string(&soroban_sdk::String::from_str(
-            env,
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
-        ));
+        let zero = Address::from_string(&soroban_sdk::String::from_str(env, ZERO_ADDRESS));
         if *address == zero {
             panic_with_error!(env, Error::InvalidAddress);
         }

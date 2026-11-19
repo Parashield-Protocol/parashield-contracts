@@ -87,7 +87,7 @@ const TIMELOCK_SECONDS: u64 = 7 * 24 * 60 * 60;
 const PARAMETER_TIMELOCK_SECONDS: u64 = 2 * 24 * 60 * 60;
 
 // Shared protocol constants — single source of truth in parashield-common (issue #342).
-use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK};
+use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK, ZERO_ADDRESS};
 
 #[contracttype]
 pub(crate) enum StorageKey {
@@ -2682,9 +2682,7 @@ impl RiskPool {
                 },
             );
         } else {
-            env.storage()
-                .instance()
-                .set(&StorageKey::PendingGuardianRemoval, &pending);
+            env.storage().instance().set(&StorageKey::PendingGuardianRemoval, &pending);
         }
     }
 
@@ -2696,6 +2694,15 @@ impl RiskPool {
             panic_with_error!(&env, Error::NoPendingUpgrade);
         }
         env.storage().instance().remove(&StorageKey::PendingGuardianRemoval);
+    }
+
+    /// Cancel a pending admin approval for an admin change.
+    pub fn cancel_pending_admin_change(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        if !env.storage().instance().has(&StorageKey::PendingAdminChange) {
+            panic_with_error!(&env, Error::NoPendingUpgrade);
+        }
+        env.storage().instance().remove(&StorageKey::PendingAdminChange);
     }
 
     /// Read the currently armed guardian-removal proposal, if any.
@@ -2839,6 +2846,9 @@ impl RiskPool {
             .get(&StorageKey::PendingAdmin)
             .unwrap_or(None);
         if pending.is_some() {
+            panic_with_error!(&env, Error::AdminTransferPending);
+        }
+        if env.storage().instance().has(&StorageKey::PendingAdminChange) {
             panic_with_error!(&env, Error::AdminTransferPending);
         }
 
@@ -3011,7 +3021,7 @@ impl RiskPool {
     fn require_not_zero_address(env: &Env, address: &Address) {
         let zero = Address::from_string(&soroban_sdk::String::from_str(
             env,
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            ZERO_ADDRESS,
         ));
         if *address == zero {
             panic_with_error!(env, Error::InvalidAddress);
@@ -3497,7 +3507,7 @@ impl RiskPool {
             return;
         }
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
-        token::Client::new(env, &usdc)
+        token::Client::new(&env, &usdc)
             .transfer(&env.current_contract_address(), provider, &amount);
 
         env.events().publish(

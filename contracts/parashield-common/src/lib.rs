@@ -42,3 +42,12 @@ pub const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year at 5 s/ledger
 /// (claims-processor, risk-pool, oracle-verifier, policy-engine)
 /// must use this same value so the security guarantee is uniform.
 pub const ADMIN_TRANSFER_TIMELOCK: u64 = 48 * 60 * 60; // 48 hours in seconds
+
+// ─── Address constants ──────────────────────────────────────────────────────
+
+/// Stellar's canonical all-zero G-address (G...).
+///
+/// This value is used for runtime validation because SDK address parsing
+/// requires an environment. Centralising the StrKey here keeps every contract
+/// in agreement and makes an encoding change easy to update protocol-wide.
+pub const ZERO_ADDRESS: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
