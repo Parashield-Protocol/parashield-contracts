@@ -1171,8 +1171,7 @@ impl GovernanceDao {
         let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
         let total_supply = proposal.total_supply;
         
-        // SECURITY FIX: Only count For + Against votes toward quorum, not Abstain
-        // This prevents a proposal from passing with only abstain votes
+        // Abstain counts toward quorum (issue #385)
         let partisan_votes = proposal.votes_for + proposal.votes_against;
         let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
 
@@ -1198,11 +1197,10 @@ impl GovernanceDao {
             .and_then(|v| v.checked_div(10_000))
             .unwrap_or(i128::MAX);
 
-        if partisan_votes == 0 {
-            // No partisan votes (For or Against) — always fails, even with high abstain turnout.
-            // An all-Abstain proposal has no clear mandate.
+        if total_votes < quorum_needed {
             proposal.status = ProposalStatus::Failed;
-        } else if partisan_votes < quorum_needed {
+        } else if partisan_votes == 0 {
+            // Guard: if votes_for + votes_against == 0, proposal fails before majority check
             proposal.status = ProposalStatus::Failed;
         } else {
             // Majority is decided by the partisan (For/Against) split only —
@@ -1210,11 +1208,11 @@ impl GovernanceDao {
             // and must not also dilute the For share here, otherwise a large
             // abstaining bloc could sink a proposal that every partisan voter
             // supported (issue #385).
-            let for_bps = if partisan_votes > 0 {
-                proposal.votes_for.checked_mul(10_000).map(|v| v / partisan_votes).unwrap_or(0)
-            } else {
-                0
-            };
+            let for_bps = proposal
+                .votes_for
+                .checked_mul(10_000)
+                .map(|v| v / partisan_votes)
+                .unwrap_or(0);
             if for_bps >= config.majority_bps as i128 {
                 proposal.status = ProposalStatus::Passed;
                 proposal.execution_time = env.ledger().timestamp() + config.proposal_timelock;
@@ -1297,6 +1295,7 @@ impl GovernanceDao {
 
             let total_supply = proposal.total_supply;
             let partisan_votes = proposal.votes_for + proposal.votes_against;
+            let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
 
             let effective = Self::effective_quorum(&env, &config);
             if effective.decayed {
@@ -1316,16 +1315,17 @@ impl GovernanceDao {
                 .and_then(|v| v.checked_div(10_000))
                 .unwrap_or(i128::MAX);
 
-            if partisan_votes == 0 {
+            if total_votes < quorum_needed {
                 proposal.status = ProposalStatus::Failed;
-            } else if partisan_votes < quorum_needed {
+            } else if partisan_votes == 0 {
+                // Guard: if votes_for + votes_against == 0, proposal fails before majority check
                 proposal.status = ProposalStatus::Failed;
             } else {
-                let for_bps = if partisan_votes > 0 {
-                    proposal.votes_for.checked_mul(10_000).map(|v| v / partisan_votes).unwrap_or(0)
-                } else {
-                    0
-                };
+                let for_bps = proposal
+                    .votes_for
+                    .checked_mul(10_000)
+                    .map(|v| v / partisan_votes)
+                    .unwrap_or(0);
                 if for_bps >= config.majority_bps as i128 {
                     proposal.status = ProposalStatus::Passed;
                     proposal.execution_time = env.ledger().timestamp() + config.proposal_timelock;
@@ -1334,7 +1334,6 @@ impl GovernanceDao {
                 }
             }
 
-            let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
             Self::record_participation(&env, total_votes, total_supply);
 
             if proposal.status != ProposalStatus::Passed {

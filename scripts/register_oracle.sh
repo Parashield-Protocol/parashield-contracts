@@ -10,7 +10,7 @@
 #     ./scripts/register_oracle.sh
 #
 # DATA_TYPE options: weather | flight | onchain | disaster
-# WEIGHT range:      1–100 (higher = more influence in median calculation)
+# WEIGHT range:      1–100,000 (higher = more influence in median calculation)
 
 set -euo pipefail
 
@@ -32,7 +32,7 @@ log "Registering oracle..."
 log "  Contract: $ORACLE_VERIFIER_ID"
 log "  Oracle:   $ORACLE_ADDRESS"
 log "  Type:     $DATA_TYPE"
-log "  Weight:   $WEIGHT / 100"
+log "  Weight:   $WEIGHT / 100000"
 log "  Network:  $NETWORK"
 
 stellar contract invoke \

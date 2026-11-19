@@ -478,3 +478,50 @@ fn only_the_admin_can_change_the_proposal_threshold() {
 
     dao.set_proposal_threshold(&voter, &1_000i128);
 }
+
+#[test]
+fn finalize_and_finalize_batch_all_abstain_no_division_by_zero() {
+    let (env, dao, _admin, voter1, _voter2, target) = setup();
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid1 = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"All abstain test 1"),
+        &target,
+        &Symbol::new(&env, "update1"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+    dao.vote(&voter1, &pid1, &VoteChoice::Abstain);
+
+    let pid2 = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"All abstain test 2"),
+        &target,
+        &Symbol::new(&env, "update2"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+    dao.vote(&voter1, &pid2, &VoteChoice::Abstain);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+
+    // finalize() on all-abstain proposal must not panic and should mark the proposal Failed
+    dao.finalize(&pid1);
+    let p1 = dao.get_proposal(&pid1);
+    assert_eq!(p1.status, ProposalStatus::Failed);
+    assert_eq!(p1.votes_for, 0);
+    assert_eq!(p1.votes_against, 0);
+    assert!(p1.votes_abstain > 0);
+
+    // finalize_batch() on all-abstain proposal must also succeed without panic
+    let mut batch: Vec<u64> = Vec::new(&env);
+    batch.push_back(pid2);
+    dao.finalize_batch(&batch);
+    let p2 = dao.get_proposal(&pid2);
+    assert_eq!(p2.status, ProposalStatus::Failed);
+    assert_eq!(p2.votes_for, 0);
+    assert_eq!(p2.votes_against, 0);
+    assert!(p2.votes_abstain > 0);
+}
