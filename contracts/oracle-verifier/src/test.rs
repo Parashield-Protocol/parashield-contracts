@@ -1530,3 +1530,110 @@ fn test_submit_data_accepts_single_char_key() {
     );
     assert_eq!(client.get_data(&weather(), &short_key).value, 1_000_000i128);
 }
+
+// ── Staleness event check (Issue #825) ───────────────────────────────────────
+
+#[test]
+fn check_staleness_fresh_data_returns_not_stale_and_emits_no_events() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+
+    let now: u64 = 1_748_736_000;
+    env.ledger().set_timestamp(now);
+
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &30_000_000i128,
+        &95u32,
+        &now,
+    );
+
+    let events_before = env.events().all().len();
+    let report = client.check_staleness(&weather(), &kisumu_key());
+    let events_after = env.events().all().len();
+
+    assert!(!report.is_stale);
+    assert_eq!(report.stale_count, 0);
+    assert_eq!(report.total_count, 1);
+    assert_eq!(events_before, events_after, "check_staleness must not emit any events");
+}
+
+#[test]
+fn check_staleness_stale_data_returns_stale_and_emits_no_events() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+
+    let data_time: u64 = 1_748_736_000;
+    env.ledger().set_timestamp(data_time);
+
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &30_000_000i128,
+        &95u32,
+        &data_time,
+    );
+
+    // Default max_data_age for weather is 604_800s (7 days).
+    // Fast-forward past max_age so data becomes stale.
+    env.ledger().set_timestamp(data_time + 604_800 + 100);
+
+    let events_before = env.events().all().len();
+    let report = client.check_staleness(&weather(), &kisumu_key());
+    let events_after = env.events().all().len();
+
+    assert!(report.is_stale);
+    assert_eq!(report.stale_count, 1);
+    assert_eq!(report.total_count, 1);
+    assert_eq!(events_before, events_after, "check_staleness must not emit stale_data_detected or any other event");
+}
+
+#[test]
+fn check_staleness_boundary_at_exactly_max_age_threshold() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+
+    let data_time: u64 = 1_748_736_000;
+    env.ledger().set_timestamp(data_time);
+
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &30_000_000i128,
+        &95u32,
+        &data_time,
+    );
+
+    // Exactly at max_age boundary: age == max_age (604_800s).
+    // Code says: if age > max_age { stale_count += 1; }
+    // So age == max_age is fresh (not stale).
+    env.ledger().set_timestamp(data_time + 604_800);
+
+    let events_before = env.events().all().len();
+    let report = client.check_staleness(&weather(), &kisumu_key());
+    let events_after = env.events().all().len();
+
+    assert!(!report.is_stale);
+    assert_eq!(report.stale_count, 0);
+    assert_eq!(events_before, events_after);
+
+    // Exactly 1 second past threshold: age > max_age -> stale.
+    env.ledger().set_timestamp(data_time + 604_800 + 1);
+    let events_before_2 = env.events().all().len();
+    let report_stale = client.check_staleness(&weather(), &kisumu_key());
+    let events_after_2 = env.events().all().len();
+
+    assert!(report_stale.is_stale);
+    assert_eq!(report_stale.stale_count, 1);
+    assert_eq!(events_before_2, events_after_2, "stale boundary check must emit no events");
+}

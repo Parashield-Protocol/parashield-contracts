@@ -2634,6 +2634,12 @@ impl GovernanceDao {
         // `decay_per_period_bps` of shortfall relaxes the bar by the same
         // amount, so the requirement tracks observed turnout rather than
         // collapsing to the floor at the first quiet vote.
+        //
+        // Note (issue #826): Integer division means `steps` is 0 when
+        // `decay_per_period_bps > shortfall`, so no decay is applied until the
+        // shortfall reaches at least one full step (`shortfall >= decay_per_period_bps`).
+        // Small shortfalls below the configured step size do not trigger partial
+        // decay. The `.max(1)` guard prevents division by zero if `decay_per_period_bps == 0`.
         let shortfall = base_bps - avg_bps;
         let steps = shortfall / decay.decay_per_period_bps.max(1);
         let reduction = steps.saturating_mul(decay.decay_per_period_bps);

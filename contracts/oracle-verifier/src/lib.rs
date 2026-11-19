@@ -1101,19 +1101,9 @@ impl OracleVerifier {
         // Data is stale if more than half of submissions are stale
         let is_stale = stale_count > total_count / 2;
 
-        if is_stale {
-            env.events().publish(
-                (Symbol::new(&env, "stale_data_detected"),),
-                StaleDataDetected {
-                    data_type: data_type.clone(),
-                    key: key.clone(),
-                    stale_count,
-                    total_count,
-                    oldest_age: now.saturating_sub(newest_age),
-                    max_age,
-                },
-            );
-        }
+        // Note (issue #825): check_staleness is a read/query function and does not
+        // emit stale_data_detected events, avoiding unnecessary resource consumption
+        // and side-effects during transactions.
 
         StalenessReport {
             data_type,

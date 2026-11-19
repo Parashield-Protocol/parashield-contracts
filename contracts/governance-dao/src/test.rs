@@ -2153,3 +2153,138 @@ fn test_same_action_allowed_after_original_is_finalized() {
     let second_id = dao.create_proposal(&voter1, &title, &target, &function, &args, &impact);
     assert_ne!(first_id, second_id);
 }
+
+// ── Quorum decay math tests (Issue #826) ─────────────────────────────────────
+
+#[test]
+fn quorum_decay_when_decay_per_period_greater_than_shortfall() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+
+    // Base quorum is 1_000 bps (10%).
+    // Set decay_per_period_bps = 500, floor = 100 bps (clamped to 1_000 MIN_QUORUM_BPS).
+    // Update config quorum to 2_000 bps (20%) so there is headroom above MIN_QUORUM_BPS.
+    let mut config = dao.get_config();
+    config.quorum_bps = 2_000;
+    dao.update_config(&admin, &config);
+
+    // voter1 holds 1_000_000 of 1_600_000 tokens (62.5% = 6250 bps).
+    // admin holds 100_000 of 1_600_000 tokens (6.25% = 625 bps).
+    // If turnout is admin only (625 bps), shortfall = 2_000 - 625 = 1_375 bps.
+    // If decay_per_period_bps = 1_500, shortfall (1_375) < decay_per_period_bps (1_500).
+    // steps = 1_375 / 1_500 = 0. reduction = 0 * 1_500 = 0.
+    dao.set_quorum_decay(&admin, &true, &1_000u32, &1_500u32, &3u32);
+
+    run_proposal(
+        &env,
+        &dao,
+        &voter1,
+        &target,
+        &[(admin.clone(), VoteChoice::For)],
+    );
+
+    let eff = dao.get_effective_quorum();
+    assert_eq!(eff.base_bps, 2_000);
+    assert_eq!(eff.avg_participation_bps, 625);
+    // Pin behavior: decay_per_period_bps > shortfall yields 0 reduction
+    assert_eq!(eff.quorum_bps, 2_000);
+    assert!(!eff.decayed);
+}
+
+#[test]
+fn quorum_decay_when_decay_per_period_equal_to_shortfall() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+
+    let mut config = dao.get_config();
+    config.quorum_bps = 2_000;
+    dao.update_config(&admin, &config);
+
+    // Turnout is admin only (625 bps), shortfall = 2_000 - 625 = 1_375 bps.
+    // Set decay_per_period_bps = 1_375, floor = 1_000 bps.
+    // steps = 1_375 / 1_375 = 1. reduction = 1 * 1_375 = 1_375.
+    // decayed_bps = max(2_000 - 1_375, 1_000) = max(625, 1_000) = 1_000 bps.
+    dao.set_quorum_decay(&admin, &true, &1_000u32, &1_375u32, &3u32);
+
+    run_proposal(
+        &env,
+        &dao,
+        &voter1,
+        &target,
+        &[(admin.clone(), VoteChoice::For)],
+    );
+
+    let eff = dao.get_effective_quorum();
+    assert_eq!(eff.base_bps, 2_000);
+    assert_eq!(eff.avg_participation_bps, 625);
+    assert_eq!(eff.quorum_bps, 1_000);
+    assert!(eff.decayed);
+}
+
+#[test]
+fn quorum_decay_when_decay_per_period_smaller_than_shortfall() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+
+    let mut config = dao.get_config();
+    config.quorum_bps = 2_000;
+    dao.update_config(&admin, &config);
+
+    // Turnout is admin only (625 bps), shortfall = 2_000 - 625 = 1_375 bps.
+    // Set decay_per_period_bps = 500, floor = 1_000 bps.
+    // steps = 1_375 / 500 = 2. reduction = 2 * 500 = 1_000.
+    // decayed_bps = max(2_000 - 1_000, 1_000) = 1_000 bps.
+    dao.set_quorum_decay(&admin, &true, &1_000u32, &500u32, &3u32);
+
+    run_proposal(
+        &env,
+        &dao,
+        &voter1,
+        &target,
+        &[(admin.clone(), VoteChoice::For)],
+    );
+
+    let eff = dao.get_effective_quorum();
+    assert_eq!(eff.base_bps, 2_000);
+    assert_eq!(eff.avg_participation_bps, 625);
+    assert_eq!(eff.quorum_bps, 1_000);
+    assert!(eff.decayed);
+}
+
+#[test]
+fn quorum_decay_edge_cases_zero_and_large_values() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+
+    let mut config = dao.get_config();
+    config.quorum_bps = 2_000;
+    dao.update_config(&admin, &config);
+
+    // 1. decay_per_period_bps = 0: guard .max(1) prevents panic/div-by-zero.
+    // steps = 1_375 / 1 = 1_375. reduction = 1_375 * 0 = 0.
+    dao.set_quorum_decay(&admin, &true, &1_000u32, &0u32, &3u32);
+
+    run_proposal(
+        &env,
+        &dao,
+        &voter1,
+        &target,
+        &[(admin.clone(), VoteChoice::For)],
+    );
+
+    let eff = dao.get_effective_quorum();
+    assert_eq!(eff.quorum_bps, 2_000);
+    assert!(!eff.decayed);
+
+    // 2. decay_per_period_bps = 1: each 1 bps of shortfall relaxes by 1 bps down to floor.
+    dao.set_quorum_decay(&admin, &true, &1_500u32, &1u32, &3u32);
+    let eff = dao.get_effective_quorum();
+    // shortfall is 1375, steps = 1375/1 = 1375, reduction = 1375.
+    // 2000 - 1375 = 625, clamped up to floor 1500.
+    assert_eq!(eff.quorum_bps, 1_500);
+    assert!(eff.decayed);
+
+    // 3. Very large decay_per_period_bps: no overflow, steps = 0, no reduction.
+    dao.set_quorum_decay(&admin, &true, &1_000u32, &u32::MAX, &3u32);
+    let eff = dao.get_effective_quorum();
+    assert_eq!(eff.quorum_bps, 2_000);
+    assert!(!eff.decayed);
+    assert!(eff.quorum_bps <= eff.base_bps);
+    assert!(eff.quorum_bps >= 1_000); // never below floor
+}

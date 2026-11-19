@@ -1847,3 +1847,97 @@ fn schedule_installments_rejects_negative_amount() {
     // A negative amount_per_installment must be rejected (issue #645).
     cp.schedule_installments(&w.keeper, &claim_id, &-1_000_000i128, &3u32, &86_400u64);
 }
+
+// ── Policy claim deadline tests (Issue #824) ─────────────────────────────────
+
+#[test]
+fn file_claim_before_end_time_succeeds() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+
+    let pe = PolicyEngineClient::new(&w.env, &w.policy_id);
+    let policy = pe.get_policy(&pol_id);
+
+    // Set time strictly before end_time
+    w.env.ledger().set_timestamp(policy.start_time + 10);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    assert!(claim_id > 0);
+}
+
+#[test]
+fn file_claim_exactly_at_end_time_succeeds() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+
+    let pe = PolicyEngineClient::new(&w.env, &w.policy_id);
+    let policy = pe.get_policy(&pol_id);
+
+    // Set time exactly at end_time
+    w.env.ledger().set_timestamp(policy.end_time);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    assert!(claim_id > 0);
+}
+
+#[test]
+fn file_claim_within_claim_deadline_after_end_time_succeeds() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+
+    let pe = PolicyEngineClient::new(&w.env, &w.policy_id);
+    let policy = pe.get_policy(&pol_id);
+
+    // 100 seconds past end_time, well within default claim_deadline (86_400s)
+    w.env.ledger().set_timestamp(policy.end_time + 100);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    assert!(claim_id > 0);
+}
+
+#[test]
+fn file_claim_exactly_at_deadline_cutoff_succeeds() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+
+    let pe = PolicyEngineClient::new(&w.env, &w.policy_id);
+    let policy = pe.get_policy(&pol_id);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let deadline = cp.get_claim_deadline();
+    // cutoff = policy.end_time + deadline
+    w.env.ledger().set_timestamp(policy.end_time + deadline);
+
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    assert!(claim_id > 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #19)")]
+fn file_claim_after_deadline_cutoff_rejected_with_claim_deadline_passed() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+
+    let pe = PolicyEngineClient::new(&w.env, &w.policy_id);
+    let policy = pe.get_policy(&pol_id);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let deadline = cp.get_claim_deadline();
+    // 1 second past cutoff: now > cutoff
+    w.env.ledger().set_timestamp(policy.end_time + deadline + 1);
+
+    cp.submit_claim(&buyer, &pol_id);
+}
