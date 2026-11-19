@@ -733,8 +733,9 @@ impl ClaimsProcessor {
     /// - `None` or `Some(10000)` → full coverage payment (default behavior).
     /// - `Some(bps)` where bps < 10000 → proportional partial payment, e.g. `Some(5000)` pays 50%.
     ///
-    /// Boundary semantics (issue #776). The CoverageMismatch guard below
-    /// uses `!=` rather than `>`/`<`, so a claim whose `coverage_amount`
+    /// Boundary semantics (issue #776). The CoverageMismatch guard (which
+    /// lives in `evaluate_and_settle` so every settlement path shares it,
+    /// issue #828) uses `!=` rather than `>`/`<`, so a claim whose `coverage_amount`
     /// equals the policy's `coverage_amount` exactly is permitted — the
     /// equality case is the common case, not a rejection branch. The
     /// downstream payout logic in `evaluate_and_settle` mirrors this:
@@ -768,11 +769,9 @@ impl ClaimsProcessor {
         let policy = PolicyEngineClient::new(&env, &policy_engine)
             .get_policy(&claim.policy_id);
 
-        // Guard: claim coverage must match the policy to prevent incorrect payouts (#589).
-        if claim.coverage_amount != policy.coverage_amount {
-            panic_with_error!(&env, Error::CoverageMismatch);
-        }
-
+        // The claim/policy CoverageMismatch guard (#589) runs first thing in
+        // `evaluate_and_settle`, shared with `auto_process` and
+        // `batch_auto_process` (#828).
         Self::evaluate_and_settle(&env, &mut claim, &policy, partial_payout_bps)
     }
 
@@ -1082,6 +1081,11 @@ impl ClaimsProcessor {
     /// data, policy engine rejection, risk-pool error), that sub-invocation
     /// returns `Err` and the claim is skipped — the batch itself never
     /// aborts, so all other claims in the queue are still processed.
+    ///
+    /// A claim whose `coverage_amount` no longer matches its policy is one
+    /// such per-claim failure (`CoverageMismatch`, issue #828): it is left
+    /// untouched and still `Pending` in the queue, omitted from the returned
+    /// results, and the rest of the batch settles normally.
     pub fn batch_auto_process(env: Env, caller: Address, limit: u32) -> Vec<(u128, ClaimResult)> {
         Self::require_keeper(&env, &caller);
         Self::require_not_paused(&env);
@@ -2609,12 +2613,26 @@ impl ClaimsProcessor {
     /// as rejected and no payout is issued. In either case, the claim record is
     /// persisted, its pending-queue entry is removed, and a settlement event is
     /// emitted so the outcome is observable off-chain.
+    ///
+    /// Every settlement entry point that evaluates a single oracle trigger —
+    /// `process_claim` (and `batch_process_claims` through it),
+    /// `auto_process` and `batch_auto_process` (through `auto_process`) —
+    /// funnels through here, so the CoverageMismatch guard lives here rather
+    /// than in any one caller (issue #828). It runs before the oracle call
+    /// and before any claim state is written or any token is transferred.
     fn evaluate_and_settle(
         env: &Env,
         claim: &mut Claim,
         policy: &parashield_policy_engine::Policy,
         partial_payout_bps: Option<u32>,
     ) -> ClaimResult {
+        // Guard: claim coverage must match the policy to prevent incorrect
+        // payouts (#589). Checked first, ahead of every other guard, so the
+        // error a caller sees is identical to what `process_claim` raised
+        // when the check lived there.
+        if claim.coverage_amount != policy.coverage_amount {
+            panic_with_error!(env, Error::CoverageMismatch);
+        }
         if claim.status != ClaimStatus::Pending {
             panic_with_error!(env, Error::AlreadyProcessed);
         }
@@ -3146,3 +3164,5 @@ mod test_advanced;
 mod test_keeper_registry;
 #[cfg(test)]
 mod test_claim_uniqueness;
+#[cfg(test)]
+mod test_coverage_mismatch;

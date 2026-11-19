@@ -761,7 +761,7 @@ fn outlier_config_disabled_by_default() {
     let c = OracleVerifierClient::new(&env, &cid);
     let cfg = c.get_outlier_config(&wt());
     assert!(!cfg.enabled);
-    assert_eq!(cfg.threshold_bps, DEFAULT_OUTLIER_THRESHOLD_BPS);
+    assert_eq!(cfg.threshold_bps, DEFAULT_OUTLIER_THRESHOLD_MULTIPLIER_BPS);
     assert_eq!(cfg.min_sample_size, DEFAULT_OUTLIER_MIN_SAMPLE_SIZE);
 }
 
@@ -817,7 +817,7 @@ fn outlier_filtering_protects_mean_from_one_bad_oracle() {
     let (env, admin, cid) = setup();
     let c = OracleVerifierClient::new(&env, &cid);
     c.set_aggregation_method(&admin, &wt(), &AggregationMethod::Mean);
-    c.set_outlier_config(&admin, &wt(), &true, &DEFAULT_OUTLIER_THRESHOLD_BPS, &DEFAULT_OUTLIER_MIN_SAMPLE_SIZE);
+    c.set_outlier_config(&admin, &wt(), &true, &DEFAULT_OUTLIER_THRESHOLD_MULTIPLIER_BPS, &DEFAULT_OUTLIER_MIN_SAMPLE_SIZE);
 
     let oracles: std::vec::Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
     for o in oracles.iter() {
@@ -845,7 +845,7 @@ fn outlier_filtering_never_drops_below_min_sample_size() {
     let (env, admin, cid) = setup();
     let c = OracleVerifierClient::new(&env, &cid);
     c.set_aggregation_method(&admin, &wt(), &AggregationMethod::Mean);
-    c.set_outlier_config(&admin, &wt(), &true, &DEFAULT_OUTLIER_THRESHOLD_BPS, &4u32);
+    c.set_outlier_config(&admin, &wt(), &true, &DEFAULT_OUTLIER_THRESHOLD_MULTIPLIER_BPS, &4u32);
 
     let oracles: std::vec::Vec<Address> = (0..4).map(|_| Address::generate(&env)).collect();
     for o in oracles.iter() {
@@ -864,4 +864,72 @@ fn outlier_filtering_never_drops_below_min_sample_size() {
     // All 4 submissions survive (below the slack needed to trim), so the
     // outlier still drags the mean up.
     assert!(agg.median_value > good * 100);
+}
+
+// ── default outlier threshold pinned (issue #829) ───────────────────────────
+
+/// The default is a multiplier of the MAD in basis points: 50_000 = 5.0x.
+/// Pinned so a change to the value is a deliberate, visible decision.
+#[test]
+fn default_outlier_threshold_is_five_times_the_mad() {
+    let (env, _admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+
+    assert_eq!(DEFAULT_OUTLIER_THRESHOLD_MULTIPLIER_BPS, 50_000u32);
+    // 10_000 bps = 1.0x the MAD, so the default is exactly 5.0x.
+    assert_eq!(DEFAULT_OUTLIER_THRESHOLD_MULTIPLIER_BPS / 10_000, 5u32);
+    assert_eq!(DEFAULT_OUTLIER_THRESHOLD_MULTIPLIER_BPS % 10_000, 0u32);
+    assert_eq!(
+        c.get_outlier_config(&wt()).threshold_bps,
+        DEFAULT_OUTLIER_THRESHOLD_MULTIPLIER_BPS
+    );
+}
+
+/// Submit `outlier` alongside four readings whose median is 100 and whose
+/// MAD is 10 (all in 7-decimal fixed point), with outlier filtering enabled
+/// at the default threshold, and return the `Mean` aggregate.
+///
+/// Sorted: [90, 100, 100, 110, outlier] → median 100.
+/// Deviations: [10, 0, 0, 10, outlier - 100] → sorted middle (MAD) = 10.
+/// At 5.0x the MAD the cutoff deviation is 50, i.e. an outlier of 150.
+fn mean_with_outlier(outlier: i128) -> i128 {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    c.set_aggregation_method(&admin, &wt(), &AggregationMethod::Mean);
+    c.set_outlier_config(
+        &admin,
+        &wt(),
+        &true,
+        &DEFAULT_OUTLIER_THRESHOLD_MULTIPLIER_BPS,
+        &DEFAULT_OUTLIER_MIN_SAMPLE_SIZE,
+    );
+
+    let oracles: std::vec::Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
+    for o in oracles.iter() {
+        c.add_oracle(&admin, o, &wt(), &50u32);
+    }
+
+    env.ledger().set_timestamp(1);
+    let values = [90_0000000i128, 100_0000000, 100_0000000, 110_0000000, outlier];
+    for (o, v) in oracles.iter().zip(values.iter()) {
+        c.submit_data(o, &wt(), &kk(), v, &90u32, &1u64);
+    }
+
+    c.get_aggregated(&wt(), &kk()).median_value
+}
+
+/// A reading exactly 5.0x the MAD from the median sits on the boundary and
+/// is kept: the comparison is strict (`>`), so the mean includes it.
+#[test]
+fn reading_at_exactly_five_times_the_mad_is_kept() {
+    // (90 + 100 + 100 + 110 + 150) / 5 = 110
+    assert_eq!(mean_with_outlier(150_0000000), 110_0000000);
+}
+
+/// One unit past the 5.0x boundary is flagged and dropped, so the mean
+/// reflects only the four in-range readings.
+#[test]
+fn reading_just_past_five_times_the_mad_is_dropped() {
+    // (90 + 100 + 100 + 110) / 4 = 100
+    assert_eq!(mean_with_outlier(150_0000001), 100_0000000);
 }
