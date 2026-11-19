@@ -180,6 +180,8 @@ pub struct QuorumDecayConfig {
     pub floor_bps: u32,
     /// Basis points of decay applied per consecutive low-participation
     /// proposal, subtracted from the configured `quorum_bps`.
+    /// Note (issue #826): Decay steps use integer division (`shortfall / decay_per_period_bps`).
+    /// When `decay_per_period_bps > shortfall`, zero reduction is applied.
     pub decay_per_period_bps: u32,
     /// Number of recent proposals whose turnout is averaged to decide whether
     /// participation counts as low.
