@@ -990,12 +990,17 @@ impl PolicyEngine {
         }
         
         // SECURITY FIX: Calculate the required premium based on product parameters.
-        // This prevents callers from providing arbitrary premium amounts.
-        let required_premium = coverage_amount
+        // Ceiling division matches the backend's calculatePremium (#598) and ensures
+        // the pool never undercollects by up to 1 stroop per policy.
+        let numerator = coverage_amount
             .checked_mul(product.premium_rate_bps as i128)
             .and_then(|v| v.checked_mul(duration_days as i128))
-            .and_then(|v| v.checked_div(365))
-            .and_then(|v| v.checked_div(10_000))
+            .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
+        let divisor: i128 = 365 * 10_000;
+        // Ceiling integer division: (n + d - 1) / d
+        let required_premium = numerator
+            .checked_add(divisor - 1)
+            .and_then(|v| v.checked_div(divisor))
             .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
 
         // SECURITY FIX (issue #719): Reject zero or negative premium amounts to prevent free coverage

@@ -119,6 +119,9 @@ pub struct Proposal {
     /// Set by a guardian via `veto_proposal`. A vetoed proposal can never be
     /// executed, even if it passed voting and the timelock has expired.
     pub is_vetoed: bool,
+    /// Ledger timestamp when the proposal was actually executed (0 if not yet executed).
+    /// Distinct from `execution_time` which is the earliest permitted execution time.
+    pub executed_at: u64,
 }
 
 /// A single vote record stored per (proposal_id, voter) key.
