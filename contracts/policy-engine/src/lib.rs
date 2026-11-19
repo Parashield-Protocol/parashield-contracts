@@ -1015,10 +1015,10 @@ impl PolicyEngine {
         let now = env.ledger().timestamp();
         let duration_secs = (duration_days as u64)
             .checked_mul(86_400)
-            .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
+            .unwrap_or_else(|| panic_with_error!(env, Error::Overflow));
         let end_time = start_time
             .checked_add(duration_secs)
-            .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
+            .unwrap_or_else(|| panic_with_error!(env, Error::Overflow));
         
         // SECURITY FIX: Validate that start_time < end_time to prevent invalid policies.
         // Policies with start >= end are meaningless and should be rejected at purchase time.

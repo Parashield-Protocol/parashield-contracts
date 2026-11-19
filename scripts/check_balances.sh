@@ -20,7 +20,16 @@ STROOPS=10000000
 
 format_usdc() {
   local raw="$1"
-  echo "scale=7; $raw / $STROOPS" | bc
+  if command -v awk >/dev/null 2>&1; then
+    awk -v r="$raw" -v s="$STROOPS" 'BEGIN { gsub(/"/, "", r); printf "%.7f", r / s }'
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c "import sys; r=sys.argv[1].strip('\"'); s=sys.argv[2]; print(f'{float(r) / float(s):.7f}')" "$raw" "$STROOPS"
+  elif command -v bc >/dev/null 2>&1; then
+    echo "scale=7; $raw / $STROOPS" | bc
+  else
+    echo "Error: decimal formatting requires awk, python3, or bc" >&2
+    exit 1
+  fi
 }
 
 log "=== Parashield Balance Check (${NETWORK}) ==="

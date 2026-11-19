@@ -130,22 +130,37 @@ fn cannot_remove_below_minimum_guardians() {
     pool.propose_remove_guardian(&admin, &g1);
 }
 
-/// Error 23 = `NotGuardian`: the guardian scheduled for removal cannot
-/// vote on their own exit.
+/// Error 23 = `NotGuardian`: a non-guardian cannot approve a guardian removal.
 #[test]
 #[should_panic(expected = "Error(Contract, #23)")]
-fn target_of_removal_cannot_approve_their_own_removal_via_set() {
+fn non_guardian_cannot_approve_removal() {
     let (env, pool, admin) = setup();
     let g1 = Address::generate(&env);
     let g2 = Address::generate(&env);
     let g3 = Address::generate(&env);
     pool.set_guardians(&admin, &vec![&env, g1.clone(), g2.clone(), g3.clone()], &2);
 
-    // We proposed to remove g3 — but g_other is not a guardian at all,
+    // We proposed to remove g3 — but not_a_guardian is not a guardian at all,
     // so approve_remove_guardian from them must fail with NotGuardian.
     let not_a_guardian = Address::generate(&env);
     pool.propose_remove_guardian(&admin, &g3);
     pool.approve_remove_guardian(&not_a_guardian);
+}
+
+/// Error 3 = `Unauthorized`: the guardian scheduled for removal cannot
+/// vote on their own exit.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn target_of_removal_cannot_approve_their_own_removal() {
+    let (env, pool, admin) = setup();
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    let g3 = Address::generate(&env);
+    pool.set_guardians(&admin, &vec![&env, g1.clone(), g2.clone(), g3.clone()], &2);
+
+    // We proposed to remove g3 — g3 cannot approve their own removal.
+    pool.propose_remove_guardian(&admin, &g3);
+    pool.approve_remove_guardian(&g3);
 }
 
 #[test]
