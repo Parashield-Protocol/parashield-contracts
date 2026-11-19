@@ -654,14 +654,6 @@ impl RiskPool {
         // Guard: prevent division by zero if total_shares == 0
         if total_shares == 0 { panic_with_error!(&env, Error::NoShares); }
 
-        // SECURITY FIX: Ensure available liquidity accounts for pending claims.
-        // The LP's proportional share of locked capital must be reserved.
-        let lp_share_of_locked = if total_shares > 0 {
-            (position.shares * total_locked) / total_shares
-        } else {
-            0
-        };
-
         let available_liquidity = total_deposited.saturating_sub(total_locked);
         if available_liquidity <= 0 { panic_with_error!(&env, Error::PoolDrained); }
         // Issue #621: shares * total_deposited / total_shares truncates

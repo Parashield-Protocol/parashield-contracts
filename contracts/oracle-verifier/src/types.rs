@@ -155,7 +155,7 @@ pub struct AggregatedData {
 pub struct OracleEntry {
     pub oracle: Address,
     pub data_type: Symbol,
-    /// Relative weight for future weighted-median (1-100)
+    /// Relative weight for future weighted-median (1–100,000)
     pub weight: u32,
     pub active: bool,
 }

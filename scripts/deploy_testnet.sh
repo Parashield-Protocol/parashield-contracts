@@ -62,8 +62,8 @@ CLAIMS_ID=$(deploy_contract "parashield-claims-processor")
 
 # ── Get USDC testnet address ──────────────────────────────────────────────────
 
-# Stellar testnet USDC (Circle-issued)
-USDC_TESTNET="GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+# Stellar testnet USDC SAC contract address (Circle-issued: USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5)
+USDC_TESTNET="${USDC_TESTNET:-CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA}"
 
 # ── Initialize contracts ──────────────────────────────────────────────────────
 
