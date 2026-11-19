@@ -34,7 +34,7 @@ pub const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year at 5 s/ledger
 // ─── Admin rotation ───────────────────────────────────────────────────────────
 
 /// Grace period between an admin transfer being armed and the proposed
-/// admin being able to call `accept_admin` (issue #356).
+/// admin being able to call `accept_admin` (issue #356, #827).
 ///
 /// 48 hours gives protocol stakeholders a window to notice and respond to
 /// a hostile or mistaken rotation before it takes effect. All four

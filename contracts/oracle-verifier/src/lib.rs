@@ -55,14 +55,25 @@ const MAX_DATA_POINTS: u32 = 100;
 /// for a data_type into one shared bucket that any oracle can overwrite.
 const MAX_KEY_LEN: usize = 32;
 
-/// Default outlier-rejection threshold, in basis points of the median
-/// absolute deviation (MAD): a submission is flagged once its distance from
-/// the median exceeds 5.0x the MAD. This approximates the standard
-/// Iglewicz-Hoaglin modified z-score cutoff of 3.5 (which is expressed in
-/// MAD-equivalent standard-deviation units via a 0.6745 consistency
-/// constant: 3.5 / 0.6745 ≈ 5.19, rounded down for a slightly more
-/// conservative default that keeps borderline genuine variation in).
-const DEFAULT_OUTLIER_THRESHOLD_BPS: u32 = 50_000;
+/// Default outlier-rejection threshold, expressed as a *multiplier* of the
+/// median absolute deviation (MAD) in basis points: 10_000 = 1.0x the MAD,
+/// so 50_000 = 5.0x the MAD. It is not a percentage of the value or of the
+/// median. `filter_outliers` flags a submission once
+/// `|value - median| * 10_000 > threshold * MAD`, i.e. once its distance from
+/// the median exceeds 5.0x the MAD; a deviation of exactly 5.0x is kept.
+///
+/// 5.0x approximates the standard Iglewicz-Hoaglin modified z-score cutoff
+/// of 3.5 (which is expressed in MAD-equivalent standard-deviation units via
+/// a 0.6745 consistency constant: 3.5 / 0.6745 ≈ 5.19, rounded down for a
+/// slightly more conservative default that keeps borderline genuine
+/// variation in).
+///
+/// Renamed from `DEFAULT_OUTLIER_THRESHOLD_BPS` (issue #829) to state the
+/// unit; the value and behavior are unchanged. The public
+/// `OutlierConfig::threshold_bps` field and the `set_outlier_config`
+/// parameter of the same name keep their names, since they are part of the
+/// contract interface and of stored data.
+const DEFAULT_OUTLIER_THRESHOLD_MULTIPLIER_BPS: u32 = 50_000;
 
 /// Maximum absolute value for oracle data submissions. Extreme values (e.g.
 /// i128::MAX) could overflow downstream median/aggregation calculations.
@@ -857,8 +868,9 @@ impl OracleVerifier {
     /// close to half the submissions for a key are bad. This runs as a
     /// preprocessing step ahead of whichever method is configured.
     ///
-    /// `threshold_bps` is basis points of the median absolute deviation
-    /// (MAD) — see [`OutlierConfig`]. `min_sample_size` must be at least 3;
+    /// `threshold_bps` is a multiplier of the median absolute deviation
+    /// (MAD) in basis points — 10_000 = 1.0x the MAD, 50_000 = 5.0x (the
+    /// default) — see [`OutlierConfig`]. `min_sample_size` must be at least 3;
     /// below that, neither a median nor a MAD is a meaningful reference to
     /// judge deviation against.
     pub fn set_outlier_config(
@@ -899,7 +911,10 @@ impl OracleVerifier {
     /// `min` and `max` are absolute value bounds in 7-decimal fixed point.
     /// Values submitted outside this range will be rejected with InvalidInput.
     ///
-    /// Clear a configured range by setting both to 0 (reverts to defaults).
+    /// Always stores the given range, including `[0, 0]` — a legitimate
+    /// range for binary and disaster data types where only a reading of 0 is
+    /// acceptable (issue #831). Earlier versions treated `[0, 0]` as a
+    /// "clear the override" sentinel; use `clear_data_type_range` for that.
     pub fn set_data_type_range(
         env: Env,
         admin: Address,
@@ -921,18 +936,41 @@ impl OracleVerifier {
         }
         
         let range_key = StorageKey::DataTypeRange(data_type.clone());
-        
-        // Special case: both zero means clear the override
-        if min == 0 && max == 0 {
-            env.storage().persistent().remove(&range_key);
-        } else {
-            env.storage().persistent().set(&range_key, &(min, max));
-            env.storage().persistent().extend_ttl(&range_key, TTL_THRESHOLD, TTL_EXTEND_TO);
-        }
-        
+
+        // No sentinel values: `[0, 0]` is stored as a real range (issue #831).
+        // Clearing is done explicitly via `clear_data_type_range`.
+        env.storage().persistent().set(&range_key, &(min, max));
+        env.storage().persistent().extend_ttl(&range_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
         env.events().publish(
             (Symbol::new(&env, "data_type_range_updated"),),
             (data_type, min, max),
+        );
+    }
+
+    /// Admin-only: remove the per-data-type range override set by
+    /// `set_data_type_range`, so submissions for `data_type` fall back to
+    /// the compiled-in default bound for that data type name (or
+    /// `MAX_DATA_VALUE` for unknown names) (issue #831).
+    ///
+    /// Idempotent: clearing a data type that has no override is a clean
+    /// no-op — no error, no state change and no event — mirroring how the
+    /// other per-data-type overrides (`set_data_type_max_age(0)`,
+    /// `set_data_type_min_oracle_count(0)`) silently fall back to defaults.
+    /// The `data_type_range_cleared` event is emitted only when an
+    /// override was actually removed.
+    pub fn clear_data_type_range(env: Env, admin: Address, data_type: Symbol) {
+        Self::require_admin(&env, &admin);
+
+        let range_key = StorageKey::DataTypeRange(data_type.clone());
+        if !env.storage().persistent().has(&range_key) {
+            return;
+        }
+        env.storage().persistent().remove(&range_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "data_type_range_cleared"),),
+            data_type,
         );
     }
 
@@ -1065,19 +1103,9 @@ impl OracleVerifier {
         // Data is stale if more than half of submissions are stale
         let is_stale = stale_count > total_count / 2;
 
-        if is_stale {
-            env.events().publish(
-                (Symbol::new(&env, "stale_data_detected"),),
-                StaleDataDetected {
-                    data_type: data_type.clone(),
-                    key: key.clone(),
-                    stale_count,
-                    total_count,
-                    oldest_age: now.saturating_sub(newest_age),
-                    max_age,
-                },
-            );
-        }
+        // Note (issue #825): check_staleness is a read/query function and does not
+        // emit stale_data_detected events, avoiding unnecessary resource consumption
+        // and side-effects during transactions.
 
         StalenessReport {
             data_type,
@@ -3586,7 +3614,7 @@ impl OracleVerifier {
             .get(&StorageKey::OutlierConfig(data_type.clone()))
             .unwrap_or(OutlierConfig {
                 enabled: false,
-                threshold_bps: DEFAULT_OUTLIER_THRESHOLD_BPS,
+                threshold_bps: DEFAULT_OUTLIER_THRESHOLD_MULTIPLIER_BPS,
                 min_sample_size: DEFAULT_OUTLIER_MIN_SAMPLE_SIZE,
             })
     }
@@ -4060,3 +4088,6 @@ mod test_confidence_bounds;
 
 #[cfg(test)]
 mod test_monotonic;
+
+#[cfg(test)]
+mod test_data_type_range;

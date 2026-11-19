@@ -450,8 +450,10 @@ pub struct OutlierConfig {
     /// Off by default — an existing data type's aggregation does not
     /// change until an admin opts it in.
     pub enabled: bool,
-    /// Rejection threshold in basis points of the MAD: a submission is
-    /// flagged once `|value - median| * 10_000 > threshold_bps * MAD`.
+    /// Rejection threshold as a multiplier of the MAD, in basis points
+    /// (10_000 = 1.0x the MAD, 50_000 = 5.0x): a submission is flagged once
+    /// `|value - median| * 10_000 > threshold_bps * MAD`. The field name is
+    /// kept as-is because it is part of the stored, public contract type.
     pub threshold_bps: u32,
     /// Filtering is skipped below this many eligible submissions, and never
     /// removes enough points to leave fewer than this many behind.

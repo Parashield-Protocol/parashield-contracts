@@ -108,3 +108,74 @@ fn get_stats_reflects_all_operations() {
     assert_eq!(stats.total_locked, 80_0000000i128);
     assert_eq!(stats.accumulated_premium, 80_0000000i128); // 80% of 100
 }
+
+// ── #356 / #827: admin transfer timelock ─────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #30)")]
+fn accept_admin_rejected_before_timelock() {
+    let (env, pool, _, admin, _, _, _) = setup_multi();
+    let new_admin = Address::generate(&env);
+    pool.propose_new_admin(&admin, &new_admin);
+    pool.accept_admin(&new_admin);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #30)")]
+fn accept_admin_rejected_one_second_before_timelock() {
+    let (env, pool, _, admin, _, _, _) = setup_multi();
+    let new_admin = Address::generate(&env);
+    pool.propose_new_admin(&admin, &new_admin);
+    env.ledger().with_mut(|l| l.timestamp += parashield_common::ADMIN_TRANSFER_TIMELOCK - 1);
+    pool.accept_admin(&new_admin);
+}
+
+#[test]
+fn accept_admin_succeeds_exactly_at_and_after_timelock() {
+    let (env, pool, _, admin, _, _, _) = setup_multi();
+    let new_admin = Address::generate(&env);
+    pool.propose_new_admin(&admin, &new_admin);
+    env.ledger().with_mut(|l| l.timestamp += parashield_common::ADMIN_TRANSFER_TIMELOCK);
+    pool.accept_admin(&new_admin);
+    assert_eq!(pool.get_admin(), new_admin);
+    assert_eq!(pool.get_pending_admin_since(), 0);
+}
+
+#[test]
+fn accept_admin_succeeds_after_timelock() {
+    let (env, pool, _, admin, _, _, _) = setup_multi();
+    let new_admin = Address::generate(&env);
+    pool.propose_new_admin(&admin, &new_admin);
+    env.ledger().with_mut(|l| l.timestamp += parashield_common::ADMIN_TRANSFER_TIMELOCK + 1);
+    pool.accept_admin(&new_admin);
+    assert_eq!(pool.get_admin(), new_admin);
+    assert_eq!(pool.get_pending_admin_since(), 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn accept_admin_rejected_for_wrong_caller() {
+    let (env, pool, _, admin, _, _, _) = setup_multi();
+    let new_admin = Address::generate(&env);
+    let wrong_caller = Address::generate(&env);
+    pool.propose_new_admin(&admin, &new_admin);
+    env.ledger().with_mut(|l| l.timestamp += parashield_common::ADMIN_TRANSFER_TIMELOCK + 1);
+    pool.accept_admin(&wrong_caller);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn accept_admin_rejected_when_no_transfer_pending() {
+    let (env, pool, _, _, _, _, _) = setup_multi();
+    let caller = Address::generate(&env);
+    pool.accept_admin(&caller);
+}
+
+#[test]
+fn admin_transfer_timelock_at_least_withdrawal_timelock_regression() {
+    // Regression test for issue #827
+    assert!(
+        parashield_common::ADMIN_TRANSFER_TIMELOCK >= 7 * 24 * 60 * 60,
+        "ADMIN_TRANSFER_TIMELOCK must be at least as long as withdrawal TIMELOCK_SECONDS (7 days)"
+    );
+}
