@@ -573,19 +573,6 @@ impl ClaimsProcessor {
             panic_with_error!(env, Error::ClaimOutsideCoveragePeriod);
         }
         
-        // SECURITY FIX: Claims must be submitted before the policy end_time.
-        // Only after end_time has passed can a claim be filed within the claim_deadline window.
-        // This prevents claims being submitted during the active policy period incorrectly.
-        if now <= policy.end_time {
-            // Policy is still active - allow the claim
-        } else {
-            // Policy has ended - check if we're within the claim_deadline window
-            let cutoff = policy.end_time.saturating_add(Self::claim_deadline(env));
-            if now > cutoff {
-                panic_with_error!(env, Error::ClaimDeadlinePassed);
-            }
-        }
-
         // Issue #625: reject submissions that are too far in the future
         // relative to the current ledger time. A scheduled policy whose
         // `start_time` is far ahead has no observable trigger yet, so a claim
