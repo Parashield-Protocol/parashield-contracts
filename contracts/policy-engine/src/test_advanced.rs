@@ -419,7 +419,7 @@ fn transfer_policy_rejects_cancelled_policy() {
     pe.transfer_policy(&user, &to, &policy_id);
 }
 
-// ── #356: admin transfer timelock ────────────────────────────────────────────
+// ── #356 / #827: admin transfer timelock ─────────────────────────────────────
 
 #[test]
 #[should_panic(expected = "Error(Contract, #24)")]
@@ -427,8 +427,29 @@ fn accept_admin_rejected_before_timelock() {
     let (env, pe, admin, _oracle, _user) = setup();
     let new_admin = Address::generate(&env);
     pe.propose_new_admin(&admin, &new_admin);
-    // Immediately accepting must fail — 48h has not elapsed.
+    // Immediately accepting must fail — ADMIN_TRANSFER_TIMELOCK has not elapsed.
     pe.accept_admin(&new_admin);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #24)")]
+fn accept_admin_rejected_one_second_before_timelock() {
+    let (env, pe, admin, _oracle, _user) = setup();
+    let new_admin = Address::generate(&env);
+    pe.propose_new_admin(&admin, &new_admin);
+    env.ledger().with_mut(|l| l.timestamp += parashield_common::ADMIN_TRANSFER_TIMELOCK - 1);
+    pe.accept_admin(&new_admin);
+}
+
+#[test]
+fn accept_admin_succeeds_exactly_at_and_after_timelock() {
+    let (env, pe, admin, _oracle, _user) = setup();
+    let new_admin = Address::generate(&env);
+    pe.propose_new_admin(&admin, &new_admin);
+    env.ledger().with_mut(|l| l.timestamp += parashield_common::ADMIN_TRANSFER_TIMELOCK);
+    pe.accept_admin(&new_admin);
+    assert_eq!(pe.get_admin(), new_admin);
+    assert_eq!(pe.get_pending_admin_since(), 0);
 }
 
 #[test]
@@ -436,7 +457,7 @@ fn accept_admin_succeeds_after_timelock() {
     let (env, pe, admin, _oracle, _user) = setup();
     let new_admin = Address::generate(&env);
     pe.propose_new_admin(&admin, &new_admin);
-    env.ledger().with_mut(|l| l.timestamp += 48 * 60 * 60 + 1);
+    env.ledger().with_mut(|l| l.timestamp += parashield_common::ADMIN_TRANSFER_TIMELOCK + 1);
     pe.accept_admin(&new_admin);
     assert_eq!(pe.get_admin(), new_admin);
     assert_eq!(pe.get_pending_admin_since(), 0);

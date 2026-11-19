@@ -89,6 +89,10 @@ const PARAMETER_TIMELOCK_SECONDS: u64 = 2 * 24 * 60 * 60;
 // Shared protocol constants — single source of truth in parashield-common (issue #342).
 use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK};
 
+// Issue #827: The admin transfer timelock must be at least as long as the
+// withdrawal timelock so stakeholders have enough time to react to a compromised admin.
+const _: () = assert!(ADMIN_TRANSFER_TIMELOCK >= TIMELOCK_SECONDS);
+
 #[contracttype]
 pub(crate) enum StorageKey {
     Initialized,
