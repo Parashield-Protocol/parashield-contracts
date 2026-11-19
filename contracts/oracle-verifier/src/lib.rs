@@ -55,14 +55,25 @@ const MAX_DATA_POINTS: u32 = 100;
 /// for a data_type into one shared bucket that any oracle can overwrite.
 const MAX_KEY_LEN: usize = 32;
 
-/// Default outlier-rejection threshold, in basis points of the median
-/// absolute deviation (MAD): a submission is flagged once its distance from
-/// the median exceeds 5.0x the MAD. This approximates the standard
-/// Iglewicz-Hoaglin modified z-score cutoff of 3.5 (which is expressed in
-/// MAD-equivalent standard-deviation units via a 0.6745 consistency
-/// constant: 3.5 / 0.6745 ≈ 5.19, rounded down for a slightly more
-/// conservative default that keeps borderline genuine variation in).
-const DEFAULT_OUTLIER_THRESHOLD_BPS: u32 = 50_000;
+/// Default outlier-rejection threshold, expressed as a *multiplier* of the
+/// median absolute deviation (MAD) in basis points: 10_000 = 1.0x the MAD,
+/// so 50_000 = 5.0x the MAD. It is not a percentage of the value or of the
+/// median. `filter_outliers` flags a submission once
+/// `|value - median| * 10_000 > threshold * MAD`, i.e. once its distance from
+/// the median exceeds 5.0x the MAD; a deviation of exactly 5.0x is kept.
+///
+/// 5.0x approximates the standard Iglewicz-Hoaglin modified z-score cutoff
+/// of 3.5 (which is expressed in MAD-equivalent standard-deviation units via
+/// a 0.6745 consistency constant: 3.5 / 0.6745 ≈ 5.19, rounded down for a
+/// slightly more conservative default that keeps borderline genuine
+/// variation in).
+///
+/// Renamed from `DEFAULT_OUTLIER_THRESHOLD_BPS` (issue #829) to state the
+/// unit; the value and behavior are unchanged. The public
+/// `OutlierConfig::threshold_bps` field and the `set_outlier_config`
+/// parameter of the same name keep their names, since they are part of the
+/// contract interface and of stored data.
+const DEFAULT_OUTLIER_THRESHOLD_MULTIPLIER_BPS: u32 = 50_000;
 
 /// Maximum absolute value for oracle data submissions. Extreme values (e.g.
 /// i128::MAX) could overflow downstream median/aggregation calculations.
@@ -855,8 +866,9 @@ impl OracleVerifier {
     /// close to half the submissions for a key are bad. This runs as a
     /// preprocessing step ahead of whichever method is configured.
     ///
-    /// `threshold_bps` is basis points of the median absolute deviation
-    /// (MAD) — see [`OutlierConfig`]. `min_sample_size` must be at least 3;
+    /// `threshold_bps` is a multiplier of the median absolute deviation
+    /// (MAD) in basis points — 10_000 = 1.0x the MAD, 50_000 = 5.0x (the
+    /// default) — see [`OutlierConfig`]. `min_sample_size` must be at least 3;
     /// below that, neither a median nor a MAD is a meaningful reference to
     /// judge deviation against.
     pub fn set_outlier_config(
@@ -3699,7 +3711,7 @@ impl OracleVerifier {
             .get(&StorageKey::OutlierConfig(data_type.clone()))
             .unwrap_or(OutlierConfig {
                 enabled: false,
-                threshold_bps: DEFAULT_OUTLIER_THRESHOLD_BPS,
+                threshold_bps: DEFAULT_OUTLIER_THRESHOLD_MULTIPLIER_BPS,
                 min_sample_size: DEFAULT_OUTLIER_MIN_SAMPLE_SIZE,
             })
     }
