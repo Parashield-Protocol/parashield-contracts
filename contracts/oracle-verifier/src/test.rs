@@ -259,6 +259,30 @@ fn test_remove_oracle_prunes_oracle_list() {
     assert_eq!(remaining.get_unchecked(0), oracle2);
 }
 
+#[test]
+fn test_remove_oracle_prevents_max_oracles_per_key_overcount() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+
+    let mut oracles = soroban_sdk::Vec::new(&env);
+    for _ in 0..MAX_ORACLES_PER_KEY {
+        let o = Address::generate(&env);
+        client.add_oracle(&admin, &o, &weather(), &50u32);
+        oracles.push_back(o);
+    }
+    assert_eq!(client.get_oracles(&weather()).len(), MAX_ORACLES_PER_KEY);
+
+    // Removing an oracle must prune OracleList so len() reflects active registrations
+    let to_remove = oracles.get(0).unwrap();
+    client.remove_oracle(&admin, &to_remove, &weather());
+    assert_eq!(client.get_oracles(&weather()).len(), MAX_ORACLES_PER_KEY - 1);
+
+    // A new oracle can now be added because len() is no longer at MAX_ORACLES_PER_KEY
+    let replacement = Address::generate(&env);
+    client.add_oracle(&admin, &replacement, &weather(), &50u32);
+    assert_eq!(client.get_oracles(&weather()).len(), MAX_ORACLES_PER_KEY);
+}
+
 // ── Issue #136: active_oracle_count vs oracle_count (submissions) ─────────────
 
 #[test]
