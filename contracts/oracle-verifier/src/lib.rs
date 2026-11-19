@@ -651,7 +651,9 @@ impl OracleVerifier {
         if pending.is_some() {
             panic_with_error!(&env, Error::AdminTransferPending);
         }
-
+        if env.storage().instance().has(&StorageKey::PendingAdminChange) {
+            panic_with_error!(&env, Error::AdminTransferPending);
+        }
         let threshold: u32 = env
             .storage()
             .instance()
@@ -1181,7 +1183,7 @@ impl OracleVerifier {
     }
 
     /// The effective minimum oracle count for a data type: the per-type
-    /// override when set, otherwise the global value.
+    /// override when set, otherwise the global value (default 1).
     pub fn get_data_type_min_oracle_count(env: Env, data_type: Symbol) -> u32 {
         Self::effective_min_oracle_count(&env, &data_type)
     }
@@ -1872,8 +1874,9 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::NoStake);
         }
         let slashed = amount.min(current);
-        let remaining = current - slashed;
-        env.storage().persistent().set(&stake_key, &remaining);
+
+
+
 
         // Slashing protection: adjust any pending stake withdrawal request during challenge period
         let req_key = StorageKey::StakeWithdrawalReq(data_type.clone(), oracle.clone());
@@ -2313,6 +2316,15 @@ impl OracleVerifier {
         env.storage().instance().remove(&StorageKey::PendingUpgrade);
     }
 
+    /// Cancel a pending guardian approval for an admin change.
+    pub fn cancel_pending_admin_change(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        if !env.storage().instance().has(&StorageKey::PendingAdminChange) {
+            panic_with_error!(&env, Error::NoPendingUpgrade);
+        }
+        env.storage().instance().remove(&StorageKey::PendingAdminChange);
+    }
+
     // ── Data Submission ───────────────────────────────────────────────────────
 
     /// Submit a data point for a (data_type, key) pair.
@@ -2699,7 +2711,7 @@ impl OracleVerifier {
             .unwrap_or_else(|| panic_with_error!(&env, Error::NoDataAvailable));
         let max_data_age = Self::effective_max_age(&env, &data_type);
         let now = env.ledger().timestamp();
-        let min_confidence: u32 = env
+        let min_confidence_val: u32 = env
             .storage()
             .instance()
             .get(&StorageKey::MinConfidence)
@@ -2707,7 +2719,7 @@ impl OracleVerifier {
         let mut eligible_count = 0u32;
         for i in 0..points.len() {
             let p = points.get_unchecked(i);
-            if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence {
+            if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence_val {
                 let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
                 if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
                     if entry.active && !Self::oracle_offline(&env, &data_type, &p.oracle) {
@@ -2914,22 +2926,22 @@ impl OracleVerifier {
         let points_cap = points.len().min(MAX_DATA_POINTS);
         for i in 0..points_cap {
             let p = points.get_unchecked(i);
-            let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
-            if let Some(entry) = env
-                .storage()
-                .persistent()
-                .get::<_, OracleEntry>(&oracle_key)
-            {
-                if entry.active && !Self::oracle_offline(&env, &data_type, &p.oracle) {
-                    oracle_count += 1;
-                    min_confidence_val = min_confidence_val.min(p.confidence);
-                    last_updated = last_updated.max(p.timestamp);
-                    weighted_confidence_sum += (p.confidence as u128) * (entry.weight as u128);
-                    total_weight_sum += entry.weight as u128;
+            if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence {
+                let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+                if let Some(entry) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, OracleEntry>(&oracle_key)
+                {
+                    if entry.active && !Self::oracle_offline(env, &data_type, &p.oracle) {
+                        oracle_count += 1;
+                        min_confidence_val = min_confidence_val.min(p.confidence);
+                        last_updated = last_updated.max(p.timestamp);
+                        weighted_confidence_sum += (p.confidence as u128) * (entry.weight as u128);
+                        total_weight_sum += entry.weight as u128;
 
-                    if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence {
                         if n >= 100 {
-                            panic_with_error!(&env, Error::TooManyOracles);
+                            panic_with_error!(env, Error::TooManyOracles);
                         }
                         values[n] = (p.value, entry.weight);
                         timestamps[n] = p.timestamp;
@@ -2940,7 +2952,7 @@ impl OracleVerifier {
             }
         }
 
-        n = Self::filter_outliers(&env, &data_type, &mut values, &mut timestamps, n);
+        n = Self::filter_outliers(env, data_type, &mut values, &mut timestamps, n);
         total_weight = values[0..n].iter().map(|&(_, wt)| wt).sum();
 
         let min_oracle_count: u32 = env
@@ -2949,7 +2961,7 @@ impl OracleVerifier {
             .get(&StorageKey::MinOracleCount)
             .unwrap_or(1);
         if (n as u32) < min_oracle_count || n == 0 || total_weight == 0 {
-            panic_with_error!(&env, Error::NoDataAvailable);
+            panic_with_error!(env, Error::NoDataAvailable);
         }
 
         // Aggregate through the same dispatcher `verify_trigger` uses, so the
@@ -3183,7 +3195,7 @@ impl OracleVerifier {
                 .get(&StorageKey::MaxTimestampAge)
                 .unwrap_or(90 * 24 * 60 * 60);
             if timestamp < now.saturating_sub(max_timestamp_age) {
-            panic_with_error!(&env, Error::InvalidTimestamp);
+                panic_with_error!(&env, Error::InvalidTimestamp);
             }
 
             // Issue #775: monotonic reading-timestamp per (data_type, key,
@@ -3191,116 +3203,17 @@ impl OracleVerifier {
             // bypass it.
             Self::require_strictly_newer_reading(&env, &data_type, &key, &oracle, timestamp);
 
-            let max_data_age = Self::effective_max_age(&env, &data_type);
-            if now.saturating_sub(timestamp) > max_data_age {
-            Self::handle_stale_submission(&env, &oracle, &data_type, timestamp, max_data_age);
-            continue;
-            }
-            let new_point = OracleDataPoint {
-            oracle: oracle.clone(),
-            value,
-            confidence,
-            timestamp,
-            };
-            Self::store_plain_reading(&env, &data_type, &key, new_point, now, max_data_age);
-            Self::record_reading_timestamp(&env, &data_type, &key, &oracle, timestamp);
-
-            env.events().publish(
-                (Symbol::new(&env, "oracle_data_submitted"),),
-                OracleDataSubmitted {
-                    oracle: oracle.clone(),
-                    data_type: data_type.clone(),
-                    key,
-                    value,
-                    confidence,
-                    timestamp,
-                },
-            );
-        }
-    }
-
-    /// Submit multiple data readings in a single invocation — avoids the cost
-    /// and latency of calling `submit_data` once per key.  All readings share
-    /// the same `oracle` and `data_type`; each carries its own key, value,
-    /// confidence, and timestamp.  Every reading is validated and persisted
-    /// atomically within the single transaction, and every key must satisfy
-    /// the same length rules as `submit_data` (#565).
-    pub fn submit_data_batch(
-        env: Env,
-        oracle: Address,
-        data_type: Symbol,
-        submissions: Vec<OracleDataSubmission>,
-    ) {
-        oracle.require_auth();
-        Self::require_data_type_active(&env, &data_type);
-        if Self::encryption_required(&env, &data_type) {
-            panic_with_error!(&env, Error::EncryptionRequiredForType);
-        }
-        Self::validate_symbol_len(&env, &data_type);
-
-        let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
-        let entry: OracleEntry = env
-            .storage()
-            .persistent()
-            .get(&oracle_key)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
-        if !entry.active {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-        // Keep the registration alive alongside the readings it authorized.
-        env.storage()
-            .persistent()
-            .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
-
-        Self::enforce_rate_limit(&env, &data_type, &oracle, env.ledger().timestamp());
-
-        for i in 0..submissions.len() {
-            let sub = submissions.get_unchecked(i);
-            Self::validate_key_len(&env, &sub.key);
-            if sub.confidence == 0 || sub.confidence > 100 {
-                panic_with_error!(&env, Error::InvalidConfidence);
-            }
-            if sub.timestamp == 0 {
-                panic_with_error!(&env, Error::InvalidTimestamp);
-            }
-            let now = env.ledger().timestamp();
-            let future_buffer: u64 = env
-                .storage()
-                .instance()
-                .get(&StorageKey::TimestampFutureBuffer)
-                .unwrap_or(60);
-            if sub.timestamp > now.saturating_add(future_buffer) {
-                panic_with_error!(&env, Error::InvalidTimestamp);
-            }
-            let max_timestamp_age: u64 = env
-                .storage()
-                .instance()
-                .get(&StorageKey::MaxTimestampAge)
-                .unwrap_or(90 * 24 * 60 * 60);
-            if sub.timestamp < now.saturating_sub(max_timestamp_age) {
-                panic_with_error!(&env, Error::InvalidTimestamp);
-            }
-            // Issue #775: monotonic reading-timestamp per (data_type, key,
-            // oracle). Same guard as submit_data — batch callers must not
-            // bypass it.
-            Self::require_strictly_newer_reading(
-                &env,
-                &data_type,
-                &sub.key,
-                &oracle,
-                sub.timestamp,
-            );
             // Issue #459: per-item stale-submission gate. A stale item in a
             // batch is skipped (with penalty accounting) rather than failing
             // the whole batch, so a partial-good batch still lands its
             // fresh entries.
             let max_data_age = Self::effective_max_age(&env, &data_type);
-            if now.saturating_sub(sub.timestamp) > max_data_age {
+            if now.saturating_sub(timestamp) > max_data_age {
                 Self::handle_stale_submission(
                     &env,
                     &oracle,
                     &data_type,
-                    sub.timestamp,
+                    timestamp,
                     max_data_age,
                 );
                 continue;
@@ -4066,7 +3979,7 @@ impl OracleVerifier {
     ///
     /// `values` and `timestamps` are parallel slices (same length, same
     /// index refers to the same submission) — callers build them from the
-    /// same loop that already collects `(value, weight)` pairs for the
+    /// same loop that already collects `(value, weight` pairs for the
     /// other aggregation methods.
     fn time_weighted_average(env: &Env, values: &[(i128, u32)], timestamps: &[u64]) -> i128 {
         let n = values.len();

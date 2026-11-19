@@ -1,4 +1,5 @@
 use super::*;
+use parashield_common::ZERO_ADDRESS;
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Ledger},
@@ -1687,7 +1688,7 @@ fn test_batch_notify_skips_already_warned_instead_of_failing() {
     let (env, admin, _oracle, usdc, contract_id) = setup();
     let client = PolicyEngineClient::new(&env, &contract_id);
     let pid = create_crop_product(&env, &client, &admin);
-    let (buyer, policy_id) = buy_30_day_policy(&env, &client, &admin, &usdc, pid);
+    let (_buyer, policy_id) = buy_30_day_policy(&env, &client, &admin, &usdc, pid);
 
     let end_time = client.get_policy(&policy_id).end_time;
     env.ledger().set_timestamp(end_time - 24 * 60 * 60);

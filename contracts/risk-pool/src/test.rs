@@ -3,6 +3,7 @@
 
 extern crate std;
 
+use parashield_common::ZERO_ADDRESS;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, Address, Env, String as SorobanString, Symbol,
@@ -359,7 +360,7 @@ fn receive_premium_adds_lp_share() {
     pool.deposit(&lp1, &1_000_0000000i128, &0i128, &false);
 
     let before = pool.get_stats().accumulated_premium;
-    pool.receive_premium(&lp1, &100_0000000i128);
+    pool.receive_premium(&lp1, &100_000_0000i128);
     let after = pool.get_stats().accumulated_premium;
     // 80% goes to LP accumulated
     assert!(after > before);

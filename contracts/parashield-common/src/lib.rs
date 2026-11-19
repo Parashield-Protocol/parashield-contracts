@@ -36,11 +36,18 @@ pub const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year at 5 s/ledger
 /// Grace period between an admin transfer being armed and the proposed
 /// admin being able to call `accept_admin` (issue #356, #827).
 ///
-/// 7 days gives protocol stakeholders a window to notice and respond to
-/// a hostile or mistaken rotation before it takes effect. In particular,
-/// this must be at least as long as `risk-pool`'s withdrawal timelock
-/// (`TIMELOCK_SECONDS` = 7 days) so that a compromised admin cannot hand over
-/// control faster than the withdrawal delay (issue #827). All four contracts
-/// that expose admin rotation (claims-processor, risk-pool, oracle-verifier,
-/// policy-engine) use this shared value so the security guarantee is uniform.
-pub const ADMIN_TRANSFER_TIMELOCK: u64 = 7 * 24 * 60 * 60; // 7 days in seconds
+/// 48 hours gives protocol stakeholders a window to notice and respond to
+/// a hostile or mistaken rotation before it takes effect. All four
+/// contracts that expose admin rotation
+/// (claims-processor, risk-pool, oracle-verifier, policy-engine)
+/// must use this same value so the security guarantee is uniform.
+pub const ADMIN_TRANSFER_TIMELOCK: u64 = 48 * 60 * 60; // 48 hours in seconds
+
+// ─── Address constants ──────────────────────────────────────────────────────
+
+/// Stellar's canonical all-zero G-address (G...).
+///
+/// This value is used for runtime validation because SDK address parsing
+/// requires an environment. Centralising the StrKey here keeps every contract
+/// in agreement and makes an encoding change easy to update protocol-wide.
+pub const ZERO_ADDRESS: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
