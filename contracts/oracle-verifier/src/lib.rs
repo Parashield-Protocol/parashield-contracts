@@ -897,7 +897,10 @@ impl OracleVerifier {
     /// `min` and `max` are absolute value bounds in 7-decimal fixed point.
     /// Values submitted outside this range will be rejected with InvalidInput.
     ///
-    /// Clear a configured range by setting both to 0 (reverts to defaults).
+    /// Always stores the given range, including `[0, 0]` — a legitimate
+    /// range for binary and disaster data types where only a reading of 0 is
+    /// acceptable (issue #831). Earlier versions treated `[0, 0]` as a
+    /// "clear the override" sentinel; use `clear_data_type_range` for that.
     pub fn set_data_type_range(
         env: Env,
         admin: Address,
@@ -919,18 +922,41 @@ impl OracleVerifier {
         }
         
         let range_key = StorageKey::DataTypeRange(data_type.clone());
-        
-        // Special case: both zero means clear the override
-        if min == 0 && max == 0 {
-            env.storage().persistent().remove(&range_key);
-        } else {
-            env.storage().persistent().set(&range_key, &(min, max));
-            env.storage().persistent().extend_ttl(&range_key, TTL_THRESHOLD, TTL_EXTEND_TO);
-        }
-        
+
+        // No sentinel values: `[0, 0]` is stored as a real range (issue #831).
+        // Clearing is done explicitly via `clear_data_type_range`.
+        env.storage().persistent().set(&range_key, &(min, max));
+        env.storage().persistent().extend_ttl(&range_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
         env.events().publish(
             (Symbol::new(&env, "data_type_range_updated"),),
             (data_type, min, max),
+        );
+    }
+
+    /// Admin-only: remove the per-data-type range override set by
+    /// `set_data_type_range`, so submissions for `data_type` fall back to
+    /// the compiled-in default bound for that data type name (or
+    /// `MAX_DATA_VALUE` for unknown names) (issue #831).
+    ///
+    /// Idempotent: clearing a data type that has no override is a clean
+    /// no-op — no error, no state change and no event — mirroring how the
+    /// other per-data-type overrides (`set_data_type_max_age(0)`,
+    /// `set_data_type_min_oracle_count(0)`) silently fall back to defaults.
+    /// The `data_type_range_cleared` event is emitted only when an
+    /// override was actually removed.
+    pub fn clear_data_type_range(env: Env, admin: Address, data_type: Symbol) {
+        Self::require_admin(&env, &admin);
+
+        let range_key = StorageKey::DataTypeRange(data_type.clone());
+        if !env.storage().persistent().has(&range_key) {
+            return;
+        }
+        env.storage().persistent().remove(&range_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "data_type_range_cleared"),),
+            data_type,
         );
     }
 
@@ -4147,3 +4173,6 @@ mod test_confidence_bounds;
 
 #[cfg(test)]
 mod test_monotonic;
+
+#[cfg(test)]
+mod test_data_type_range;
