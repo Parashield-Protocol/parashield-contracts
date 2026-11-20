@@ -3558,14 +3558,20 @@ impl OracleVerifier {
         if limit == 0 {
             return false;
         }
-        match env
+        let Some(last) = env
             .storage()
             .persistent()
             .get::<_, u64>(&StorageKey::LastSubmission(data_type.clone(), oracle.clone()))
-        {
-            Some(last) => env.ledger().timestamp().saturating_sub(last) > limit,
-            None => false,
-        }
+        else {
+            // No accepted submission means there is no inactivity interval to
+            // measure; newly registered oracles are not auto-deactivated.
+            return false;
+        };
+
+        let now = env.ledger().timestamp();
+        // Treat a clock moving backwards as zero elapsed time rather than
+        // allowing unsigned arithmetic to classify the oracle as offline.
+        now > last && now - last > limit
     }
 
     /// Symbols are capped at 32 bytes by the host; the check that matters is

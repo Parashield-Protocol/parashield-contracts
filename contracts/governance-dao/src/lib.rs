@@ -2924,11 +2924,6 @@ impl GovernanceDao {
         }
     }
 
-    /// Extend the TTL for proposal-related storage entries to prevent expiry
-    /// during voting, timelock, and execution periods.
-    fn extend_proposal_ttl(env: &Env, key: &StorageKey, _config: &DaoConfig) {
-        env.storage().persistent().extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
-    }
 }
 
 #[cfg(test)]

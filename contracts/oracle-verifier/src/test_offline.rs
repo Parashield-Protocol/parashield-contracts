@@ -100,6 +100,17 @@ fn oracle_goes_offline_only_after_the_limit() {
 }
 
 #[test]
+fn clock_skew_does_not_mark_oracle_offline() {
+    let (env, admin, client) = setup();
+    client.set_oracle_inactivity_limit(&admin, &LIMIT);
+    let oracle = register(&env, &admin, &client);
+    submit(&env, &client, &oracle, 10_000_000);
+
+    env.ledger().set_timestamp(START - 1);
+    assert!(!client.is_oracle_offline(&oracle, &weather()));
+}
+
+#[test]
 fn oracle_that_never_submitted_is_not_offline() {
     let (env, admin, client) = setup();
     client.set_oracle_inactivity_limit(&admin, &LIMIT);
