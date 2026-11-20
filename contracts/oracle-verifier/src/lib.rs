@@ -38,7 +38,7 @@ use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK};
 #[allow(dead_code)]
 const MAX_ORACLES: u32 = 100;
 /// Maximum number of registered oracles per key or data type (issue #727).
-pub const MAX_ORACLES_PER_KEY: u32 = 10;
+pub const MAX_ORACLES_PER_DATA_TYPE: u32 = 10;
 /// Maximum number of data points stored per (data_type, key).
 const MAX_DATA_POINTS: u32 = 100;
 
@@ -371,10 +371,10 @@ impl OracleVerifier {
             .get(&StorageKey::OracleList(data_type.clone()))
             .unwrap_or_else(|| Vec::new(&env));
 
-        // Count how many oracles are already registered for this data_type / key (issue #727).
-        // Limit to MAX_ORACLES_PER_KEY to prevent Sybil attacks and oracle domination.
+        // Count how many oracles are already registered for this data_type (issue #727).
+        // Limit to MAX_ORACLES_PER_DATA_TYPE to prevent Sybil attacks and oracle domination.
         let oracle_count = list.len();
-        if oracle_count >= MAX_ORACLES_PER_KEY {
+        if oracle_count >= MAX_ORACLES_PER_DATA_TYPE {
             panic_with_error!(&env, Error::TooManyOracles);
         }
 
@@ -442,6 +442,7 @@ impl OracleVerifier {
         weight: u32,
     ) {
         Self::require_admin(&env, &admin);
+        Self::validate_symbol_len(&env, &data_type);
         // SECURITY FIX: Add maximum weight bounds to prevent one oracle from dominating
         // the weighted median calculation. Weight must be between 1 and 100,000.
         // This ensures no single oracle can have disproportionate influence.
@@ -1393,6 +1394,24 @@ impl OracleVerifier {
             .unwrap_or_else(|| Vec::new(env));
 
         if targets.is_empty() {
+            return;
+        }
+
+        // SECURITY FIX: Check source data exists before calling get_median_value
+        // If source data type has no submissions, skip cross-validation.
+        // This prevents validation failures due to asynchronous data submission.
+        let source_points: Vec<OracleDataPoint> = match env.storage().persistent().get(
+            &StorageKey::DataPoints(source_type.clone(), key.clone()),
+        ) {
+            Some(pts) => pts,
+            None => {
+                // No data for this source type yet — skip validation
+                return;
+            }
+        };
+
+        if source_points.is_empty() {
+            // Empty data points list for source — skip validation
             return;
         }
 

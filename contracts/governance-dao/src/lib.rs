@@ -2402,9 +2402,10 @@ impl GovernanceDao {
             .get(&StorageKey::Proposal(proposal_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
 
-        // Can only veto before execution
-        if proposal.status == ProposalStatus::Executed {
-            panic_with_error!(&env, Error::AlreadyExecuted);
+        // SECURITY FIX (issue #813): Only allow veto on Discussion and Active proposals
+        // Veto on terminal states (Passed, Failed, Executed, Cancelled, Expired) has no effect
+        if proposal.status != ProposalStatus::Discussion && proposal.status != ProposalStatus::Active {
+            panic_with_error!(&env, Error::ProposalNotActive);
         }
 
         if proposal.is_vetoed {
@@ -2654,7 +2655,7 @@ impl GovernanceDao {
             total_votes
                 .checked_mul(10_000)
                 .map(|v| v / total_supply)
-                .unwrap_or(10_000)
+                .unwrap_or(0)
                 .clamp(0, 10_000) as u32
         };
 
