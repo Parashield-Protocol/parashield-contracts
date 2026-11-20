@@ -989,13 +989,18 @@ impl PolicyEngine {
             panic_with_error!(env, Error::InvalidPremiumRate);
         }
         
-        // SECURITY FIX: Calculate the required premium based on product parameters.
-        // This prevents callers from providing arbitrary premium amounts.
-        let required_premium = coverage_amount
+        // Calculate required premium using a 30-day base period to match the
+        // backend quote engine (issue #808).  Formula:
+        //   premium = ceil(coverage * rate_bps * duration_days / (10_000 * 30))
+        // Integer division truncates; add (divisor - 1) before dividing to ceil.
+        let divisor: i128 = 10_000 * 30;
+        let numerator = coverage_amount
             .checked_mul(product.premium_rate_bps as i128)
             .and_then(|v| v.checked_mul(duration_days as i128))
-            .and_then(|v| v.checked_div(365))
-            .and_then(|v| v.checked_div(10_000))
+            .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
+        let required_premium = numerator
+            .checked_add(divisor - 1)
+            .and_then(|v| v.checked_div(divisor))
             .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
 
         // SECURITY FIX (issue #719): Reject zero or negative premium amounts to prevent free coverage
