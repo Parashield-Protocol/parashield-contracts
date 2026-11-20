@@ -104,6 +104,7 @@ fn create_crop_product(w: &World) -> u128 {
             coverage_max:       10_000_000_000,
             premium_rate_bps:   500,
             max_duration_days:  365,
+            expected_token:     w.usdc.clone(),
         },
     )
 }
@@ -118,7 +119,7 @@ fn buy_crop_policy(w: &World, buyer: &Address, product_id: u128) -> u128 {
     StellarAssetClient::new(&w.env, &w.usdc).mint(&w.policy_id, &10_000_000_000i128);
     
     let policy_id = PolicyEngineClient::new(&w.env, &w.policy_id)
-        .buy_policy(buyer, &product_id, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+        .buy_policy(buyer, &product_id, &COVERAGE, &30u32, &symbol_short!("kis2606"), &w.usdc);
     
     // Lock coverage in the pool for this policy
     RiskPoolClient::new(&w.env, &w.pool_id).lock_for_policy(&w.admin, &policy_id, &COVERAGE);
@@ -1272,6 +1273,36 @@ fn test_batch_submit_and_process_claims() {
     assert_eq!(results.get_unchecked(0).1, ClaimResult::Paid);
     assert_eq!(results.get_unchecked(1).1, ClaimResult::Paid);
 
+    assert_eq!(cp.get_pending_claims().len(), 0);
+}
+
+#[test]
+fn test_batch_process_claims_overrides() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id1 = buy_crop_policy(&w, &buyer, pid);
+    let pol_id2 = buy_crop_policy(&w, &buyer, pid);
+
+    submit_rainfall(&w, 20_000_000); // 20mm < 50mm threshold
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    let mut policy_ids = soroban_sdk::Vec::new(&w.env);
+    policy_ids.push_back(pol_id1);
+    policy_ids.push_back(pol_id2);
+
+    let claim_ids = cp.batch_submit_claims(&buyer, &policy_ids);
+    assert_eq!(claim_ids.len(), 2);
+
+    let mut overrides = soroban_sdk::Vec::new(&w.env);
+    overrides.push_back((claim_ids.get_unchecked(0), Some(5_000u32)));
+    overrides.push_back((claim_ids.get_unchecked(1), None));
+
+    let results = cp.batch_process_claims_overrides(&w.keeper, &overrides);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results.get_unchecked(0).1, ClaimResult::Paid);
+    assert_eq!(results.get_unchecked(1).1, ClaimResult::Paid);
     assert_eq!(cp.get_pending_claims().len(), 0);
 }
 

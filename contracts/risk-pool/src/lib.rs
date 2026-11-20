@@ -19,7 +19,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    token, Address, Env, IntoVal, String, Symbol, Val, Vec,
+    token, Address, Env, IntoVal, String, Symbol, Vec,
 };
 
 pub mod types;
@@ -180,7 +180,11 @@ pub(crate) enum StorageKey {
     AdminWithdrawalApprovals,
 }
 
-/// Maximum pool name length in bytes/characters (issue #748).
+/// Maximum pool name length in characters (issue #748).
+///
+/// Note: Enforced in characters via `name.len()`. A 32-character limit is standard for
+/// pool labels across the protocol UI and storage. In Soroban, `String::len()` returns the
+/// character count, and names up to `MAX_POOL_NAME_LEN` (32 characters) are permitted.
 pub const MAX_POOL_NAME_LEN: u32 = 32;
 
 #[contracterror]
@@ -924,6 +928,12 @@ impl RiskPool {
 
     /// Pull `amount` USDC from `caller` and split it among LPs, treasury, and backstop
     /// according to the protocol fee schedule. No-op if `amount` is zero or negative.
+    ///
+    /// Note: Premiums intentionally bypass the `MIN_DEPOSIT` granularity check (`amount % MIN_DEPOSIT == 0`)
+    /// enforced on LP deposits. Insurance premiums are calculated based on risk models, coverage amounts,
+    /// duration, and premium rates (e.g., in PolicyEngine), which frequently produce premium amounts that are
+    /// not exact multiples of `MIN_DEPOSIT` (1 USDC / 1_000_000 stroops). Sub-stroop rounding remainders from
+    /// integer division during split calculations remain in the contract's token balance as pool reserves.
     pub fn receive_premium(env: Env, caller: Address, amount: i128) {
         let _guard = ReentrancyGuard::enter(&env);
         caller.require_auth();
@@ -3525,6 +3535,9 @@ impl RiskPool {
     }
 
     /// Set or update the pool's human-readable name, enforcing length limits (issue #748).
+    ///
+    /// The length limit `MAX_POOL_NAME_LEN` (32) is enforced in characters via `name.len()`.
+    /// Multi-byte UTF-8 character names are accepted up to 32 characters.
     pub fn set_pool_name(env: Env, admin: Address, name: String) {
         Self::require_admin(&env, &admin);
         if name.len() == 0 || name.len() > MAX_POOL_NAME_LEN {

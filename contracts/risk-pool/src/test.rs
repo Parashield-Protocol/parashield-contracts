@@ -846,3 +846,39 @@ fn lp_nft_id_exhaustion_fails_with_overflow() {
 
     pool.deposit(&lp1, &1000_0000000i128, &0i128, &false);
 }
+
+#[test]
+fn test_receive_premium_accepts_non_multiple_of_min_deposit() {
+    let (env, pool, usdc_id, _admin, _treasury, lp1) = setup();
+    pool.deposit(&lp1, &1000_0000000i128, &0i128, &false);
+
+    // Premium amount that is not a multiple of MIN_DEPOSIT (1_000_000)
+    let premium = 1_234_567i128;
+    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp1, &premium);
+    pool.receive_premium(&lp1, &premium);
+
+    let claimed = pool.claim_yield(&lp1);
+    assert!(claimed > 0);
+}
+
+#[test]
+fn test_set_pool_name_enforces_character_length_limit() {
+    let (env, pool, _usdc_id, admin, _treasury, _lp1) = setup();
+
+    // Valid 32-character name
+    let name_32 = soroban_sdk::String::from_str(&env, "Weather-Risk-Pool-North-America!");
+    assert_eq!(name_32.len(), 32);
+    pool.set_pool_name(&admin, &name_32);
+    assert_eq!(pool.get_pool_name(), Some(name_32));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #48)")]
+fn test_set_pool_name_too_long_panics() {
+    let (env, pool, _usdc_id, admin, _treasury, _lp1) = setup();
+
+    // 33-character name
+    let name_33 = soroban_sdk::String::from_str(&env, "Weather-Risk-Pool-North-America!!");
+    assert_eq!(name_33.len(), 33);
+    pool.set_pool_name(&admin, &name_33);
+}

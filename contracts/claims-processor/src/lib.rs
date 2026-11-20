@@ -18,8 +18,6 @@
 //! Once a policy is Claimed or Expired, further process/auto_process calls
 //! return the appropriate ClaimResult without writing again.
 #![no_std]
-extern crate alloc;
-use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
@@ -814,6 +812,11 @@ impl ClaimsProcessor {
     }
 
     /// Process multiple existing claims in a single transaction up to MAX_BATCH_SIZE.
+    ///
+    /// Limitation: A single uniform `partial_payout_bps: Option<u32>` is passed to every
+    /// `process_claim` call in this batch. All claims in the batch receive the same payout
+    /// ratio (or full payout if `None`). To settle different claims at different payout
+    /// rates in one batch, use `batch_process_claims_overrides`.
     pub fn batch_process_claims(
         env: Env,
         keeper: Address,
@@ -833,6 +836,42 @@ impl ClaimsProcessor {
         for i in 0..count {
             let cid = claim_ids.get_unchecked(i);
             let res = Self::process_claim(env.clone(), keeper.clone(), cid, partial_payout_bps);
+            results.push_back((cid, res));
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_claims_processed"),),
+            BatchClaimsProcessed {
+                keeper,
+                count,
+            },
+        );
+
+        results
+    }
+
+    /// Process multiple existing claims with individual per-claim payout overrides up to MAX_BATCH_SIZE.
+    ///
+    /// Accepts a list of `(claim_id, partial_payout_bps)` tuples, allowing different claims in the same
+    /// batch to be settled at individual payout ratios.
+    pub fn batch_process_claims_overrides(
+        env: Env,
+        keeper: Address,
+        claims: Vec<(u128, Option<u32>)>,
+    ) -> Vec<(u128, ClaimResult)> {
+        Self::require_keeper(&env, &keeper);
+        Self::require_not_paused(&env);
+
+        let mut results = Vec::new(&env);
+        let count = if claims.len() > MAX_BATCH_SIZE {
+            MAX_BATCH_SIZE
+        } else {
+            claims.len()
+        };
+
+        for i in 0..count {
+            let (cid, bps) = claims.get_unchecked(i);
+            let res = Self::process_claim(env.clone(), keeper.clone(), cid, bps);
             results.push_back((cid, res));
         }
 

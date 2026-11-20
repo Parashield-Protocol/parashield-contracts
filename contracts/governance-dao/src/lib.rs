@@ -133,6 +133,9 @@ enum StorageKey {
     /// Marks that a delegator's weight was already counted in a proposal, so
     /// they cannot also vote it themselves — (proposal_id, delegator).
     DelegatedVote(u64, Address),
+    /// Tracks all delegators whose weight was counted for a proposal,
+    /// so DelegatedVote markers can be cleaned up on finalization/resolution.
+    DelegatedVoters(u64),
     /// A registered proposal template (`ProposalTemplate`) by name.
     Template(Symbol),
     /// Names of all registered templates (`Vec<Symbol>`).
@@ -169,7 +172,6 @@ pub enum Error {
     ProposalNotActive = 6,
     AlreadyVoted = 7,
     VotingClosed = 8,
-    VotingStillOpen = 9,
     ProposalNotPassed = 10,
     AlreadyExecuted = 11,
     AlreadyCancelled = 12,
@@ -1224,6 +1226,7 @@ impl GovernanceDao {
         // Issue #630: proposal is now resolved — clear its content hash so
         // the same action can be re-proposed.
         Self::clear_proposal_hash(&env, &proposal);
+        Self::cleanup_delegated_votes(&env, proposal_id);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_finalized"),),
@@ -1332,6 +1335,7 @@ impl GovernanceDao {
 
             // Issue #630: clear hash so the same action can be re-proposed.
             Self::clear_proposal_hash(&env, &proposal);
+            Self::cleanup_delegated_votes(&env, pid);
 
             env.events().publish(
                 (Symbol::new(&env, "proposal_finalized"),),
@@ -1387,6 +1391,7 @@ impl GovernanceDao {
 
         // Issue #630: clear hash so the same action can be re-proposed.
         Self::clear_proposal_hash(&env, &proposal);
+        Self::cleanup_delegated_votes(&env, proposal_id);
 
         env.events().publish(
             (Symbol::new(&env, "deposit_reclaimed"),),
@@ -1667,6 +1672,7 @@ impl GovernanceDao {
 
         // Issue #630: clear hash so the same action can be re-proposed.
         Self::clear_proposal_hash(&env, &proposal);
+        Self::cleanup_delegated_votes(&env, proposal_id);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_cancelled"),),
@@ -1947,7 +1953,7 @@ impl GovernanceDao {
 
         // Validate template payload structure (#694)
         if min_title_len == 0 || min_title_len > 256 || required_arg_count > 64 {
-            panic_with_error!(&env, Error::InvalidParameter);
+            panic_with_error!(&env, Error::InvalidInput);
         }
 
         if env.storage().instance().has(&StorageKey::Template(name.clone())) {
@@ -2715,6 +2721,13 @@ impl GovernanceDao {
             .get(&StorageKey::Delegators(voter.clone()))
             .unwrap_or_else(|| Vec::new(env));
 
+        let mut recorded_delegators: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DelegatedVoters(proposal_id))
+            .unwrap_or_else(|| Vec::new(env));
+        let mut recorded_any = false;
+
         let mut total: i128 = 0;
         for i in 0..delegators.len() {
             let delegator = delegators.get_unchecked(i);
@@ -2728,6 +2741,8 @@ impl GovernanceDao {
                 continue;
             }
             env.storage().persistent().set(&marker, &true);
+            recorded_delegators.push_back(delegator.clone());
+            recorded_any = true;
 
             let counted = Self::time_weighted(env, &delegator, balance);
             total = total.saturating_add(counted);
@@ -2744,7 +2759,32 @@ impl GovernanceDao {
             );
         }
 
+        if recorded_any {
+            env.storage()
+                .persistent()
+                .set(&StorageKey::DelegatedVoters(proposal_id), &recorded_delegators);
+        }
+
         total
+    }
+
+    /// Clean up DelegatedVote markers and DelegatedVoters tracking list for a resolved proposal.
+    fn cleanup_delegated_votes(env: &Env, proposal_id: u64) {
+        if let Some(voters) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<Address>>(&StorageKey::DelegatedVoters(proposal_id))
+        {
+            for i in 0..voters.len() {
+                let delegator = voters.get_unchecked(i);
+                env.storage()
+                    .persistent()
+                    .remove(&StorageKey::DelegatedVote(proposal_id, delegator));
+            }
+            env.storage()
+                .persistent()
+                .remove(&StorageKey::DelegatedVoters(proposal_id));
+        }
     }
 
     /// Panic with `DuplicateProposal` if `hash_key` points to a still-open
