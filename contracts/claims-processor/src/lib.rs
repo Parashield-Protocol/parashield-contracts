@@ -629,6 +629,21 @@ impl ClaimsProcessor {
 
         let claim_id   = Self::next_claim_id(env);
 
+        // Issue #801: update claimant history BEFORE evaluate_fraud so that
+        // blocked (high-score) submissions still count toward rate/burst
+        // limits. Previously a blocked claim never incremented the history,
+        // allowing unlimited fraud-screened submissions without consequence.
+        let burst_window = Self::fraud_config(env)
+            .map(|c| c.burst_window_secs)
+            .unwrap_or(0);
+        Self::update_claimant_history(
+            env,
+            claimant,
+            now,
+            policy.coverage_amount,
+            burst_window,
+        );
+
         // Issue #437: score this submission against the configured fraud
         // rules. In `Block` mode a high enough score panics here, before any
         // claim state is written — the caller gets FraudSuspected and the
@@ -674,22 +689,6 @@ impl ClaimsProcessor {
                 claimant: claimant.clone(),
                 coverage_amount: policy.coverage_amount,
             },
-        );
-
-        // Issue #437: fold this submission into the claimant's aggregate
-        // history for the next call's fraud check. Only meaningful when the
-        // detector is on, but cheap enough to always maintain; keeping the
-        // aggregate up to date lets an admin turn the detector on later
-        // without every claimant looking like a first-time submitter.
-        let burst_window = Self::fraud_config(env)
-            .map(|c| c.burst_window_secs)
-            .unwrap_or(0);
-        Self::update_claimant_history(
-            env,
-            claimant,
-            now,
-            policy.coverage_amount,
-            burst_window,
         );
 
         claim_id
@@ -2535,6 +2534,12 @@ impl ClaimsProcessor {
         let policy_engine_id = Self::policy_engine(&env);
         let pe_client = parashield_policy_engine::PolicyEngineClient::new(&env, &policy_engine_id);
 
+        // Issue #805: cache (product_id -> threshold) so that claims sharing a
+        // product only pay one get_policy + one get_product cross-contract call
+        // per distinct product_id rather than 2 calls per claim.
+        let mut cached_product_id: Option<u128> = None;
+        let mut cached_threshold: u64 = Self::escalation_threshold(&env, None);
+
         for i in 0..pending.len() {
             let cid = pending.get_unchecked(i);
             if let Some(claim) = env
@@ -2544,9 +2549,16 @@ impl ClaimsProcessor {
             {
                 if claim.status == ClaimStatus::Pending {
                     let policy = pe_client.get_policy(&claim.policy_id);
-                    let product = pe_client.get_product(&policy.product_id);
-                    let threshold = Self::escalation_threshold(&env, Some(product.category));
-                    
+                    let threshold = if cached_product_id == Some(policy.product_id) {
+                        cached_threshold
+                    } else {
+                        let product = pe_client.get_product(&policy.product_id);
+                        let t = Self::escalation_threshold(&env, Some(product.category));
+                        cached_product_id = Some(policy.product_id);
+                        cached_threshold = t;
+                        t
+                    };
+
                     if now.saturating_sub(claim.submitted_at) >= threshold {
                         overdue.push_back(cid);
                     }
@@ -3270,3 +3282,5 @@ mod test_keeper_registry;
 mod test_claim_uniqueness;
 #[cfg(test)]
 mod test_coverage_mismatch;
+
+mod test_cross_contract_failures;
