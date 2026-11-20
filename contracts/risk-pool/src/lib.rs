@@ -936,10 +936,12 @@ impl RiskPool {
         token::Client::new(&env, &usdc)
             .transfer(&caller, &env.current_contract_address(), &amount);
 
-        let (lp_bps, treas_bps, backstop_bps) = Self::get_premium_split_bps(&env);
-        let lp_share       = amount * lp_bps       / 10_000;
-        let treas_share    = amount * treas_bps    / 10_000;
-        let backstop_share = amount * backstop_bps / 10_000;
+        let (lp_bps, treas_bps, _backstop_bps) = Self::get_premium_split_bps(&env);
+        let lp_share    = amount * lp_bps    / 10_000;
+        let treas_share = amount * treas_bps / 10_000;
+        // Issue #787: absorb integer-division rounding into backstop_share so
+        // lp_share + treas_share + backstop_share == amount exactly.
+        let backstop_share = amount - lp_share - treas_share;
 
         // CEI: update state before outgoing external token transfers
         let acc: i128 = env.storage().instance()
@@ -3381,22 +3383,18 @@ impl RiskPool {
             );
         }
 
-        // Update pool totals
+        // Issue #788: only reduce total_shares — the seized USDC stays in the
+        // contract as available liquidity, so total_deposited must NOT be
+        // reduced. Reducing it would understate share value: surviving LPs'
+        // shares would map to less capital than actually exists in the pool.
         let current_total_shares: i128 = env
             .storage().instance().get(&StorageKey::TotalShares).unwrap_or(0);
-        let current_total_deposited: i128 = env
-            .storage().instance().get(&StorageKey::TotalDeposited).unwrap_or(0);
         env.storage().instance().set(
             &StorageKey::TotalShares,
             &current_total_shares.saturating_sub(shares_seized),
         );
-        env.storage().instance().set(
-            &StorageKey::TotalDeposited,
-            &current_total_deposited.saturating_sub(amount_recovered),
-        );
-
-        // Return seized funds to pool (they stay as available liquidity)
-        // The recovered amount stays in the contract as pool liquidity
+        // total_deposited is intentionally NOT reduced: the capital is still
+        // present in the contract; only the LP's claim on it has been removed.
 
         env.events().publish(
             (Symbol::new(&env, "position_liquidated"),),
