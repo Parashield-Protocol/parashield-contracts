@@ -458,23 +458,12 @@ impl RiskPool {
             panic_with_error!(&env, Error::PoolCapExceeded);
         }
         
-        // SECURITY FIX: Additional validation to prevent deposits that would push
-        // the pool beyond safe utilization limits for this category.
-        // Check that current utilization doesn't already exceed the limit before accepting more funds.
-        let total_locked: i128 = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
-        let current_utilization_bps = if total_deposited > 0 {
-            total_locked.checked_mul(10_000)
-                .and_then(|v| v.checked_div(total_deposited))
-                .unwrap_or(0) as u32
-        } else {
-            0
-        };
-        
-        // If utilization is already at or above max, reject new deposits to prevent
-        // over-leveraging the category pool beyond its risk tolerance.
-        if current_utilization_bps >= capacity.max_utilization_bps {
-            panic_with_error!(&env, Error::PoolCapExceeded);
-        }
+        // Issue #802: the previous guard rejected deposits when
+        // utilization >= max_utilization_bps. That is backwards: deposits
+        // increase total_deposited, which REDUCES utilization (total_locked is
+        // unchanged). Blocking deposits prevents the pool from raising the
+        // capital needed to lower utilization. The utilization cap belongs on
+        // lock_for_claim (where total_locked increases), not here.
 
         // Both branches use checked arithmetic: a share calculation that
         // cannot be represented traps as a typed `Overflow` rather than
