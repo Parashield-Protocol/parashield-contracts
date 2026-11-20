@@ -131,7 +131,8 @@ enum StorageKey {
     /// data_type (u64)
     MinSubmitInterval,
     /// Timestamp (u64) of an oracle's last accepted submission for a
-    /// data_type — (data_type, oracle) → last submission time
+    /// data_type — (data_type, oracle) → last submission time.
+    /// Used by `oracle_offline` to track per-data-type oracle activity.
     LastSubmission(Symbol, Address),
     /// Monotonic guard: the latest reading-timestamp (u64) this oracle has
     /// published for a specific (data_type, key) stream. Any subsequent
@@ -224,6 +225,10 @@ enum StorageKey {
     StakeWithdrawalReq(Symbol, Address),
     /// Global registration tracker for oracle addresses across all data types (issue #742).
     GlobalOracle(Address),
+    /// Timestamp (u64) of an oracle's last accepted submission for a specific
+    /// (data_type, key) stream — used to enforce `MinSubmitInterval` per stream
+    /// rather than across all keys of a data_type (issue #834).
+    LastKeySubmission(Symbol, Symbol, Address),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -2434,7 +2439,7 @@ impl OracleVerifier {
             .persistent()
             .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
-        Self::enforce_rate_limit(&env, &data_type, &oracle, now);
+        Self::enforce_rate_limit(&env, &data_type, &key, &oracle, now);
 
         // Issue #775: monotonic reading-timestamp per (data_type, key, oracle).
         // Readings for one stream from one oracle must advance strictly
@@ -2588,7 +2593,7 @@ impl OracleVerifier {
             .persistent()
             .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
-        Self::enforce_rate_limit(&env, &data_type, &oracle, now);
+        Self::enforce_rate_limit(&env, &data_type, &key, &oracle, now);
 
         // Issue #459: same stale-submission gate as `submit_data`.
         let max_data_age = Self::effective_max_age(&env, &data_type);
@@ -3170,8 +3175,6 @@ impl OracleVerifier {
             .persistent()
             .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
-        Self::enforce_rate_limit(&env, &data_type, &oracle, env.ledger().timestamp());
-
         for i in 0..submissions.len() {
             let (key, value, confidence, timestamp) = submissions.get_unchecked(i);
             Self::validate_key_len(&env, &key);
@@ -3201,6 +3204,8 @@ impl OracleVerifier {
             if timestamp < now.saturating_sub(max_timestamp_age) {
                 panic_with_error!(&env, Error::InvalidTimestamp);
             }
+
+            Self::enforce_rate_limit(&env, &data_type, &key, &oracle, now);
 
             // Issue #775: monotonic reading-timestamp per (data_type, key,
             // oracle). Same guard as submit_data — batch callers must not
@@ -3451,24 +3456,40 @@ impl OracleVerifier {
             .extend_ttl(&storage_key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
-    /// Enforce the per-oracle submission cooldown for `data_type`: panics with
-    /// `RateLimited` if `oracle` submitted for this data_type more recently
-    /// than `get_min_submit_interval()` seconds ago, otherwise records `now`
-    /// as the new last-submission time. Call once per submission entry point
-    /// (submit_data / submit_data_batch / batch_submit_data), not per reading,
-    /// so a single call with many keys pays the check once.
-    fn enforce_rate_limit(env: &Env, data_type: &Symbol, oracle: &Address, now: u64) {
+    /// Enforce the per-(data_type, key, oracle) submission cooldown: panics with
+    /// `RateLimited` if `oracle` submitted for this `(data_type, key)` stream
+    /// more recently than `get_min_submit_interval()` seconds ago, otherwise
+    /// records `now` as the new last-submission time for the stream and updates
+    /// the per-(data_type, oracle) activity timestamp used by `oracle_offline`
+    /// (issue #834).
+    fn enforce_rate_limit(
+        env: &Env,
+        data_type: &Symbol,
+        key: &Symbol,
+        oracle: &Address,
+        now: u64,
+    ) {
         let min_interval = Self::get_min_submit_interval(env.clone());
-        let key = StorageKey::LastSubmission(data_type.clone(), oracle.clone());
-        if let Some(last) = env.storage().persistent().get::<_, u64>(&key) {
+        let rate_key = StorageKey::LastKeySubmission(
+            data_type.clone(),
+            key.clone(),
+            oracle.clone(),
+        );
+        if let Some(last) = env.storage().persistent().get::<_, u64>(&rate_key) {
             if now.saturating_sub(last) < min_interval {
                 panic_with_error!(env, Error::RateLimited);
             }
         }
-        env.storage().persistent().set(&key, &now);
+        env.storage().persistent().set(&rate_key, &now);
         env.storage()
             .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            .extend_ttl(&rate_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        let activity_key = StorageKey::LastSubmission(data_type.clone(), oracle.clone());
+        env.storage().persistent().set(&activity_key, &now);
+        env.storage()
+            .persistent()
+            .extend_ttl(&activity_key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
     /// Mark an oracle inactive and drop it from its data_type's oracle list.
@@ -4095,3 +4116,6 @@ mod test_monotonic;
 
 #[cfg(test)]
 mod test_data_type_range;
+
+#[cfg(test)]
+mod test_rate_limit;
