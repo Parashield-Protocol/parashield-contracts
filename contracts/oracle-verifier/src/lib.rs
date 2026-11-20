@@ -131,7 +131,8 @@ enum StorageKey {
     /// data_type (u64)
     MinSubmitInterval,
     /// Timestamp (u64) of an oracle's last accepted submission for a
-    /// data_type — (data_type, oracle) → last submission time
+    /// data_type — (data_type, oracle) → last submission time.
+    /// Used by `oracle_offline` to track per-data-type oracle activity.
     LastSubmission(Symbol, Address),
     /// Monotonic guard: the latest reading-timestamp (u64) this oracle has
     /// published for a specific (data_type, key) stream. Any subsequent
@@ -224,6 +225,10 @@ enum StorageKey {
     StakeWithdrawalReq(Symbol, Address),
     /// Global registration tracker for oracle addresses across all data types (issue #742).
     GlobalOracle(Address),
+    /// Timestamp (u64) of an oracle's last accepted submission for a specific
+    /// (data_type, key) stream — used to enforce `MinSubmitInterval` per stream
+    /// rather than across all keys of a data_type (issue #834).
+    LastKeySubmission(Symbol, Symbol, Address),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -318,7 +323,9 @@ impl OracleVerifier {
     // ── Oracle Management (admin only) ───────────────────────────────────────
 
     /// Register an oracle address for a given data type with a relative weight.
-    /// `weight` is 1–100,000 (MAX_WEIGHT); higher-weight oracles contribute more to the median.
+    /// `weight` must be in `1..=MAX_WEIGHT` (`MAX_WEIGHT = 100_000`, inclusive);
+    /// values outside this range panic with `Error::InvalidWeight`.
+    /// Higher-weight oracles contribute more to the median.
     pub fn add_oracle(env: Env, admin: Address, oracle: Address, data_type: Symbol, weight: u32) {
         Self::require_admin(&env, &admin);
         Self::validate_contract_address(&env, &oracle);
@@ -352,23 +359,25 @@ impl OracleVerifier {
         // This is a simplified check — in production, you'd likely require external
         // identity verification or proof-of-humanity, but checking for concentrated
         // control is a basic safeguard.
-        // 
+        //
         // For now, we check if this oracle's account controller already manages
         // too many oracles for this data type. A simple limit of 1 oracle per
         // entity per data type prevents basic Sybil attacks.
-        let list: Vec<Address> = env
+        //
+        // issue #811: read OracleList once and reuse for both the count check and the push.
+        let mut list: Vec<Address> = env
             .storage()
             .instance()
             .get(&StorageKey::OracleList(data_type.clone()))
             .unwrap_or_else(|| Vec::new(&env));
-        
+
         // Count how many oracles are already registered for this data_type / key (issue #727).
         // Limit to MAX_ORACLES_PER_KEY to prevent Sybil attacks and oracle domination.
         let oracle_count = list.len();
         if oracle_count >= MAX_ORACLES_PER_KEY {
             panic_with_error!(&env, Error::TooManyOracles);
         }
-        
+
         // Enforce a minimum economic stake so oracles have skin in the game (issue #721).
         // Reject zero-stake registration when minimum stake is enforced.
         let min_stake: i128 = env
@@ -395,11 +404,7 @@ impl OracleVerifier {
         env.storage().persistent().set(&key, &entry);
         env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
-        let mut list: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&StorageKey::OracleList(data_type.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
+        // Reuse the list already read above — no second storage read (issue #811).
         let mut already_present = false;
         for i in 0..list.len() {
             if list.get_unchecked(i) == oracle {
@@ -426,7 +431,9 @@ impl OracleVerifier {
     }
 
     /// Update the relative weight of an existing oracle registration.
-    /// `weight` is 1–100,000 (MAX_WEIGHT); use `add_oracle` only for new registrations.
+    /// `weight` must be in `1..=MAX_WEIGHT` (`MAX_WEIGHT = 100_000`, inclusive);
+    /// values outside this range panic with `Error::InvalidWeight`.
+    /// Use `add_oracle` only for new registrations.
     pub fn update_oracle_weight(
         env: Env,
         admin: Address,
@@ -535,19 +542,26 @@ impl OracleVerifier {
             .instance()
             .get(&StorageKey::OracleList(data_type.clone()))
             .unwrap_or_else(|| Vec::new(&env));
-        let mut deactivated: Vec<Address> = Vec::new(&env);
+        // issue #810: collect offline oracles first, then deactivate after the
+        // loop so deactivate_oracle's mutation of OracleList does not interfere
+        // with the iteration over the snapshot.
+        let mut to_deactivate: Vec<Address> = Vec::new(&env);
         for oracle in list.iter() {
             if Self::oracle_offline(&env, &data_type, &oracle) {
-                Self::deactivate_oracle(&env, &data_type, &oracle);
-                env.events().publish(
-                    (Symbol::new(&env, "oracle_auto_deactivated"),),
-                    OracleRemoved {
-                        oracle: oracle.clone(),
-                        data_type: data_type.clone(),
-                    },
-                );
-                deactivated.push_back(oracle);
+                to_deactivate.push_back(oracle);
             }
+        }
+        let mut deactivated: Vec<Address> = Vec::new(&env);
+        for oracle in to_deactivate.iter() {
+            Self::deactivate_oracle(&env, &data_type, &oracle);
+            env.events().publish(
+                (Symbol::new(&env, "oracle_auto_deactivated"),),
+                OracleRemoved {
+                    oracle: oracle.clone(),
+                    data_type: data_type.clone(),
+                },
+            );
+            deactivated.push_back(oracle);
         }
         deactivated
     }
@@ -2430,7 +2444,7 @@ impl OracleVerifier {
             .persistent()
             .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
-        Self::enforce_rate_limit(&env, &data_type, &oracle, now);
+        Self::enforce_rate_limit(&env, &data_type, &key, &oracle, now);
 
         // Issue #775: monotonic reading-timestamp per (data_type, key, oracle).
         // Readings for one stream from one oracle must advance strictly
@@ -2584,7 +2598,7 @@ impl OracleVerifier {
             .persistent()
             .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
-        Self::enforce_rate_limit(&env, &data_type, &oracle, now);
+        Self::enforce_rate_limit(&env, &data_type, &key, &oracle, now);
 
         // Issue #459: same stale-submission gate as `submit_data`.
         let max_data_age = Self::effective_max_age(&env, &data_type);
@@ -3166,8 +3180,6 @@ impl OracleVerifier {
             .persistent()
             .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
-        Self::enforce_rate_limit(&env, &data_type, &oracle, env.ledger().timestamp());
-
         for i in 0..submissions.len() {
             let (key, value, confidence, timestamp) = submissions.get_unchecked(i);
             Self::validate_key_len(&env, &key);
@@ -3197,6 +3209,8 @@ impl OracleVerifier {
             if timestamp < now.saturating_sub(max_timestamp_age) {
                 panic_with_error!(&env, Error::InvalidTimestamp);
             }
+
+            Self::enforce_rate_limit(&env, &data_type, &key, &oracle, now);
 
             // Issue #775: monotonic reading-timestamp per (data_type, key,
             // oracle). Same guard as submit_data — batch callers must not
@@ -3447,24 +3461,40 @@ impl OracleVerifier {
             .extend_ttl(&storage_key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
-    /// Enforce the per-oracle submission cooldown for `data_type`: panics with
-    /// `RateLimited` if `oracle` submitted for this data_type more recently
-    /// than `get_min_submit_interval()` seconds ago, otherwise records `now`
-    /// as the new last-submission time. Call once per submission entry point
-    /// (submit_data / submit_data_batch / batch_submit_data), not per reading,
-    /// so a single call with many keys pays the check once.
-    fn enforce_rate_limit(env: &Env, data_type: &Symbol, oracle: &Address, now: u64) {
+    /// Enforce the per-(data_type, key, oracle) submission cooldown: panics with
+    /// `RateLimited` if `oracle` submitted for this `(data_type, key)` stream
+    /// more recently than `get_min_submit_interval()` seconds ago, otherwise
+    /// records `now` as the new last-submission time for the stream and updates
+    /// the per-(data_type, oracle) activity timestamp used by `oracle_offline`
+    /// (issue #834).
+    fn enforce_rate_limit(
+        env: &Env,
+        data_type: &Symbol,
+        key: &Symbol,
+        oracle: &Address,
+        now: u64,
+    ) {
         let min_interval = Self::get_min_submit_interval(env.clone());
-        let key = StorageKey::LastSubmission(data_type.clone(), oracle.clone());
-        if let Some(last) = env.storage().persistent().get::<_, u64>(&key) {
+        let rate_key = StorageKey::LastKeySubmission(
+            data_type.clone(),
+            key.clone(),
+            oracle.clone(),
+        );
+        if let Some(last) = env.storage().persistent().get::<_, u64>(&rate_key) {
             if now.saturating_sub(last) < min_interval {
                 panic_with_error!(env, Error::RateLimited);
             }
         }
-        env.storage().persistent().set(&key, &now);
+        env.storage().persistent().set(&rate_key, &now);
         env.storage()
             .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            .extend_ttl(&rate_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        let activity_key = StorageKey::LastSubmission(data_type.clone(), oracle.clone());
+        env.storage().persistent().set(&activity_key, &now);
+        env.storage()
+            .persistent()
+            .extend_ttl(&activity_key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
     /// Mark an oracle inactive and drop it from its data_type's oracle list.
@@ -4091,3 +4121,6 @@ mod test_monotonic;
 
 #[cfg(test)]
 mod test_data_type_range;
+
+#[cfg(test)]
+mod test_rate_limit;
