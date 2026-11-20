@@ -10,7 +10,8 @@ use soroban_sdk::{
 };
 
 use crate::{
-    DaoConfig, GovernanceDao, GovernanceDaoClient, ProposalKind, ProposalStatus, VoteChoice,
+    DaoConfig, GovernanceDao, GovernanceDaoClient, ProposalKind, ProposalStatus, StorageKey,
+    VoteChoice,
 };
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -1238,6 +1239,45 @@ fn a_delegator_cannot_vote_after_their_delegate_has() {
     // Revoking after the fact must not unlock a second vote for weight that
     // has already been counted.
     dao.vote(&voter1, &pid, &VoteChoice::For);
+}
+
+#[test]
+fn delegated_vote_markers_are_cleaned_up_on_finalize() {
+    let (env, dao, _admin, voter1, voter2, target) = setup();
+
+    dao.delegate(&voter1, &voter2);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter2,
+        &Bytes::from_slice(&env, b"delegated cleanup test"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+
+    // Marker exists while proposal is active
+    let marker = StorageKey::DelegatedVote(pid, voter1.clone());
+    assert!(env.as_contract(&dao.address, || {
+        env.storage().persistent().has(&marker)
+    }));
+
+    // Advance past voting period + finalize delay
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+
+    dao.finalize(&pid);
+
+    // Marker is cleaned up after finalization
+    assert!(!env.as_contract(&dao.address, || {
+        env.storage().persistent().has(&marker)
+    }));
+    assert!(!env.as_contract(&dao.address, || {
+        env.storage().persistent().has(&StorageKey::DelegatedVoters(pid))
+    }));
 }
 
 #[test]

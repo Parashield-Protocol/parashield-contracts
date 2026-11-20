@@ -1888,11 +1888,8 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::NoStake);
         }
         let slashed = amount.min(current);
-
-
-
-
-        // Slashing protection: adjust any pending stake withdrawal request during challenge period
+        let remaining = current - slashed;
+        env.storage().persistent().set(&stake_key, &remaining);
         let req_key = StorageKey::StakeWithdrawalReq(data_type.clone(), oracle.clone());
         if let Some(mut req) = env.storage().persistent().get::<_, StakeWithdrawalRequest>(&req_key) {
             req.amount = req.amount.saturating_sub(slashed);
@@ -2947,7 +2944,7 @@ impl OracleVerifier {
                     .persistent()
                     .get::<_, OracleEntry>(&oracle_key)
                 {
-                    if entry.active && !Self::oracle_offline(env, &data_type, &p.oracle) {
+                    if entry.active && !Self::oracle_offline(&env, &data_type, &p.oracle) {
                         oracle_count += 1;
                         min_confidence_val = min_confidence_val.min(p.confidence);
                         last_updated = last_updated.max(p.timestamp);
@@ -2966,7 +2963,7 @@ impl OracleVerifier {
             }
         }
 
-        n = Self::filter_outliers(env, data_type, &mut values, &mut timestamps, n);
+        n = Self::filter_outliers(&env, &data_type, &mut values, &mut timestamps, n);
         total_weight = values[0..n].iter().map(|&(_, wt)| wt).sum();
 
         let min_oracle_count: u32 = env
@@ -3233,30 +3230,30 @@ impl OracleVerifier {
                 continue;
             }
             let new_point = OracleDataPoint {
-            oracle: oracle.clone(),
-            value: sub.value,
-            confidence: sub.confidence,
-            timestamp: sub.timestamp,
+                oracle: oracle.clone(),
+                value,
+                confidence,
+                timestamp,
             };
             Self::store_plain_reading(
-            &env,
-            &data_type,
-            &sub.key,
-            new_point,
-            now,
-            max_data_age,
+                &env,
+                &data_type,
+                &key,
+                new_point,
+                now,
+                max_data_age,
             );
-            Self::record_reading_timestamp(&env, &data_type, &sub.key, &oracle, sub.timestamp);
+            Self::record_reading_timestamp(&env, &data_type, &key, &oracle, timestamp);
 
             env.events().publish(
                 (Symbol::new(&env, "oracle_data_submitted"),),
                 OracleDataSubmitted {
                     oracle: oracle.clone(),
                     data_type: data_type.clone(),
-                    key: sub.key,
-                    value: sub.value,
-                    confidence: sub.confidence,
-                    timestamp: sub.timestamp,
+                    key,
+                    value,
+                    confidence,
+                    timestamp,
                 },
             );
         }
