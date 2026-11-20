@@ -359,23 +359,25 @@ impl OracleVerifier {
         // This is a simplified check — in production, you'd likely require external
         // identity verification or proof-of-humanity, but checking for concentrated
         // control is a basic safeguard.
-        // 
+        //
         // For now, we check if this oracle's account controller already manages
         // too many oracles for this data type. A simple limit of 1 oracle per
         // entity per data type prevents basic Sybil attacks.
-        let list: Vec<Address> = env
+        //
+        // issue #811: read OracleList once and reuse for both the count check and the push.
+        let mut list: Vec<Address> = env
             .storage()
             .instance()
             .get(&StorageKey::OracleList(data_type.clone()))
             .unwrap_or_else(|| Vec::new(&env));
-        
+
         // Count how many oracles are already registered for this data_type / key (issue #727).
         // Limit to MAX_ORACLES_PER_KEY to prevent Sybil attacks and oracle domination.
         let oracle_count = list.len();
         if oracle_count >= MAX_ORACLES_PER_KEY {
             panic_with_error!(&env, Error::TooManyOracles);
         }
-        
+
         // Enforce a minimum economic stake so oracles have skin in the game (issue #721).
         // Reject zero-stake registration when minimum stake is enforced.
         let min_stake: i128 = env
@@ -402,11 +404,7 @@ impl OracleVerifier {
         env.storage().persistent().set(&key, &entry);
         env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
-        let mut list: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&StorageKey::OracleList(data_type.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
+        // Reuse the list already read above — no second storage read (issue #811).
         let mut already_present = false;
         for i in 0..list.len() {
             if list.get_unchecked(i) == oracle {
@@ -544,19 +542,26 @@ impl OracleVerifier {
             .instance()
             .get(&StorageKey::OracleList(data_type.clone()))
             .unwrap_or_else(|| Vec::new(&env));
-        let mut deactivated: Vec<Address> = Vec::new(&env);
+        // issue #810: collect offline oracles first, then deactivate after the
+        // loop so deactivate_oracle's mutation of OracleList does not interfere
+        // with the iteration over the snapshot.
+        let mut to_deactivate: Vec<Address> = Vec::new(&env);
         for oracle in list.iter() {
             if Self::oracle_offline(&env, &data_type, &oracle) {
-                Self::deactivate_oracle(&env, &data_type, &oracle);
-                env.events().publish(
-                    (Symbol::new(&env, "oracle_auto_deactivated"),),
-                    OracleRemoved {
-                        oracle: oracle.clone(),
-                        data_type: data_type.clone(),
-                    },
-                );
-                deactivated.push_back(oracle);
+                to_deactivate.push_back(oracle);
             }
+        }
+        let mut deactivated: Vec<Address> = Vec::new(&env);
+        for oracle in to_deactivate.iter() {
+            Self::deactivate_oracle(&env, &data_type, &oracle);
+            env.events().publish(
+                (Symbol::new(&env, "oracle_auto_deactivated"),),
+                OracleRemoved {
+                    oracle: oracle.clone(),
+                    data_type: data_type.clone(),
+                },
+            );
+            deactivated.push_back(oracle);
         }
         deactivated
     }

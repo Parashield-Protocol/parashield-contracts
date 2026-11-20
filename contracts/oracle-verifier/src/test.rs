@@ -1722,3 +1722,53 @@ fn check_staleness_boundary_at_exactly_max_age_threshold() {
     assert_eq!(report_stale.stale_count, 1);
     assert_eq!(events_before_2, events_after_2, "stale boundary check must emit no events");
 }
+
+// ── Issue #807: remove_oracle must clear GlobalOracle so oracle can be re-added ──
+
+#[test]
+fn test_remove_oracle_clears_global_key_allows_reregistration() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle, &weather(), &50u32);
+    assert_eq!(client.get_oracles(&weather()).len(), 1);
+
+    // After removal the GlobalOracle marker must be cleared so the same
+    // address can be re-registered (issue #807).
+    client.remove_oracle(&admin, &oracle, &weather());
+    assert_eq!(client.get_oracles(&weather()).len(), 0);
+
+    // This would panic with OracleAlreadyExists if GlobalOracle were not cleared.
+    client.add_oracle(&admin, &oracle, &weather(), &60u32);
+    assert_eq!(client.get_oracles(&weather()).len(), 1);
+}
+
+// ── Issue #810: deactivate_inactive_oracles must not skip elements ────────────
+
+#[test]
+fn test_deactivate_inactive_oracles_deactivates_all_offline() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+
+    // Set inactivity limit to 60 seconds.
+    client.set_oracle_inactivity_limit(&admin, &60u64);
+
+    let oracle1 = Address::generate(&env);
+    let oracle2 = Address::generate(&env);
+    let oracle3 = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle1, &weather(), &50u32);
+    client.add_oracle(&admin, &oracle2, &weather(), &50u32);
+    client.add_oracle(&admin, &oracle3, &weather(), &50u32);
+    assert_eq!(client.get_oracles(&weather()).len(), 3);
+
+    // Advance time past the inactivity limit — none of the oracles ever submitted.
+    env.ledger().set_timestamp(1748736000 + 61);
+
+    let deactivated = client.deactivate_inactive_oracles(&weather());
+
+    // All three oracles must be deactivated (issue #810: none may be skipped).
+    assert_eq!(deactivated.len(), 3, "all offline oracles must be deactivated");
+    assert_eq!(client.get_oracles(&weather()).len(), 0);
+}
