@@ -920,8 +920,10 @@ impl PolicyEngine {
                 Ok(s) => {
                     let s_str: &str = s.as_ref();
                     let bytes: &[u8] = s_str.as_bytes();
-                    // Reject empty oracle keys (issue #795) and keys longer than 32 chars.
-                    if bytes.is_empty() || bytes.len() > 32 {
+                    // Issue #789: match the same 3-9 char limit enforced by
+                    // create_product so the oracle key accepted at buy time is
+                    // always a valid key for the product it was created with.
+                    if bytes.len() < 3 || bytes.len() > 9 {
                         panic_with_error!(env, Error::InvalidOracleKey);
                     }
                 }
@@ -1310,6 +1312,13 @@ impl PolicyEngine {
     ///
     /// Reads pre-aggregated per-product counters in O(1) rather than scanning
     /// `1..NextPolicyId` (issue #821).
+    /// Return aggregate stats for `product_id` in O(1) (#790).
+    ///
+    /// Counters are maintained incrementally by `buy_policy` / `cancel_policy` /
+    /// `pay_claim` / `expire_policy` so this is a single persistent-storage read
+    /// regardless of the number of policies. Existing policies created before
+    /// incremental tracking was introduced can be backfilled with
+    /// `backfill_product_stats`.
     pub fn get_product_stats(env: Env, product_id: u128) -> ProductStats {
         if !env
             .storage()
