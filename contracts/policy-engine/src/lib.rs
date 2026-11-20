@@ -800,7 +800,7 @@ impl PolicyEngine {
     ///
     /// The buyer must have approved this contract to spend `premium` USDC
     /// (or the transaction must include the token transfer auth).
-    /// Premium = coverage_amount * premium_rate_bps / 10_000.
+    /// Premium = coverage_amount * premium_rate_bps * duration_days / (365 * 10_000).
     ///
     /// `oracle_key` is the specific measurement key to watch, e.g.
     /// `symbol_short!("kis2606")` for Kisumu June 2026 rainfall.

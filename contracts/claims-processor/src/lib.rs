@@ -661,7 +661,7 @@ impl ClaimsProcessor {
         env.storage().persistent().set(&StorageKey::PolicyClaim(policy_id), &claim_id);
         env.storage().persistent().extend_ttl(&StorageKey::PolicyClaim(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
 
-        let mut pending: Vec<u128> = env.storage().instance()
+        let pending: Vec<u128> = env.storage().instance()
             .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(env));
         pending.push_back(claim_id);
         env.storage().instance().set(&StorageKey::PendingClaims, &pending);
@@ -1202,6 +1202,12 @@ impl ClaimsProcessor {
             .get(&StorageKey::PendingClaims)
             .unwrap_or_else(|| Vec::new(&env));
         
+        let effective_limit = if limit > MAX_BATCH_SIZE { MAX_BATCH_SIZE } else { limit };
+        // The queue is maintained in FIFO order. For a one-claim request,
+        // preserve that order without reading and sorting the whole queue.
+        let sorted_pending = if effective_limit == 1 {
+            pending.clone()
+        } else {
         // FAIRNESS FIX: Sort claims by submission time to ensure true FIFO processing.
         // Even if the pending queue gets slightly out of order (due to concurrent 
         // submissions or manual queue manipulation), this ensures oldest claims 
@@ -1238,9 +1244,10 @@ impl ClaimsProcessor {
         
         // Update storage with sorted order
         env.storage().instance().set(&StorageKey::PendingClaims, &sorted_pending);
+            sorted_pending
+        };
         
         let mut results: Vec<(u128, ClaimResult)> = Vec::new(&env);
-        let effective_limit = if limit > MAX_BATCH_SIZE { MAX_BATCH_SIZE } else { limit };
         let process_count = if sorted_pending.len() < effective_limit {
             sorted_pending.len()
         } else {

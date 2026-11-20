@@ -191,3 +191,16 @@ fn cancel_stake_withdrawal_restores_pending_state() {
     // Stake still remains in contract
     assert_eq!(f.client.get_oracle_stake(&weather(), &f.oracle), stake_amt);
 }
+
+#[test]
+fn stake_deposit_is_recorded_and_challenge_period_is_enforced() {
+    let f = setup_stake_fixture();
+    f.client.stake(&f.oracle, &weather(), &250_000i128);
+    assert_eq!(f.client.get_oracle_stake(&weather(), &f.oracle), 250_000);
+
+    f.client.remove_oracle(&f.admin, &f.oracle, &weather());
+    f.client.request_stake_withdrawal(&f.oracle, &weather());
+    let unlock_at = f.client.get_stake_withdrawal_request(&weather(), &f.oracle).unwrap().unlock_at;
+    f.env.ledger().set_timestamp(unlock_at - 1);
+    assert_eq!(f.client.try_withdraw_stake(&f.oracle, &weather()).unwrap_err().unwrap(), Error::ChallengePeriodNotElapsed.into());
+}
