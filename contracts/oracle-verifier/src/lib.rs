@@ -318,7 +318,9 @@ impl OracleVerifier {
     // ── Oracle Management (admin only) ───────────────────────────────────────
 
     /// Register an oracle address for a given data type with a relative weight.
-    /// `weight` is 1–100,000 (MAX_WEIGHT); higher-weight oracles contribute more to the median.
+    /// `weight` must be in `1..=MAX_WEIGHT` (`MAX_WEIGHT = 100_000`, inclusive);
+    /// values outside this range panic with `Error::InvalidWeight`.
+    /// Higher-weight oracles contribute more to the median.
     pub fn add_oracle(env: Env, admin: Address, oracle: Address, data_type: Symbol, weight: u32) {
         Self::require_admin(&env, &admin);
         Self::validate_contract_address(&env, &oracle);
@@ -426,7 +428,9 @@ impl OracleVerifier {
     }
 
     /// Update the relative weight of an existing oracle registration.
-    /// `weight` is 1–100,000 (MAX_WEIGHT); use `add_oracle` only for new registrations.
+    /// `weight` must be in `1..=MAX_WEIGHT` (`MAX_WEIGHT = 100_000`, inclusive);
+    /// values outside this range panic with `Error::InvalidWeight`.
+    /// Use `add_oracle` only for new registrations.
     pub fn update_oracle_weight(
         env: Env,
         admin: Address,
