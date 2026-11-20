@@ -797,7 +797,12 @@ impl RiskPool {
             .instance()
             .get(&StorageKey::UsdcToken)
             .unwrap();
-        let total_payout = amount + pending_yield;
+        // Guard against i128 overflow when both amount and pending_yield are
+        // near i128::MAX (#793). Regular withdraw_inner pays them separately;
+        // emergency_withdraw must do the same checked arithmetic.
+        let total_payout = amount
+            .checked_add(pending_yield)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
         token::Client::new(&env, &usdc).transfer(
             &env.current_contract_address(),
             &provider,

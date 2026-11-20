@@ -602,17 +602,15 @@ impl ClaimsProcessor {
             panic_with_error!(env, Error::ClaimOutsideCoveragePeriod);
         }
 
-        // Issue #635: allow claims filed after end_time within claim_deadline,
-        // then reject anything past that window. The prior code rejected
-        // `now > end_time` before this check ran, making the deadline window
-        // unreachable.
+        // Issue #635 / #783: allow claims filed after end_time within claim_deadline,
+        // then reject anything past that window. When end_time is 0 the policy has
+        // no expiry, so no deadline check is needed. The former `else if now > 0`
+        // branch was dead code (a u64 timestamp is always > 0) and is removed (#783).
         if policy.end_time > 0 {
             let cutoff = policy.end_time.saturating_add(Self::claim_deadline(env));
             if now > cutoff {
                 panic_with_error!(env, Error::ClaimDeadlinePassed);
             }
-        } else if now > policy.end_time {
-            panic_with_error!(env, Error::ClaimOutsideCoveragePeriod);
         }
 
         // SECURITY FIX (issue #737): Rate limit claim submissions per user to prevent claim flooding.
@@ -1027,22 +1025,26 @@ impl ClaimsProcessor {
             }
         }
         
-        // Update the last processed timestamp for this policy
-        env.storage().persistent()
-            .set(&StorageKey::AutoProcessLastTime(policy_id), &now);
-
         // ─── IDEMPOTENCY GUARD ───
-        // Check if an evaluation record already exists for this policy in our storage
+        // Check if an evaluation record already exists for this policy in our storage.
+        // This guard runs BEFORE updating AutoProcessLastTime (#786) so that a call
+        // that returns AlreadyProcessed does not consume the cooldown window.
         if env.storage().persistent().has(&StorageKey::PolicyClaim(policy_id)) {
             let existing_claim_id: u128 = env.storage().persistent()
                 .get(&StorageKey::PolicyClaim(policy_id)).unwrap();
-            
+
             if let Some(existing_claim) = env.storage().persistent().get::<StorageKey, Claim>(&StorageKey::Claim(existing_claim_id)) {
                 if existing_claim.status != ClaimStatus::Pending {
                     return ClaimResult::AlreadyProcessed;
                 }
             }
         }
+
+        // Update the last processed timestamp for this policy — written AFTER the
+        // idempotency guard so rejected/AlreadyProcessed calls do not consume
+        // the cooldown window (#786).
+        env.storage().persistent()
+            .set(&StorageKey::AutoProcessLastTime(policy_id), &now);
 
         let policy_engine: Address = env.storage().instance()
             .get(&StorageKey::PolicyEngine)
@@ -1186,19 +1188,21 @@ impl ClaimsProcessor {
             }
         }
         
-        // Sort by timestamp (ascending - oldest first) using bubble sort
-        // Bubble sort is used here because Soroban doesn't have built-in sorting
+        // Sort by timestamp (ascending - oldest first) using insertion sort (#784).
+        // Insertion sort is O(n) on nearly-sorted data (the common case — claims
+        // are appended in submission order) and avoids the O(n²) worst case of the
+        // previous bubble sort that could exhaust the Soroban instruction budget on
+        // large queues.
         let len = claim_timestamps.len();
-        for i in 0..len {
-            for j in 0..(len - i - 1) {
-                let curr = claim_timestamps.get_unchecked(j);
-                let next = claim_timestamps.get_unchecked(j + 1);
-                if curr.1 > next.1 {
-                    // Swap
-                    claim_timestamps.set(j, next);
-                    claim_timestamps.set(j + 1, curr);
-                }
+        for i in 1..len {
+            let key = claim_timestamps.get_unchecked(i);
+            let mut j = i;
+            while j > 0 && claim_timestamps.get_unchecked(j - 1).1 > key.1 {
+                let prev = claim_timestamps.get_unchecked(j - 1);
+                claim_timestamps.set(j, prev);
+                j -= 1;
             }
+            claim_timestamps.set(j, key);
         }
         
         // Rebuild pending queue in correct FIFO order
