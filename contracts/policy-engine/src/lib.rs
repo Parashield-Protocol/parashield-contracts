@@ -918,9 +918,9 @@ impl PolicyEngine {
             panic_with_error!(env, Error::InvalidStartTime);
         }
         
-        // SECURITY FIX: Validate oracle_key length to prevent excessively long keys
-        // that could cause issues with oracle lookups. Backend validates max 32 chars,
-        // but direct contract calls could bypass that. Enforce the same limit on-chain.
+        // Validate oracle_key: must be non-empty and at most 32 characters (issue #795).
+        // An empty Symbol passes the length-only check and would produce a policy with
+        // no oracle key, causing claim evaluation to fail silently.
         {
             let sym_val = oracle_key.to_symbol_val();
             let sym_str: Result<soroban_sdk::SymbolStr, _> = soroban_sdk::SymbolStr::try_from_val(env, &sym_val);
@@ -928,8 +928,8 @@ impl PolicyEngine {
                 Ok(s) => {
                     let s_str: &str = s.as_ref();
                     let bytes: &[u8] = s_str.as_bytes();
-                    // Reject oracle keys longer than 32 characters
-                    if bytes.len() > 32 {
+                    // Reject empty oracle keys (issue #795) and keys longer than 32 chars.
+                    if bytes.is_empty() || bytes.len() > 32 {
                         panic_with_error!(env, Error::InvalidOracleKey);
                     }
                 }

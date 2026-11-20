@@ -438,6 +438,12 @@ impl ClaimsProcessor {
     /// trigger looks, so the conflict is removed rather than documented.
     /// A policy the admin bought is still handled by the keeper-driven
     /// `auto_process` path, which is not a claimant-initiated flow.
+    /// Submit a claim without a reference number.
+    ///
+    /// **Reference numbers are opt-in** (issue #797). Use `submit_claim_with_ref`
+    /// to attach a human-readable reference that can be looked up via
+    /// `get_claim_id_by_ref`. Claims filed here are still accessible by their
+    /// returned claim ID and by `StorageKey::PolicyClaim(policy_id)`.
     pub fn submit_claim(env: Env, claimant: Address, policy_id: u128) -> u128 {
         claimant.require_auth();
         Self::require_not_paused(&env);
@@ -876,9 +882,8 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         let policy = PolicyEngineClient::new(&env, &policy_engine).get_policy(&claim.policy_id);
 
-        if claim.coverage_amount != policy.coverage_amount {
-            panic_with_error!(&env, Error::CoverageMismatch);
-        }
+        // CoverageMismatch guard runs inside evaluate_and_settle (issue #798 / #828),
+        // shared by all settlement paths. No duplicate check needed here.
 
         // Batch verify all readings in ONE cross-contract call
         let results = Self::batch_verify_oracle_readings(env.clone(), queries.clone());
