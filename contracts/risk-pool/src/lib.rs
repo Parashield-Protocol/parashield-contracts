@@ -823,6 +823,7 @@ impl RiskPool {
     /// otherwise `transfer_position` is a one-transaction way around the
     /// `deposit` restriction and the separation of duties it exists for.
     pub fn transfer_position(env: Env, from: Address, to: Address, shares: i128) -> i128 {
+        let _guard = ReentrancyGuard::enter(&env);
         from.require_auth();
         if shares <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if from == to { panic_with_error!(&env, Error::InvalidAddress); }

@@ -343,23 +343,11 @@ impl GovernanceDao {
         // effect. A different title does not make a different governance
         // action; it just splits voter attention and wastes deposit capital.
         let content_hash = Self::proposal_content_hash(&env, &target, &function, &args);
-        let hash_key = StorageKey::ActiveProposalHash(content_hash.clone());
-        if let Some(existing_id) = env.storage().instance().get::<_, u64>(&hash_key) {
-            // Only block if the existing proposal is still open. Once it
-            // resolves the hash is cleared (see finalize/cancel/reclaim_deposit)
-            // and the same action can be re-proposed legitimately.
-            if let Some(existing) = env
-                .storage()
-                .persistent()
-                .get::<_, Proposal>(&StorageKey::Proposal(existing_id))
-            {
-                if existing.status == ProposalStatus::Active
-                    || existing.status == ProposalStatus::Discussion
-                {
-                    panic_with_error!(&env, Error::DuplicateProposal);
-                }
-            }
-        }
+        let hash_key = StorageKey::ActiveProposalHash(content_hash);
+        let legacy_hash = Self::legacy_proposal_content_hash(&env, &target, &function, &args);
+        let legacy_hash_key = StorageKey::ActiveProposalHash(legacy_hash);
+        Self::reject_if_active_duplicate(&env, &hash_key);
+        Self::reject_if_active_duplicate(&env, &legacy_hash_key);
 
         let config: DaoConfig = env
             .storage()
@@ -494,20 +482,12 @@ impl GovernanceDao {
         upgrade_args.push_back(new_wasm_hash.clone().into_val(&env));
 
         let upgrade_content_hash = Self::proposal_content_hash(&env, &target, &upgrade_function, &upgrade_args);
-        let upgrade_hash_key = StorageKey::ActiveProposalHash(upgrade_content_hash.clone());
-        if let Some(existing_id) = env.storage().instance().get::<_, u64>(&upgrade_hash_key) {
-            if let Some(existing) = env
-                .storage()
-                .persistent()
-                .get::<_, Proposal>(&StorageKey::Proposal(existing_id))
-            {
-                if existing.status == ProposalStatus::Active
-                    || existing.status == ProposalStatus::Discussion
-                {
-                    panic_with_error!(&env, Error::DuplicateProposal);
-                }
-            }
-        }
+        let upgrade_hash_key = StorageKey::ActiveProposalHash(upgrade_content_hash);
+        let legacy_upgrade_hash =
+            Self::legacy_proposal_content_hash(&env, &target, &upgrade_function, &upgrade_args);
+        let legacy_upgrade_hash_key = StorageKey::ActiveProposalHash(legacy_upgrade_hash);
+        Self::reject_if_active_duplicate(&env, &upgrade_hash_key);
+        Self::reject_if_active_duplicate(&env, &legacy_upgrade_hash_key);
 
         let config: DaoConfig = env
             .storage()
@@ -2766,10 +2746,36 @@ impl GovernanceDao {
         total
     }
 
+    /// Panic with `DuplicateProposal` if `hash_key` points to a still-open
+    /// (`Active` or `Discussion`) proposal.
+    fn reject_if_active_duplicate(env: &Env, hash_key: &StorageKey) {
+        if let Some(existing_id) = env.storage().instance().get::<_, u64>(hash_key) {
+            // Only block if the existing proposal is still open. Once it
+            // resolves the hash is cleared (see finalize/cancel/reclaim_deposit)
+            // and the same action can be re-proposed legitimately.
+            if let Some(existing) = env
+                .storage()
+                .persistent()
+                .get::<_, Proposal>(&StorageKey::Proposal(existing_id))
+            {
+                if existing.status == ProposalStatus::Active
+                    || existing.status == ProposalStatus::Discussion
+                {
+                    panic_with_error!(env, Error::DuplicateProposal);
+                }
+            }
+        }
+    }
+
     /// Compute a content hash over `(target, function, args)` that uniquely
     /// identifies the on-chain action a proposal would perform. Used to detect
-    /// duplicate proposals (issue #630). SHA-256 is available through the
+    /// duplicate proposals (issue #630, #820). SHA-256 is available through the
     /// Soroban host and produces a 32-byte `BytesN<32>`.
+    ///
+    /// Each argument is encoded as a fixed-width 9-byte sequence:
+    /// `[scval_type_tag: u8, raw_payload_be: [u8; 8]]` (issue #820), so the
+    /// ScVal type tag is explicitly part of the hash preimage alongside the
+    /// 64-bit `Val` payload.
     fn proposal_content_hash(
         env: &Env,
         target: &Address,
@@ -2785,7 +2791,34 @@ impl GovernanceDao {
         // Append the function symbol bytes (up to 9 chars encoded as Soroban's u64).
         let fn_val: u64 = function.to_val().get_payload();
         preimage.extend_from_array(&fn_val.to_be_bytes());
-        // Append each arg's raw XDR payload so identical argument lists hash identically.
+        // Append each arg's explicit ScVal type tag (1 byte) followed by its
+        // 64-bit big-endian payload (8 bytes) so argument types, boundaries,
+        // and ordering are unambiguous.
+        for i in 0..args.len() {
+            let v: Val = args.get_unchecked(i);
+            let tag: u8 = v.get_tag() as u8;
+            let payload: u64 = v.get_payload();
+            preimage.extend_from_array(&[tag]);
+            preimage.extend_from_array(&payload.to_be_bytes());
+        }
+        env.crypto().sha256(&preimage).into()
+    }
+
+    /// Pre-#820 payload-only hash kept solely for backward-compatible lookup
+    /// and cleanup of proposals created before the tag byte was added.
+    fn legacy_proposal_content_hash(
+        env: &Env,
+        target: &Address,
+        function: &Symbol,
+        args: &Vec<Val>,
+    ) -> BytesN<32> {
+        let mut preimage = soroban_sdk::Bytes::new(env);
+        let target_str = target.to_string();
+        let mut target_buf = [0u8; 56];
+        target_str.copy_into_slice(&mut target_buf);
+        preimage.extend_from_array(&target_buf);
+        let fn_val: u64 = function.to_val().get_payload();
+        preimage.extend_from_array(&fn_val.to_be_bytes());
         for i in 0..args.len() {
             let v: Val = args.get_unchecked(i);
             let payload: u64 = v.get_payload();
@@ -2796,7 +2829,9 @@ impl GovernanceDao {
 
     /// Remove the active-proposal hash entry for `proposal`, if present.
     /// Called whenever a proposal leaves Active/Discussion so the same action
-    /// can be re-proposed later (issue #630).
+    /// can be re-proposed later (issue #630). Also clears any legacy pre-#820
+    /// hash entry so in-flight proposals created before upgrade leave no
+    /// orphaned storage keys.
     fn clear_proposal_hash(env: &Env, proposal: &Proposal) {
         let hash = Self::proposal_content_hash(
             env,
@@ -2807,6 +2842,16 @@ impl GovernanceDao {
         let key = StorageKey::ActiveProposalHash(hash);
         if env.storage().instance().has(&key) {
             env.storage().instance().remove(&key);
+        }
+        let legacy_hash = Self::legacy_proposal_content_hash(
+            env,
+            &proposal.target,
+            &proposal.function,
+            &proposal.args,
+        );
+        let legacy_key = StorageKey::ActiveProposalHash(legacy_hash);
+        if env.storage().instance().has(&legacy_key) {
+            env.storage().instance().remove(&legacy_key);
         }
     }
 
@@ -2845,3 +2890,5 @@ impl GovernanceDao {
 mod test;
 #[cfg(test)]
 mod test_advanced;
+#[cfg(test)]
+mod test_content_hash;
