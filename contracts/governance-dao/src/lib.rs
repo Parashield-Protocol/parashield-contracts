@@ -157,6 +157,8 @@ enum StorageKey {
     /// Discussion). Cleared when the proposal resolves so the same action can
     /// be re-proposed after the previous one closes. Issue #630.
     ActiveProposalHash(BytesN<32>),
+    /// Immutable content hash captured at proposal creation, keyed by id.
+    ProposalContentHash(u64),
 }
 
 
@@ -411,6 +413,7 @@ impl GovernanceDao {
 
         let proposal_key = StorageKey::Proposal(proposal_id);
         env.storage().persistent().set(&proposal_key, &proposal);
+        env.storage().persistent().set(&StorageKey::ProposalContentHash(proposal_id), &content_hash);
         env.storage()
             .instance()
             .set(&StorageKey::NextProposalId, &(proposal_id.checked_add(1).unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))));
@@ -552,6 +555,7 @@ impl GovernanceDao {
 
         let proposal_key = StorageKey::Proposal(proposal_id);
         env.storage().persistent().set(&proposal_key, &proposal);
+        env.storage().persistent().set(&StorageKey::ProposalContentHash(proposal_id), &upgrade_content_hash);
         env.storage().instance().set(
             &StorageKey::NextProposalId,
             &(proposal_id
@@ -2878,12 +2882,9 @@ impl GovernanceDao {
     /// hash entry so in-flight proposals created before upgrade leave no
     /// orphaned storage keys.
     fn clear_proposal_hash(env: &Env, proposal: &Proposal) {
-        let hash = Self::proposal_content_hash(
-            env,
-            &proposal.target,
-            &proposal.function,
-            &proposal.args,
-        );
+        let hash = env.storage().persistent()
+            .get(&StorageKey::ProposalContentHash(proposal.id))
+            .unwrap_or_else(|| Self::proposal_content_hash(env, &proposal.target, &proposal.function, &proposal.args));
         let key = StorageKey::ActiveProposalHash(hash);
         if env.storage().instance().has(&key) {
             env.storage().instance().remove(&key);
@@ -2898,6 +2899,7 @@ impl GovernanceDao {
         if env.storage().instance().has(&legacy_key) {
             env.storage().instance().remove(&legacy_key);
         }
+        env.storage().persistent().remove(&StorageKey::ProposalContentHash(proposal.id));
     }
 
     fn require_admin(env: &Env, caller: &Address) {        let admin: Address = env
