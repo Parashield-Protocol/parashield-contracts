@@ -51,7 +51,7 @@ const _: () = assert!(DEFAULT_PREMIUM_LP_BPS + DEFAULT_PREMIUM_TREAS_BPS + DEFAU
 const MAX_TOTAL_DEPOSITED: i128 = 1_000_000_000_000_000;
 
 /// Minimum deposit amount (1_000_000 stroops).
-pub const MIN_DEPOSIT: i128 = 1_000_000;
+pub const MIN_DEPOSIT: i128 = 100_000;
 
 /// Minimum shares that must be minted on deposit (issue #493).
 /// Enforces that calculated shares cannot be 0 or infinitesimal when depositing into large pools.

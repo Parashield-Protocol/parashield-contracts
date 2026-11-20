@@ -682,8 +682,9 @@ impl ClaimsProcessor {
     }
 
     /// Submit multiple claims in a single transaction up to MAX_BATCH_SIZE.
-    /// Rejects with `InvalidInput` if `policy_ids.len() > MAX_BATCH_SIZE` so the
-    /// caller is never silently left with unfiled claims.
+    /// Isolates failures per claim — if one fails, others proceed (issue #817).
+    /// Uses try_invoke_contract to run each submit_claim in a sub-invocation.
+    /// Returns only successfully filed claim IDs; failed claims are skipped.
     pub fn batch_submit_claims(env: Env, claimant: Address, policy_ids: Vec<u128>) -> Vec<u128> {
         claimant.require_auth();
         Self::require_not_paused(&env);
@@ -696,11 +697,37 @@ impl ClaimsProcessor {
 
         let mut claim_ids = Vec::new(&env);
         let count = policy_ids.len();
+        let this = env.current_contract_address();
+        let fn_name = Symbol::new(&env, "submit_claim");
 
         for i in 0..count {
             let pid = policy_ids.get_unchecked(i);
-            let cid = Self::file_claim(&env, &claimant, pid);
-            claim_ids.push_back(cid);
+
+            // Each claim is submitted in its own sub-invocation (try_invoke_contract).
+            // If file_claim fails (e.g. already claimed, rate limit), only that
+            // sub-invocation is rolled back. Other claims proceed normally.
+            // This isolates per-claim failures like batch_auto_process does (issue #817).
+            let claim_type = Symbol::new(&env, "");
+            let args = soroban_sdk::vec![
+                &env,
+                claimant.to_val(),
+                pid.into_val(&env),
+                claim_type.to_val(),
+            ];
+
+            match env.try_invoke_contract::<u128, soroban_sdk::Error>(
+                &this,
+                &fn_name,
+                args,
+            ) {
+                Ok(Ok(claim_id)) => {
+                    claim_ids.push_back(claim_id);
+                }
+                Ok(Err(_)) | Err(_) => {
+                    // Claim submission failed — skip this policy and continue
+                    // with the next one. Failures don't propagate or revert the batch.
+                }
+            }
         }
 
         env.events().publish(
