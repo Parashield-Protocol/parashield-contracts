@@ -22,7 +22,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token, Address,
-    BytesN, Env, IntoVal, Symbol, SymbolStr, TryFromVal, Vec,
+    BytesN, Env, IntoVal, String, Symbol, SymbolStr, TryFromVal, Vec,
 };
 
 pub mod types;
@@ -82,8 +82,8 @@ enum StorageKey {
     Version,
     ExpiryWarningWindow,
     ExpiryWarned(u128),
-    /// Maps product name -> product_id, so names stay unique (issue #514).
-    ProductName(Symbol),
+    /// Maps product name -> product_id, so names stay unique (issue #514, #804).
+    ProductName(String),
     /// Ledger timestamp (u64) of a buyer's last purchase on an oracle key,
     /// used to enforce `PURCHASE_COOLING_OFF_SECONDS` (issue #671).
     LastPurchase((Address, Symbol)),
@@ -470,22 +470,14 @@ impl PolicyEngine {
             panic_with_error!(&env, Error::InvalidCategory);
         }
 
-        // Product description / name must not be empty (issue #755).
-        if params.name == Symbol::new(&env, "") {
-            panic_with_error!(&env, Error::EmptyDescription);
-        }
+        // Product name must not be empty or too short (issue #755, #804).
         {
-            let sym_val = params.name.to_symbol_val();
-            let sym_str: Result<SymbolStr, _> = SymbolStr::try_from_val(&env, &sym_val);
-            if let Ok(s) = sym_str {
-                let s_str: &str = s.as_ref();
-                let bytes: &[u8] = s_str.as_bytes();
-                if bytes.is_empty() {
-                    panic_with_error!(&env, Error::EmptyDescription);
-                }
-                if bytes.len() < 3 {
-                    panic_with_error!(&env, Error::InvalidDescription);
-                }
+            let name_len = params.name.len();
+            if name_len == 0 {
+                panic_with_error!(&env, Error::EmptyDescription);
+            }
+            if name_len < 3 {
+                panic_with_error!(&env, Error::InvalidDescription);
             }
         }
 
@@ -1142,7 +1134,10 @@ impl PolicyEngine {
                 .checked_mul(elapsed_capped as i128)
                 .and_then(|v| v.checked_div(total_duration as i128))
                 .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
-            policy.premium_paid.saturating_sub(earned)
+            // Clamp earned to [0, premium_paid] so integer division rounding
+            // can never produce a negative refund or a refund above the premium (#800).
+            let earned_clamped = earned.min(policy.premium_paid).max(0);
+            policy.premium_paid.saturating_sub(earned_clamped)
         };
 
         let usdc: Address = env

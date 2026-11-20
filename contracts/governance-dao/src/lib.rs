@@ -2534,6 +2534,10 @@ impl GovernanceDao {
             Some(cp) => (core::cmp::min(cp.amount, balance), cp.since),
             None => (0, now),
         };
+        // Guard against division by zero: a zero ramp_period means no ramp-up — apply full weight immediately (#809).
+        if cfg.ramp_period == 0 {
+            return balance;
+        }
         let elapsed = core::cmp::min(now.saturating_sub(since), cfg.ramp_period) as i128;
         let factor = min + (full - min) * elapsed / cfg.ramp_period as i128;
         aged.saturating_mul(factor) / full + (balance - aged).saturating_mul(min) / full
