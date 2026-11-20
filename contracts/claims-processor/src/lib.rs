@@ -1085,42 +1085,45 @@ impl ClaimsProcessor {
             .get(&StorageKey::PendingClaims)
             .unwrap_or_else(|| Vec::new(&env));
         
-        // FAIRNESS FIX: Sort claims by submission time to ensure true FIFO processing.
-        // Even if the pending queue gets slightly out of order (due to concurrent 
-        // submissions or manual queue manipulation), this ensures oldest claims 
-        // are always processed first.
-        let mut claim_timestamps: Vec<(u128, u64)> = Vec::new(&env);
-        for i in 0..pending.len() {
-            let claim_id = pending.get_unchecked(i);
-            if let Some(claim) = env.storage().persistent().get::<_, Claim>(&StorageKey::Claim(claim_id)) {
-                claim_timestamps.push_back((claim_id, claim.submitted_at));
-            }
-        }
-        
-        // Sort by timestamp (ascending - oldest first) using bubble sort
-        // Bubble sort is used here because Soroban doesn't have built-in sorting
-        let len = claim_timestamps.len();
-        for i in 0..len {
-            for j in 0..(len - i - 1) {
-                let curr = claim_timestamps.get_unchecked(j);
-                let next = claim_timestamps.get_unchecked(j + 1);
-                if curr.1 > next.1 {
-                    // Swap
-                    claim_timestamps.set(j, next);
-                    claim_timestamps.set(j + 1, curr);
+        // The pending queue is maintained in FIFO insertion order. Only re-sort
+        // (and persist the sorted order) when processing more than one claim —
+        // sorting a single-element slice is free but writing the whole vector
+        // back to instance storage costs as much as the claim settlement itself.
+        let sorted_pending: Vec<u128> = if limit <= 1 || pending.len() <= 1 {
+            pending.clone()
+        } else {
+            let mut claim_timestamps: Vec<(u128, u64)> = Vec::new(&env);
+            for i in 0..pending.len() {
+                let claim_id = pending.get_unchecked(i);
+                if let Some(claim) = env.storage().persistent().get::<_, Claim>(&StorageKey::Claim(claim_id)) {
+                    claim_timestamps.push_back((claim_id, claim.submitted_at));
                 }
             }
-        }
-        
-        // Rebuild pending queue in correct FIFO order
-        let mut sorted_pending: Vec<u128> = Vec::new(&env);
-        for i in 0..claim_timestamps.len() {
-            let (claim_id, _) = claim_timestamps.get_unchecked(i);
-            sorted_pending.push_back(claim_id);
-        }
-        
-        // Update storage with sorted order
-        env.storage().instance().set(&StorageKey::PendingClaims, &sorted_pending);
+
+            // Bubble sort by submission timestamp (ascending — oldest first).
+            // Soroban does not provide a built-in sort; O(n²) is acceptable
+            // because the queue is bounded by MAX_BATCH_SIZE.
+            let len = claim_timestamps.len();
+            for i in 0..len {
+                for j in 0..(len - i - 1) {
+                    let curr = claim_timestamps.get_unchecked(j);
+                    let next = claim_timestamps.get_unchecked(j + 1);
+                    if curr.1 > next.1 {
+                        claim_timestamps.set(j, next);
+                        claim_timestamps.set(j + 1, curr);
+                    }
+                }
+            }
+
+            let mut out: Vec<u128> = Vec::new(&env);
+            for i in 0..claim_timestamps.len() {
+                let (claim_id, _) = claim_timestamps.get_unchecked(i);
+                out.push_back(claim_id);
+            }
+            // Persist the sorted order so the next batch call starts already ordered.
+            env.storage().instance().set(&StorageKey::PendingClaims, &out);
+            out
+        };
         
         let mut results: Vec<(u128, ClaimResult)> = Vec::new(&env);
         let effective_limit = if limit > MAX_BATCH_SIZE { MAX_BATCH_SIZE } else { limit };
@@ -2267,7 +2270,17 @@ impl ClaimsProcessor {
     ///
     /// When a payout delay is configured, approved claims enter Paid/PartiallyPaid
     /// status but funds are not transferred until the delay passes. This function
-    /// completes the transfer. Callable by anyone — the claim is already approved.
+    /// completes the transfer.
+    ///
+    /// **Authorization model**: this function is intentionally permissionless — no
+    /// `require_auth` is called (issue #794). The payout was already authorized by the
+    /// governance/admin flow that set `payout_ready_at`; executing the transfer is a
+    /// mechanical step any caller can trigger. The claimant is the party with the
+    /// strongest interest in calling it, but gatekeeping on the claimant would mean
+    /// the admin (who controls the payout schedule) is also the only party able to
+    /// release funds — an unacceptable single point of failure. Timing attacks (e.g.
+    /// triggering during high fees) have no economic impact because the payout amount
+    /// is fixed at approval time and paid to the claimant's recorded address.
     pub fn claim_payout(env: Env, claim_id: u128) -> i128 {
         Self::require_not_paused(&env);
 

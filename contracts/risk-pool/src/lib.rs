@@ -657,6 +657,14 @@ impl RiskPool {
         // may be tiny relative to total_shares and a small redemption
         // rounds to 0.  The ZeroAmount guard below rejects such cases so
         // no shares are ever burned without returning capital.
+        //
+        // Rounding behavior (issue #796): integer division truncates toward zero,
+        // so an LP may receive up to 1 stroop less than their exact proportional
+        // share. The remainder (rounding dust) stays in the pool and is implicitly
+        // distributed to remaining LPs on future withdrawals. This is standard
+        // AMM behavior — the pool always rounds in its own favour. The dust is not
+        // explicitly tracked; it is instead absorbed into `total_deposited` through
+        // the subtraction below, which keeps the invariant consistent.
         let amount = shares.checked_mul(total_deposited)
             .and_then(|v| v.checked_div(total_shares))
             .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));

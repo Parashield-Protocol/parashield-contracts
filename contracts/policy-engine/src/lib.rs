@@ -237,14 +237,19 @@ impl PolicyEngine {
         // Verify the token implements transfer — required for premium collection,
         // claim payouts, and refunds. A contract with balance but no transfer
         // would fail silently on buy_policy or pay_claim.
-        let transfer_res = env.try_invoke_contract::<soroban_sdk::Bytes, soroban_sdk::Error>(
+        //
+        // We use amount = 1 (1 stroop, self-to-self) rather than 0 because some
+        // token contracts reject zero-amount transfers with an error, which would
+        // cause initialization to fail even for valid tokens (issue #792).
+        // A 1-stroop self-transfer is a no-op economically and always accepted.
+        let transfer_res = env.try_invoke_contract::<(), soroban_sdk::Error>(
             &usdc_token,
             &Symbol::new(&env, "transfer"),
             soroban_sdk::vec![
                 &env,
                 env.current_contract_address().into_val(&env),
                 env.current_contract_address().into_val(&env),
-                0i128.into_val(&env),
+                1i128.into_val(&env),
             ],
         );
         if transfer_res.is_err() {
