@@ -86,6 +86,10 @@ const TIMELOCK_SECONDS: u64 = 7 * 24 * 60 * 60;
 /// Shorter than withdrawal timelock since parameter changes are less risky.
 const PARAMETER_TIMELOCK_SECONDS: u64 = 2 * 24 * 60 * 60;
 
+/// Minimum interval between consecutive fee configuration updates: 24 hours.
+/// Prevents rapid oscillation that would destabilise LP return expectations.
+const FEE_UPDATE_COOLDOWN_SECONDS: u64 = 24 * 60 * 60;
+
 // Shared protocol constants — single source of truth in parashield-common (issue #342).
 use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK, ZERO_ADDRESS};
 
@@ -819,6 +823,7 @@ impl RiskPool {
     /// otherwise `transfer_position` is a one-transaction way around the
     /// `deposit` restriction and the separation of duties it exists for.
     pub fn transfer_position(env: Env, from: Address, to: Address, shares: i128) -> i128 {
+        let _guard = ReentrancyGuard::enter(&env);
         from.require_auth();
         if shares <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if from == to { panic_with_error!(&env, Error::InvalidAddress); }
@@ -1790,6 +1795,14 @@ impl RiskPool {
         enabled: bool,
     ) {
         Self::require_admin(&env, &admin);
+
+        // Enforce cooldown between consecutive fee updates (issue #778).
+        let now = env.ledger().timestamp();
+        if let Some(existing) = env.storage().instance().get::<_, DynamicFeeConfig>(&StorageKey::DynamicFeeConfig) {
+            if now < existing.last_updated.saturating_add(FEE_UPDATE_COOLDOWN_SECONDS) {
+                panic_with_error!(&env, Error::InvalidParameter);
+            }
+        }
 
         // Validate thresholds
         if base_fee_bps > 10000 || max_fee_bps > 10000 || min_fee_bps > 10000 {
