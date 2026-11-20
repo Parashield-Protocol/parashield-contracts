@@ -7,9 +7,12 @@
 
 extern crate std;
 
-use soroban_sdk::{testutils::Address as _, token, Address, Env, Symbol};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
+    token, Address, Env, IntoVal, Symbol,
+};
 
-use crate::{RiskPool, RiskPoolClient};
+use crate::{Error, RiskPool, RiskPoolClient};
 
 // Each mock reinsurer lives in its own module: `#[contractimpl]` generates
 // module-scoped spec constants keyed only by function name (e.g.
@@ -301,4 +304,271 @@ fn request_reinsurance_recovery_requires_protocol_caller() {
 
     let impostor = Address::generate(&env);
     pool.request_reinsurance_recovery(&impostor, &1u128, &10_000_0000000i128);
+}
+
+// ── Issue #837: reinsurance coverage_limit boundaries & liquidation tests ────
+
+/// When no reinsurance arrangement is configured, `request_reinsurance_recovery`
+/// returns 0 without panicking and leaves pool balances and stats untouched.
+#[test]
+fn reinsurance_recovery_when_unconfigured_returns_zero() {
+    let (env, pool, usdc, _admin, claims_processor) = setup();
+    let recovered =
+        pool.request_reinsurance_recovery(&claims_processor, &1u128, &50_000_0000000i128);
+    assert_eq!(recovered, 0);
+    assert_eq!(pool.get_reinsurance_stats().total_recovered, 0);
+    assert_eq!(pool.get_reinsurance_stats().coverage_remaining, 0);
+    assert_eq!(token::Client::new(&env, &usdc).balance(&pool.address), 0);
+}
+
+/// Reinsurance recovery at exact attachment point, below coverage_limit,
+/// hitting coverage_limit exactly across repeated recoveries, and a single
+/// claim exceeding coverage_limit.
+#[test]
+fn reinsurance_recovery_below_at_and_above_coverage_limit() {
+    let (env, pool, usdc, admin, claims_processor) = setup();
+    let reinsurer_id = env.register(MockReinsurer, ());
+    MockReinsurerClient::new(&env, &reinsurer_id).init(&usdc);
+    token::StellarAssetClient::new(&env, &usdc).mint(&reinsurer_id, &500_000_0000000i128);
+
+    // attachment_point = 10,000 USDC, coverage_limit = 50,000 USDC.
+    let attachment = 10_000_0000000i128;
+    let limit = 50_000_0000000i128;
+    pool.set_reinsurance(&admin, &reinsurer_id, &attachment, &limit);
+
+    // Exact attachment point: loss == 10,000 -> excess = 0 -> recovers 0.
+    assert_eq!(
+        pool.request_reinsurance_recovery(&claims_processor, &1u128, &attachment),
+        0
+    );
+
+    // Below limit: loss = 30,000 -> excess = 20,000 < 50,000 -> recovers 20,000.
+    let r1 = pool.request_reinsurance_recovery(&claims_processor, &2u128, &30_000_0000000i128);
+    assert_eq!(r1, 20_000_0000000i128);
+    assert_eq!(pool.get_reinsurance_stats().total_recovered, 20_000_0000000i128);
+    assert_eq!(
+        pool.get_reinsurance_stats().coverage_remaining,
+        30_000_0000000i128
+    );
+
+    // Repeated recovery hitting coverage_limit exactly:
+    // loss = 40,000 -> excess = 30,000 == remaining 30,000 -> recovers 30,000.
+    let r2 = pool.request_reinsurance_recovery(&claims_processor, &3u128, &40_000_0000000i128);
+    assert_eq!(r2, 30_000_0000000i128);
+    assert_eq!(pool.get_reinsurance_stats().total_recovered, limit);
+    assert_eq!(pool.get_reinsurance_stats().coverage_remaining, 0);
+    assert_eq!(
+        token::Client::new(&env, &usdc).balance(&pool.address),
+        limit
+    );
+
+    // Fresh pool: single claim with excess above coverage_limit (90,000 > 50,000)
+    // is capped at coverage_limit (50,000).
+    let (env2, pool2, usdc2, admin2, cp2) = setup();
+    let reinsurer2 = env2.register(MockReinsurer, ());
+    MockReinsurerClient::new(&env2, &reinsurer2).init(&usdc2);
+    token::StellarAssetClient::new(&env2, &usdc2).mint(&reinsurer2, &500_000_0000000i128);
+    pool2.set_reinsurance(&admin2, &reinsurer2, &attachment, &limit);
+
+    // loss = 100,000 -> excess = 90,000, capped to coverage_limit = 50,000.
+    let r_cap = pool2.request_reinsurance_recovery(&cp2, &1u128, &100_000_0000000i128);
+    assert_eq!(r_cap, limit);
+    assert_eq!(pool2.get_reinsurance_stats().coverage_remaining, 0);
+}
+
+/// Partial liquidation seizes shares proportional to undercollateralization
+/// (`(10_000 - collateralization_bps) / 10_000`) and conserves share totals
+/// and contract token balance.
+#[test]
+fn liquidate_position_partial_seizure_and_conservation() {
+    let (env, pool, usdc, admin, _cp) = setup();
+    env.ledger().set_timestamp(1_750_000_000);
+
+    let lp1 = Address::generate(&env);
+    let lp2 = Address::generate(&env);
+    let sac = token::StellarAssetClient::new(&env, &usdc);
+    let tok = token::Client::new(&env, &usdc);
+    let deposit_amt = 100_0000000i128; // 100 USDC each
+    sac.mint(&lp1, &deposit_amt);
+    sac.mint(&lp2, &deposit_amt);
+
+    let s1 = pool.deposit(&lp1, &deposit_amt, &0, &false);
+    let s2 = pool.deposit(&lp2, &deposit_amt, &0, &false);
+    assert_eq!(s1, deposit_amt);
+    assert_eq!(s2, deposit_amt);
+
+    // Lock 160 USDC out of 200 USDC -> available = 40 USDC.
+    // For lp1 (100 of 200 shares):
+    //   position_value     = 100 * 40 / 200 = 20 USDC
+    //   position_liability = 100 * 160 / 200 = 80 USDC
+    //   collateralization_bps = 20 * 10_000 / 80 = 2_500 (25%)
+    //   undercollateral_bps   = 10_000 - 2_500 = 7_500 (75%)
+    //   shares_seized    = 100_0000000 * 7_500 / 10_000 = 75_0000000
+    //   amount_recovered = 75_0000000 * 200_0000000 / 200_0000000 = 75_0000000
+    pool.lock_for_policy(&admin, &1u128, &160_0000000i128);
+
+    let pool_usdc_before = tok.balance(&pool.address);
+    let res = pool.liquidate_position(&admin, &lp1);
+    assert_eq!(res.provider, lp1);
+    assert_eq!(res.previous_ratio_bps, 2_500);
+    assert_eq!(res.shares_seized, 75_0000000i128);
+    assert_eq!(res.amount_recovered, 75_0000000i128);
+
+    // Conservation checks: sum of LP shares == total_shares, USDC stays in pool.
+    let lp1_after = pool.get_position(&lp1).unwrap().shares;
+    let lp2_after = pool.get_position(&lp2).unwrap().shares;
+    assert_eq!(lp1_after, 25_0000000i128);
+    assert_eq!(lp2_after, 100_0000000i128);
+    assert_eq!(lp1_after + lp2_after, pool.get_stats().total_shares);
+    assert_eq!(tok.balance(&pool.address), pool_usdc_before);
+}
+
+/// Full liquidation at 0% collateralization seizes 100% of shares, removes the
+/// LP position, and conserves remaining share totals and pool token balance.
+#[test]
+fn liquidate_position_full_seizure_removes_position_and_conserves_totals() {
+    let (env, pool, usdc, admin, _cp) = setup();
+    env.ledger().set_timestamp(1_750_000_000);
+
+    let lp1 = Address::generate(&env);
+    let lp2 = Address::generate(&env);
+    let sac = token::StellarAssetClient::new(&env, &usdc);
+    let tok = token::Client::new(&env, &usdc);
+    let deposit_amt = 100_0000000i128;
+    sac.mint(&lp1, &deposit_amt);
+    sac.mint(&lp2, &deposit_amt);
+
+    pool.deposit(&lp1, &deposit_amt, &0, &false);
+    pool.deposit(&lp2, &deposit_amt, &0, &false);
+
+    // Lock 100% of deposited capital (200 USDC) -> available = 0 -> ratio = 0 bps.
+    // undercollateral_bps = 10_000 -> shares_seized = 100_0000000 (100%).
+    pool.lock_for_policy(&admin, &1u128, &200_0000000i128);
+
+    let res = pool.liquidate_position(&admin, &lp1);
+    assert_eq!(res.previous_ratio_bps, 0);
+    assert_eq!(res.shares_seized, deposit_amt);
+    assert_eq!(res.amount_recovered, deposit_amt);
+
+    assert_eq!(pool.get_position(&lp1), None);
+    let lp2_after = pool.get_position(&lp2).unwrap().shares;
+    assert_eq!(lp2_after, deposit_amt);
+    assert_eq!(pool.get_stats().total_shares, lp2_after);
+    assert_eq!(tok.balance(&pool.address), 2 * deposit_amt);
+}
+
+/// Ineligible positions (no liability, or collateralization >= 10,000 bps) are
+/// rejected by `liquidate_position` with `Error::Undercollateralized` (#11).
+#[test]
+fn liquidate_position_rejects_ineligible_positions() {
+    let (env, pool, usdc, admin, _cp) = setup();
+    env.ledger().set_timestamp(1_750_000_000);
+
+    let lp1 = Address::generate(&env);
+    let lp2 = Address::generate(&env);
+    let sac = token::StellarAssetClient::new(&env, &usdc);
+    sac.mint(&lp1, &100_0000000i128);
+    sac.mint(&lp2, &100_0000000i128);
+
+    pool.deposit(&lp1, &100_0000000i128, &0, &false);
+    pool.deposit(&lp2, &100_0000000i128, &0, &false);
+
+    // 1. No locked capital -> position_liability == 0 -> rejected (#11).
+    assert_eq!(
+        pool.try_liquidate_position(&admin, &lp1),
+        Err(Ok(Error::Undercollateralized))
+    );
+
+    // 2. Lock 50% (100 of 200 USDC): available = 100, locked = 100 ->
+    // collateralization_bps == 10_000 (100%, exact boundary) -> rejected (#11).
+    pool.lock_for_policy(&admin, &1u128, &100_0000000i128);
+    assert_eq!(
+        pool.try_liquidate_position(&admin, &lp1),
+        Err(Ok(Error::Undercollateralized))
+    );
+}
+
+/// Unauthorized caller attempting `liquidate_position` without blanket auth
+/// mocking is rejected with `Error::Unauthorized` (#3).
+#[test]
+fn liquidate_position_rejects_unauthorized_caller_without_blanket_auth() {
+    let (env, pool, usdc, admin, _cp) = setup();
+    env.ledger().set_timestamp(1_750_000_000);
+
+    let lp1 = Address::generate(&env);
+    let outsider = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &usdc).mint(&lp1, &100_0000000i128);
+    pool.deposit(&lp1, &100_0000000i128, &0, &false);
+    pool.lock_for_policy(&admin, &1u128, &80_0000000i128);
+
+    // Replace blanket auth mocking with explicit auth only for `outsider`.
+    env.mock_auths(&[MockAuth {
+        address: &outsider,
+        invoke: &MockAuthInvoke {
+            contract: &pool.address,
+            fn_name: "liquidate_position",
+            args: (&outsider, &lp1).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = pool.try_liquidate_position(&outsider, &lp1);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert_eq!(pool.get_position(&lp1).unwrap().shares, 100_0000000i128);
+}
+
+/// Liquidating a position that has a pending exit reservation seizes the
+/// proportional shares and preserves share/token conservation.
+#[test]
+fn liquidate_position_with_pending_exit_reservation_seizes_shares() {
+    let (env, pool, usdc, admin, _cp) = setup();
+    env.ledger().set_timestamp(1_750_000_000);
+    pool.set_exit_delay(&admin, &3_600u64);
+
+    let lp1 = Address::generate(&env);
+    let lp2 = Address::generate(&env);
+    let sac = token::StellarAssetClient::new(&env, &usdc);
+    let tok = token::Client::new(&env, &usdc);
+    sac.mint(&lp1, &100_0000000i128);
+    sac.mint(&lp2, &100_0000000i128);
+
+    pool.deposit(&lp1, &100_0000000i128, &0, &false);
+    pool.deposit(&lp2, &100_0000000i128, &0, &false);
+    pool.request_exit(&lp1, &50_0000000i128);
+
+    // Lock 160 of 200 USDC -> collateralization_bps = 2_500 -> seize 75% (75 shares).
+    pool.lock_for_policy(&admin, &1u128, &160_0000000i128);
+
+    let res = pool.liquidate_position(&admin, &lp1);
+    assert_eq!(res.shares_seized, 75_0000000i128);
+    assert_eq!(pool.get_position(&lp1).unwrap().shares, 25_0000000i128);
+    assert_eq!(pool.get_stats().total_shares, 125_0000000i128);
+    assert_eq!(tok.balance(&pool.address), 200_0000000i128);
+}
+
+/// Suspected bug: `liquidate_position` does not adjust or clear the provider's
+/// pending `ExitReq` or `QueuedExitShares`, leaving the queued reservation
+/// larger than the provider's remaining shares.
+#[test]
+#[ignore = "Suspected bug: liquidate_position leaves stale ExitReq and QueuedExitShares unadjusted"]
+fn liquidate_position_reconciles_pending_exit_reservation() {
+    let (env, pool, usdc, admin, _cp) = setup();
+    env.ledger().set_timestamp(1_750_000_000);
+    pool.set_exit_delay(&admin, &3_600u64);
+
+    let lp1 = Address::generate(&env);
+    let lp2 = Address::generate(&env);
+    let sac = token::StellarAssetClient::new(&env, &usdc);
+    sac.mint(&lp1, &100_0000000i128);
+    sac.mint(&lp2, &100_0000000i128);
+
+    pool.deposit(&lp1, &100_0000000i128, &0, &false);
+    pool.deposit(&lp2, &100_0000000i128, &0, &false);
+    pool.request_exit(&lp1, &50_0000000i128);
+    pool.lock_for_policy(&admin, &1u128, &160_0000000i128);
+
+    pool.liquidate_position(&admin, &lp1);
+    let remaining = pool.get_position(&lp1).unwrap().shares; // 25_0000000
+    assert!(pool.get_exit_info(&lp1).shares <= remaining);
+    assert!(pool.get_queued_exit_shares() <= remaining);
 }
