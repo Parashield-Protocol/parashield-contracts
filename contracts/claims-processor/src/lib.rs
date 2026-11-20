@@ -811,6 +811,31 @@ impl ClaimsProcessor {
         Self::evaluate_and_settle(&env, &mut claim, &policy, partial_payout_bps)
     }
 
+    /// Inner claim-processing logic that skips the keeper-auth and pause checks
+    /// (issue #803). Called by `batch_process_claims` after those checks have
+    /// already been performed once for the whole batch.
+    fn process_claim_inner(
+        env: &Env,
+        claim_id: u128,
+        partial_payout_bps: Option<u32>,
+    ) -> ClaimResult {
+        let mut claim: Claim = env.storage().persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(env, Error::ClaimNotFound));
+
+        if claim.status != ClaimStatus::Pending {
+            return ClaimResult::AlreadyProcessed;
+        }
+
+        let policy_engine: Address = env.storage().instance()
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        let policy = PolicyEngineClient::new(env, &policy_engine)
+            .get_policy(&claim.policy_id);
+
+        Self::evaluate_and_settle(env, &mut claim, &policy, partial_payout_bps)
+    }
+
     /// Process multiple existing claims in a single transaction up to MAX_BATCH_SIZE.
     ///
     /// Limitation: A single uniform `partial_payout_bps: Option<u32>` is passed to every
@@ -835,7 +860,9 @@ impl ClaimsProcessor {
 
         for i in 0..count {
             let cid = claim_ids.get_unchecked(i);
-            let res = Self::process_claim(env.clone(), keeper.clone(), cid, partial_payout_bps);
+            // Use process_claim_inner to avoid redundant keeper-auth and pause
+            // checks on every iteration — both were verified once above (#803).
+            let res = Self::process_claim_inner(&env, cid, partial_payout_bps);
             results.push_back((cid, res));
         }
 
@@ -871,7 +898,8 @@ impl ClaimsProcessor {
 
         for i in 0..count {
             let (cid, bps) = claims.get_unchecked(i);
-            let res = Self::process_claim(env.clone(), keeper.clone(), cid, bps);
+            // Use process_claim_inner to skip per-iteration keeper/pause checks (#803).
+            let res = Self::process_claim_inner(&env, cid, bps);
             results.push_back((cid, res));
         }
 
