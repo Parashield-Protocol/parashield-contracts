@@ -416,6 +416,7 @@ impl GovernanceDao {
             verification_callback: None,
             execution_verified: true,
             is_vetoed: false,
+            executed_at: 0,
         };
 
         let proposal_key = StorageKey::Proposal(proposal_id);
@@ -564,6 +565,7 @@ impl GovernanceDao {
             verification_callback: None,
             execution_verified: true,
             is_vetoed: false,
+            executed_at: 0,
         };
 
         let proposal_key = StorageKey::Proposal(proposal_id);
@@ -1499,12 +1501,12 @@ impl GovernanceDao {
             },
         );
 
+        let executed_at = env.ledger().timestamp();
         proposal.status = ProposalStatus::Executed;
+        proposal.executed_at = executed_at;
         env.storage()
             .persistent()
             .set(&StorageKey::Proposal(proposal_id), &proposal);
-
-        let executed_at = env.ledger().timestamp();
         let audit = ExecutionAuditRecord {
             proposal_id,
             executor: proposal.proposer.clone(),

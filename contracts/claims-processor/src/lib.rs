@@ -676,18 +676,20 @@ impl ClaimsProcessor {
     }
 
     /// Submit multiple claims in a single transaction up to MAX_BATCH_SIZE.
+    /// Rejects with `InvalidInput` if `policy_ids.len() > MAX_BATCH_SIZE` so the
+    /// caller is never silently left with unfiled claims.
     pub fn batch_submit_claims(env: Env, claimant: Address, policy_ids: Vec<u128>) -> Vec<u128> {
         claimant.require_auth();
         Self::require_not_paused(&env);
         Self::require_not_admin(&env, &claimant);
         Self::require_not_zero_address(&env, &claimant);
 
+        if policy_ids.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
         let mut claim_ids = Vec::new(&env);
-        let count = if policy_ids.len() > MAX_BATCH_SIZE {
-            MAX_BATCH_SIZE
-        } else {
-            policy_ids.len()
-        };
+        let count = policy_ids.len();
 
         for i in 0..count {
             let pid = policy_ids.get_unchecked(i);
