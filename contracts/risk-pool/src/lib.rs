@@ -929,6 +929,9 @@ impl RiskPool {
     /// not exact multiples of `MIN_DEPOSIT` (1 USDC / 1_000_000 stroops). Sub-stroop rounding remainders from
     /// integer division during split calculations remain in the contract's token balance as pool reserves.
     pub fn receive_premium(env: Env, caller: Address, amount: i128) {
+        // Hold the guard across the complete operation, including outgoing
+        // treasury and backstop transfers. Token hooks must not re-enter any
+        // guarded pool operation while premium distribution is in progress.
         let _guard = ReentrancyGuard::enter(&env);
         caller.require_auth();
         if amount <= 0 { return; }

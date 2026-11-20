@@ -1159,6 +1159,37 @@ fn test_resolve_dispute_succeeds() {
     assert_eq!(cp.get_pending_claims().get_unchecked(0), claim_id);
 }
 
+/// Pausing the claims processor blocks dispute transitions.
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_dispute_claim_rejected_while_paused() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+
+    cp.pause(&w.admin);
+    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("paused"));
+}
+
+/// Pausing the claims processor blocks admin dispute resolution too.
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_resolve_dispute_rejected_while_paused() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("paused"));
+
+    cp.pause(&w.admin);
+    cp.resolve_dispute(&w.admin, &claim_id);
+}
+
 /// Resolving a non-existent claim must fail with ClaimNotFound.
 #[test]
 #[should_panic(expected = "Error(Contract, #4)")]

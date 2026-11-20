@@ -1385,6 +1385,7 @@ impl ClaimsProcessor {
     /// an admin resolves the dispute.
     pub fn dispute_claim(env: Env, caller: Address, claim_id: u128, reason: soroban_sdk::Symbol) {
         caller.require_auth();
+        Self::require_not_paused(&env);
         let mut claim: Claim = env.storage().persistent()
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
@@ -1470,6 +1471,7 @@ impl ClaimsProcessor {
     /// claims queue for the next keeper to process.
     pub fn resolve_dispute(env: Env, admin: Address, claim_id: u128) {
         Self::require_admin(&env, &admin);
+        Self::require_not_paused(&env);
         
         let mut claim: Claim = env.storage().persistent()
             .get(&StorageKey::Claim(claim_id))
