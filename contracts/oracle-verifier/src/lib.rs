@@ -1397,6 +1397,24 @@ impl OracleVerifier {
             return;
         }
 
+        // SECURITY FIX: Check source data exists before calling get_median_value
+        // If source data type has no submissions, skip cross-validation.
+        // This prevents validation failures due to asynchronous data submission.
+        let source_points: Vec<OracleDataPoint> = match env.storage().persistent().get(
+            &StorageKey::DataPoints(source_type.clone(), key.clone()),
+        ) {
+            Some(pts) => pts,
+            None => {
+                // No data for this source type yet — skip validation
+                return;
+            }
+        };
+
+        if source_points.is_empty() {
+            // Empty data points list for source — skip validation
+            return;
+        }
+
         // Get source aggregated value
         let source_value = Self::get_median_value(env, source_type, key);
 

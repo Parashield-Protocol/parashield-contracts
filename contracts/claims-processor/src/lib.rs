@@ -455,6 +455,22 @@ impl ClaimsProcessor {
         // would settle a payout nobody can ever collect (issue #586).
         Self::require_not_zero_address(&env, &claimant);
 
+        // CONSISTENCY FIX (issue #818): Validate claim type is registered
+        // Get the policy to retrieve its product category and validate it
+        let policy_engine: Address = env.storage().instance()
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        let policy = PolicyEngineClient::new(&env, &policy_engine)
+            .get_policy(&policy_id);
+        let product = PolicyEngineClient::new(&env, &policy_engine)
+            .get_product(&policy.product_id);
+
+        // Validate the product category is a registered claim type
+        let category = product.category;
+        if category == Symbol::new(&env, "") || !Self::is_claim_type_registered(env.clone(), category) {
+            panic_with_error!(&env, Error::InvalidClaimType);
+        }
+
         Self::file_claim(&env, &claimant, policy_id)
     }
 
