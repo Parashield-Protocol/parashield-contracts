@@ -92,6 +92,52 @@ CLAIMS_ID=$(deploy_contract "parashield-claims-processor")
 POOL_ID=$(deploy_contract "parashield-risk-pool")
 DAO_ID=$(deploy_contract "parashield-governance-dao")
 
+# ── Initialize Governance DAO ─────────────────────────────────────────────────
+
+log "Initializing Governance DAO..."
+
+# TODO: Replace these placeholder values with actual governance configuration
+# GOV_TOKEN_ADDRESS: deployed governance token contract address
+# ADMIN_ADDRESS: DAO administrator address (can be same as deployer or multisig)
+# These should be set via environment variables before running this script
+
+if [[ -z "${GOV_TOKEN_ADDRESS:-}" ]]; then
+  log "WARNING: GOV_TOKEN_ADDRESS not set. Skipping DAO initialization."
+  log "The DAO contract is deployed but not initialized."
+  log "Run the following command manually to initialize:"
+  log "  stellar contract invoke --id $DAO_ID \\"
+  log "    --source \$DEPLOYER_SECRET \\"
+  log "    --network mainnet \\"
+  log "    -- initialize \\"
+  log "      --admin <ADMIN_ADDRESS> \\"
+  log "      --config '{\"gov_token\": \"<GOV_TOKEN_ADDRESS>\", \"proposal_threshold\": \"1000000000\", \"total_supply\": \"100000000000000\", \"quorum_bps\": 1000, \"majority_bps\": 5100, \"voting_period\": 604800, \"proposal_timelock\": 172800, \"discussion_period\": 86400, \"vote_weight_cap\": 0}'"
+else
+  # Default DAO configuration values (adjust as needed):
+  # - proposal_threshold: 1,000 tokens (1000000000 stroops with 7 decimals)
+  # - total_supply: 100M tokens (100000000000000 stroops)
+  # - quorum_bps: 1000 = 10% of total supply must vote
+  # - majority_bps: 5100 = 51% of votes must be FOR
+  # - voting_period: 604800 seconds = 7 days
+  # - proposal_timelock: 172800 seconds = 2 days
+  # - discussion_period: 86400 seconds = 1 day
+  # - vote_weight_cap: 0 = no cap (adjust to prevent whale dominance)
+  
+  ADMIN_ADDR="${DAO_ADMIN_ADDRESS:-$SOURCE}"
+  
+  stellar contract invoke \
+    --id "$DAO_ID" \
+    --source "$SOURCE" \
+    --network "$NETWORK" \
+    --rpc-url "$RPC" \
+    --network-passphrase "$PASSPHRASE" \
+    -- initialize \
+      --admin "$ADMIN_ADDR" \
+      --config "{\"gov_token\": \"$GOV_TOKEN_ADDRESS\", \"proposal_threshold\": \"1000000000\", \"total_supply\": \"100000000000000\", \"quorum_bps\": 1000, \"majority_bps\": 5100, \"voting_period\": 604800, \"proposal_timelock\": 172800, \"discussion_period\": 86400, \"vote_weight_cap\": 0}" \
+    2>&1 | tail -5
+  
+  log "Governance DAO initialized."
+fi
+
 log ""
 log "=== Mainnet deployment complete ==="
 log "Oracle Verifier:  $ORACLE_ID"

@@ -2488,12 +2488,12 @@ impl ClaimsProcessor {
             panic_with_error!(&env, Error::NotEscalatable);
         }
 
-        // SECURITY FIX: Verify escalation is within the allowed time window from claim submission.
-        // Claims should only be escalatable within a reasonable time after submission.
-        // After the policy end_time + claim_deadline has passed, escalation is no longer meaningful
-        // because the policy period is over and the claim should have been processed already.
+        // The escalation window is relative to claim submission, not policy end.
+        // A claim submitted just before the deadline has the same escalation
+        // window as one submitted early. Using policy.end_time would give
+        // late-submitted claims less time to escalate, which is incorrect.
         let claim_deadline = Self::claim_deadline(&env);
-        let escalation_cutoff = policy.end_time.saturating_add(claim_deadline);
+        let escalation_cutoff = claim.submitted_at.saturating_add(claim_deadline);
         if now > escalation_cutoff {
             panic_with_error!(&env, Error::NotEscalatable);
         }
