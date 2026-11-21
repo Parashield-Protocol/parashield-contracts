@@ -2037,6 +2037,12 @@ impl GovernanceDao {
     /// `template.min_title_len` bytes and `args` must have exactly
     /// `template.required_arg_count` entries. Otherwise behaves exactly
     /// like `create_proposal` (same deposit/threshold/lifecycle).
+    ///
+    /// This template check is purely structural. It does not look at the
+    /// proposer's gov-token balance or scan for a duplicate active
+    /// proposal, so passing it is not a guarantee that the `create_proposal`
+    /// call below will succeed — that call can still panic with, e.g.,
+    /// `Error::InsufficientWeight` or `Error::DuplicateProposal` (issue #851).
     pub fn create_proposal_from_template(
         env: Env,
         proposer: Address,

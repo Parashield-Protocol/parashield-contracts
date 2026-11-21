@@ -84,6 +84,9 @@ pub struct BatchBuyItem {
 pub struct CreateProductParams {
     /// Product name — stored as `String` to support names longer than Symbol's
     /// ~32-character limit, e.g. "Crop Insurance – Kisumu Rainfall" (#804).
+    /// Uniqueness is an exact byte comparison: it is case-sensitive and does
+    /// not normalize Unicode, so e.g. "Crop" and "crop" are different names
+    /// (issue #850).
     pub name: String,
     pub category: Symbol,
     pub oracle_key: Symbol,
