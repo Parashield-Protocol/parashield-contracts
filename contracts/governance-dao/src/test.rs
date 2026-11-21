@@ -2328,3 +2328,49 @@ fn quorum_decay_edge_cases_zero_and_large_values() {
     assert!(eff.quorum_bps <= eff.base_bps);
     assert!(eff.quorum_bps >= 1_000); // never below floor
 }
+
+// ── Storage migrations: upgrades to unmigrated versions are rejected ─────────
+
+/// Upgrading past `CURRENT_STORAGE_VERSION` must fail instead of stamping a
+/// version whose storage layout was never migrated.
+#[test]
+#[should_panic(expected = "Error(Contract, #54)")]
+fn test_upgrade_to_unsupported_version_rejected() {
+    let (env, dao, admin, _v1, _v2, _target) = setup();
+    let wasm_hash = soroban_sdk::BytesN::from_array(&env, &[7u8; 32]);
+    dao.upgrade(&admin, &wasm_hash, &(crate::CURRENT_STORAGE_VERSION + 1));
+}
+
+/// With guardians configured, an unsupported version must be rejected before
+/// a pending upgrade is registered, not only when the final approval lands.
+#[test]
+fn test_guardian_upgrade_to_unsupported_version_not_registered() {
+    let (env, dao, admin, _v1, _v2, _target) = setup();
+    let g1 = Address::generate(&env);
+    let mut guardians = Vec::new(&env);
+    guardians.push_back(g1.clone());
+    dao.set_guardians(&admin, &guardians, &1);
+
+    let wasm_hash = soroban_sdk::BytesN::from_array(&env, &[7u8; 32]);
+    let result = dao.try_upgrade(&admin, &wasm_hash, &(crate::CURRENT_STORAGE_VERSION + 1));
+    assert!(result.is_err());
+    assert!(dao.get_pending_upgrade().is_none());
+    assert_eq!(dao.get_version(), 1);
+}
+
+#[test]
+fn test_run_migrations_walks_every_supported_step() {
+    let (env, dao, _admin, _v1, _v2, _target) = setup();
+    env.as_contract(&dao.address, || {
+        GovernanceDao::run_migrations(&env, 1, crate::CURRENT_STORAGE_VERSION);
+    });
+}
+
+#[test]
+#[should_panic]
+fn test_run_migrations_rejects_downgrade() {
+    let (env, dao, _admin, _v1, _v2, _target) = setup();
+    env.as_contract(&dao.address, || {
+        GovernanceDao::run_migrations(&env, 2, 1);
+    });
+}

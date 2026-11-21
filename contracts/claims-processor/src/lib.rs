@@ -1238,11 +1238,18 @@ impl ClaimsProcessor {
         // are appended in submission order) and avoids the O(n²) worst case of the
         // previous bubble sort that could exhaust the Soroban instruction budget on
         // large queues.
+        //
+        // Ordering key is `(submitted_at, claim_id)`. Claims submitted in the
+        // same ledger share a `submitted_at`, so the timestamp alone leaves
+        // their relative order up to whatever position they happen to hold in
+        // the queue. `claim_id` is allocated from a monotonically increasing
+        // counter (`next_claim_id`), so using it as the tie-breaker yields a
+        // total, deterministic order that matches true submission order.
         let len = claim_timestamps.len();
         for i in 1..len {
             let key = claim_timestamps.get_unchecked(i);
             let mut j = i;
-            while j > 0 && claim_timestamps.get_unchecked(j - 1).1 > key.1 {
+            while j > 0 && Self::claim_sorts_after(&claim_timestamps.get_unchecked(j - 1), &key) {
                 let prev = claim_timestamps.get_unchecked(j - 1);
                 claim_timestamps.set(j, prev);
                 j -= 1;
@@ -3049,6 +3056,14 @@ impl ClaimsProcessor {
         let desired_ledgers = (CLAIM_RETENTION_SECONDS / LEDGER_SECONDS) as u32;
         let extend_to = desired_ledgers.min(env.storage().max_ttl());
         env.storage().persistent().extend_ttl(key, extend_to, extend_to);
+    }
+
+    /// Strict ordering used by `batch_auto_process`: returns true when claim
+    /// `a` must be processed after claim `b`. Compares `submitted_at` first
+    /// and breaks ties on the monotonically increasing `claim_id`, so claims
+    /// submitted in the same ledger are always ordered deterministically.
+    fn claim_sorts_after(a: &(u128, u64), b: &(u128, u64)) -> bool {
+        (a.1, a.0) > (b.1, b.0)
     }
 
     fn next_claim_id(env: &Env) -> u128 {

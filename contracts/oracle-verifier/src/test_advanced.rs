@@ -56,7 +56,9 @@ fn three_oracle_median_is_middle_value() {
 }
 
 #[test]
-#[should_panic(expected = "HostError: Error(Contract, #3)")] // Match Soroban's native error panic style
+// remove_oracle hard-deletes the registration, so a removed oracle is
+// rejected as OracleNotRegistered (#4).
+#[should_panic(expected = "HostError: Error(Contract, #4)")]
 fn deactivated_oracle_cannot_submit() {
     let (env, admin, cid) = setup();
     let c = OracleVerifierClient::new(&env, &cid);
