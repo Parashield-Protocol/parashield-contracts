@@ -46,6 +46,21 @@ jobs:
         working-directory: contracts
         run: cargo clippy --all-targets -- -D warnings
 
+  shellcheck:
+    name: Shell Script Linting
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Run shellcheck on all scripts
+        run: |
+          echo "Running shellcheck on shell scripts..."
+          find scripts -name "*.sh" -type f -exec shellcheck -x {} +
+
   wasm-size:
     name: WASM Binary Size Report
     runs-on: ubuntu-latest
