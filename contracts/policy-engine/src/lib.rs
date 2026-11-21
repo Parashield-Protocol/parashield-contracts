@@ -2208,3 +2208,5 @@ mod test_category_validation;
 mod test_cooling_off;
 #[cfg(test)]
 mod test_product_stats;
+#[cfg(test)]
+mod test_admin_transfer;

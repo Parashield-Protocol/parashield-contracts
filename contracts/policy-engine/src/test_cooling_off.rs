@@ -135,3 +135,55 @@ fn scheduled_purchase_does_not_bypass_cooling_off() {
     );
     buy(&client, &buyer, pid, symbol_short!("kis2606"), &usdc);
 }
+
+// ── Scheduled policy start time validation (issue #856) ─────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #19)")]
+fn buy_policy_scheduled_rejects_past_start_time() {
+    let (env, usdc, client, pid, buyer) = setup();
+    // Advance time past START
+    advance(&env, 100);
+    // Try to schedule a policy with start_time in the past (START is now < current time)
+    client.buy_policy_scheduled(
+        &buyer,
+        &pid,
+        &1_000_000_000i128,
+        &30u32,
+        &symbol_short!("kis2606"),
+        &START,  // This is in the past relative to current ledger time
+        &usdc,
+    );
+}
+
+#[test]
+fn buy_policy_scheduled_accepts_current_time() {
+    let (env, usdc, client, pid, buyer) = setup();
+    let now = env.ledger().timestamp();
+    let policy_id = client.buy_policy_scheduled(
+        &buyer,
+        &pid,
+        &1_000_000_000i128,
+        &30u32,
+        &symbol_short!("kis2606"),
+        &now,
+        &usdc,
+    );
+    assert!(policy_id > 0);
+}
+
+#[test]
+fn buy_policy_scheduled_accepts_future_start() {
+    let (env, usdc, client, pid, buyer) = setup();
+    let future = env.ledger().timestamp() + 86400; // 1 day in future
+    let policy_id = client.buy_policy_scheduled(
+        &buyer,
+        &pid,
+        &1_000_000_000i128,
+        &30u32,
+        &symbol_short!("kis2606"),
+        &future,
+        &usdc,
+    );
+    assert!(policy_id > 0);
+}
