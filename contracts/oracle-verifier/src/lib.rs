@@ -99,8 +99,9 @@ const _: () = {
 /// Outlier filtering is skipped below this many eligible submissions —
 /// with too few points neither the median nor the MAD used to judge
 /// deviation is a meaningful reference, so filtering would be as likely to
-/// discard a legitimate value as a bad one.
-const DEFAULT_OUTLIER_MIN_SAMPLE_SIZE: u32 = 4;
+/// discard a legitimate value as a bad one. Matches the minimum enforced by
+/// set_outlier_config (issue #889).
+const DEFAULT_OUTLIER_MIN_SAMPLE_SIZE: u32 = 3;
 
 /// Default challenge period for stake withdrawals: 7 days in seconds (#681).
 pub const DEFAULT_CHALLENGE_PERIOD: u64 = 7 * 24 * 60 * 60;
