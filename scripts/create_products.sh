@@ -9,6 +9,11 @@
 #   - Policy Engine contract initialized
 #   - SOURCE key must be the admin key used in initialize()
 #   - USDC_TOKEN must be set to the token contract address expected for premium payments
+#
+# Test Coverage:
+#   The JSON parameters in this script are validated against CreateProductParams
+#   in contracts/policy-engine/src/test_create_products_json.rs. If the struct
+#   changes but this script is not updated, the test will fail at build time.
 
 set -euo pipefail
 
