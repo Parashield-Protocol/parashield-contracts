@@ -2053,6 +2053,24 @@ impl GovernanceDao {
         args: Vec<Val>,
         impact_analysis: Bytes,
     ) -> u64 {
+        // Validate deposit threshold BEFORE template validation to avoid partial state.
+        // If the proposer lacks sufficient governance tokens, fail fast before any
+        // template validation succeeds. This prevents the confusing error where
+        // template validation passes but create_proposal fails (issue #888).
+        let config: DaoConfig = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        
+        let deposit = Self::effective_threshold(&env, &ProposalKind::Standard, &target);
+        let gov_token = token::Client::new(&env, &config.gov_token);
+        let weight = gov_token.balance(&proposer);
+        if weight < deposit {
+            panic_with_error!(&env, Error::InsufficientWeight);
+        }
+
+        // Now proceed with template validation
         let template: ProposalTemplate = env
             .storage()
             .instance()

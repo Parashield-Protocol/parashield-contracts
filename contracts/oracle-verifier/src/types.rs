@@ -423,6 +423,13 @@ pub struct MaxTimestampAgeUpdated {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DataTypeMaxTimestampAgeUpdated {
+    pub data_type: Symbol,
+    pub max_timestamp_age: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OracleEncryptedDataSubmitted {
     pub oracle: Address,
     pub data_type: Symbol,

@@ -182,6 +182,11 @@ enum StorageKey {
     /// minutes while a monthly rainfall total is valid for weeks — one global
     /// number cannot serve both.
     DataTypeMaxAge(Symbol),
+    /// Per-data-type max timestamp age override (u64 seconds). Falls back to
+    /// the global `MaxTimestampAge` when unset. Flight delay data goes stale
+    /// in minutes (should use 3600 = 1 hour) while weather data can be valid
+    /// for days (should use 604800 = 7 days).
+    DataTypeMaxTimestampAge(Symbol),
     /// Per-data-type aggregation method. Falls back to `WeightedMedian`.
     AggregationMethod(Symbol),
     /// Whether plaintext `submit_data`/`batch_submit_data` is refused for a
@@ -621,6 +626,41 @@ impl OracleVerifier {
             .instance()
             .get(&StorageKey::MaxTimestampAge)
             .unwrap_or(90 * 24 * 60 * 60)
+    }
+
+    /// Set per-data-type max timestamp age override. When set, submissions for
+    /// this data_type use this value instead of the global MaxTimestampAge.
+    /// Use tighter limits for time-sensitive data (flight: 3600 = 1 hour,
+    /// weather: 604800 = 7 days) to prevent stale data from being accepted.
+    /// Set to 0 to remove the override and fall back to the global value.
+    pub fn set_data_type_max_timestamp_age(
+        env: Env,
+        admin: Address,
+        data_type: Symbol,
+        max_timestamp_age: u64,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        if max_timestamp_age == 0 {
+            env.storage()
+                .instance()
+                .remove(&StorageKey::DataTypeMaxTimestampAge(data_type.clone()));
+        } else {
+            env.storage()
+                .instance()
+                .set(&StorageKey::DataTypeMaxTimestampAge(data_type.clone()), &max_timestamp_age);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "dt_max_timestamp_age_updated"),),
+            DataTypeMaxTimestampAgeUpdated { data_type, max_timestamp_age },
+        );
+    }
+
+    /// Get the effective max timestamp age for a data_type (per-type override
+    /// if set, otherwise global MaxTimestampAge).
+    pub fn get_data_type_max_timestamp_age(env: Env, data_type: Symbol) -> u64 {
+        Self::effective_max_timestamp_age(&env, &data_type)
     }
 
     /// Set the maximum number of seconds a submission timestamp may be ahead of
@@ -2414,11 +2454,8 @@ impl OracleVerifier {
         if timestamp > now.saturating_add(future_buffer) {
             panic_with_error!(&env, Error::InvalidTimestamp);
         }
-        let max_timestamp_age: u64 = env
-            .storage()
-            .instance()
-            .get(&StorageKey::MaxTimestampAge)
-            .unwrap_or(90 * 24 * 60 * 60);
+        // Use per-data-type max timestamp age if configured, otherwise global
+        let max_timestamp_age: u64 = Self::effective_max_timestamp_age(&env, &data_type);
         if timestamp < now.saturating_sub(max_timestamp_age) {
             panic_with_error!(&env, Error::InvalidTimestamp);
         }
@@ -3199,11 +3236,8 @@ impl OracleVerifier {
             if timestamp > now.saturating_add(future_buffer) {
                 panic_with_error!(&env, Error::InvalidTimestamp);
             }
-            let max_timestamp_age: u64 = env
-                .storage()
-                .instance()
-                .get(&StorageKey::MaxTimestampAge)
-                .unwrap_or(90 * 24 * 60 * 60);
+            // Use per-data-type max timestamp age if configured, otherwise global
+            let max_timestamp_age: u64 = Self::effective_max_timestamp_age(&env, &data_type);
             if timestamp < now.saturating_sub(max_timestamp_age) {
                 panic_with_error!(&env, Error::InvalidTimestamp);
             }
@@ -3626,6 +3660,20 @@ impl OracleVerifier {
                     .instance()
                     .get(&StorageKey::MaxDataAge)
                     .unwrap_or(604_800)
+            })
+    }
+
+    /// The max timestamp age configured for a data type, or the global
+    /// MaxTimestampAge if no per-type override is set. Defaults to 90 days.
+    fn effective_max_timestamp_age(env: &Env, data_type: &Symbol) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::DataTypeMaxTimestampAge(data_type.clone()))
+            .unwrap_or_else(|| {
+                env.storage()
+                    .instance()
+                    .get(&StorageKey::MaxTimestampAge)
+                    .unwrap_or(90 * 24 * 60 * 60)
             })
     }
 

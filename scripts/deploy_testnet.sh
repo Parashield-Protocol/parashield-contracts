@@ -60,6 +60,7 @@ ORACLE_ID=$(deploy_contract "parashield-oracle-verifier")
 RISK_POOL_ID=$(deploy_contract "parashield-risk-pool")
 POLICY_ID=$(deploy_contract "parashield-policy-engine")
 CLAIMS_ID=$(deploy_contract "parashield-claims-processor")
+DAO_ID=$(deploy_contract "parashield-governance-dao")
 
 # ── Get USDC testnet address ──────────────────────────────────────────────────
 
@@ -117,6 +118,24 @@ stellar contract invoke \
     --admin "$DEPLOYER_ADDR" \
     --claims_processor "$CLAIMS_ID"
 
+log "Initializing governance-dao..."
+# Testnet governance configuration:
+# - proposal_threshold: 100 tokens (lower than mainnet for testing)
+# - total_supply: 10M tokens (smaller supply for testnet)
+# - quorum_bps: 500 = 5% quorum (lower for easier testnet testing)
+# - majority_bps: 5100 = 51% majority
+# - voting_period: 86400 = 1 day (shorter for faster testing)
+# - proposal_timelock: 3600 = 1 hour (shorter for faster testing)
+# - discussion_period: 1800 = 30 minutes
+# - vote_weight_cap: 0 = no cap
+stellar contract invoke \
+    --id "$DAO_ID" \
+    --source "$SOURCE" \
+    --network "$NETWORK" \
+    -- initialize \
+    --admin "$DEPLOYER_ADDR" \
+    --config '{"gov_token": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC", "proposal_threshold": "1000000000", "total_supply": "10000000000000000", "quorum_bps": 500, "majority_bps": 5100, "voting_period": 86400, "proposal_timelock": 3600, "discussion_period": 1800, "vote_weight_cap": 0}'
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 log ""
@@ -126,6 +145,7 @@ log "Oracle Verifier:  $ORACLE_ID"
 log "Risk Pool:        $RISK_POOL_ID"
 log "Policy Engine:    $POLICY_ID"
 log "Claims Processor: $CLAIMS_ID"
+log "Governance DAO:   $DAO_ID"
 log ""
 log "Next steps:"
 log "  1. Register an oracle: stellar contract invoke --id $ORACLE_ID ... -- add_oracle --oracle <ADDR> --data_type weather --weight 90"
