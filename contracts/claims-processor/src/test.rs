@@ -35,6 +35,7 @@ fn deploy() -> World {
     let env = Env::default();
     env.mock_all_auths();
     env.cost_estimate().budget().reset_unlimited();
+    env.ledger().with_mut(|l| l.timestamp = 1_000_000);
 
     let admin  = Address::generate(&env);
     let keeper = Address::generate(&env);
@@ -86,6 +87,10 @@ fn deploy() -> World {
     PolicyEngineClient::new(&env, &policy_id)
         .set_claims_processor(&admin, &claims_id);
 
+    // Register crop claim type
+    ClaimsProcessorClient::new(&env, &claims_id)
+        .register_claim_type(&admin, &symbol_short!("crop"));
+
     World { env, admin, keeper, oracle_w: oracle_wallet, usdc, oracle_id, policy_id, claims_id, pool_id, lp }
 }
 
@@ -93,7 +98,7 @@ fn create_crop_product(w: &World) -> u128 {
     PolicyEngineClient::new(&w.env, &w.policy_id).create_product(
         &w.admin,
         &CreateProductParams {
-            name:               symbol_short!("crop_kism"),
+            name:               soroban_sdk::String::from_str(&w.env, "crop_kism"),
             category:           symbol_short!("crop"),
             oracle_key:         symbol_short!("kis2606"),
             trigger_type:       TriggerType::Threshold,
@@ -114,8 +119,8 @@ fn buy_crop_policy(w: &World, buyer: &Address, product_id: u128) -> u128 {
     // Fund the pool with coverage capital. The LP must not be the admin:
     // RiskPool rejects an admin deposit (issue #568), because the admin also
     // sets the pool's risk parameters and can authorise emergency exits.
-    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.lp, &1_000_000_000i128);
-    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&w.lp, &1_000_000_000i128, &0i128, &false);
+    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.lp, &5_000_000_000i128);
+    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&w.lp, &5_000_000_000i128, &0i128, &false);
     StellarAssetClient::new(&w.env, &w.usdc).mint(&w.policy_id, &10_000_000_000i128);
     
     let policy_id = PolicyEngineClient::new(&w.env, &w.policy_id)
@@ -157,7 +162,7 @@ fn test_drought_trigger_pays_out() {
     assert_eq!(result, ClaimResult::Paid);
     // Buyer: minted 5_000_000_000, paid 50_000_000 premium, received 1_000_000_000 coverage
     let balance = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
-    assert_eq!(balance, 5_000_000_000 - 4_109_589 + 1_000_000_000);
+    assert_eq!(balance, 5_000_000_000 - 4_109_590 + 1_000_000_000);
 }
 
 /// Buy policy → oracle submits above threshold → auto_process rejects.
@@ -177,7 +182,7 @@ fn test_good_rainfall_no_payout() {
     assert_eq!(result, ClaimResult::Rejected);
     // Buyer: minted 5_000_000_000, paid 50_000_000 premium, no payout received
     let buyer_bal = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
-    assert_eq!(buyer_bal, 5_000_000_000 - 4_109_589, "no payout when trigger not met");
+    assert_eq!(buyer_bal, 5_000_000_000 - 4_109_590, "no payout when trigger not met");
 }
 
 /// Policy past end_time with no trigger → auto_process marks Expired.
@@ -250,7 +255,7 @@ fn test_double_process_idempotent() {
 
     // Buyer should NOT receive double coverage — exactly one payout
     let balance = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
-    assert_eq!(balance, 5_000_000_000 - 4_109_589 + 1_000_000_000);
+    assert_eq!(balance, 5_000_000_000 - 4_109_590 + 1_000_000_000);
 }
 
 #[test]
@@ -675,7 +680,7 @@ fn test_process_claim_double_processing_returns_already_processed() {
 
     // Balance confirms exactly one payout — no double-spend
     let balance = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
-    assert_eq!(balance, 5_000_000_000 - 4_109_589 + 1_000_000_000);
+    assert_eq!(balance, 5_000_000_000 - 4_109_590 + 1_000_000_000);
 }
 
 /// Test that batch_auto_process with an empty pending list returns an empty vector.
@@ -1255,7 +1260,7 @@ fn test_resolved_dispute_can_be_processed() {
     assert_eq!(claim.status, ClaimStatus::Paid);
     
     let balance = soroban_sdk::token::Client::new(&w.env, &w.usdc).balance(&buyer);
-    assert_eq!(balance, 5_000_000_000 - 4_109_589 + 1_000_000_000);
+    assert_eq!(balance, 5_000_000_000 - 4_109_590 + 1_000_000_000);
 }
 
 /// Resolving a Paid claim must fail with AlreadyProcessed.
@@ -1771,9 +1776,9 @@ fn test_non_admin_policyholder_still_files_claim() {
 fn test_payout_delay_within_bounds() {
     let w = deploy();
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
-    let delay = 365 * 24 * 60 * 60; // Exact max
+    let delay: i64 = 365 * 24 * 60 * 60; // Exact max
     cp.set_payout_delay(&w.admin, &delay);
-    assert_eq!(cp.get_payout_delay(), delay);
+    assert_eq!(cp.get_payout_delay(), delay as u64);
 }
 
 #[test]

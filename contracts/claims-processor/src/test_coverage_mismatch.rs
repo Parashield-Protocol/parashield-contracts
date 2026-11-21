@@ -102,9 +102,10 @@ fn deploy() -> World {
     let product_id = PolicyEngineClient::new(&env, &policy_id).create_product(
         &admin,
         &CreateProductParams {
-            name: symbol_short!("cov_mism"),
+            name: soroban_sdk::String::from_str(&env, "cov_mism"),
             category: symbol_short!("crop"),
             oracle_key: symbol_short!("kis2606"),
+            expected_token: usdc.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -146,6 +147,7 @@ fn buy_policy(w: &World) -> (Address, u128) {
         &COVERAGE,
         &30u32,
         &symbol_short!("kis2606"),
+        &w.usdc,
     );
     RiskPoolClient::new(&w.env, &w.pool_id).lock_for_policy(&w.admin, &policy_id, &COVERAGE);
     (buyer, policy_id)

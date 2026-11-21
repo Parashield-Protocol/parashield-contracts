@@ -18,9 +18,45 @@ Policy buyer pays premium
 
 ## Premium Rate
 
-Premium = `coverage_amount × premium_rate_bps / 10_000`
+### Canonical Smart Contract Formula (365-Day Annualized Base)
 
-Example: 1,000 USDC coverage at 3% rate = 30 USDC premium.
+The smart contract implements an annualized premium calculation using a 365-day base and integer ceiling division to ensure the risk pool never undercollects:
+
+$$\text{premium} = \left\lceil \frac{\text{coverage\_amount} \times \text{premium\_rate\_bps} \times \text{duration\_days}}{365 \times 10{,}000} \right\rceil$$
+
+In Soroban contract integer arithmetic:
+```rust
+let numerator = coverage_amount
+    .checked_mul(product.premium_rate_bps as i128)
+    .and_then(|v| v.checked_mul(duration_days as i128))
+    .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
+let divisor: i128 = 365 * 10_000;
+// Ceiling integer division: (numerator + divisor - 1) / divisor
+let required_premium = numerator
+    .checked_add(divisor - 1)
+    .and_then(|v| v.checked_div(divisor))
+    .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
+```
+
+### Protocol Discrepancy & Resolution (Issue #808)
+
+- **Legacy Backend Formula (30-Day Monthly Base)**:
+  Earlier versions of the backend off-chain quoting services calculated premiums using a 30-day monthly base:
+  $$\text{premium}_{\text{backend}} = \left\lceil \frac{\text{coverage\_amount} \times \text{premium\_rate\_bps} \times \text{duration\_days}}{10{,}000 \times 30} \right\rceil$$
+- **Discrepancy**:
+  Because $\frac{365}{30} \approx 12.167$, this created an approximate $12\times$ discrepancy where the backend quoted ~12 times higher premiums than the smart contract enforced for the same duration.
+- **Protocol Standard**:
+  The smart contract's 365-day annualized formula is the authoritative protocol standard. All off-chain backend quoting engines, APIs, and client-side calculators must use the 365-day annualized formula with ceiling integer division matching the on-chain contract.
+
+### Worked Example
+
+- **Coverage**: 1,000 USDC (`1_000_000_000` stroops / 7 decimals)
+- **Rate**: 5.0% (`500` bps)
+- **Duration**: 30 days
+- **Numerator**: $1{,}000{,}000{,}000 \times 500 \times 30 = 15{,}000{,}000{,}000{,}000$
+- **Divisor**: $365 \times 10{,}000 = 3{,}650{,}000$
+- **Contract Premium**: $\lceil 15{,}000{,}000{,}000{,}000 / 3{,}650{,}000 \rceil = 4{,}109{,}590$ stroops ($\approx 4.109590$ USDC)
+- **Legacy Backend (Incorrect)**: $\lceil 15{,}000{,}000{,}000{,}000 / 300{,}000 \rceil = 50{,}000{,}000$ stroops ($50.0$ USDC, ~12.17x higher)
 
 ## Claim Settlement
 

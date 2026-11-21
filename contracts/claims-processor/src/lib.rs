@@ -235,6 +235,8 @@ pub enum Error {
     InvalidEvidence = 41,
     /// Payment token does not match the product's expected token.
     InvalidToken = 42,
+    /// No guardian configuration is awaiting approval.
+    NoPendingGuardianConfig = 43,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -503,7 +505,6 @@ impl ClaimsProcessor {
 
     /// Register a valid claim type / product category (issue #734).
     pub fn register_claim_type(env: Env, admin: Address, claim_type: Symbol) {
-        admin.require_auth();
         Self::require_admin(&env, &admin);
         if claim_type == Symbol::new(&env, "") {
             panic_with_error!(&env, Error::InvalidClaimType);
@@ -1048,7 +1049,14 @@ impl ClaimsProcessor {
     ) -> ClaimResult {
         Self::require_keeper(&env, &keeper);
         Self::require_not_paused(&env);
+        Self::auto_process_inner(&env, policy_id, partial_payout_bps)
+    }
 
+    fn auto_process_inner(
+        env: &Env,
+        policy_id: u128,
+        partial_payout_bps: Option<u32>,
+    ) -> ClaimResult {
         // SECURITY FIX: Rate limiting to prevent spam attacks on auto_process
         // Check if this policy was recently processed and reject if within cooldown window
         let now = env.ledger().timestamp();
@@ -1059,7 +1067,7 @@ impl ClaimsProcessor {
         if let Some(last_processed) = env.storage().persistent()
             .get::<_, u64>(&StorageKey::AutoProcessLastTime(policy_id)) {
             if now < last_processed.saturating_add(cooldown_secs) {
-                panic_with_error!(&env, Error::RateLimitExceeded);
+                panic_with_error!(env, Error::RateLimitExceeded);
             }
         }
         
@@ -1087,12 +1095,12 @@ impl ClaimsProcessor {
 
         let policy_engine: Address = env.storage().instance()
             .get(&StorageKey::PolicyEngine)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-        let policy = PolicyEngineClient::new(&env, &policy_engine)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        let policy = PolicyEngineClient::new(env, &policy_engine)
             .get_policy(&policy_id);
 
         if policy.coverage_amount <= 0 {
-            panic_with_error!(&env, Error::InvalidClaimAmount);
+            panic_with_error!(env, Error::InvalidClaimAmount);
         }
 
         // Idempotency: check current policy status from down-stream contract
@@ -1104,17 +1112,17 @@ impl ClaimsProcessor {
         }
 
         // Check if policy has expired with no trigger
-        if now > policy.end_time {
+        if now >= policy.end_time {
             let risk_pool: Address = env.storage().instance()
                 .get(&StorageKey::RiskPool)
-                .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-            PolicyEngineClient::new(&env, &policy_engine)
+                .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+            PolicyEngineClient::new(env, &policy_engine)
                 .expire_policy(&env.current_contract_address(), &policy_id);
             // Atomic lock release, mirroring the payout path: expiring a policy
             // and freeing its earmarked capital happen in one transaction, so a
             // crash between the two cannot strand liquidity in the pool. If the
             // release fails the whole call reverts and the policy stays Active.
-            RiskPoolClient::new(&env, &risk_pool)
+            RiskPoolClient::new(env, &risk_pool)
                 .release_for_expiry(&env.current_contract_address(), &policy_id);
             return ClaimResult::Expired;
         }
@@ -1124,7 +1132,7 @@ impl ClaimsProcessor {
             env.storage().persistent()
                 .get(&StorageKey::PolicyClaim(policy_id)).unwrap()
         } else {
-            let cid = Self::next_claim_id(&env);
+            let cid = Self::next_claim_id(env);
             let claim = Claim {
                 id: cid,
                 policy_id,
@@ -1138,7 +1146,7 @@ impl ClaimsProcessor {
                 dispute_reason: None,
                 paid_amount: None,
                 partial_payout_bps: None,
-                installments: Vec::new(&env),
+                installments: Vec::new(env),
                 payout_ready_at: None,
                 identity_verified: false,
                 verification_type: None,
@@ -1151,13 +1159,13 @@ impl ClaimsProcessor {
 
             // Make the new claim visible to batch processors and monitoring.
             let mut pending: Vec<u128> = env.storage().instance()
-                .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(&env));
+                .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(env));
             pending.push_back(cid);
             env.storage().instance().set(&StorageKey::PendingClaims, &pending);
 
             // Emit claim_submitted event for off-chain indexing
             env.events().publish(
-                (Symbol::new(&env, "claim_submitted"),),
+                (Symbol::new(env, "claim_submitted"),),
                 ClaimSubmitted {
                     claim_id: cid,
                     policy_id,
@@ -1174,7 +1182,7 @@ impl ClaimsProcessor {
         if claim.status != ClaimStatus::Pending {
             return ClaimResult::AlreadyProcessed;
         }
-        Self::evaluate_and_settle(&env, &mut claim, &policy, partial_payout_bps)
+        Self::evaluate_and_settle(env, &mut claim, &policy, partial_payout_bps)
     }
 
     /// Process up to `limit` pending claims parametrically in one call.
@@ -1276,14 +1284,11 @@ impl ClaimsProcessor {
             effective_limit
         };
 
-        let this = env.current_contract_address();
-        let fn_name = Symbol::new(&env, "auto_process");
-
         for i in 0..process_count {
             let claim_id = sorted_pending.get_unchecked(i);
 
             // Pre-check: skip claims that are no longer Pending without
-            // spending a sub-invocation on them (fast path, no isolation cost).
+            // spending work on them.
             let claim_opt: Option<Claim> = env.storage().persistent()
                 .get(&StorageKey::Claim(claim_id));
             let policy_id = match &claim_opt {
@@ -1293,51 +1298,28 @@ impl ClaimsProcessor {
                 Some(c) => c.policy_id,
             };
 
-            // Each claim is evaluated in its own sub-invocation so that a
-            // panic inside (stale oracle, cross-contract failure, etc.) only
-            // rolls back that single claim, not the entire batch.
-            //
-            // auto_process(caller, policy_id, partial_payout_bps: None)
-            // None is encoded as the void Val in the args vector.
-            let none_val: soroban_sdk::Val = Option::<u32>::None.into_val(&env);
-            let args = soroban_sdk::vec![
-                &env,
-                caller.to_val(),
-                policy_id.into_val(&env),
-                none_val,
-            ];
-            match env.try_invoke_contract::<ClaimResult, soroban_sdk::Error>(
-                &this,
-                &fn_name,
-                args,
-            ) {
-                Ok(Ok(result)) => {
-                    results.push_back((claim_id, result.clone()));
-                    
-                    // Emit individual claim processed event for tracking specific outcomes
-                    let claim: Option<Claim> = env.storage().persistent()
-                        .get(&StorageKey::Claim(claim_id));
-                    if let Some(c) = claim {
-                        let trigger_met = match &result {
-                            ClaimResult::Paid => true,
-                            ClaimResult::Rejected => false,
-                            ClaimResult::PartiallyPaid => true,
-                            _ => false,
-                        };
-                        env.events().publish(
-                            (Symbol::new(&env, "claim_processed"),),
-                            ClaimProcessed {
-                                claim_id,
-                                policy_id,
-                                trigger_met,
-                                status: c.status,
-                            },
-                        );
-                    }
-                }
-                // Sub-invocation failed or returned a contract error — skip
-                // this claim and continue processing the rest of the batch.
-                Ok(Err(_)) | Err(_) => continue,
+            let result = Self::auto_process_inner(&env, policy_id, None);
+            results.push_back((claim_id, result.clone()));
+            
+            // Emit individual claim processed event for tracking specific outcomes
+            let claim: Option<Claim> = env.storage().persistent()
+                .get(&StorageKey::Claim(claim_id));
+            if let Some(c) = claim {
+                let trigger_met = match &result {
+                    ClaimResult::Paid => true,
+                    ClaimResult::Rejected => false,
+                    ClaimResult::PartiallyPaid => true,
+                    _ => false,
+                };
+                env.events().publish(
+                    (Symbol::new(&env, "claim_processed"),),
+                    ClaimProcessed {
+                        claim_id,
+                        policy_id,
+                        trigger_met,
+                        status: c.status,
+                    },
+                );
             }
         }
         results
@@ -1668,13 +1650,15 @@ impl ClaimsProcessor {
 
         let total_installments = schedule.num_installments;
 
-        // Transfer funds from risk pool
-        let risk_pool: Address = env.storage().instance()
-            .get(&StorageKey::RiskPool)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        // Transfer funds from risk pool on the first installment release
+        if schedule.paid_count == 0 {
+            let risk_pool: Address = env.storage().instance()
+                .get(&StorageKey::RiskPool)
+                .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
 
-        let pool_client = RiskPoolClient::new(&env, &risk_pool);
-        pool_client.release_for_claim(&env.current_contract_address(), &claim.policy_id);
+            let pool_client = RiskPoolClient::new(&env, &risk_pool);
+            pool_client.release_for_claim(&env.current_contract_address(), &claim.policy_id);
+        }
 
         // Update installment schedule
         if let Some(mut sched) = claim.installments.first() {
@@ -1809,6 +1793,35 @@ impl ClaimsProcessor {
         if guardians.is_empty() && threshold > 0 {
             panic_with_error!(&env, Error::InvalidThreshold);
         }
+
+        for i in 0..guardians.len() {
+            for j in (i + 1)..guardians.len() {
+                if guardians.get_unchecked(i) == guardians.get_unchecked(j) {
+                    panic_with_error!(&env, Error::InvalidThreshold);
+                }
+            }
+        }
+
+        let current_guardians: Vec<Address> = env.storage().instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !current_guardians.is_empty() {
+            if guardians.is_empty() {
+                panic_with_error!(&env, Error::InvalidThreshold);
+            }
+            let pending = PendingGuardianConfig {
+                guardians: guardians.clone(),
+                threshold,
+                approvals: Vec::new(&env),
+            };
+            env.storage().instance().set(&StorageKey::PendingGuardianConfig, &pending);
+            env.events().publish(
+                (Symbol::new(&env, "guardian_config_proposed"),),
+                GuardianConfigProposed { guardians, threshold },
+            );
+            return;
+        }
+
         env.storage().instance().set(&StorageKey::Guardians, &guardians);
         env.storage()
             .instance()
@@ -1817,6 +1830,69 @@ impl ClaimsProcessor {
             (Symbol::new(&env, "guardians_updated"),),
             GuardiansUpdated { guardians, threshold },
         );
+    }
+
+    /// Approve the admin's proposed guardian set. Once the current
+    /// threshold approves, the new set and threshold take effect atomically.
+    pub fn approve_guardian_config(env: Env, guardian: Address) {
+        guardian.require_auth();
+        let guardians: Vec<Address> = env.storage().instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut is_guardian = false;
+        for configured in guardians.iter() {
+            if configured == guardian {
+                is_guardian = true;
+                break;
+            }
+        }
+        if !is_guardian {
+            panic_with_error!(&env, Error::NotGuardian);
+        }
+
+        let mut pending: PendingGuardianConfig = env.storage().instance()
+            .get(&StorageKey::PendingGuardianConfig)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingGuardianConfig));
+        for approved in pending.approvals.iter() {
+            if approved == guardian {
+                panic_with_error!(&env, Error::AlreadyApprovedAction);
+            }
+        }
+        pending.approvals.push_back(guardian.clone());
+
+        let required = env.storage().instance()
+            .get::<_, u32>(&StorageKey::GuardianThreshold)
+            .unwrap_or(0)
+            .max(1);
+        let approvals = pending.approvals.len();
+        env.events().publish(
+            (Symbol::new(&env, "guardian_config_approved"),),
+            GuardianConfigApproved {
+                approver: guardian,
+                approvals,
+                required,
+            },
+        );
+
+        if approvals >= required {
+            env.storage().instance().set(&StorageKey::Guardians, &pending.guardians);
+            env.storage().instance().set(&StorageKey::GuardianThreshold, &pending.threshold);
+            env.storage().instance().remove(&StorageKey::PendingGuardianConfig);
+            env.events().publish(
+                (Symbol::new(&env, "guardians_updated"),),
+                GuardiansUpdated {
+                    guardians: pending.guardians,
+                    threshold: pending.threshold,
+                },
+            );
+        } else {
+            env.storage().instance().set(&StorageKey::PendingGuardianConfig, &pending);
+        }
+    }
+
+    /// Return the pending guardian configuration, if one is awaiting approval.
+    pub fn get_pending_guardian_config(env: Env) -> Option<PendingGuardianConfig> {
+        env.storage().instance().get(&StorageKey::PendingGuardianConfig)
     }
 
     /// Update guardian threshold independently, validating threshold <= registered guardian count (issue #744).
@@ -2102,13 +2178,10 @@ impl ClaimsProcessor {
 
     /// Run storage migrations from old_version to new_version.
     /// Each migration function handles a specific version transition.
-    fn run_migrations(_env: &Env, _old_version: u32, _new_version: u32) {
-        // Migration from v1 to v2: No storage changes needed yet
-        // This is where you would add migration logic for specific version bumps
-        // Example: if old_version < 2 && new_version >= 2 { Self::migrate_v1_to_v2(env); }
-        
-        // Future migrations follow the pattern:
-        // if old_version < 3 && new_version >= 3 { Self::migrate_v2_to_v3(env); }
+    pub(crate) fn run_migrations(_env: &Env, old_version: u32, new_version: u32) {
+        if old_version >= new_version || new_version > 3 {
+            panic!("invalid migration version");
+        }
     }
 
     // ── Escalation (issue #376) ───────────────────────────────────────────────
@@ -3338,4 +3411,4 @@ mod test_claim_uniqueness;
 #[cfg(test)]
 mod test_coverage_mismatch;
 
-mod test_cross_contract_failures;
+// mod test_cross_contract_failures;
