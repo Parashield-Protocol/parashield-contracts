@@ -2210,3 +2210,5 @@ mod test_cooling_off;
 mod test_product_stats;
 #[cfg(test)]
 mod test_admin_transfer;
+#[cfg(test)]
+mod test_create_products_json;
