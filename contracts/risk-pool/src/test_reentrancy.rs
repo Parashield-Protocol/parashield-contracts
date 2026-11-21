@@ -411,3 +411,44 @@ fn transfer_position_releases_guard_after_unauthorized_call() {
     let amount = f.pool.transfer_position(&f.lp1, &f.lp2, &(f.shares / 2));
     assert!(amount > 0);
 }
+
+#[test]
+fn emergency_withdraw_rejects_reentrant_call() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let backstop = Address::generate(&env);
+    let lp = Address::generate(&env);
+    let policy_engine = Address::generate(&env);
+    let claims_processor = Address::generate(&env);
+
+    let mal_token_id = env.register(MaliciousToken, ());
+    let mal_client = MaliciousTokenClient::new(&env, &mal_token_id);
+
+    let pool_id = env.register(RiskPool, ());
+    let pool = RiskPoolClient::new(&env, &pool_id);
+
+    pool.initialize(
+        &admin,
+        &mal_token_id,
+        &treasury,
+        &backstop,
+        &Symbol::new(&env, "crop"),
+        &policy_engine,
+        &claims_processor,
+    );
+
+    // Initial deposit
+    let shares = pool.deposit(&lp, &100_000_000, &0, &false);
+    assert!(shares > 0);
+
+    // Arm MaliciousToken with pool_id so the token transfer during emergency_withdraw tries to re-enter deposit
+    mal_client.set_pool(&pool_id);
+
+    // emergency_withdraw triggers token.transfer which tries to re-enter deposit.
+    // The ReentrancyGuard rejects the reentrant call, causing the operation to fail.
+    let res = pool.try_emergency_withdraw(&lp, &admin, &shares);
+    assert!(res.is_err(), "emergency_withdraw reentrant attempt must fail");
+}

@@ -1135,8 +1135,8 @@ fn weighted_median_handles_negative_values() {
     assert_eq!(c.get_aggregated(&wt(), &key_even).median_value, -25_000_000);
 }
 
-/// Very large values up to MAX_DATA_VALUE (10^27) on a custom data type do not
-/// overflow WeightedMedian or Mean.
+/// Very large values up to MAX_DATA_VALUE on a custom data type do not
+/// overflow WeightedMedian or Mean (issue #839).
 #[test]
 fn large_values_near_max_data_value_do_not_overflow() {
     let (env, admin, cid) = setup();
@@ -1144,9 +1144,9 @@ fn large_values_near_max_data_value_do_not_overflow() {
     let now = env.ledger().timestamp();
     let custom = symbol_short!("custom");
 
-    let v1: i128 = 900_000_000_000_000_000_000_000_000; // 9 * 10^26
-    let v2: i128 = 1_000_000_000_000_000_000_000_000_000; // 10^27 == MAX_DATA_VALUE
-    let expected_mid: i128 = 950_000_000_000_000_000_000_000_000; // (9e26 + 1e27) / 2
+    let v1: i128 = MAX_DATA_VALUE * 9 / 10; // 9 * 10^20
+    let v2: i128 = MAX_DATA_VALUE; // 10^21 == MAX_DATA_VALUE
+    let expected_mid: i128 = (v1 + v2) / 2; // (9e20 + 1e21) / 2 = 9.5e20
 
     submit_from_many(
         &env,

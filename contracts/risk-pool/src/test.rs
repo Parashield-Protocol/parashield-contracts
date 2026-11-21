@@ -882,3 +882,130 @@ fn test_set_pool_name_too_long_panics() {
     assert_eq!(name_33.len(), 33);
     pool.set_pool_name(&admin, &name_33);
 }
+
+// ── Emergency withdrawal tests (#833) ────────────────────────────────────────
+
+#[test]
+fn test_emergency_withdraw_pays_amount_and_pending_yield() {
+    let (env, pool, usdc_id, admin, _, lp1) = setup();
+    let deposit_amt = 1_000_0000000i128; // 1,000 USDC
+    let shares = pool.deposit(&lp1, &deposit_amt, &0i128, &false);
+
+    // Premium payment generates accrued yield for LP (80% of 100 USDC = 80 USDC)
+    let premium = 100_0000000i128;
+    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp1, &premium);
+    pool.receive_premium(&lp1, &premium);
+
+    let before = token::Client::new(&env, &usdc_id).balance(&lp1);
+    let returned = pool.emergency_withdraw(&lp1, &admin, &shares);
+    let after = token::Client::new(&env, &usdc_id).balance(&lp1);
+
+    let expected_yield = 80_0000000i128;
+    assert_eq!(returned, deposit_amt);
+    assert_eq!(after - before, deposit_amt + expected_yield);
+}
+
+#[test]
+fn test_emergency_withdraw_zero_pending_yield() {
+    let (env, pool, usdc_id, admin, _, lp1) = setup();
+    let deposit_amt = 500_0000000i128;
+    let shares = pool.deposit(&lp1, &deposit_amt, &0i128, &false);
+
+    let before = token::Client::new(&env, &usdc_id).balance(&lp1);
+    let returned = pool.emergency_withdraw(&lp1, &admin, &shares);
+    let after = token::Client::new(&env, &usdc_id).balance(&lp1);
+
+    assert_eq!(returned, deposit_amt);
+    assert_eq!(after - before, deposit_amt);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_emergency_withdraw_user_with_no_position_fails() {
+    let (env, pool, _, admin, _, _) = setup();
+    let stranger = Address::generate(&env);
+    pool.emergency_withdraw(&stranger, &admin, &100_0000000i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_emergency_withdraw_unauthorized_admin_rejected() {
+    let (env, pool, _, _admin, _, lp1) = setup();
+    let shares = pool.deposit(&lp1, &500_0000000i128, &0i128, &false);
+    let fake_admin = Address::generate(&env);
+    pool.emergency_withdraw(&lp1, &fake_admin, &shares);
+}
+
+#[test]
+fn test_emergency_withdraw_unauthorized_caller_rejected() {
+    let (env, pool, _, admin, _, lp1) = setup();
+    let shares = pool.deposit(&lp1, &500_0000000i128, &0i128, &false);
+    env.mock_auths(&[]); // Disable blanket auth mocking
+    assert!(pool.try_emergency_withdraw(&lp1, &admin, &shares).is_err());
+}
+
+#[test]
+fn test_emergency_withdraw_state_after_call() {
+    let (env, pool, usdc_id, admin, _, lp1) = setup();
+    let deposit_amt = 1_000_0000000i128;
+    let shares = pool.deposit(&lp1, &deposit_amt, &0i128, &false);
+
+    let premium = 100_0000000i128;
+    token::StellarAssetClient::new(&env, &usdc_id).mint(&lp1, &premium);
+    pool.receive_premium(&lp1, &premium);
+
+    pool.emergency_withdraw(&lp1, &admin, &shares);
+
+    let pos = pool.get_position(&lp1).unwrap();
+    assert_eq!(pos.shares, 0);
+    assert_eq!(pos.deposited, 0);
+    assert_eq!(pool.get_stats().total_deposited, 0);
+    assert_eq!(pool.get_stats().total_shares, 0);
+
+    // Yield cannot be claimed again
+    let claimed_again = pool.claim_yield(&lp1);
+    assert_eq!(claimed_again, 0);
+}
+
+#[test]
+fn test_emergency_withdraw_overflow_case_rejected() {
+    let (env, pool, _, admin, _, lp1) = setup();
+    let deposit_amt = 100_0000000i128;
+    let shares = pool.deposit(&lp1, &deposit_amt, &0i128, &false);
+
+    // Artificially inject accumulated_yield = i128::MAX into LP position
+    env.as_contract(&pool.address, || {
+        let lp_key = StorageKey::LpPosition(lp1.clone());
+        let mut pos: crate::LpPosition = env.storage().persistent().get(&lp_key).unwrap();
+        pos.accumulated_yield = i128::MAX;
+        env.storage().persistent().set(&lp_key, &pos);
+    });
+
+    let res = pool.try_emergency_withdraw(&lp1, &admin, &shares);
+    assert!(res.is_err(), "emergency_withdraw with overflowing total payout must fail");
+
+    // State remains untouched
+    let pos_after = pool.get_position(&lp1).unwrap();
+    assert_eq!(pos_after.shares, shares);
+    assert_eq!(pos_after.deposited, deposit_amt);
+}
+
+#[test]
+fn test_emergency_withdraw_failed_token_transfer_leaves_no_state_change() {
+    let (env, pool, usdc_id, admin, _, lp1) = setup();
+    let deposit_amt = 500_0000000i128;
+    let shares = pool.deposit(&lp1, &deposit_amt, &0i128, &false);
+
+    // Drain pool's USDC balance to simulate token transfer failure
+    env.as_contract(&pool.address, || {
+        token::Client::new(&env, &usdc_id).transfer(&pool.address, &admin, &deposit_amt);
+    });
+
+    let res = pool.try_emergency_withdraw(&lp1, &admin, &shares);
+    assert!(res.is_err(), "emergency_withdraw with drained balance must fail");
+
+    // State is rolled back
+    let pos = pool.get_position(&lp1).unwrap();
+    assert_eq!(pos.shares, shares);
+    assert_eq!(pos.deposited, deposit_amt);
+}
