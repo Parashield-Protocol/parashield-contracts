@@ -504,6 +504,16 @@ pub struct ExitClaimed {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExitSweepSkipped {
+    pub provider: Address,
+    pub shares_requested: i128,
+    /// Why this exit wasn't settled on this sweep: `insufficient_liquidity`
+    /// or `zero_amount`.
+    pub reason: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MinReserveUpdated {
     pub min_reserve: i128,
 }

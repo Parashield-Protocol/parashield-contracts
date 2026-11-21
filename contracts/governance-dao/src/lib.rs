@@ -347,7 +347,7 @@ impl GovernanceDao {
         // effect. A different title does not make a different governance
         // action; it just splits voter attention and wastes deposit capital.
         let content_hash = Self::proposal_content_hash(&env, &target, &function, &args);
-        let hash_key = StorageKey::ActiveProposalHash(content_hash);
+        let hash_key = StorageKey::ActiveProposalHash(content_hash.clone());
         let legacy_hash = Self::legacy_proposal_content_hash(&env, &target, &function, &args);
         let legacy_hash_key = StorageKey::ActiveProposalHash(legacy_hash);
         Self::reject_if_active_duplicate(&env, &hash_key);
@@ -487,7 +487,7 @@ impl GovernanceDao {
         upgrade_args.push_back(new_wasm_hash.clone().into_val(&env));
 
         let upgrade_content_hash = Self::proposal_content_hash(&env, &target, &upgrade_function, &upgrade_args);
-        let upgrade_hash_key = StorageKey::ActiveProposalHash(upgrade_content_hash);
+        let upgrade_hash_key = StorageKey::ActiveProposalHash(upgrade_content_hash.clone());
         let legacy_upgrade_hash =
             Self::legacy_proposal_content_hash(&env, &target, &upgrade_function, &upgrade_args);
         let legacy_upgrade_hash_key = StorageKey::ActiveProposalHash(legacy_upgrade_hash);

@@ -1397,21 +1397,14 @@ impl OracleVerifier {
             return;
         }
 
-        // SECURITY FIX: Check source data exists before calling get_median_value
-        // If source data type has no submissions, skip cross-validation.
-        // This prevents validation failures due to asynchronous data submission.
-        let source_points: Vec<OracleDataPoint> = match env.storage().persistent().get(
-            &StorageKey::DataPoints(source_type.clone(), key.clone()),
-        ) {
-            Some(pts) => pts,
-            None => {
-                // No data for this source type yet — skip validation
-                return;
-            }
-        };
-
-        if source_points.is_empty() {
-            // Empty data points list for source — skip validation
+        // SECURITY FIX (#853): guard on whether `get_median_value` would
+        // actually have eligible data to aggregate, not just whether the raw
+        // DataPoints list is non-empty. A source with only stale, low
+        // confidence, or inactive-oracle submissions still has a non-empty
+        // list but no eligible points, and `get_median_value` panics in that
+        // case — the stored-list check alone let that panic through.
+        if !Self::has_eligible_oracle_data(env, source_type, key) {
+            // No usable data for this source type yet — skip validation
             return;
         }
 
@@ -1427,25 +1420,14 @@ impl OracleVerifier {
                 None => continue,
             };
 
-            // SECURITY FIX: Gracefully handle missing target data
-            // If the target data type has no submissions when cross-validation runs,
-            // we skip validation rather than failing or producing incorrect results.
-            // This prevents validation failures due to asynchronous data submission.
-            let target_points: Vec<OracleDataPoint> = match env.storage().persistent().get(
-                &StorageKey::DataPoints(target_type.clone(), key.clone()),
-            ) {
-                Some(pts) => pts,
-                None => {
-                    // No data for this target type yet — skip validation
-                    // The source data may be valid independently; cross-validation
-                    // can succeed on a retry once target data is available.
-                    continue;
-                }
-            };
-            
-            // SECURITY FIX: Verify we have at least one valid data point before attempting validation
-            if target_points.is_empty() {
-                // Empty data points list for target — skip validation similar to missing data
+            // SECURITY FIX (#853): same eligible-data guard as the source
+            // check above — the target may have a non-empty DataPoints list
+            // made up entirely of stale/low-confidence/inactive submissions,
+            // which would still panic in `get_median_value`.
+            if !Self::has_eligible_oracle_data(env, &target_type, key) {
+                // No usable data for this target type yet — skip validation.
+                // The source data may be valid independently; cross-validation
+                // can succeed on a retry once target data is available.
                 continue;
             }
 
@@ -3870,6 +3852,55 @@ impl OracleVerifier {
         env.storage()
             .persistent()
             .extend_ttl(&storage_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// True when `get_median_value(env, data_type, key)` has enough eligible
+    /// submissions to return a value instead of panicking with
+    /// `NoDataAvailable`. Mirrors the freshness/confidence/active-oracle
+    /// filter and `MinOracleCount` gate that `get_median_value` applies
+    /// internally, so callers that need to skip rather than panic on missing
+    /// or stale data (e.g. `check_cross_validation`, #853) can check first.
+    fn has_eligible_oracle_data(env: &Env, data_type: &Symbol, key: &Symbol) -> bool {
+        let points: Vec<OracleDataPoint> = match env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
+        {
+            Some(pts) => pts,
+            None => return false,
+        };
+        if points.is_empty() {
+            return false;
+        }
+
+        let max_data_age = Self::effective_max_age(env, data_type);
+        let now = env.ledger().timestamp();
+        let min_confidence: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
+        let min_oracle_count: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinOracleCount)
+            .unwrap_or(1);
+
+        let mut eligible_count: u32 = 0;
+        let points_cap = points.len().min(MAX_DATA_POINTS);
+        for i in 0..points_cap {
+            let p = points.get_unchecked(i);
+            if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence {
+                let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+                if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+                    if entry.active && !Self::oracle_offline(env, data_type, &p.oracle) {
+                        eligible_count += 1;
+                    }
+                }
+            }
+        }
+
+        eligible_count > 0 && eligible_count >= min_oracle_count
     }
 
     /// Compute the weighted median of active, sufficiently fresh submissions.

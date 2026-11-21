@@ -3154,6 +3154,21 @@ impl RiskPool {
                 _ => 0,
             };
             if amount <= 0 || amount > available {
+                // Issue #854: tell the provider why this sweep pass left
+                // their request queued instead of silently skipping it.
+                let reason = if amount <= 0 {
+                    Symbol::new(env, "zero_amount")
+                } else {
+                    Symbol::new(env, "insufficient_liquidity")
+                };
+                env.events().publish(
+                    (Symbol::new(env, "exit_sweep_skipped"),),
+                    ExitSweepSkipped {
+                        provider,
+                        shares_requested: request.shares,
+                        reason,
+                    },
+                );
                 continue;
             }
 

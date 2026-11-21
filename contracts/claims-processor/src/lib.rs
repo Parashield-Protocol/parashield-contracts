@@ -627,10 +627,18 @@ impl ClaimsProcessor {
 
         let claim_id   = Self::next_claim_id(env);
 
-        // Issue #801: update claimant history BEFORE evaluate_fraud so that
-        // blocked (high-score) submissions still count toward rate/burst
-        // limits. Previously a blocked claim never incremented the history,
-        // allowing unlimited fraud-screened submissions without consequence.
+        // Issue #855: snapshot the claimant's history as it stood *before*
+        // this submission. `evaluate_fraud`'s rules (rate / burst / coverage
+        // anomaly) are defined relative to that prior state — e.g. the rate
+        // rule only fires when the *previous* submission was recent, not
+        // this one. Fetching it here, before `update_claimant_history` below
+        // overwrites it, is what keeps that comparison meaningful.
+        let history_before = Self::claimant_history(env, claimant);
+
+        // Update claimant history BEFORE evaluate_fraud so that blocked
+        // (high-score) submissions still count toward rate/burst limits.
+        // Previously a blocked claim never incremented the history, allowing
+        // unlimited fraud-screened submissions without consequence.
         let burst_window = Self::fraud_config(env)
             .map(|c| c.burst_window_secs)
             .unwrap_or(0);
@@ -643,12 +651,15 @@ impl ClaimsProcessor {
         );
 
         // Issue #437: score this submission against the configured fraud
-        // rules. In `Block` mode a high enough score panics here, before any
-        // claim state is written — the caller gets FraudSuspected and the
-        // world looks exactly as it did before the call. In `FlagOnly` mode
-        // a FraudRecord is persisted and the claim proceeds. When no config
-        // is set, this is a no-op.
-        Self::evaluate_fraud(env, claim_id, claimant, policy.coverage_amount);
+        // rules, using the pre-submission history snapshot above — not the
+        // just-written one, which would make every rule compare this
+        // submission against itself instead of against what came before it.
+        // In `Block` mode a high enough score panics here, before any claim
+        // state is written — the caller gets FraudSuspected and the world
+        // looks exactly as it did before the call. In `FlagOnly` mode a
+        // FraudRecord is persisted and the claim proceeds. When no config is
+        // set, this is a no-op.
+        Self::evaluate_fraud(env, claim_id, claimant, policy.coverage_amount, &history_before);
 
         let claim = Claim {
             id: claim_id,
@@ -674,7 +685,7 @@ impl ClaimsProcessor {
         env.storage().persistent().set(&StorageKey::PolicyClaim(policy_id), &claim_id);
         env.storage().persistent().extend_ttl(&StorageKey::PolicyClaim(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
 
-        let pending: Vec<u128> = env.storage().instance()
+        let mut pending: Vec<u128> = env.storage().instance()
             .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(env));
         pending.push_back(claim_id);
         env.storage().instance().set(&StorageKey::PendingClaims, &pending);
@@ -3189,18 +3200,23 @@ impl ClaimsProcessor {
     ///
     /// Called from `submit_claim` after all existing gates so a rejection at
     /// this point does not leak partial state.
+    ///
+    /// `history` must be the claimant's history as it stood *before* this
+    /// submission (issue #855) — `submit_claim` already writes the
+    /// post-submission history to storage by the time this runs, so
+    /// re-fetching it here would score the submission against itself.
     fn evaluate_fraud(
         env: &Env,
         claim_id: u128,
         claimant: &Address,
         coverage_amount: i128,
+        history: &ClaimantHistory,
     ) -> (u32, u32) {
         let Some(cfg) = Self::fraud_config(env) else {
             return (0, 0);
         };
         let now = env.ledger().timestamp();
-        let history = Self::claimant_history(env, claimant);
-        let (score, flags) = Self::score_submission(&cfg, now, &history, coverage_amount);
+        let (score, flags) = Self::score_submission(&cfg, now, history, coverage_amount);
         if score >= cfg.fraud_threshold_score && cfg.fraud_threshold_score > 0 {
             env.events().publish(
                 (Symbol::new(env, "fraud_flagged"),),
