@@ -59,12 +59,12 @@ pub const MIN_SHARES: i128 = 1;
 
 /// Default ceiling on `total_locked / total_deposited`, in basis points.
 ///
-/// 10_000 (100%) preserves the historical behaviour exactly: before this was
-/// configurable the pool would commit every unit of capital it held. Lowering
-/// it is how an admin expresses "keep a buffer against correlated risk", and
-/// that has to be an explicit choice rather than a silent change to how much
-/// coverage an existing pool can write.
-const DEFAULT_MAX_UTILIZATION_BPS: u32 = 10_000;
+/// 8_000 (80%) provides a safer default buffer against correlated risk.
+/// While 10_000 (100%) was the historical behaviour, allowing the pool to
+/// commit every unit of capital leaves no buffer for simultaneous claims.
+/// A lower default protects new deployments while still allowing admins
+/// to explicitly raise it to 100% if their risk profile justifies it.
+const DEFAULT_MAX_UTILIZATION_BPS: u32 = 8_000;
 
 /// Longest withdrawal delay an admin may configure (30 days).
 ///
@@ -1059,6 +1059,13 @@ impl RiskPool {
     ///   limit: a pool fully committed to one category in one region is a
     ///   single event away from insolvency however much capital it holds, and
     ///   nothing in the deposit ceiling prevents that.
+    ///
+    /// **Note:** Setting `max_utilization_bps` to 10_000 (100%) allows the
+    /// pool to commit all capital to coverage, leaving no buffer against
+    /// correlated claims. While permitted for flexibility, this is dangerous
+    /// for pools exposed to correlated risk (e.g., weather events, regional
+    /// disasters). The default is 8_000 (80%) to provide a safety buffer.
+    /// Only raise to 100% if the risk profile is truly uncorrelated.
     ///
     /// Lowering a limit below current usage is allowed and does not claw
     /// anything back — existing deposits and locks stand, and the pool simply
