@@ -69,6 +69,104 @@ No adjuster. No form. No delay.
 ```
 
 
+## Cross-Contract Interactions
+
+The protocol relies on synchronized interactions among five core smart contracts and Stellar Asset (token) contracts.
+
+### Call Graph
+
+```mermaid
+flowchart TD
+    User["User / Policyholder / LP"]
+    Keeper["Keeper"]
+    Admin["Admin / DAO"]
+    Guardians["Guardians"]
+    PE["Policy Engine (policy-engine)"]
+    CP["Claims Processor (claims-processor)"]
+    RP["Risk Pool (risk-pool)"]
+    OV["Oracle Verifier (oracle-verifier)"]
+    Token["USDC / Stellar Asset Contract"]
+
+    User -->|buy_policy / cancel_policy| PE
+    User -->|deposit / withdraw / claim_yield| RP
+    Keeper -->|auto_process / batch_auto_process| CP
+    Admin -->|create_product / pause| PE
+    Admin -->|initialize / wiring| CP
+    Admin -->|propose_parameter_change| RP
+    Admin -->|add_oracle / set_data_type_range| OV
+    Guardians -->|approve_admin_change / approve_upgrade| CP
+    Guardians -->|approve_admin_change / approve_upgrade| RP
+    Guardians -->|approve_admin_change / approve_upgrade| OV
+    Guardians -->|veto / emergency pause| PE
+
+    CP -->|get_policy / get_product| PE
+    CP -->|pay_claim| PE
+    CP -->|expire_policy| PE
+    CP -->|verify_trigger / batch_verify_fresh| OV
+    CP -->|release_for_claim / release_for_expiry| RP
+
+    PE -->|transfer premium in / refund out / pay_claim out| Token
+    RP -->|deposit in / withdraw out / yield out| Token
+    OV -->|stake deposit / slash / withdraw| Token
+```
+
+### Cross-Contract Call Matrix
+
+| Caller Contract | Callee Contract | Invoked Function | Purpose | Authorization Mechanism |
+|---|---|---|---|---|
+| `claims-processor` | `policy-engine` | `get_policy(policy_id)` | Read policy parameters, coverage amount, status, and claimant address | Public view function (`&env`) |
+| `claims-processor` | `policy-engine` | `get_product(product_id)` | Read product configuration, oracle key, and trigger condition | Public view function (`&env`) |
+| `claims-processor` | `policy-engine` | `pay_claim(caller, policy_id)` | Trigger USDC payout from policy escrow to policyholder | `require_claims_processor`: verifies `caller == StorageKey::ClaimsProcessor` |
+| `claims-processor` | `policy-engine` | `expire_policy(caller, policy_id)` | Mark policy expired with no payout | `require_claims_processor`: verifies `caller == StorageKey::ClaimsProcessor` |
+| `claims-processor` | `oracle-verifier` | `verify_trigger(data_type, key, condition)` | Check if condition is satisfied by aggregated oracle observations | Public view function (`&env`) |
+| `claims-processor` | `oracle-verifier` | `verify_trigger_fresh(data_type, key, condition, max_age)` | Check trigger condition with strict max-age staleness enforcement | Public view function (`&env`) |
+| `claims-processor` | `oracle-verifier` | `batch_verify_fresh(queries)` | Batch evaluate multiple triggers with freshness check | Public view function (`&env`) |
+| `claims-processor` | `risk-pool` | `release_for_claim(caller, policy_id)` | Release earmarked pool liquidity upon claim settlement | `require_claims_processor`: verifies `caller == StorageKey::ClaimsProcessor` |
+| `claims-processor` | `risk-pool` | `release_for_expiry(caller, policy_id)` | Free earmarked pool liquidity upon policy expiration | `require_claims_processor`: verifies `caller == StorageKey::ClaimsProcessor` |
+| `policy-engine` | `token` (USDC) | `transfer(buyer, contract, premium)` | Pull insurance premium on policy purchase (`buy_policy`) | `buyer.require_auth()` |
+| `policy-engine` | `token` (USDC) | `transfer(contract, policyholder, refund)` | Refund unearned premium upon policy cancellation (`cancel_policy`) | `policyholder.require_auth()` |
+| `policy-engine` | `token` (USDC) | `transfer(contract, policyholder, coverage)` | Disburse claim settlement directly to policyholder (`pay_claim`) | Authorized via `claims_processor` |
+| `risk-pool` | `token` (USDC) | `transfer(provider, contract, amount)` | Pull LP deposit capital into liquidity pool (`deposit`) | `provider.require_auth()` |
+| `risk-pool` | `token` (USDC) | `transfer(contract, provider, amount)` | Return capital & yield on standard (`withdraw`) or emergency exit (`emergency_withdraw`) | `provider.require_auth()` + `admin.require_auth()` (emergency) |
+| `risk-pool` | `token` (USDC) | `transfer(contract, provider, yield)` | Disburse accumulated yield (`claim_yield`, `pay_out_yield`) | `provider.require_auth()` |
+| `risk-pool` | `token` (USDC) | `transfer(contract, destination, share)` | Route premium splits to Treasury / Backstop (`receive_premium`) | Caller authorization |
+| `governance-dao` | Target Contract | `env.invoke_contract(target, function, args)` | Execute passed governance proposal following 2-day timelock | Passed DAO proposal voting threshold & quorum |
+
+### Trust Assumptions
+
+1. **Policy Engine trusts Claims Processor**: `policy-engine` delegates all payout decisions to `claims-processor`. Only `claims-processor` can invoke `pay_claim` or `expire_policy`. It assumes `claims-processor` faithfully validates oracle data before triggering payouts.
+2. **Risk Pool trusts Claims Processor**: `risk-pool` allows `claims-processor` to atomically unlock capital (`release_for_claim` / `release_for_expiry`). It trusts that `claims-processor` only releases locks associated with valid policy resolutions.
+3. **Claims Processor trusts Oracle Verifier**: `claims-processor` relies on `oracle-verifier`'s aggregation algorithm (median/mean/TWA) to prevent false positives and manipulation.
+4. **All Contracts trust Token Implementation**: Contracts assume the underlying USDC token behaves strictly according to standard Stellar Asset / SEP-41 specifications (reverting on insufficient balance or failed transfer).
+5. **Admin and Governance Transition**: Admin keys hold privileged parameters during initial phases. Protocol security assumes transition to `governance-dao` on mainnet, where SHIELD token holders govern protocol parameters subject to voting periods and execution timelocks.
+
+### Failure Modes & Handling
+
+- **Atomic Cross-Contract Reverts**: A failed external cross-contract call rolls back the entire transaction. In `claims-processor.auto_process`, if `policy_engine.pay_claim` succeeds but `risk_pool.release_for_claim` fails, the whole invocation reverts atomically, preventing partial execution or stranded capital.
+- **Batch Isolation**: In `batch_auto_process` and `batch_submit_claims`, `claims-processor` uses `env.try_invoke_contract` sub-invocations to isolate individual failures. A single failing claim or policy does not abort processing of the remaining batch.
+- **Stale or Missing Oracle Data**: If oracle readings are absent, `oracle-verifier` panics with `NoDataAvailable`. If readings exceed `staleness_threshold` (or `MAX_DATA_AGE`, default 7 days), calls fail with `StaleData`. In `auto_process`, this maps to `ClaimResult::OracleDataStale`, which consumes the cooldown to prevent keeper retry spam.
+- **Pool Solvency & Liquidity Shortage**: `risk-pool` enforces that withdrawals cannot exceed unlocked available liquidity (`total_deposited.saturating_sub(total_locked)`). If liquidity is exhausted, redemption attempts revert with `Undercollateralized`.
+- **Reentrancy Protection**: All fund-handling entry points in `risk-pool` (`deposit`, `withdraw`, `emergency_withdraw`, `transfer_position`, `claim_yield`, `receive_premium`) acquire a reentrancy guard (`ReentrancyGuard::enter(&env)`). Any recursive re-entrant call fails with `Error::Reentrancy` (`#47`).
+- **Timelock Constraints**:
+  - `ADMIN_TRANSFER_TIMELOCK`: 48 hours (`48 * 60 * 60` s) delay between proposing and accepting an admin transfer across all protocol contracts.
+  - `ORACLE_CHANGE_TIMELOCK_SECONDS`: 48 hours delay before an oracle contract address change takes effect in `policy-engine`.
+  - `ADMIN_ACTION_TIMELOCK_SECONDS`: 48 hours delay for sensitive admin actions in `policy-engine`.
+  - `PARAMETER_TIMELOCK_SECONDS`: 2 days (`2 * 24 * 60 * 60` s) delay between proposing and executing risk pool parameter changes.
+  - `TIMELOCK_SECONDS`: 7 days (`7 * 24 * 60 * 60` s) delay for admin emergency withdrawals in `risk-pool`.
+  - `DEFAULT_CHALLENGE_PERIOD`: 7 days delay for oracle node stake withdrawal in `oracle-verifier`.
+  - `Governance DAO`: 7-day voting period followed by a 2-day execution timelock for approved proposals.
+
+### Access Control & Role Model
+
+| Role | Controlled Functions / Powers | Role Management & Timelocks |
+|---|---|---|
+| **Admin** | Initialization, product catalogue management, contract wiring, pause/resume, parameter changes, guardian configuration, oracle registration. | Two-step transfer: `transfer_admin` starts `ADMIN_TRANSFER_TIMELOCK` (48 hours). Requires multisig guardian approval if `GuardianThreshold > 0`. Proposed admin calls `accept_admin` once timelock elapses. |
+| **Guardian** | Critical safety approvals: multisig approval of admin changes, multisig approval of contract WASM upgrades, emergency pause veto in `policy-engine`. | Configured by Admin via `set_guardians(guardians, threshold)`. In `claims-processor`, changing guardian threshold requires current threshold approvals. |
+| **Keeper** | Calling automated processing: `auto_process`, `batch_auto_process`, `process_claim`, `batch_process_claims`. Cannot alter parameters, withdraw funds, or change policy status manually. | Authorized by Admin via `add_keeper(keeper)` / `remove_keeper(keeper)`. Gated by `require_keeper` in `claims-processor`. Off-chain keeper bot scheduling cadence (e.g. hourly cron vs event listeners) is determined by deployment configuration *(to confirm)*. |
+| **Policyholder / LP** | `buy_policy`, `cancel_policy`, `submit_claim`, `dispute_claim`, `deposit`, `withdraw`, `emergency_withdraw`, `claim_yield`, `transfer_shares`. | Permissionless user roles guarded by `caller.require_auth()`. |
+| **Governance DAO** | Protocol-wide parameter governance, treasury allocation, emergency actions, contract upgrades on mainnet. | SHIELD token voting (≥10% quorum, simple majority, 7-day voting, 2-day execution timelock). Production DAO governance contract address *(to confirm)*. |
+
+
 ## Risk Pool Economics (v2)
 
 ```
