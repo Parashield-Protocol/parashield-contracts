@@ -3332,11 +3332,16 @@ impl RiskPool {
     pub fn liquidate_position(env: Env, caller: Address, provider: Address) -> LiquidationResult {
         Self::require_protocol_caller(&env, &caller);
 
-        let position: LpPosition = env
+        let mut position: LpPosition = env
             .storage()
             .persistent()
             .get(&StorageKey::LpPosition(provider.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
+
+        // Settle any yield the position has accrued up to this point before
+        // seizing shares, so it is paid out to the provider instead of being
+        // silently absorbed into the pool (issue #849).
+        let yield_claimed = Self::settle_yield(&env, &mut position);
 
         let info = Self::get_collateralization_ratio(env.clone(), provider.clone());
 
@@ -3376,6 +3381,15 @@ impl RiskPool {
         let mut new_position = position.clone();
         new_position.shares = new_position.shares.saturating_sub(shares_seized);
         new_position.deposited = new_position.deposited.saturating_sub(amount_recovered);
+        // Re-base yield_debt on the post-seizure share count (same approach
+        // as `withdraw_inner`), so a later claim is measured against what
+        // the position holds now rather than what it held before seizure.
+        let acc_per_share: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::AccumulatedPerShare)
+            .unwrap_or(0);
+        new_position.yield_debt = (acc_per_share * new_position.shares) / 1_000_000_000_000;
 
         if new_position.shares <= 0 {
             env.storage().persistent().remove(&StorageKey::LpPosition(provider.clone()));
@@ -3408,6 +3422,11 @@ impl RiskPool {
                 collateralization_bps: info.collateralization_bps,
             },
         );
+
+        // Pay out the yield settled above now that all other state has
+        // landed — emits `YieldClaimed` so the seized position's accrued
+        // yield has an audit trail instead of being absorbed into the pool.
+        Self::pay_out_yield(&env, &provider, yield_claimed);
 
         LiquidationResult {
             provider,

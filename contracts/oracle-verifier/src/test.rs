@@ -28,6 +28,10 @@ fn weather() -> soroban_sdk::Symbol {
     symbol_short!("weather")
 }
 
+fn flight() -> soroban_sdk::Symbol {
+    symbol_short!("flight")
+}
+
 fn kisumu_key() -> soroban_sdk::Symbol {
     symbol_short!("kis2606") // "rainfall:kisumu:2026-06" compressed to 9 chars
 }
@@ -1723,10 +1727,10 @@ fn check_staleness_boundary_at_exactly_max_age_threshold() {
     assert_eq!(events_before_2, events_after_2, "stale boundary check must emit no events");
 }
 
-// ── Issue #807: remove_oracle must clear GlobalOracle so oracle can be re-added ──
+// ── Issue #807: an oracle removed from a data type must be re-registrable ──
 
 #[test]
-fn test_remove_oracle_clears_global_key_allows_reregistration() {
+fn test_remove_oracle_allows_reregistration() {
     let (env, admin, contract_id) = setup();
     let client = OracleVerifierClient::new(&env, &contract_id);
     let oracle = Address::generate(&env);
@@ -1734,14 +1738,30 @@ fn test_remove_oracle_clears_global_key_allows_reregistration() {
     client.add_oracle(&admin, &oracle, &weather(), &50u32);
     assert_eq!(client.get_oracles(&weather()).len(), 1);
 
-    // After removal the GlobalOracle marker must be cleared so the same
-    // address can be re-registered (issue #807).
     client.remove_oracle(&admin, &oracle, &weather());
     assert_eq!(client.get_oracles(&weather()).len(), 0);
 
-    // This would panic with OracleAlreadyExists if GlobalOracle were not cleared.
     client.add_oracle(&admin, &oracle, &weather(), &60u32);
     assert_eq!(client.get_oracles(&weather()).len(), 1);
+}
+
+// ── Issue #848: an oracle may register for more than one data type ───────────
+
+#[test]
+fn test_add_oracle_allows_registration_across_multiple_data_types() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle, &weather(), &50u32);
+    // Registering the same oracle for a second data type must succeed —
+    // the per-data-type `Oracle` check already prevents duplicates within
+    // a single data type, so a global cross-type block is unnecessary and
+    // blocks legitimate multi-type oracles.
+    client.add_oracle(&admin, &oracle, &flight(), &60u32);
+
+    assert_eq!(client.get_oracles(&weather()).len(), 1);
+    assert_eq!(client.get_oracles(&flight()).len(), 1);
 }
 
 // ── Issue #810: deactivate_inactive_oracles must not skip elements ────────────

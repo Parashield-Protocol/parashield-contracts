@@ -8,7 +8,7 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
+    testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
     token, Address, Env, IntoVal, Symbol,
 };
 
@@ -544,6 +544,57 @@ fn liquidate_position_with_pending_exit_reservation_seizes_shares() {
     assert_eq!(pool.get_position(&lp1).unwrap().shares, 25_0000000i128);
     assert_eq!(pool.get_stats().total_shares, 125_0000000i128);
     assert_eq!(tok.balance(&pool.address), 200_0000000i128);
+}
+
+/// Liquidating a position settles and pays out any yield it had accrued up
+/// to that point, instead of silently absorbing it into the pool (#849).
+#[test]
+fn liquidate_position_settles_and_pays_out_accrued_yield() {
+    let (env, pool, usdc, admin, _cp) = setup();
+    env.ledger().set_timestamp(1_750_000_000);
+
+    let lp1 = Address::generate(&env);
+    let lp2 = Address::generate(&env);
+    let sac = token::StellarAssetClient::new(&env, &usdc);
+    let tok = token::Client::new(&env, &usdc);
+    let deposit_amt = 100_0000000i128; // 100 USDC each
+    sac.mint(&lp1, &(deposit_amt + 50_0000000i128)); // extra 50 USDC to pay as premium
+    sac.mint(&lp2, &deposit_amt);
+
+    pool.deposit(&lp1, &deposit_amt, &0, &false);
+    pool.deposit(&lp2, &deposit_amt, &0, &false);
+
+    // 50 USDC premium, 80% (40 USDC) routed to LPs and split evenly across
+    // lp1/lp2's equal shares -> 20 USDC of yield accrues to lp1.
+    pool.receive_premium(&lp1, &50_0000000i128);
+
+    // Lock 160 of 200 USDC -> collateralization_bps = 2_500 -> seize 75% of lp1's shares.
+    pool.lock_for_policy(&admin, &1u128, &160_0000000i128);
+
+    let lp1_balance_before = tok.balance(&lp1);
+    let res = pool.liquidate_position(&admin, &lp1);
+    assert_eq!(res.shares_seized, 75_0000000i128);
+
+    // The 20 USDC of yield accrued before liquidation must reach lp1, not
+    // be absorbed into the pool by the seizure.
+    assert_eq!(tok.balance(&lp1) - lp1_balance_before, 20_0000000i128);
+
+    // A `yield_claimed` event was emitted for the settled amount.
+    let yield_claimed_topic = Symbol::new(&env, "yield_claimed");
+    let found = env.events().all().iter().any(|event| {
+        event.0 == pool.address
+            && event
+                .1
+                .iter()
+                .any(|t| soroban_sdk::TryFromVal::try_from_val(&env, &t) == Ok(yield_claimed_topic.clone()))
+    });
+    assert!(found, "liquidate_position must emit yield_claimed for the settled yield");
+
+    // The position's own remaining yield debt reflects the settlement, so a
+    // later claim does not double-pay the already-settled amount.
+    let remaining_shares = pool.get_position(&lp1).unwrap().shares;
+    assert_eq!(remaining_shares, 25_0000000i128);
+    assert_eq!(pool.claim_yield(&lp1), 0);
 }
 
 /// Suspected bug: `liquidate_position` does not adjust or clear the provider's

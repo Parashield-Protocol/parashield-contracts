@@ -604,6 +604,12 @@ impl PolicyEngine {
         }
 
         // Product names must be unique so users can tell products apart (#514).
+        // This uniqueness check is an exact byte comparison on `String` and
+        // performs no case-folding or Unicode normalization: "Crop" and
+        // "crop" (or two differently-normalized forms of the same visible
+        // name) are distinct names and do not collide (issue #850). Callers
+        // that want human-friendly de-duplication must normalize `name`
+        // themselves before calling `create_product`.
         let name_key = StorageKey::ProductName(params.name.clone());
         if env.storage().persistent().has(&name_key) {
             panic_with_error!(&env, Error::DuplicateProductName);

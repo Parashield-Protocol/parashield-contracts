@@ -223,8 +223,6 @@ enum StorageKey {
     ChallengePeriod,
     /// Pending stake withdrawal request for (data_type, oracle).
     StakeWithdrawalReq(Symbol, Address),
-    /// Global registration tracker for oracle addresses across all data types (issue #742).
-    GlobalOracle(Address),
     /// Timestamp (u64) of an oracle's last accepted submission for a specific
     /// (data_type, key) stream — used to enforce `MinSubmitInterval` per stream
     /// rather than across all keys of a data_type (issue #834).
@@ -345,15 +343,6 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::OracleAlreadyExists);
         }
 
-        // SECURITY FIX (issue #742): Reject re-registration of the same oracle address
-        // under different IDs or across data types without prior de-registration.
-        let global_key = StorageKey::GlobalOracle(oracle.clone());
-        if env.storage().persistent().has(&global_key) {
-            panic_with_error!(&env, Error::OracleAlreadyExists);
-        }
-        env.storage().persistent().set(&global_key, &true);
-        env.storage().persistent().extend_ttl(&global_key, TTL_THRESHOLD, TTL_EXTEND_TO);
-        
         // Sybil detection: Track which addresses control each oracle to prevent
         // the same entity from registering multiple oracles for the same data type.
         // This is a simplified check — in production, you'd likely require external
@@ -2079,11 +2068,6 @@ impl OracleVerifier {
             .unwrap_or(0)
     }
 
-    /// Check whether an oracle address is already registered globally (issue #742).
-    pub fn is_oracle_registered(env: Env, oracle: Address) -> bool {
-        env.storage().persistent().has(&StorageKey::GlobalOracle(oracle))
-    }
-
     /// Increment the stale-submission counter for this oracle + data_type
     /// and, if the threshold is reached, slash stake and drop reputation.
     /// Always emits `StaleSubmissionDetected`; emits `StalePenaltyApplied`
@@ -3541,7 +3525,6 @@ impl OracleVerifier {
             }
         }
         env.storage().instance().set(&StorageKey::OracleList(data_type.clone()), &pruned);
-        env.storage().persistent().remove(&StorageKey::GlobalOracle(oracle.clone()));
     }
 
     fn inactivity_limit(env: &Env) -> u64 {
