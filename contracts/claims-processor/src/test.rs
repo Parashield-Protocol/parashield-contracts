@@ -2186,3 +2186,17 @@ fn test_auto_process_regression_already_processed_does_not_consume_cooldown() {
     });
     assert_eq!(stored_time, None, "Regression: AutoProcessLastTime must not be set on AlreadyProcessed");
 }
+
+// ── batch_auto_process ordering: deterministic tie-break on claim_id ─────────
+
+#[test]
+fn claim_ordering_breaks_timestamp_ties_by_claim_id() {
+    // Same ledger timestamp: lower (earlier-allocated) claim id goes first.
+    assert!(ClaimsProcessor::claim_sorts_after(&(7, 100), &(3, 100)));
+    assert!(!ClaimsProcessor::claim_sorts_after(&(3, 100), &(7, 100)));
+    // Timestamp still dominates the id.
+    assert!(ClaimsProcessor::claim_sorts_after(&(1, 200), &(9, 100)));
+    assert!(!ClaimsProcessor::claim_sorts_after(&(9, 100), &(1, 200)));
+    // Identical keys never swap.
+    assert!(!ClaimsProcessor::claim_sorts_after(&(5, 100), &(5, 100)));
+}

@@ -35,6 +35,15 @@ trait IRiskPool {
 
 /// Minimum voting period: 1 hour in seconds.
 const MIN_VOTING_PERIOD: u64 = 3_600;
+/// Highest storage schema version this WASM knows how to migrate to.
+///
+/// `upgrade` rejects any `new_version` above this value, and `run_migrations`
+/// requires an explicit migration step for every version transition up to
+/// it. Bumping this constant without adding the matching `migrate_vN_to_vN+1`
+/// arm in `run_migrations` makes every upgrade to the new version panic with
+/// `UnsupportedVersion` instead of silently stamping a version whose storage
+/// layout was never migrated.
+const CURRENT_STORAGE_VERSION: u32 = 2;
 /// Maximum voting period: 30 days in seconds. Prevents an admin from setting
 /// an unreachably large period that would cause vote_end + FINALIZE_DELAY to
 /// overflow or make proposals permanently unresolvable.
@@ -234,6 +243,9 @@ pub enum Error {
     DuplicateTemplateName = 52,
     /// Vote weight must be strictly positive (> 0) (issue #739).
     ZeroVoteWeight = 53,
+    /// `upgrade` targeted a version with no registered storage migration
+    /// (above `CURRENT_STORAGE_VERSION`, or a gap in the migration chain).
+    UnsupportedVersion = 54,
 }
 
 #[contract]
@@ -2246,6 +2258,11 @@ impl GovernanceDao {
         if new_version <= current_version {
             panic_with_error!(&env, Error::VersionNotNewer);
         }
+        // Reject unsupported targets up front so a guardian-gated upgrade is
+        // never registered as pending for a version that cannot be migrated.
+        if new_version > CURRENT_STORAGE_VERSION {
+            panic_with_error!(&env, Error::UnsupportedVersion);
+        }
 
         let threshold: u32 = env
             .storage()
@@ -2461,16 +2478,45 @@ impl GovernanceDao {
         );
     }
 
-    /// Run storage migrations from old_version to new_version.
-    /// Each migration function handles a specific version transition.
-    fn run_migrations(_env: &Env, _old_version: u32, _new_version: u32) {
-        // Migration from v1 to v2: No storage changes needed yet
-        // This is where you would add migration logic for specific version bumps
-        // Example: if old_version < 2 && new_version >= 2 { Self::migrate_v1_to_v2(env); }
-        
-        // Future migrations follow the pattern:
-        // if old_version < 3 && new_version >= 3 { Self::migrate_v2_to_v3(env); }
+    /// Run storage migrations from `old_version` to `new_version`.
+    ///
+    /// Migrations are applied one version step at a time, in order, so an
+    /// upgrade that skips versions (e.g. 1 -> 3) still runs every
+    /// intermediate step. Every transition must have an explicit arm below;
+    /// an unknown step panics with `UnsupportedVersion`, which aborts the
+    /// whole upgrade transaction before the version is stamped or the WASM
+    /// is swapped, so storage can never be left half-migrated.
+    ///
+    /// To add schema version N+1:
+    /// 1. Bump `CURRENT_STORAGE_VERSION` to N+1.
+    /// 2. Add an `N => { Self::migrate_vN_to_vN+1(env); version = N + 1; }` arm.
+    /// 3. Make the migration idempotent (check before write) and test it.
+    fn run_migrations(env: &Env, old_version: u32, new_version: u32) {
+        if old_version == 0 || new_version <= old_version {
+            panic_with_error!(env, Error::VersionNotNewer);
+        }
+        if new_version > CURRENT_STORAGE_VERSION {
+            panic_with_error!(env, Error::UnsupportedVersion);
+        }
+
+        let mut version = old_version;
+        while version < new_version {
+            match version {
+                1 => {
+                    Self::migrate_v1_to_v2(env);
+                    version = 2;
+                }
+                _ => panic_with_error!(env, Error::UnsupportedVersion),
+            }
+        }
     }
+
+    /// v1 -> v2: the v2 schema made no changes to existing storage entries
+    /// (keys added since v1 are all read with defaults), so nothing needs to
+    /// be rewritten. Kept as an explicit step so the transition is
+    /// registered in `run_migrations` and future schema changes have a
+    /// concrete place to land.
+    fn migrate_v1_to_v2(_env: &Env) {}
 
     /// Query the risk pool for any LP share delegation the voter may have.
     /// Returns the delegated LP share count, or 0 if no risk pool is

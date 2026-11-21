@@ -473,10 +473,26 @@ impl OracleVerifier {
         env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
-    /// Deactivate an oracle (soft delete — historical data is retained).
+    /// Remove an oracle registration for `data_type` (hard delete).
+    ///
+    /// The `OracleEntry` and the oracle's `LastSubmission` marker are deleted
+    /// from persistent storage and the oracle is pruned from the data type's
+    /// oracle list, so frequent oracle rotation does not grow storage without
+    /// bound. Every aggregation path already treats a missing entry exactly
+    /// like an inactive one, so readings the oracle submitted earlier are
+    /// retained but no longer counted.
+    ///
+    /// Deliberately kept: the oracle's stake (`OracleStakeAmt`) and any
+    /// pending withdrawal request, so it can still withdraw through the normal
+    /// challenge period, and its `Reputation`, so re-registering cannot be
+    /// used to reset a bad track record.
+    ///
+    /// Also works on an entry that was already deactivated by slashing or
+    /// offline detection, which lets the admin purge those entries too.
+    /// Panics with `OracleNotRegistered` if no entry exists.
     pub fn remove_oracle(env: Env, admin: Address, oracle: Address, data_type: Symbol) {
         Self::require_admin(&env, &admin);
-        Self::deactivate_oracle(&env, &data_type, &oracle);
+        Self::delete_oracle(&env, &data_type, &oracle);
 
         env.events().publish(
             (Symbol::new(&env, "oracle_removed"),),
@@ -3528,6 +3544,35 @@ impl OracleVerifier {
         env.storage()
             .persistent()
             .extend_ttl(&activity_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Delete an oracle's registration entry and activity marker and drop it
+    /// from its data_type's oracle list. Used by `remove_oracle`; see its
+    /// docs for what is intentionally retained. Panics if the oracle was
+    /// never registered.
+    fn delete_oracle(env: &Env, data_type: &Symbol, oracle: &Address) {
+        let key = StorageKey::Oracle(data_type.clone(), oracle.clone());
+        if !env.storage().persistent().has(&key) {
+            panic_with_error!(env, Error::OracleNotRegistered);
+        }
+        env.storage().persistent().remove(&key);
+        env.storage()
+            .persistent()
+            .remove(&StorageKey::LastSubmission(data_type.clone(), oracle.clone()));
+
+        let list_key = StorageKey::OracleList(data_type.clone());
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&list_key)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut pruned: Vec<Address> = Vec::new(env);
+        for addr in list.iter() {
+            if addr != *oracle {
+                pruned.push_back(addr);
+            }
+        }
+        env.storage().instance().set(&list_key, &pruned);
     }
 
     /// Mark an oracle inactive and drop it from its data_type's oracle list.

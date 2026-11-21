@@ -1792,3 +1792,64 @@ fn test_deactivate_inactive_oracles_deactivates_all_offline() {
     assert_eq!(deactivated.len(), 3, "all offline oracles must be deactivated");
     assert_eq!(client.get_oracles(&weather()).len(), 0);
 }
+
+// ── remove_oracle hard-deletes the registration so storage stays bounded ────
+
+#[test]
+fn test_remove_oracle_deletes_entry_from_storage() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle, &weather(), &50u32);
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &kisumu_key(),
+        &10_000_000i128,
+        &90u32,
+        &1748736000u64,
+    );
+    client.remove_oracle(&admin, &oracle, &weather());
+
+    env.as_contract(&contract_id, || {
+        let storage = env.storage().persistent();
+        assert!(!storage.has(&StorageKey::Oracle(weather(), oracle.clone())));
+        assert!(!storage.has(&StorageKey::LastSubmission(weather(), oracle.clone())));
+    });
+}
+
+#[test]
+fn test_oracle_rotation_does_not_accumulate_entries() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+
+    let mut previous: Option<Address> = None;
+    for _ in 0..10 {
+        let oracle = Address::generate(&env);
+        client.add_oracle(&admin, &oracle, &weather(), &50u32);
+        if let Some(old) = previous.take() {
+            client.remove_oracle(&admin, &old, &weather());
+            env.as_contract(&contract_id, || {
+                assert!(!env
+                    .storage()
+                    .persistent()
+                    .has(&StorageKey::Oracle(weather(), old.clone())));
+            });
+        }
+        previous = Some(oracle);
+    }
+    assert_eq!(client.get_oracles(&weather()).len(), 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_remove_oracle_twice_fails() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle, &weather(), &50u32);
+    client.remove_oracle(&admin, &oracle, &weather());
+    client.remove_oracle(&admin, &oracle, &weather());
+}

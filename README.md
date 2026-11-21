@@ -65,7 +65,7 @@ The policy-engine contract holds USDC directly and executes `token.transfer` to 
 |---|---|---|
 | `initialize(admin)` | — | one-time setup |
 | `add_oracle(admin, oracle, data_type, weight)` | admin | register oracle wallet |
-| `remove_oracle(admin, oracle, data_type)` | admin | soft-deactivate |
+| `remove_oracle(admin, oracle, data_type)` | admin | delete registration (stake, reputation and past readings are kept) |
 | `submit_data(oracle, data_type, key, value, confidence, ts)` | oracle | submit reading |
 | `verify_trigger(data_type, key, condition) → bool` | public | used by claims-processor |
 | `get_data(data_type, key) → OracleDataPoint` | public | latest reading |
