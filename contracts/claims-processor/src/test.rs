@@ -2003,3 +2003,186 @@ fn file_claim_after_deadline_cutoff_rejected_with_claim_deadline_passed() {
 
     cp.submit_claim(&buyer, &pol_id);
 }
+
+// ── Auto-process cooldown & idempotency ordering tests (#832) ────────────────
+
+/// 1. The first-ever call on a policy has no stored timestamp and succeeds without rate limiting.
+#[test]
+fn test_auto_process_first_ever_call_succeeds_without_rate_limiting() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000); // Trigger met
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    // Verify no cooldown is recorded yet
+    assert_eq!(
+        w.env.as_contract(&w.claims_id, || {
+            w.env.storage().persistent().get::<_, u64>(&StorageKey::AutoProcessLastTime(pol_id))
+        }),
+        None
+    );
+
+    let res = cp.auto_process(&w.keeper, &pol_id, &None);
+    assert_eq!(res, ClaimResult::Paid);
+}
+
+/// 2. An AlreadyProcessed call leaves the cooldown untouched:
+/// If a settled claim already exists for the policy, calling auto_process returns
+/// AlreadyProcessed but does NOT write AutoProcessLastTime.
+/// Therefore, a subsequent legitimate call right after is not rate-limited.
+#[test]
+fn test_auto_process_already_processed_leaves_cooldown_untouched() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    // Create a pre-existing settled claim for this policy in storage
+    let claim_id = 999u128;
+    let settled_claim = Claim {
+        id: claim_id,
+        policy_id: pol_id,
+        claimant: buyer.clone(),
+        coverage_amount: COVERAGE,
+        observed_value: Some(20_000_000),
+        trigger_met: true,
+        status: ClaimStatus::Paid,
+        submitted_at: 100,
+        processed_at: Some(100),
+        dispute_reason: None,
+        paid_amount: Some(COVERAGE),
+        partial_payout_bps: None,
+        installments: soroban_sdk::Vec::new(&w.env),
+        payout_ready_at: None,
+        identity_verified: true,
+        verification_type: None,
+        verification_time: None,
+    };
+
+    w.env.as_contract(&w.claims_id, || {
+        w.env.storage().persistent().set(&StorageKey::Claim(claim_id), &settled_claim);
+        w.env.storage().persistent().set(&StorageKey::PolicyClaim(pol_id), &claim_id);
+    });
+
+    // Call auto_process on the already-processed policy
+    let res = cp.auto_process(&w.keeper, &pol_id, &None);
+    assert_eq!(res, ClaimResult::AlreadyProcessed);
+
+    // Verify AutoProcessLastTime was NOT set for this policy
+    let last_time = w.env.as_contract(&w.claims_id, || {
+        w.env.storage().persistent().get::<_, u64>(&StorageKey::AutoProcessLastTime(pol_id))
+    });
+    assert_eq!(last_time, None, "AutoProcessLastTime must remain untouched when AlreadyProcessed is returned");
+
+    // If the claim is reset to Pending, calling auto_process immediately at the exact same ledger timestamp succeeds
+    w.env.as_contract(&w.claims_id, || {
+        let mut claim: Claim = w.env.storage().persistent().get(&StorageKey::Claim(claim_id)).unwrap();
+        claim.status = ClaimStatus::Pending;
+        w.env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
+    });
+
+    submit_rainfall(&w, 20_000_000);
+    let res2 = cp.auto_process(&w.keeper, &pol_id, &None);
+    assert_eq!(res2, ClaimResult::Paid);
+}
+
+/// 3. Successful processing sets the cooldown and an immediate second call is rejected with RateLimitExceeded.
+#[test]
+#[should_panic(expected = "Error(Contract, #25)")]
+fn test_auto_process_immediate_second_call_rejected_with_rate_limit() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let first = cp.auto_process(&w.keeper, &pol_id, &None);
+    assert_eq!(first, ClaimResult::Paid);
+
+    // Immediate second call at the same timestamp must be rejected with RateLimitExceeded (Error #25)
+    cp.auto_process(&w.keeper, &pol_id, &None);
+}
+
+/// 4. Exact cooldown boundary (pin the inclusive / exclusive behavior):
+/// Cooldown is strictly `< last_processed + cooldown_secs`.
+/// At `now == last_processed + cooldown_secs - 1`, it panics with RateLimitExceeded.
+/// At `now == last_processed + cooldown_secs`, the cooldown has elapsed and call is allowed.
+#[test]
+fn test_auto_process_exact_cooldown_boundary() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    w.env.ledger().set_timestamp(1_000);
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let res = cp.auto_process(&w.keeper, &pol_id, &None);
+    assert_eq!(res, ClaimResult::Paid);
+
+    // Cooldown default is 300 seconds. Boundary: 1000 + 300 = 1300.
+    // At t = 1299: still inside cooldown (1299 < 1300) -> fails
+    w.env.ledger().set_timestamp(1_299);
+    assert!(cp.try_auto_process(&w.keeper, &pol_id, &None).is_err(), "1 second before cooldown boundary must be rejected");
+
+    // At t = 1300: exact boundary (1300 < 1300 is false) -> allowed!
+    w.env.ledger().set_timestamp(1_300);
+    let res_boundary = cp.auto_process(&w.keeper, &pol_id, &None);
+    // Since policy is already paid, it reaches the idempotency check and returns AlreadyProcessed
+    assert_eq!(res_boundary, ClaimResult::AlreadyProcessed);
+}
+
+/// 5. Regression test for #832: verify that an AlreadyProcessed return leaves
+/// AutoProcessLastTime unset. Under the old buggy ordering where AutoProcessLastTime
+/// was written before the idempotency check, AutoProcessLastTime would have been Some(now).
+#[test]
+fn test_auto_process_regression_already_processed_does_not_consume_cooldown() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    w.env.ledger().set_timestamp(5_000);
+
+    // Pre-populate claim as Rejected (already processed)
+    let claim_id = 777u128;
+    let rejected_claim = Claim {
+        id: claim_id,
+        policy_id: pol_id,
+        claimant: buyer.clone(),
+        coverage_amount: COVERAGE,
+        observed_value: Some(80_000_000),
+        trigger_met: false,
+        status: ClaimStatus::Rejected,
+        submitted_at: 4_000,
+        processed_at: Some(4_500),
+        dispute_reason: None,
+        paid_amount: None,
+        partial_payout_bps: None,
+        installments: soroban_sdk::Vec::new(&w.env),
+        payout_ready_at: None,
+        identity_verified: false,
+        verification_type: None,
+        verification_time: None,
+    };
+
+    w.env.as_contract(&w.claims_id, || {
+        w.env.storage().persistent().set(&StorageKey::Claim(claim_id), &rejected_claim);
+        w.env.storage().persistent().set(&StorageKey::PolicyClaim(pol_id), &claim_id);
+    });
+
+    let res = cp.auto_process(&w.keeper, &pol_id, &None);
+    assert_eq!(res, ClaimResult::AlreadyProcessed);
+
+    // Critical assertion: AutoProcessLastTime must NOT be set to 5_000.
+    // In the old ordering, it was written before checking claim.status != Pending.
+    let stored_time = w.env.as_contract(&w.claims_id, || {
+        w.env.storage().persistent().get::<_, u64>(&StorageKey::AutoProcessLastTime(pol_id))
+    });
+    assert_eq!(stored_time, None, "Regression: AutoProcessLastTime must not be set on AlreadyProcessed");
+}

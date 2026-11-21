@@ -1065,7 +1065,7 @@ impl ClaimsProcessor {
         
         // ─── IDEMPOTENCY GUARD ───
         // Check if an evaluation record already exists for this policy in our storage.
-        // This guard runs BEFORE updating AutoProcessLastTime (#786) so that a call
+        // This guard runs BEFORE updating AutoProcessLastTime (#786, #832) so that a call
         // that returns AlreadyProcessed does not consume the cooldown window.
         if env.storage().persistent().has(&StorageKey::PolicyClaim(policy_id)) {
             let existing_claim_id: u128 = env.storage().persistent()
@@ -1080,7 +1080,8 @@ impl ClaimsProcessor {
 
         // Update the last processed timestamp for this policy — written AFTER the
         // idempotency guard so rejected/AlreadyProcessed calls do not consume
-        // the cooldown window (#786).
+        // the cooldown window (#786, #832). Written before cross-contract calls
+        // to maintain the checks-effects-interactions pattern.
         env.storage().persistent()
             .set(&StorageKey::AutoProcessLastTime(policy_id), &now);
 
