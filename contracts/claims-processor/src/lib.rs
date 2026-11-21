@@ -2407,7 +2407,17 @@ impl ClaimsProcessor {
     ///
     /// When a payout delay is configured, approved claims enter Paid/PartiallyPaid
     /// status but funds are not transferred until the delay passes. This function
-    /// completes the transfer. Callable by anyone — the claim is already approved.
+    /// completes the transfer.
+    ///
+    /// **Authorization model**: this function is intentionally permissionless — no
+    /// `require_auth` is called (issue #794). The payout was already authorized by the
+    /// governance/admin flow that set `payout_ready_at`; executing the transfer is a
+    /// mechanical step any caller can trigger. The claimant is the party with the
+    /// strongest interest in calling it, but gatekeeping on the claimant would mean
+    /// the admin (who controls the payout schedule) is also the only party able to
+    /// release funds — an unacceptable single point of failure. Timing attacks (e.g.
+    /// triggering during high fees) have no economic impact because the payout amount
+    /// is fixed at approval time and paid to the claimant's recorded address.
     pub fn claim_payout(env: Env, claim_id: u128) -> i128 {
         Self::require_not_paused(&env);
 
