@@ -6,7 +6,8 @@
 #
 # Prerequisites:
 #   - stellar CLI installed
-#   - DEPLOYER_SECRET set to a funded Mainnet secret key
+#   - DEPLOYER_SECRET set to a key NAME (not the secret key itself)
+#     Generate one with: stellar keys generate deployer --network mainnet
 #   - All contracts passing `make test` and `make lint`
 
 set -euo pipefail
@@ -25,7 +26,7 @@ die()  { echo "[mainnet-deploy] FATAL: $*" >&2; exit 1; }
 # ── Safety gate ───────────────────────────────────────────────────────────────
 
 if [[ -z "$SOURCE" ]]; then
-  die "DEPLOYER_SECRET is not set."
+  die "DEPLOYER_SECRET is not set. Set it to a key NAME (e.g., 'deployer'), not the secret key itself."
 fi
 
 echo ""
@@ -45,7 +46,10 @@ read -p "Type 'DEPLOY MAINNET' to proceed: " FINAL
 # ── Build ─────────────────────────────────────────────────────────────────────
 
 log "Running tests before deploy..."
-cd "$ROOT/contracts" && cargo test --quiet 2>&1 | tail -5
+cd "$ROOT/contracts"
+if ! cargo test --quiet 2>&1 | tail -5; then
+  die "Tests failed"
+fi
 log "Tests passed."
 
 log "Building optimized WASM..."
