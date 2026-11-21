@@ -75,11 +75,27 @@ const MAX_KEY_LEN: usize = 32;
 /// contract interface and of stored data.
 const DEFAULT_OUTLIER_THRESHOLD_MULTIPLIER_BPS: u32 = 50_000;
 
-/// Maximum absolute value for oracle data submissions. Extreme values (e.g.
-/// i128::MAX) could overflow downstream median/aggregation calculations.
-/// This bound is generous enough for any realistic physical measurement
-/// while preventing arithmetic overflow in the aggregation pipeline.
-const MAX_DATA_VALUE: i128 = 1_000_000_000_000_000_000_000_000_000i128; // 10^27
+/// Maximum absolute value for oracle data submissions (global fallback ceiling).
+/// Lowered from 10^27 (issue #839) to 10^21 (1_000_000_000_000_000_000_000), which
+/// matches the largest legitimate value across all supported data types at their scale:
+/// - weather:   10,000 mm rainfall / 1000°C = 10^10 (DEFAULT_WEATHER_MAX)
+/// - flight:    48h delay in seconds = 1.728 * 10^11 (DEFAULT_FLIGHT_MAX)
+/// - disaster:  binary/magnitude = 10^8 (DEFAULT_DISASTER_MAX)
+/// - health:    health metrics = 10^9 (DEFAULT_HEALTH_MAX)
+/// - onchain:   on-chain balances / TVL = 10^21 (DEFAULT_ONCHAIN_MAX)
+/// - defi:      DeFi protocol values / TVL = 10^21 (DEFAULT_DEFI_MAX, also matches
+///              policy-engine's MAX_TRIGGER_THRESHOLD of 10^21)
+///
+/// Overflow headroom: with MAX_WEIGHT = 100_000 and MAX_DATA_POINTS = 100, the worst-case
+/// weighted sum in aggregation is 10^21 * 100_000 * 100 = 10^28, which easily fits within
+/// i128::MAX (~1.7014 * 10^38), leaving 10 orders of magnitude of safety headroom.
+pub const MAX_DATA_VALUE: i128 = 1_000_000_000_000_000_000_000i128; // 10^21
+
+// Compile-time check that worst-case weighted sum in aggregation cannot overflow i128 (issue #839)
+const _: () = {
+    let worst_case = MAX_DATA_VALUE * (100_000i128) * (100i128); // 10^28
+    assert!(worst_case < i128::MAX);
+};
 /// Outlier filtering is skipped below this many eligible submissions —
 /// with too few points neither the median nor the MAD used to judge
 /// deviation is a meaningful reference, so filtering would be as likely to
@@ -2374,16 +2390,13 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::InvalidConfidence);
         }
         
-        // SECURITY FIX: Validate data_value is within data-type-specific ranges
-        // to prevent overflow in downstream aggregation calculations.
-        // First check global bounds, then apply per-data-type limits.
-        if value > MAX_DATA_VALUE || value < -MAX_DATA_VALUE {
-            panic_with_error!(&env, Error::InvalidInput);
-        }
-        
-        // Get data-type-specific range if configured, otherwise use defaults
+        // SECURITY FIX (issue #839): Validate data_value against per-data-type range
+        // as the primary check, falling back to global MAX_DATA_VALUE ceiling.
         let type_max = Self::get_data_type_max(&env, &data_type);
         if value.abs() > type_max {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        if value > MAX_DATA_VALUE || value < -MAX_DATA_VALUE {
             panic_with_error!(&env, Error::InvalidInput);
         }
 
@@ -3168,8 +3181,11 @@ impl OracleVerifier {
             if confidence == 0 || confidence > 100 {
                 panic_with_error!(&env, Error::InvalidConfidence);
             }
-            // Validate data_value is within a reasonable range to prevent overflow
-            // in downstream aggregation calculations (median, weighted average, etc.)
+            // Validate data_value is within per-data-type bounds (primary) and global MAX_DATA_VALUE (issue #839)
+            let type_max = Self::get_data_type_max(&env, &data_type);
+            if value.abs() > type_max {
+                panic_with_error!(&env, Error::InvalidInput);
+            }
             if value > MAX_DATA_VALUE || value < -MAX_DATA_VALUE {
                 panic_with_error!(&env, Error::InvalidInput);
             }

@@ -233,3 +233,177 @@ fn clear_data_type_range_requires_admin() {
     let impostor = Address::generate(&env);
     client.clear_data_type_range(&impostor, &disaster());
 }
+
+// ── Lowered MAX_DATA_VALUE & per-data-type range validation tests (#839) ─────
+
+/// 1. A value exactly at the new ceiling (MAX_DATA_VALUE = 10^21) is accepted,
+/// and one above (MAX_DATA_VALUE + 1) is rejected (also for negative values).
+#[test]
+fn test_global_max_data_value_ceiling_boundaries() {
+    let (env, admin, oracle, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let custom = symbol_short!("custom");
+    client.add_oracle(&admin, &oracle, &custom, &100u32);
+
+    // Value exactly at MAX_DATA_VALUE is accepted
+    client.submit_data(&oracle, &custom, &key(), &MAX_DATA_VALUE, &100u32, &OBSERVED_AT);
+    assert_eq!(client.get_data(&custom, &key()).value, MAX_DATA_VALUE);
+
+    // Negative value exactly at -MAX_DATA_VALUE is accepted
+    let k_neg = symbol_short!("custom_n");
+    client.submit_data(&oracle, &custom, &k_neg, &-MAX_DATA_VALUE, &100u32, &OBSERVED_AT);
+    assert_eq!(client.get_data(&custom, &k_neg).value, -MAX_DATA_VALUE);
+
+    // Value above MAX_DATA_VALUE is rejected
+    let k_over = symbol_short!("cust_ov");
+    assert_eq!(
+        contract_error(client.try_submit_data(&oracle, &custom, &k_over, &(MAX_DATA_VALUE + 1), &100u32, &OBSERVED_AT)),
+        Some(invalid_input()),
+        "value > MAX_DATA_VALUE must be rejected"
+    );
+
+    // Negative value below -MAX_DATA_VALUE is rejected
+    let k_under = symbol_short!("cust_un");
+    assert_eq!(
+        contract_error(client.try_submit_data(&oracle, &custom, &k_under, &(-MAX_DATA_VALUE - 1), &100u32, &OBSERVED_AT)),
+        Some(invalid_input()),
+        "value < -MAX_DATA_VALUE must be rejected"
+    );
+}
+
+/// 2. Realistic value for a supported data type (e.g., rainfall = 50 mm = 500_000_000) is accepted.
+#[test]
+fn test_realistic_data_type_value_accepted() {
+    let (env, admin, oracle, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let weather = symbol_short!("weather");
+    client.add_oracle(&admin, &oracle, &weather, &100u32);
+
+    let rainfall_50mm = 500_000_000i128; // 50 mm in 7-decimal fixed point
+    client.submit_data(&oracle, &weather, &key(), &rainfall_50mm, &100u32, &OBSERVED_AT);
+    assert_eq!(client.get_data(&weather, &key()).value, rainfall_50mm);
+}
+
+/// 3. A value above a data type's configured/default range but below the global ceiling
+/// is rejected (e.g. 10^15 for weather, where DEFAULT_WEATHER_MAX is 10^10).
+#[test]
+fn test_value_above_type_range_below_global_ceiling_rejected() {
+    let (env, admin, oracle, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let weather = symbol_short!("weather");
+    client.add_oracle(&admin, &oracle, &weather, &100u32);
+
+    // DEFAULT_WEATHER_MAX is 10_000_000_000 (10,000 mm rainfall = 10^10).
+    // A value of 10^15 is well below MAX_DATA_VALUE (10^21), but exceeds weather's range limit.
+    let excessive_rainfall = 1_000_000_000_000_000i128;
+    assert_eq!(
+        contract_error(client.try_submit_data(&oracle, &weather, &key(), &excessive_rainfall, &100u32, &OBSERVED_AT)),
+        Some(invalid_input()),
+        "rainfall above weather max must be rejected even when below MAX_DATA_VALUE"
+    );
+
+    // Also verify in batch_submit_data (issue #839 primary enforcement everywhere values enter)
+    let mut batch = soroban_sdk::Vec::new(&env);
+    batch.push_back((key(), excessive_rainfall, 100u32, OBSERVED_AT));
+    assert_eq!(
+        contract_error(client.try_batch_submit_data(&oracle, &weather, &batch)),
+        Some(invalid_input()),
+        "batch_submit_data must also reject out-of-range rainfall"
+    );
+}
+
+/// 4. Exact boundaries of a configured range:
+/// Pin the inclusive behavior: value == max is accepted; value == max + 1 is rejected.
+#[test]
+fn test_exact_boundaries_of_configured_range() {
+    let (env, admin, oracle, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let custom = symbol_short!("custom");
+    client.add_oracle(&admin, &oracle, &custom, &100u32);
+
+    let min_bound = 100_0000000i128;
+    let max_bound = 500_0000000i128;
+    client.set_data_type_range(&admin, &custom, &min_bound, &max_bound);
+
+    // Exact max boundary is accepted
+    let k_max = symbol_short!("k_max");
+    client.submit_data(&oracle, &custom, &k_max, &max_bound, &100u32, &OBSERVED_AT);
+    assert_eq!(client.get_data(&custom, &k_max).value, max_bound);
+
+    // 1 above max boundary is rejected
+    let k_over = symbol_short!("k_over");
+    assert_eq!(
+        contract_error(client.try_submit_data(&oracle, &custom, &k_over, &(max_bound + 1), &100u32, &OBSERVED_AT)),
+        Some(invalid_input())
+    );
+
+    // Negative exceeding abs(max) is rejected
+    let k_neg_over = symbol_short!("k_neg_ov");
+    assert_eq!(
+        contract_error(client.try_submit_data(&oracle, &custom, &k_neg_over, &(-max_bound - 1), &100u32, &OBSERVED_AT)),
+        Some(invalid_input())
+    );
+}
+
+/// 5. A data type with no configured range falls back to the global ceiling MAX_DATA_VALUE.
+#[test]
+fn test_unconfigured_data_type_falls_back_to_global_ceiling() {
+    let (env, admin, oracle, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let unknown_type = symbol_short!("unknown");
+    client.add_oracle(&admin, &oracle, &unknown_type, &100u32);
+
+    // No range is configured for 'unknown', so it accepts up to MAX_DATA_VALUE
+    client.submit_data(&oracle, &unknown_type, &key(), &MAX_DATA_VALUE, &100u32, &OBSERVED_AT);
+    assert_eq!(client.get_data(&unknown_type, &key()).value, MAX_DATA_VALUE);
+
+    // But rejects MAX_DATA_VALUE + 1
+    let k2 = symbol_short!("k2");
+    assert_eq!(
+        contract_error(client.try_submit_data(&oracle, &unknown_type, &k2, &(MAX_DATA_VALUE + 1), &100u32, &OBSERVED_AT)),
+        Some(invalid_input())
+    );
+}
+
+/// 6. Changing a range updates validation behavior immediately.
+#[test]
+fn test_changing_range_updates_validation() {
+    let (env, admin, oracle, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let custom = symbol_short!("custom");
+    client.add_oracle(&admin, &oracle, &custom, &100u32);
+
+    // Initially range is [0, 100]
+    client.set_data_type_range(&admin, &custom, &0i128, &100i128);
+
+    let k1 = symbol_short!("k1");
+    // 150 is rejected under [0, 100]
+    assert_eq!(
+        contract_error(client.try_submit_data(&oracle, &custom, &k1, &150i128, &100u32, &OBSERVED_AT)),
+        Some(invalid_input())
+    );
+
+    // Admin expands range to [0, 200]
+    client.set_data_type_range(&admin, &custom, &0i128, &200i128);
+
+    // 150 is now accepted
+    client.submit_data(&oracle, &custom, &k1, &150i128, &100u32, &OBSERVED_AT);
+    assert_eq!(client.get_data(&custom, &k1).value, 150i128);
+}
+
+/// 7. Overflow headroom check:
+/// Verify that MAX_DATA_VALUE * MAX_WEIGHT * MAX_DATA_POINTS fits in i128 with extensive headroom.
+#[test]
+fn test_overflow_headroom_invariant() {
+    let max_weight = 100_000i128;
+    let max_submissions = 100i128;
+    let worst_case_sum = MAX_DATA_VALUE
+        .checked_mul(max_weight)
+        .and_then(|v| v.checked_mul(max_submissions));
+
+    assert!(worst_case_sum.is_some(), "Worst-case aggregation must not overflow i128");
+    let sum = worst_case_sum.unwrap();
+    assert!(sum < i128::MAX);
+    // 10^21 * 10^5 * 10^2 = 10^28
+    assert_eq!(sum, 10_000_000_000_000_000_000_000_000_000i128);
+}
