@@ -766,6 +766,16 @@ impl RiskPool {
         }
 
         let pending_yield = Self::settle_yield(&env, &mut position);
+
+        // Guard against i128 overflow when both amount and pending_yield are
+        // near i128::MAX (#793, #833). Checked arithmetic is performed to ensure
+        // total payout does not overflow before any state changes or transfers.
+        // A single consolidated transfer is kept to guarantee atomic exit and
+        // preserve event/transfer semantics for indexers.
+        let total_payout = amount
+            .checked_add(pending_yield)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+
         position.deposited = position.deposited.saturating_sub(amount);
         position.shares -= shares;
         position.yield_debt = (env
@@ -794,12 +804,7 @@ impl RiskPool {
             .instance()
             .get(&StorageKey::UsdcToken)
             .unwrap();
-        // Guard against i128 overflow when both amount and pending_yield are
-        // near i128::MAX (#793). Regular withdraw_inner pays them separately;
-        // emergency_withdraw must do the same checked arithmetic.
-        let total_payout = amount
-            .checked_add(pending_yield)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+
         token::Client::new(&env, &usdc).transfer(
             &env.current_contract_address(),
             &provider,
