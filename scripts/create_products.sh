@@ -2,20 +2,23 @@
 # create_products.sh — Seed the four Parashield insurance products.
 #
 # Usage:
-#   POLICY_ENGINE_ID=<contract_id> NETWORK=testnet ./scripts/create_products.sh
+#   POLICY_ENGINE_ID=<contract_id> USDC_TOKEN=<usdc_address> NETWORK=testnet ./scripts/create_products.sh
 #
 # Prerequisites:
 #   - stellar CLI installed and configured
 #   - Policy Engine contract initialized
 #   - SOURCE key must be the admin key used in initialize()
+#   - USDC_TOKEN must be set to the token contract address expected for premium payments
 
 set -euo pipefail
 
 POLICY_ID="${POLICY_ENGINE_ID:-}"
+USDC_TOKEN="${USDC_TOKEN:-}"
 NETWORK="${NETWORK:-testnet}"
 SOURCE="${SOURCE:-deployer}"
 
 [[ -n "$POLICY_ID" ]] || { echo "Error: POLICY_ENGINE_ID not set" >&2; exit 1; }
+[[ -n "$USDC_TOKEN" ]] || { echo "Error: USDC_TOKEN not set" >&2; exit 1; }
 
 log() { echo "[create-products] $*"; }
 
@@ -36,6 +39,8 @@ invoke create_product \
   --params '{
     "name": "Crop_Drought_Insurance",
     "category": "crop",
+    "oracle_key": "kis2606",
+    "expected_token": "'"$USDC_TOKEN"'",
     "trigger_type": "Threshold",
     "oracle_data_type": "weather",
     "premium_rate_bps": 300,
@@ -53,6 +58,8 @@ invoke create_product \
   --params '{
     "name": "Flight_Delay_Insurance",
     "category": "flight",
+    "oracle_key": "flt001",
+    "expected_token": "'"$USDC_TOKEN"'",
     "trigger_type": "Binary",
     "oracle_data_type": "flight",
     "premium_rate_bps": 150,
@@ -70,6 +77,8 @@ invoke create_product \
   --params '{
     "name": "DeFi_Hack_Insurance",
     "category": "defi",
+    "oracle_key": "defi001",
+    "expected_token": "'"$USDC_TOKEN"'",
     "trigger_type": "Parametric",
     "oracle_data_type": "onchain",
     "premium_rate_bps": 500,
@@ -87,6 +96,8 @@ invoke create_product \
   --params '{
     "name": "Natural_Disaster_Insurance",
     "category": "disaster",
+    "oracle_key": "dis001",
+    "expected_token": "'"$USDC_TOKEN"'",
     "trigger_type": "Threshold",
     "oracle_data_type": "disaster",
     "premium_rate_bps": 200,

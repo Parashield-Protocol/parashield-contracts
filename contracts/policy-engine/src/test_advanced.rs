@@ -4,7 +4,7 @@
 
 extern crate std;
 
-use soroban_sdk::{testutils::{Address as _, Ledger as _}, token, vec, Address, Env};
+use soroban_sdk::{testutils::{Address as _, Ledger as _}, token, vec, Address, Env, String};
 
 use crate::{
     BatchBuyItem, CreateProductParams, PolicyEngine, PolicyEngineClient, ProductStatus,
@@ -12,11 +12,12 @@ use crate::{
 };
 use soroban_sdk::symbol_short;
 
-fn basic_params() -> CreateProductParams {
+fn basic_params(usdc: &Address) -> CreateProductParams {
     CreateProductParams {
-        name: symbol_short!("crop"),
+        name: String::from_str(&Env::default(), "crop"),
         category: symbol_short!("crop"),
-        oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
+        oracle_key: symbol_short!("kis2606"),
+        expected_token: usdc.clone(),
         trigger_type: TriggerType::Threshold,
         oracle_data_type: symbol_short!("weather"),
         trigger_threshold: 500_000_000i128,
@@ -28,7 +29,7 @@ fn basic_params() -> CreateProductParams {
     }
 }
 
-fn setup() -> (Env, PolicyEngineClient<'static>, Address, Address, Address) {
+fn setup() -> (Env, PolicyEngineClient<'static>, Address, Address, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -49,27 +50,27 @@ fn setup() -> (Env, PolicyEngineClient<'static>, Address, Address, Address) {
     // fund the contract for coverage payouts
     token::StellarAssetClient::new(&env, &usdc).mint(&pe_id, &1_000_000_0000000i128);
 
-    (env, pe, admin, oracle, user)
+    (env, pe, admin, oracle, user, usdc)
 }
 
 // ── emergency pause ────────────────────────────────────────────────────────────
 
 #[test]
 fn is_paused_defaults_to_false() {
-    let (_, pe, _, _, _) = setup();
+    let (_, pe, _, _, _, _) = setup();
     assert!(!pe.is_paused());
 }
 
 #[test]
 fn emergency_pause_sets_paused_flag() {
-    let (_, pe, admin, _, _) = setup();
+    let (_, pe, admin, _, _, _) = setup();
     pe.emergency_pause(&admin);
     assert!(pe.is_paused());
 }
 
 #[test]
 fn emergency_resume_clears_paused_flag() {
-    let (_, pe, admin, _, _) = setup();
+    let (_, pe, admin, _, _, _) = setup();
     pe.emergency_pause(&admin);
     pe.emergency_resume(&admin);
     assert!(!pe.is_paused());
@@ -78,7 +79,7 @@ fn emergency_resume_clears_paused_flag() {
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn non_admin_cannot_pause() {
-    let (_env, pe, _, _, user) = setup();
+    let (_env, pe, _, _, user, _) = setup();
     pe.emergency_pause(&user);
 }
 
@@ -86,8 +87,8 @@ fn non_admin_cannot_pause() {
 
 #[test]
 fn deprecate_product_removes_from_active_list() {
-    let (_, pe, admin, _, _) = setup();
-    let prod_id = pe.create_product(&admin, &basic_params());
+    let (_, pe, admin, _, _, usdc) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params(&usdc));
     assert_eq!(pe.get_active_products().len(), 1);
     pe.deprecate_product(&admin, &prod_id);
     assert_eq!(pe.get_active_products().len(), 0);
@@ -97,8 +98,8 @@ fn deprecate_product_removes_from_active_list() {
 
 #[test]
 fn pause_product_removes_from_active_list() {
-    let (_, pe, admin, _, _) = setup();
-    let prod_id = pe.create_product(&admin, &basic_params());
+    let (_, pe, admin, _, _, usdc) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params(&usdc));
     assert_eq!(pe.get_active_products().len(), 1);
     pe.pause_product(&admin, &prod_id);
     let prod = pe.get_product(&prod_id);
@@ -110,8 +111,8 @@ fn pause_product_removes_from_active_list() {
 
 #[test]
 fn cancel_policy_returns_premium_to_holder() {
-    let (env, pe, admin, _, user) = setup();
-    let prod_id = pe.create_product(&admin, &basic_params());
+    let (env, pe, admin, _, user, usdc) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params(&usdc));
     let policy_id = pe.buy_policy(
         &user,
         &prod_id,
@@ -128,8 +129,8 @@ fn cancel_policy_returns_premium_to_holder() {
 
 #[test]
 fn get_user_policies_tracks_multiple_policies() {
-    let (_, pe, admin, _, user) = setup();
-    let prod_id = pe.create_product(&admin, &basic_params());
+    let (_, pe, admin, _, user, usdc) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params(&usdc));
     pe.buy_policy(
         &user,
         &prod_id,
@@ -166,8 +167,8 @@ fn get_user_policies_tracks_multiple_policies() {
 fn cancel_policy_prorates_refund_by_elapsed_time() {
     use soroban_sdk::testutils::Ledger as _;
 
-    let (env, pe, admin, _, user) = setup();
-    let prod_id = pe.create_product(&admin, &basic_params());
+    let (env, pe, admin, _, user, usdc) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params(&usdc));
 
     // Buy at t=0 with a 30-day policy.
     env.ledger().with_mut(|l| l.timestamp = 0);
@@ -208,8 +209,8 @@ fn cancel_policy_prorates_refund_by_elapsed_time() {
 fn cancel_policy_refund_matches_hand_calculated_value_at_known_elapsed() {
     use soroban_sdk::testutils::Ledger as _;
 
-    let (env, pe, admin, _, user) = setup();
-    let prod_id = pe.create_product(&admin, &basic_params());
+    let (env, pe, admin, _, user, usdc) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params(&usdc));
 
     env.ledger().with_mut(|l| l.timestamp = 0);
     let policy_id = pe.buy_policy(
@@ -240,8 +241,8 @@ fn cancel_policy_refund_matches_hand_calculated_value_at_known_elapsed() {
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn buy_policy_blocked_while_paused() {
-    let (_env, pe, admin, _, user) = setup();
-    let prod_id = pe.create_product(&admin, &basic_params());
+    let (_env, pe, admin, _, user, usdc) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params(&usdc));
     pe.emergency_pause(&admin);
     // Purchasing while paused must panic with Unauthorized (#3).
     pe.buy_policy(
@@ -271,7 +272,7 @@ fn test_pay_claim_insufficient_funds_reverts_policy_active() {
     let pe = PolicyEngineClient::new(&env, &pe_id);
     pe.initialize(&admin, &usdc, &oracle);
 
-    let prod_id = pe.create_product(&admin, &basic_params());
+    let prod_id = pe.create_product(&admin, &basic_params(&usdc));
     let policy_id = pe.buy_policy(
         &user,
         &prod_id,
@@ -296,8 +297,8 @@ fn test_pay_claim_insufficient_funds_reverts_policy_active() {
 
 #[test]
 fn batch_buy_policy_creates_all_policies_and_pulls_premium() {
-    let (env, pe, admin, _oracle, user) = setup();
-    let prod_id = pe.create_product(&admin, &basic_params());
+    let (env, pe, admin, _oracle, user, usdc) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params(&usdc));
 
     let items = vec![
         &env,
@@ -305,13 +306,15 @@ fn batch_buy_policy_creates_all_policies_and_pulls_premium() {
             product_id: prod_id,
             coverage_amount: 200_0000000i128,
             duration_days: 30,
-            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
+            oracle_key: symbol_short!("kis2606"),
+            payment_token: usdc.clone(),
         },
         BatchBuyItem {
             product_id: prod_id,
             coverage_amount: 300_0000000i128,
             duration_days: 45,
-            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
+            oracle_key: symbol_short!("kis2606"),
+            payment_token: usdc.clone(),
         },
     ];
 
@@ -327,7 +330,7 @@ fn batch_buy_policy_creates_all_policies_and_pulls_premium() {
 #[test]
 #[should_panic(expected = "Error(Contract, #29)")]
 fn batch_buy_policy_rejects_empty_batch() {
-    let (env, pe, _admin, _oracle, user) = setup();
+    let (env, pe, _admin, _oracle, user, _) = setup();
     let items: soroban_sdk::Vec<BatchBuyItem> = soroban_sdk::Vec::new(&env);
     pe.batch_buy_policy(&user, &items);
 }
@@ -335,15 +338,16 @@ fn batch_buy_policy_rejects_empty_batch() {
 #[test]
 #[should_panic(expected = "Error(Contract, #30)")]
 fn batch_buy_policy_rejects_oversized_batch() {
-    let (env, pe, admin, _oracle, user) = setup();
-    let prod_id = pe.create_product(&admin, &basic_params());
+    let (env, pe, admin, _oracle, user, usdc) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params(&usdc));
     let mut items = soroban_sdk::Vec::new(&env);
     for _ in 0..21u32 {
         items.push_back(BatchBuyItem {
             product_id: prod_id,
             coverage_amount: 100_0000000i128,
             duration_days: 1,
-            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
+            oracle_key: symbol_short!("kis2606"),
+            payment_token: usdc.clone(),
         });
     }
     pe.batch_buy_policy(&user, &items);
@@ -352,8 +356,8 @@ fn batch_buy_policy_rejects_oversized_batch() {
 #[test]
 #[should_panic]
 fn batch_buy_policy_is_atomic_on_bad_item() {
-    let (env, pe, admin, _oracle, user) = setup();
-    let prod_id = pe.create_product(&admin, &basic_params());
+    let (env, pe, admin, _oracle, user, usdc) = setup();
+    let prod_id = pe.create_product(&admin, &basic_params(&usdc));
     // Second item has a bogus product id -> whole batch reverts.
     let items = vec![
         &env,
@@ -361,13 +365,15 @@ fn batch_buy_policy_is_atomic_on_bad_item() {
             product_id: prod_id,
             coverage_amount: 200_0000000i128,
             duration_days: 30,
-            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
+            oracle_key: symbol_short!("kis2606"),
+            payment_token: usdc.clone(),
         },
         BatchBuyItem {
             product_id: 9_999u128,
             coverage_amount: 200_0000000i128,
             duration_days: 30,
-            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
+            oracle_key: symbol_short!("kis2606"),
+            payment_token: usdc.clone(),
         },
     ];
     pe.batch_buy_policy(&user, &items);
@@ -377,9 +383,9 @@ fn batch_buy_policy_is_atomic_on_bad_item() {
 
 #[test]
 fn transfer_policy_moves_ownership_and_index() {
-    let (env, pe, admin, _oracle, user) = setup();
+    let (env, pe, admin, _oracle, user, usdc) = setup();
     let to = Address::generate(&env);
-    let prod_id = pe.create_product(&admin, &basic_params());
+    let prod_id = pe.create_product(&admin, &basic_params(&usdc));
     let policy_id = pe.buy_policy(
         &user, &prod_id, &500_0000000i128, &30u32, &symbol_short!("kis2606"),
     );
@@ -396,10 +402,10 @@ fn transfer_policy_moves_ownership_and_index() {
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn transfer_policy_rejects_non_owner() {
-    let (env, pe, admin, _oracle, user) = setup();
+    let (env, pe, admin, _oracle, user, usdc) = setup();
     let stranger = Address::generate(&env);
     let to = Address::generate(&env);
-    let prod_id = pe.create_product(&admin, &basic_params());
+    let prod_id = pe.create_product(&admin, &basic_params(&usdc));
     let policy_id = pe.buy_policy(
         &user, &prod_id, &500_0000000i128, &30u32, &symbol_short!("kis2606"),
     );
@@ -409,9 +415,9 @@ fn transfer_policy_rejects_non_owner() {
 #[test]
 #[should_panic(expected = "Error(Contract, #7)")]
 fn transfer_policy_rejects_cancelled_policy() {
-    let (env, pe, admin, _oracle, user) = setup();
+    let (env, pe, admin, _oracle, user, usdc) = setup();
     let to = Address::generate(&env);
-    let prod_id = pe.create_product(&admin, &basic_params());
+    let prod_id = pe.create_product(&admin, &basic_params(&usdc));
     let policy_id = pe.buy_policy(
         &user, &prod_id, &500_0000000i128, &30u32, &symbol_short!("kis2606"),
     );
@@ -424,7 +430,7 @@ fn transfer_policy_rejects_cancelled_policy() {
 #[test]
 #[should_panic(expected = "Error(Contract, #24)")]
 fn accept_admin_rejected_before_timelock() {
-    let (env, pe, admin, _oracle, _user) = setup();
+    let (env, pe, admin, _oracle, _user, _) = setup();
     let new_admin = Address::generate(&env);
     pe.propose_new_admin(&admin, &new_admin);
     // Immediately accepting must fail — ADMIN_TRANSFER_TIMELOCK has not elapsed.
@@ -434,7 +440,7 @@ fn accept_admin_rejected_before_timelock() {
 #[test]
 #[should_panic(expected = "Error(Contract, #24)")]
 fn accept_admin_rejected_one_second_before_timelock() {
-    let (env, pe, admin, _oracle, _user) = setup();
+    let (env, pe, admin, _oracle, _user, _) = setup();
     let new_admin = Address::generate(&env);
     pe.propose_new_admin(&admin, &new_admin);
     env.ledger().with_mut(|l| l.timestamp += parashield_common::ADMIN_TRANSFER_TIMELOCK - 1);
@@ -443,7 +449,7 @@ fn accept_admin_rejected_one_second_before_timelock() {
 
 #[test]
 fn accept_admin_succeeds_exactly_at_and_after_timelock() {
-    let (env, pe, admin, _oracle, _user) = setup();
+    let (env, pe, admin, _oracle, _user, _) = setup();
     let new_admin = Address::generate(&env);
     pe.propose_new_admin(&admin, &new_admin);
     env.ledger().with_mut(|l| l.timestamp += parashield_common::ADMIN_TRANSFER_TIMELOCK);
@@ -454,7 +460,7 @@ fn accept_admin_succeeds_exactly_at_and_after_timelock() {
 
 #[test]
 fn accept_admin_succeeds_after_timelock() {
-    let (env, pe, admin, _oracle, _user) = setup();
+    let (env, pe, admin, _oracle, _user, _) = setup();
     let new_admin = Address::generate(&env);
     pe.propose_new_admin(&admin, &new_admin);
     env.ledger().with_mut(|l| l.timestamp += parashield_common::ADMIN_TRANSFER_TIMELOCK + 1);
