@@ -42,6 +42,14 @@ jobs:
         working-directory: contracts
         run: cargo build --target wasm32v1-none --release --quiet
 
+      - name: Install Stellar CLI
+        run: |
+          cargo install --locked stellar-cli --features opt
+          stellar --version
+
+      - name: Validate deploy script arguments
+        run: ./scripts/validate_deploy_args.sh
+
       - name: Run Clippy
         working-directory: contracts
         run: cargo clippy --all-targets -- -D warnings
