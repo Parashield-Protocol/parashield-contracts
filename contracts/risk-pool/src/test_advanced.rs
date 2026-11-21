@@ -4,7 +4,10 @@
 
 extern crate std;
 
-use soroban_sdk::{testutils::Address as _, token, Address, Env, Symbol};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger as _},
+    token, Address, Env, Symbol,
+};
 
 use crate::{RiskPool, RiskPoolClient};
 

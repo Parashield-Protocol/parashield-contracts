@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Symbol};
+use soroban_sdk::{contracttype, Address, String, Symbol};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,8 +42,9 @@ pub enum PolicyStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InsuranceProduct {
     pub id: u128,
-    /// e.g. "Crop Insurance – Kisumu Rainfall"
-    pub name: Symbol,
+    /// e.g. "Crop Insurance – Kisumu Rainfall" — stored as String to support
+    /// names longer than Symbol's ~32-character alphanumeric limit (#804).
+    pub name: String,
     /// "crop" | "flight" | "disaster" | "health" | "defi"
     pub category: Symbol,
     /// Specific oracle measurement key, e.g. symbol_short!("kis2606")
@@ -81,7 +82,12 @@ pub struct BatchBuyItem {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateProductParams {
-    pub name: Symbol,
+    /// Product name — stored as `String` to support names longer than Symbol's
+    /// ~32-character limit, e.g. "Crop Insurance – Kisumu Rainfall" (#804).
+    /// Uniqueness is an exact byte comparison: it is case-sensitive and does
+    /// not normalize Unicode, so e.g. "Crop" and "crop" are different names
+    /// (issue #850).
+    pub name: String,
     pub category: Symbol,
     pub oracle_key: Symbol,
     pub expected_token: Address,
@@ -156,7 +162,7 @@ pub struct PendingOracleChange {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProductCreated {
     pub product_id: u128,
-    pub name: Symbol,
+    pub name: String,
     pub category: Symbol,
     pub premium_rate_bps: u32,
 }

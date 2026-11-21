@@ -28,6 +28,10 @@ fn weather() -> soroban_sdk::Symbol {
     symbol_short!("weather")
 }
 
+fn flight() -> soroban_sdk::Symbol {
+    symbol_short!("flight")
+}
+
 fn kisumu_key() -> soroban_sdk::Symbol {
     symbol_short!("kis2606") // "rainfall:kisumu:2026-06" compressed to 9 chars
 }
@@ -157,7 +161,7 @@ fn test_cannot_update_unregistered_oracle_weight() {
 }
 
 /// Adding an oracle with weight == 0 must be rejected with InvalidWeight (#8).
-/// Weight must be 1-100 for all oracle registrations.
+/// Weight must be in 1..=MAX_WEIGHT (1..=100_000) for all oracle registrations (issue #823).
 #[test]
 #[should_panic(expected = "Error(Contract, #8)")]
 fn test_add_oracle_with_zero_weight_rejected() {
@@ -167,6 +171,67 @@ fn test_add_oracle_with_zero_weight_rejected() {
     
     // Attempt to add oracle with weight = 0 — must panic with InvalidWeight (#8)
     client.add_oracle(&admin, &oracle, &weather(), &0u32);
+}
+
+/// Issue #823: `add_oracle` accepts both boundary weights: 1 and MAX_WEIGHT (100_000).
+#[test]
+fn test_add_oracle_accepts_weight_boundaries() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle_min = Address::generate(&env);
+    let oracle_max = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle_min, &weather(), &1u32);
+    client.add_oracle(&admin, &oracle_max, &weather(), &100_000u32);
+
+    assert_eq!(client.get_oracles(&weather()).len(), 2);
+}
+
+/// Issue #823: `add_oracle` rejects weight == MAX_WEIGHT + 1 (100_001) with InvalidWeight (#8).
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_add_oracle_above_max_weight_rejected() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle, &weather(), &100_001u32);
+}
+
+/// Issue #823: `update_oracle_weight` accepts both boundary weights: 1 and MAX_WEIGHT (100_000).
+#[test]
+fn test_update_oracle_weight_accepts_boundaries() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle, &weather(), &50u32);
+    client.update_oracle_weight(&admin, &oracle, &weather(), &1u32);
+    client.update_oracle_weight(&admin, &oracle, &weather(), &100_000u32);
+}
+
+/// Issue #823: `update_oracle_weight` rejects weight == 0 with InvalidWeight (#8).
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_update_oracle_weight_zero_rejected() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle, &weather(), &50u32);
+    client.update_oracle_weight(&admin, &oracle, &weather(), &0u32);
+}
+
+/// Issue #823: `update_oracle_weight` rejects weight == MAX_WEIGHT + 1 (100_001) with InvalidWeight (#8).
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_update_oracle_weight_above_max_rejected() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle, &weather(), &50u32);
+    client.update_oracle_weight(&admin, &oracle, &weather(), &100_001u32);
 }
 
 #[test]
@@ -1660,4 +1725,70 @@ fn check_staleness_boundary_at_exactly_max_age_threshold() {
     assert!(report_stale.is_stale);
     assert_eq!(report_stale.stale_count, 1);
     assert_eq!(events_before_2, events_after_2, "stale boundary check must emit no events");
+}
+
+// ── Issue #807: an oracle removed from a data type must be re-registrable ──
+
+#[test]
+fn test_remove_oracle_allows_reregistration() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle, &weather(), &50u32);
+    assert_eq!(client.get_oracles(&weather()).len(), 1);
+
+    client.remove_oracle(&admin, &oracle, &weather());
+    assert_eq!(client.get_oracles(&weather()).len(), 0);
+
+    client.add_oracle(&admin, &oracle, &weather(), &60u32);
+    assert_eq!(client.get_oracles(&weather()).len(), 1);
+}
+
+// ── Issue #848: an oracle may register for more than one data type ───────────
+
+#[test]
+fn test_add_oracle_allows_registration_across_multiple_data_types() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle, &weather(), &50u32);
+    // Registering the same oracle for a second data type must succeed —
+    // the per-data-type `Oracle` check already prevents duplicates within
+    // a single data type, so a global cross-type block is unnecessary and
+    // blocks legitimate multi-type oracles.
+    client.add_oracle(&admin, &oracle, &flight(), &60u32);
+
+    assert_eq!(client.get_oracles(&weather()).len(), 1);
+    assert_eq!(client.get_oracles(&flight()).len(), 1);
+}
+
+// ── Issue #810: deactivate_inactive_oracles must not skip elements ────────────
+
+#[test]
+fn test_deactivate_inactive_oracles_deactivates_all_offline() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+
+    // Set inactivity limit to 60 seconds.
+    client.set_oracle_inactivity_limit(&admin, &60u64);
+
+    let oracle1 = Address::generate(&env);
+    let oracle2 = Address::generate(&env);
+    let oracle3 = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle1, &weather(), &50u32);
+    client.add_oracle(&admin, &oracle2, &weather(), &50u32);
+    client.add_oracle(&admin, &oracle3, &weather(), &50u32);
+    assert_eq!(client.get_oracles(&weather()).len(), 3);
+
+    // Advance time past the inactivity limit — none of the oracles ever submitted.
+    env.ledger().set_timestamp(1748736000 + 61);
+
+    let deactivated = client.deactivate_inactive_oracles(&weather());
+
+    // All three oracles must be deactivated (issue #810: none may be skipped).
+    assert_eq!(deactivated.len(), 3, "all offline oracles must be deactivated");
+    assert_eq!(client.get_oracles(&weather()).len(), 0);
 }

@@ -38,7 +38,7 @@ use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK};
 #[allow(dead_code)]
 const MAX_ORACLES: u32 = 100;
 /// Maximum number of registered oracles per key or data type (issue #727).
-pub const MAX_ORACLES_PER_KEY: u32 = 10;
+pub const MAX_ORACLES_PER_DATA_TYPE: u32 = 10;
 /// Maximum number of data points stored per (data_type, key).
 const MAX_DATA_POINTS: u32 = 100;
 
@@ -131,7 +131,8 @@ enum StorageKey {
     /// data_type (u64)
     MinSubmitInterval,
     /// Timestamp (u64) of an oracle's last accepted submission for a
-    /// data_type — (data_type, oracle) → last submission time
+    /// data_type — (data_type, oracle) → last submission time.
+    /// Used by `oracle_offline` to track per-data-type oracle activity.
     LastSubmission(Symbol, Address),
     /// Monotonic guard: the latest reading-timestamp (u64) this oracle has
     /// published for a specific (data_type, key) stream. Any subsequent
@@ -222,8 +223,10 @@ enum StorageKey {
     ChallengePeriod,
     /// Pending stake withdrawal request for (data_type, oracle).
     StakeWithdrawalReq(Symbol, Address),
-    /// Global registration tracker for oracle addresses across all data types (issue #742).
-    GlobalOracle(Address),
+    /// Timestamp (u64) of an oracle's last accepted submission for a specific
+    /// (data_type, key) stream — used to enforce `MinSubmitInterval` per stream
+    /// rather than across all keys of a data_type (issue #834).
+    LastKeySubmission(Symbol, Symbol, Address),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -318,7 +321,9 @@ impl OracleVerifier {
     // ── Oracle Management (admin only) ───────────────────────────────────────
 
     /// Register an oracle address for a given data type with a relative weight.
-    /// `weight` is 1–100,000 (MAX_WEIGHT); higher-weight oracles contribute more to the median.
+    /// `weight` must be in `1..=MAX_WEIGHT` (`MAX_WEIGHT = 100_000`, inclusive);
+    /// values outside this range panic with `Error::InvalidWeight`.
+    /// Higher-weight oracles contribute more to the median.
     pub fn add_oracle(env: Env, admin: Address, oracle: Address, data_type: Symbol, weight: u32) {
         Self::require_admin(&env, &admin);
         Self::validate_contract_address(&env, &oracle);
@@ -338,37 +343,30 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::OracleAlreadyExists);
         }
 
-        // SECURITY FIX (issue #742): Reject re-registration of the same oracle address
-        // under different IDs or across data types without prior de-registration.
-        let global_key = StorageKey::GlobalOracle(oracle.clone());
-        if env.storage().persistent().has(&global_key) {
-            panic_with_error!(&env, Error::OracleAlreadyExists);
-        }
-        env.storage().persistent().set(&global_key, &true);
-        env.storage().persistent().extend_ttl(&global_key, TTL_THRESHOLD, TTL_EXTEND_TO);
-        
         // Sybil detection: Track which addresses control each oracle to prevent
         // the same entity from registering multiple oracles for the same data type.
         // This is a simplified check — in production, you'd likely require external
         // identity verification or proof-of-humanity, but checking for concentrated
         // control is a basic safeguard.
-        // 
+        //
         // For now, we check if this oracle's account controller already manages
         // too many oracles for this data type. A simple limit of 1 oracle per
         // entity per data type prevents basic Sybil attacks.
-        let list: Vec<Address> = env
+        //
+        // issue #811: read OracleList once and reuse for both the count check and the push.
+        let mut list: Vec<Address> = env
             .storage()
             .instance()
             .get(&StorageKey::OracleList(data_type.clone()))
             .unwrap_or_else(|| Vec::new(&env));
-        
-        // Count how many oracles are already registered for this data_type / key (issue #727).
-        // Limit to MAX_ORACLES_PER_KEY to prevent Sybil attacks and oracle domination.
+
+        // Count how many oracles are already registered for this data_type (issue #727).
+        // Limit to MAX_ORACLES_PER_DATA_TYPE to prevent Sybil attacks and oracle domination.
         let oracle_count = list.len();
-        if oracle_count >= MAX_ORACLES_PER_KEY {
+        if oracle_count >= MAX_ORACLES_PER_DATA_TYPE {
             panic_with_error!(&env, Error::TooManyOracles);
         }
-        
+
         // Enforce a minimum economic stake so oracles have skin in the game (issue #721).
         // Reject zero-stake registration when minimum stake is enforced.
         let min_stake: i128 = env
@@ -395,11 +393,7 @@ impl OracleVerifier {
         env.storage().persistent().set(&key, &entry);
         env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
-        let mut list: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&StorageKey::OracleList(data_type.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
+        // Reuse the list already read above — no second storage read (issue #811).
         let mut already_present = false;
         for i in 0..list.len() {
             if list.get_unchecked(i) == oracle {
@@ -426,7 +420,9 @@ impl OracleVerifier {
     }
 
     /// Update the relative weight of an existing oracle registration.
-    /// `weight` is 1–100,000 (MAX_WEIGHT); use `add_oracle` only for new registrations.
+    /// `weight` must be in `1..=MAX_WEIGHT` (`MAX_WEIGHT = 100_000`, inclusive);
+    /// values outside this range panic with `Error::InvalidWeight`.
+    /// Use `add_oracle` only for new registrations.
     pub fn update_oracle_weight(
         env: Env,
         admin: Address,
@@ -435,6 +431,7 @@ impl OracleVerifier {
         weight: u32,
     ) {
         Self::require_admin(&env, &admin);
+        Self::validate_symbol_len(&env, &data_type);
         // SECURITY FIX: Add maximum weight bounds to prevent one oracle from dominating
         // the weighted median calculation. Weight must be between 1 and 100,000.
         // This ensures no single oracle can have disproportionate influence.
@@ -535,19 +532,26 @@ impl OracleVerifier {
             .instance()
             .get(&StorageKey::OracleList(data_type.clone()))
             .unwrap_or_else(|| Vec::new(&env));
-        let mut deactivated: Vec<Address> = Vec::new(&env);
+        // issue #810: collect offline oracles first, then deactivate after the
+        // loop so deactivate_oracle's mutation of OracleList does not interfere
+        // with the iteration over the snapshot.
+        let mut to_deactivate: Vec<Address> = Vec::new(&env);
         for oracle in list.iter() {
             if Self::oracle_offline(&env, &data_type, &oracle) {
-                Self::deactivate_oracle(&env, &data_type, &oracle);
-                env.events().publish(
-                    (Symbol::new(&env, "oracle_auto_deactivated"),),
-                    OracleRemoved {
-                        oracle: oracle.clone(),
-                        data_type: data_type.clone(),
-                    },
-                );
-                deactivated.push_back(oracle);
+                to_deactivate.push_back(oracle);
             }
+        }
+        let mut deactivated: Vec<Address> = Vec::new(&env);
+        for oracle in to_deactivate.iter() {
+            Self::deactivate_oracle(&env, &data_type, &oracle);
+            env.events().publish(
+                (Symbol::new(&env, "oracle_auto_deactivated"),),
+                OracleRemoved {
+                    oracle: oracle.clone(),
+                    data_type: data_type.clone(),
+                },
+            );
+            deactivated.push_back(oracle);
         }
         deactivated
     }
@@ -1382,6 +1386,17 @@ impl OracleVerifier {
             return;
         }
 
+        // SECURITY FIX (#853): guard on whether `get_median_value` would
+        // actually have eligible data to aggregate, not just whether the raw
+        // DataPoints list is non-empty. A source with only stale, low
+        // confidence, or inactive-oracle submissions still has a non-empty
+        // list but no eligible points, and `get_median_value` panics in that
+        // case — the stored-list check alone let that panic through.
+        if !Self::has_eligible_oracle_data(env, source_type, key) {
+            // No usable data for this source type yet — skip validation
+            return;
+        }
+
         // Get source aggregated value
         let source_value = Self::get_median_value(env, source_type, key);
 
@@ -1394,25 +1409,14 @@ impl OracleVerifier {
                 None => continue,
             };
 
-            // SECURITY FIX: Gracefully handle missing target data
-            // If the target data type has no submissions when cross-validation runs,
-            // we skip validation rather than failing or producing incorrect results.
-            // This prevents validation failures due to asynchronous data submission.
-            let target_points: Vec<OracleDataPoint> = match env.storage().persistent().get(
-                &StorageKey::DataPoints(target_type.clone(), key.clone()),
-            ) {
-                Some(pts) => pts,
-                None => {
-                    // No data for this target type yet — skip validation
-                    // The source data may be valid independently; cross-validation
-                    // can succeed on a retry once target data is available.
-                    continue;
-                }
-            };
-            
-            // SECURITY FIX: Verify we have at least one valid data point before attempting validation
-            if target_points.is_empty() {
-                // Empty data points list for target — skip validation similar to missing data
+            // SECURITY FIX (#853): same eligible-data guard as the source
+            // check above — the target may have a non-empty DataPoints list
+            // made up entirely of stale/low-confidence/inactive submissions,
+            // which would still panic in `get_median_value`.
+            if !Self::has_eligible_oracle_data(env, &target_type, key) {
+                // No usable data for this target type yet — skip validation.
+                // The source data may be valid independently; cross-validation
+                // can succeed on a retry once target data is available.
                 continue;
             }
 
@@ -1874,11 +1878,8 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::NoStake);
         }
         let slashed = amount.min(current);
-
-
-
-
-        // Slashing protection: adjust any pending stake withdrawal request during challenge period
+        let remaining = current - slashed;
+        env.storage().persistent().set(&stake_key, &remaining);
         let req_key = StorageKey::StakeWithdrawalReq(data_type.clone(), oracle.clone());
         if let Some(mut req) = env.storage().persistent().get::<_, StakeWithdrawalRequest>(&req_key) {
             req.amount = req.amount.saturating_sub(slashed);
@@ -2047,11 +2048,6 @@ impl OracleVerifier {
             .persistent()
             .get(&StorageKey::StaleCount(data_type, oracle))
             .unwrap_or(0)
-    }
-
-    /// Check whether an oracle address is already registered globally (issue #742).
-    pub fn is_oracle_registered(env: Env, oracle: Address) -> bool {
-        env.storage().persistent().has(&StorageKey::GlobalOracle(oracle))
     }
 
     /// Increment the stale-submission counter for this oracle + data_type
@@ -2430,7 +2426,7 @@ impl OracleVerifier {
             .persistent()
             .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
-        Self::enforce_rate_limit(&env, &data_type, &oracle, now);
+        Self::enforce_rate_limit(&env, &data_type, &key, &oracle, now);
 
         // Issue #775: monotonic reading-timestamp per (data_type, key, oracle).
         // Readings for one stream from one oracle must advance strictly
@@ -2584,7 +2580,7 @@ impl OracleVerifier {
             .persistent()
             .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
-        Self::enforce_rate_limit(&env, &data_type, &oracle, now);
+        Self::enforce_rate_limit(&env, &data_type, &key, &oracle, now);
 
         // Issue #459: same stale-submission gate as `submit_data`.
         let max_data_age = Self::effective_max_age(&env, &data_type);
@@ -2933,7 +2929,7 @@ impl OracleVerifier {
                     .persistent()
                     .get::<_, OracleEntry>(&oracle_key)
                 {
-                    if entry.active && !Self::oracle_offline(env, &data_type, &p.oracle) {
+                    if entry.active && !Self::oracle_offline(&env, &data_type, &p.oracle) {
                         oracle_count += 1;
                         min_confidence_val = min_confidence_val.min(p.confidence);
                         last_updated = last_updated.max(p.timestamp);
@@ -2952,7 +2948,7 @@ impl OracleVerifier {
             }
         }
 
-        n = Self::filter_outliers(env, data_type, &mut values, &mut timestamps, n);
+        n = Self::filter_outliers(&env, &data_type, &mut values, &mut timestamps, n);
         total_weight = values[0..n].iter().map(|&(_, wt)| wt).sum();
 
         let min_oracle_count: u32 = env
@@ -3166,8 +3162,6 @@ impl OracleVerifier {
             .persistent()
             .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
-        Self::enforce_rate_limit(&env, &data_type, &oracle, env.ledger().timestamp());
-
         for i in 0..submissions.len() {
             let (key, value, confidence, timestamp) = submissions.get_unchecked(i);
             Self::validate_key_len(&env, &key);
@@ -3198,6 +3192,8 @@ impl OracleVerifier {
                 panic_with_error!(&env, Error::InvalidTimestamp);
             }
 
+            Self::enforce_rate_limit(&env, &data_type, &key, &oracle, now);
+
             // Issue #775: monotonic reading-timestamp per (data_type, key,
             // oracle). Same guard as submit_data — batch callers must not
             // bypass it.
@@ -3219,30 +3215,30 @@ impl OracleVerifier {
                 continue;
             }
             let new_point = OracleDataPoint {
-            oracle: oracle.clone(),
-            value: sub.value,
-            confidence: sub.confidence,
-            timestamp: sub.timestamp,
+                oracle: oracle.clone(),
+                value,
+                confidence,
+                timestamp,
             };
             Self::store_plain_reading(
-            &env,
-            &data_type,
-            &sub.key,
-            new_point,
-            now,
-            max_data_age,
+                &env,
+                &data_type,
+                &key,
+                new_point,
+                now,
+                max_data_age,
             );
-            Self::record_reading_timestamp(&env, &data_type, &sub.key, &oracle, sub.timestamp);
+            Self::record_reading_timestamp(&env, &data_type, &key, &oracle, timestamp);
 
             env.events().publish(
                 (Symbol::new(&env, "oracle_data_submitted"),),
                 OracleDataSubmitted {
                     oracle: oracle.clone(),
                     data_type: data_type.clone(),
-                    key: sub.key,
-                    value: sub.value,
-                    confidence: sub.confidence,
-                    timestamp: sub.timestamp,
+                    key,
+                    value,
+                    confidence,
+                    timestamp,
                 },
             );
         }
@@ -3447,24 +3443,40 @@ impl OracleVerifier {
             .extend_ttl(&storage_key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
-    /// Enforce the per-oracle submission cooldown for `data_type`: panics with
-    /// `RateLimited` if `oracle` submitted for this data_type more recently
-    /// than `get_min_submit_interval()` seconds ago, otherwise records `now`
-    /// as the new last-submission time. Call once per submission entry point
-    /// (submit_data / submit_data_batch / batch_submit_data), not per reading,
-    /// so a single call with many keys pays the check once.
-    fn enforce_rate_limit(env: &Env, data_type: &Symbol, oracle: &Address, now: u64) {
+    /// Enforce the per-(data_type, key, oracle) submission cooldown: panics with
+    /// `RateLimited` if `oracle` submitted for this `(data_type, key)` stream
+    /// more recently than `get_min_submit_interval()` seconds ago, otherwise
+    /// records `now` as the new last-submission time for the stream and updates
+    /// the per-(data_type, oracle) activity timestamp used by `oracle_offline`
+    /// (issue #834).
+    fn enforce_rate_limit(
+        env: &Env,
+        data_type: &Symbol,
+        key: &Symbol,
+        oracle: &Address,
+        now: u64,
+    ) {
         let min_interval = Self::get_min_submit_interval(env.clone());
-        let key = StorageKey::LastSubmission(data_type.clone(), oracle.clone());
-        if let Some(last) = env.storage().persistent().get::<_, u64>(&key) {
+        let rate_key = StorageKey::LastKeySubmission(
+            data_type.clone(),
+            key.clone(),
+            oracle.clone(),
+        );
+        if let Some(last) = env.storage().persistent().get::<_, u64>(&rate_key) {
             if now.saturating_sub(last) < min_interval {
                 panic_with_error!(env, Error::RateLimited);
             }
         }
-        env.storage().persistent().set(&key, &now);
+        env.storage().persistent().set(&rate_key, &now);
         env.storage()
             .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            .extend_ttl(&rate_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        let activity_key = StorageKey::LastSubmission(data_type.clone(), oracle.clone());
+        env.storage().persistent().set(&activity_key, &now);
+        env.storage()
+            .persistent()
+            .extend_ttl(&activity_key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
     /// Mark an oracle inactive and drop it from its data_type's oracle list.
@@ -3495,7 +3507,6 @@ impl OracleVerifier {
             }
         }
         env.storage().instance().set(&StorageKey::OracleList(data_type.clone()), &pruned);
-        env.storage().persistent().remove(&StorageKey::GlobalOracle(oracle.clone()));
     }
 
     fn inactivity_limit(env: &Env) -> u64 {
@@ -3512,14 +3523,20 @@ impl OracleVerifier {
         if limit == 0 {
             return false;
         }
-        match env
+        let Some(last) = env
             .storage()
             .persistent()
             .get::<_, u64>(&StorageKey::LastSubmission(data_type.clone(), oracle.clone()))
-        {
-            Some(last) => env.ledger().timestamp().saturating_sub(last) > limit,
-            None => false,
-        }
+        else {
+            // No accepted submission means there is no inactivity interval to
+            // measure; newly registered oracles are not auto-deactivated.
+            return false;
+        };
+
+        let now = env.ledger().timestamp();
+        // Treat a clock moving backwards as zero elapsed time rather than
+        // allowing unsigned arithmetic to classify the oracle as offline.
+        now > last && now - last > limit
     }
 
     /// Symbols are capped at 32 bytes by the host; the check that matters is
@@ -3820,6 +3837,55 @@ impl OracleVerifier {
             .extend_ttl(&storage_key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
+    /// True when `get_median_value(env, data_type, key)` has enough eligible
+    /// submissions to return a value instead of panicking with
+    /// `NoDataAvailable`. Mirrors the freshness/confidence/active-oracle
+    /// filter and `MinOracleCount` gate that `get_median_value` applies
+    /// internally, so callers that need to skip rather than panic on missing
+    /// or stale data (e.g. `check_cross_validation`, #853) can check first.
+    fn has_eligible_oracle_data(env: &Env, data_type: &Symbol, key: &Symbol) -> bool {
+        let points: Vec<OracleDataPoint> = match env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type.clone(), key.clone()))
+        {
+            Some(pts) => pts,
+            None => return false,
+        };
+        if points.is_empty() {
+            return false;
+        }
+
+        let max_data_age = Self::effective_max_age(env, data_type);
+        let now = env.ledger().timestamp();
+        let min_confidence: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinConfidence)
+            .unwrap_or(0);
+        let min_oracle_count: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::MinOracleCount)
+            .unwrap_or(1);
+
+        let mut eligible_count: u32 = 0;
+        let points_cap = points.len().min(MAX_DATA_POINTS);
+        for i in 0..points_cap {
+            let p = points.get_unchecked(i);
+            if now.saturating_sub(p.timestamp) <= max_data_age && p.confidence >= min_confidence {
+                let oracle_key = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
+                if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+                    if entry.active && !Self::oracle_offline(env, data_type, &p.oracle) {
+                        eligible_count += 1;
+                    }
+                }
+            }
+        }
+
+        eligible_count > 0 && eligible_count >= min_oracle_count
+    }
+
     /// Compute the weighted median of active, sufficiently fresh submissions.
     fn get_median_value(env: &Env, data_type: &Symbol, key: &Symbol) -> i128 {
         let points: Vec<OracleDataPoint> = env
@@ -4091,3 +4157,6 @@ mod test_monotonic;
 
 #[cfg(test)]
 mod test_data_type_range;
+
+#[cfg(test)]
+mod test_rate_limit;

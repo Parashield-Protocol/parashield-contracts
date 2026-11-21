@@ -19,7 +19,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    token, Address, Env, IntoVal, String, Symbol, Val, Vec,
+    token, Address, Env, IntoVal, String, Symbol, Vec,
 };
 
 pub mod types;
@@ -51,7 +51,7 @@ const _: () = assert!(DEFAULT_PREMIUM_LP_BPS + DEFAULT_PREMIUM_TREAS_BPS + DEFAU
 const MAX_TOTAL_DEPOSITED: i128 = 1_000_000_000_000_000;
 
 /// Minimum deposit amount (1_000_000 stroops).
-pub const MIN_DEPOSIT: i128 = 1_000_000;
+pub const MIN_DEPOSIT: i128 = 100_000;
 
 /// Minimum shares that must be minted on deposit (issue #493).
 /// Enforces that calculated shares cannot be 0 or infinitesimal when depositing into large pools.
@@ -59,12 +59,12 @@ pub const MIN_SHARES: i128 = 1;
 
 /// Default ceiling on `total_locked / total_deposited`, in basis points.
 ///
-/// 10_000 (100%) preserves the historical behaviour exactly: before this was
-/// configurable the pool would commit every unit of capital it held. Lowering
-/// it is how an admin expresses "keep a buffer against correlated risk", and
-/// that has to be an explicit choice rather than a silent change to how much
-/// coverage an existing pool can write.
-const DEFAULT_MAX_UTILIZATION_BPS: u32 = 10_000;
+/// 8_000 (80%) provides a safer default buffer against correlated risk.
+/// While 10_000 (100%) was the historical behaviour, allowing the pool to
+/// commit every unit of capital leaves no buffer for simultaneous claims.
+/// A lower default protects new deployments while still allowing admins
+/// to explicitly raise it to 100% if their risk profile justifies it.
+const DEFAULT_MAX_UTILIZATION_BPS: u32 = 8_000;
 
 /// Longest withdrawal delay an admin may configure (30 days).
 ///
@@ -85,6 +85,10 @@ const TIMELOCK_SECONDS: u64 = 7 * 24 * 60 * 60;
 /// Timelock duration for parameter changes: 2 days in seconds.
 /// Shorter than withdrawal timelock since parameter changes are less risky.
 const PARAMETER_TIMELOCK_SECONDS: u64 = 2 * 24 * 60 * 60;
+
+/// Minimum interval between consecutive fee configuration updates: 24 hours.
+/// Prevents rapid oscillation that would destabilise LP return expectations.
+const FEE_UPDATE_COOLDOWN_SECONDS: u64 = 24 * 60 * 60;
 
 // Shared protocol constants — single source of truth in parashield-common (issue #342).
 use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK, ZERO_ADDRESS};
@@ -176,7 +180,11 @@ pub(crate) enum StorageKey {
     AdminWithdrawalApprovals,
 }
 
-/// Maximum pool name length in bytes/characters (issue #748).
+/// Maximum pool name length in characters (issue #748).
+///
+/// Note: Enforced in characters via `name.len()`. A 32-character limit is standard for
+/// pool labels across the protocol UI and storage. In Soroban, `String::len()` returns the
+/// character count, and names up to `MAX_POOL_NAME_LEN` (32 characters) are permitted.
 pub const MAX_POOL_NAME_LEN: u32 = 32;
 
 #[contracterror]
@@ -450,23 +458,12 @@ impl RiskPool {
             panic_with_error!(&env, Error::PoolCapExceeded);
         }
         
-        // SECURITY FIX: Additional validation to prevent deposits that would push
-        // the pool beyond safe utilization limits for this category.
-        // Check that current utilization doesn't already exceed the limit before accepting more funds.
-        let total_locked: i128 = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
-        let current_utilization_bps = if total_deposited > 0 {
-            total_locked.checked_mul(10_000)
-                .and_then(|v| v.checked_div(total_deposited))
-                .unwrap_or(0) as u32
-        } else {
-            0
-        };
-        
-        // If utilization is already at or above max, reject new deposits to prevent
-        // over-leveraging the category pool beyond its risk tolerance.
-        if current_utilization_bps >= capacity.max_utilization_bps {
-            panic_with_error!(&env, Error::PoolCapExceeded);
-        }
+        // Issue #802: the previous guard rejected deposits when
+        // utilization >= max_utilization_bps. That is backwards: deposits
+        // increase total_deposited, which REDUCES utilization (total_locked is
+        // unchanged). Blocking deposits prevents the pool from raising the
+        // capital needed to lower utilization. The utilization cap belongs on
+        // lock_for_claim (where total_locked increases), not here.
 
         // Both branches use checked arithmetic: a share calculation that
         // cannot be represented traps as a typed `Overflow` rather than
@@ -797,7 +794,12 @@ impl RiskPool {
             .instance()
             .get(&StorageKey::UsdcToken)
             .unwrap();
-        let total_payout = amount + pending_yield;
+        // Guard against i128 overflow when both amount and pending_yield are
+        // near i128::MAX (#793). Regular withdraw_inner pays them separately;
+        // emergency_withdraw must do the same checked arithmetic.
+        let total_payout = amount
+            .checked_add(pending_yield)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
         token::Client::new(&env, &usdc).transfer(
             &env.current_contract_address(),
             &provider,
@@ -827,6 +829,7 @@ impl RiskPool {
     /// otherwise `transfer_position` is a one-transaction way around the
     /// `deposit` restriction and the separation of duties it exists for.
     pub fn transfer_position(env: Env, from: Address, to: Address, shares: i128) -> i128 {
+        let _guard = ReentrancyGuard::enter(&env);
         from.require_auth();
         if shares <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if from == to { panic_with_error!(&env, Error::InvalidAddress); }
@@ -927,7 +930,16 @@ impl RiskPool {
 
     /// Pull `amount` USDC from `caller` and split it among LPs, treasury, and backstop
     /// according to the protocol fee schedule. No-op if `amount` is zero or negative.
+    ///
+    /// Note: Premiums intentionally bypass the `MIN_DEPOSIT` granularity check (`amount % MIN_DEPOSIT == 0`)
+    /// enforced on LP deposits. Insurance premiums are calculated based on risk models, coverage amounts,
+    /// duration, and premium rates (e.g., in PolicyEngine), which frequently produce premium amounts that are
+    /// not exact multiples of `MIN_DEPOSIT` (1 USDC / 1_000_000 stroops). Sub-stroop rounding remainders from
+    /// integer division during split calculations remain in the contract's token balance as pool reserves.
     pub fn receive_premium(env: Env, caller: Address, amount: i128) {
+        // Hold the guard across the complete operation, including outgoing
+        // treasury and backstop transfers. Token hooks must not re-enter any
+        // guarded pool operation while premium distribution is in progress.
         let _guard = ReentrancyGuard::enter(&env);
         caller.require_auth();
         if amount <= 0 { return; }
@@ -935,10 +947,12 @@ impl RiskPool {
         token::Client::new(&env, &usdc)
             .transfer(&caller, &env.current_contract_address(), &amount);
 
-        let (lp_bps, treas_bps, backstop_bps) = Self::get_premium_split_bps(&env);
-        let lp_share       = amount * lp_bps       / 10_000;
-        let treas_share    = amount * treas_bps    / 10_000;
-        let backstop_share = amount * backstop_bps / 10_000;
+        let (lp_bps, treas_bps, _backstop_bps) = Self::get_premium_split_bps(&env);
+        let lp_share    = amount * lp_bps    / 10_000;
+        let treas_share = amount * treas_bps / 10_000;
+        // Issue #787: absorb integer-division rounding into backstop_share so
+        // lp_share + treas_share + backstop_share == amount exactly.
+        let backstop_share = amount - lp_share - treas_share;
 
         // CEI: update state before outgoing external token transfers
         let acc: i128 = env.storage().instance()
@@ -1053,6 +1067,13 @@ impl RiskPool {
     ///   limit: a pool fully committed to one category in one region is a
     ///   single event away from insolvency however much capital it holds, and
     ///   nothing in the deposit ceiling prevents that.
+    ///
+    /// **Note:** Setting `max_utilization_bps` to 10_000 (100%) allows the
+    /// pool to commit all capital to coverage, leaving no buffer against
+    /// correlated claims. While permitted for flexibility, this is dangerous
+    /// for pools exposed to correlated risk (e.g., weather events, regional
+    /// disasters). The default is 8_000 (80%) to provide a safety buffer.
+    /// Only raise to 100% if the risk profile is truly uncorrelated.
     ///
     /// Lowering a limit below current usage is allowed and does not claw
     /// anything back — existing deposits and locks stand, and the pool simply
@@ -1798,6 +1819,14 @@ impl RiskPool {
         enabled: bool,
     ) {
         Self::require_admin(&env, &admin);
+
+        // Enforce cooldown between consecutive fee updates (issue #778).
+        let now = env.ledger().timestamp();
+        if let Some(existing) = env.storage().instance().get::<_, DynamicFeeConfig>(&StorageKey::DynamicFeeConfig) {
+            if now < existing.last_updated.saturating_add(FEE_UPDATE_COOLDOWN_SECONDS) {
+                panic_with_error!(&env, Error::InvalidParameter);
+            }
+        }
 
         // Validate thresholds
         if base_fee_bps > 10000 || max_fee_bps > 10000 || min_fee_bps > 10000 {
@@ -3133,6 +3162,21 @@ impl RiskPool {
                 _ => 0,
             };
             if amount <= 0 || amount > available {
+                // Issue #854: tell the provider why this sweep pass left
+                // their request queued instead of silently skipping it.
+                let reason = if amount <= 0 {
+                    Symbol::new(env, "zero_amount")
+                } else {
+                    Symbol::new(env, "insufficient_liquidity")
+                };
+                env.events().publish(
+                    (Symbol::new(env, "exit_sweep_skipped"),),
+                    ExitSweepSkipped {
+                        provider,
+                        shares_requested: request.shares,
+                        reason,
+                    },
+                );
                 continue;
             }
 
@@ -3318,11 +3362,16 @@ impl RiskPool {
     pub fn liquidate_position(env: Env, caller: Address, provider: Address) -> LiquidationResult {
         Self::require_protocol_caller(&env, &caller);
 
-        let position: LpPosition = env
+        let mut position: LpPosition = env
             .storage()
             .persistent()
             .get(&StorageKey::LpPosition(provider.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
+
+        // Settle any yield the position has accrued up to this point before
+        // seizing shares, so it is paid out to the provider instead of being
+        // silently absorbed into the pool (issue #849).
+        let yield_claimed = Self::settle_yield(&env, &mut position);
 
         let info = Self::get_collateralization_ratio(env.clone(), provider.clone());
 
@@ -3362,6 +3411,15 @@ impl RiskPool {
         let mut new_position = position.clone();
         new_position.shares = new_position.shares.saturating_sub(shares_seized);
         new_position.deposited = new_position.deposited.saturating_sub(amount_recovered);
+        // Re-base yield_debt on the post-seizure share count (same approach
+        // as `withdraw_inner`), so a later claim is measured against what
+        // the position holds now rather than what it held before seizure.
+        let acc_per_share: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::AccumulatedPerShare)
+            .unwrap_or(0);
+        new_position.yield_debt = (acc_per_share * new_position.shares) / 1_000_000_000_000;
 
         if new_position.shares <= 0 {
             env.storage().persistent().remove(&StorageKey::LpPosition(provider.clone()));
@@ -3372,22 +3430,18 @@ impl RiskPool {
             );
         }
 
-        // Update pool totals
+        // Issue #788: only reduce total_shares — the seized USDC stays in the
+        // contract as available liquidity, so total_deposited must NOT be
+        // reduced. Reducing it would understate share value: surviving LPs'
+        // shares would map to less capital than actually exists in the pool.
         let current_total_shares: i128 = env
             .storage().instance().get(&StorageKey::TotalShares).unwrap_or(0);
-        let current_total_deposited: i128 = env
-            .storage().instance().get(&StorageKey::TotalDeposited).unwrap_or(0);
         env.storage().instance().set(
             &StorageKey::TotalShares,
             &current_total_shares.saturating_sub(shares_seized),
         );
-        env.storage().instance().set(
-            &StorageKey::TotalDeposited,
-            &current_total_deposited.saturating_sub(amount_recovered),
-        );
-
-        // Return seized funds to pool (they stay as available liquidity)
-        // The recovered amount stays in the contract as pool liquidity
+        // total_deposited is intentionally NOT reduced: the capital is still
+        // present in the contract; only the LP's claim on it has been removed.
 
         env.events().publish(
             (Symbol::new(&env, "position_liquidated"),),
@@ -3398,6 +3452,11 @@ impl RiskPool {
                 collateralization_bps: info.collateralization_bps,
             },
         );
+
+        // Pay out the yield settled above now that all other state has
+        // landed — emits `YieldClaimed` so the seized position's accrued
+        // yield has an audit trail instead of being absorbed into the pool.
+        Self::pay_out_yield(&env, &provider, yield_claimed);
 
         LiquidationResult {
             provider,
@@ -3520,6 +3579,9 @@ impl RiskPool {
     }
 
     /// Set or update the pool's human-readable name, enforcing length limits (issue #748).
+    ///
+    /// The length limit `MAX_POOL_NAME_LEN` (32) is enforced in characters via `name.len()`.
+    /// Multi-byte UTF-8 character names are accepted up to 32 characters.
     pub fn set_pool_name(env: Env, admin: Address, name: String) {
         Self::require_admin(&env, &admin);
         if name.len() == 0 || name.len() > MAX_POOL_NAME_LEN {

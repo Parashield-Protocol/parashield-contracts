@@ -18,8 +18,6 @@
 //! Once a policy is Claimed or Expired, further process/auto_process calls
 //! return the appropriate ClaimResult without writing again.
 #![no_std]
-extern crate alloc;
-use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
@@ -438,6 +436,12 @@ impl ClaimsProcessor {
     /// trigger looks, so the conflict is removed rather than documented.
     /// A policy the admin bought is still handled by the keeper-driven
     /// `auto_process` path, which is not a claimant-initiated flow.
+    /// Submit a claim without a reference number.
+    ///
+    /// **Reference numbers are opt-in** (issue #797). Use `submit_claim_with_ref`
+    /// to attach a human-readable reference that can be looked up via
+    /// `get_claim_id_by_ref`. Claims filed here are still accessible by their
+    /// returned claim ID and by `StorageKey::PolicyClaim(policy_id)`.
     pub fn submit_claim(env: Env, claimant: Address, policy_id: u128) -> u128 {
         claimant.require_auth();
         Self::require_not_paused(&env);
@@ -448,6 +452,22 @@ impl ClaimsProcessor {
         // The zero address cannot hold or move funds; a claim filed for it
         // would settle a payout nobody can ever collect (issue #586).
         Self::require_not_zero_address(&env, &claimant);
+
+        // CONSISTENCY FIX (issue #818): Validate claim type is registered
+        // Get the policy to retrieve its product category and validate it
+        let policy_engine: Address = env.storage().instance()
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        let policy = PolicyEngineClient::new(&env, &policy_engine)
+            .get_policy(&policy_id);
+        let product = PolicyEngineClient::new(&env, &policy_engine)
+            .get_product(&policy.product_id);
+
+        // Validate the product category is a registered claim type
+        let category = product.category;
+        if category == Symbol::new(&env, "") || !Self::is_claim_type_registered(env.clone(), category) {
+            panic_with_error!(&env, Error::InvalidClaimType);
+        }
 
         Self::file_claim(&env, &claimant, policy_id)
     }
@@ -582,17 +602,15 @@ impl ClaimsProcessor {
             panic_with_error!(env, Error::ClaimOutsideCoveragePeriod);
         }
 
-        // Issue #635: allow claims filed after end_time within claim_deadline,
-        // then reject anything past that window. The prior code rejected
-        // `now > end_time` before this check ran, making the deadline window
-        // unreachable.
+        // Issue #635 / #783: allow claims filed after end_time within claim_deadline,
+        // then reject anything past that window. When end_time is 0 the policy has
+        // no expiry, so no deadline check is needed. The former `else if now > 0`
+        // branch was dead code (a u64 timestamp is always > 0) and is removed (#783).
         if policy.end_time > 0 {
             let cutoff = policy.end_time.saturating_add(Self::claim_deadline(env));
             if now > cutoff {
                 panic_with_error!(env, Error::ClaimDeadlinePassed);
             }
-        } else if now > policy.end_time {
-            panic_with_error!(env, Error::ClaimOutsideCoveragePeriod);
         }
 
         // SECURITY FIX (issue #737): Rate limit claim submissions per user to prevent claim flooding.
@@ -609,13 +627,39 @@ impl ClaimsProcessor {
 
         let claim_id   = Self::next_claim_id(env);
 
+        // Issue #855: snapshot the claimant's history as it stood *before*
+        // this submission. `evaluate_fraud`'s rules (rate / burst / coverage
+        // anomaly) are defined relative to that prior state — e.g. the rate
+        // rule only fires when the *previous* submission was recent, not
+        // this one. Fetching it here, before `update_claimant_history` below
+        // overwrites it, is what keeps that comparison meaningful.
+        let history_before = Self::claimant_history(env, claimant);
+
+        // Update claimant history BEFORE evaluate_fraud so that blocked
+        // (high-score) submissions still count toward rate/burst limits.
+        // Previously a blocked claim never incremented the history, allowing
+        // unlimited fraud-screened submissions without consequence.
+        let burst_window = Self::fraud_config(env)
+            .map(|c| c.burst_window_secs)
+            .unwrap_or(0);
+        Self::update_claimant_history(
+            env,
+            claimant,
+            now,
+            policy.coverage_amount,
+            burst_window,
+        );
+
         // Issue #437: score this submission against the configured fraud
-        // rules. In `Block` mode a high enough score panics here, before any
-        // claim state is written — the caller gets FraudSuspected and the
-        // world looks exactly as it did before the call. In `FlagOnly` mode
-        // a FraudRecord is persisted and the claim proceeds. When no config
-        // is set, this is a no-op.
-        Self::evaluate_fraud(env, claim_id, claimant, policy.coverage_amount);
+        // rules, using the pre-submission history snapshot above — not the
+        // just-written one, which would make every rule compare this
+        // submission against itself instead of against what came before it.
+        // In `Block` mode a high enough score panics here, before any claim
+        // state is written — the caller gets FraudSuspected and the world
+        // looks exactly as it did before the call. In `FlagOnly` mode a
+        // FraudRecord is persisted and the claim proceeds. When no config is
+        // set, this is a no-op.
+        Self::evaluate_fraud(env, claim_id, claimant, policy.coverage_amount, &history_before);
 
         let claim = Claim {
             id: claim_id,
@@ -656,43 +700,56 @@ impl ClaimsProcessor {
             },
         );
 
-        // Issue #437: fold this submission into the claimant's aggregate
-        // history for the next call's fraud check. Only meaningful when the
-        // detector is on, but cheap enough to always maintain; keeping the
-        // aggregate up to date lets an admin turn the detector on later
-        // without every claimant looking like a first-time submitter.
-        let burst_window = Self::fraud_config(env)
-            .map(|c| c.burst_window_secs)
-            .unwrap_or(0);
-        Self::update_claimant_history(
-            env,
-            claimant,
-            now,
-            policy.coverage_amount,
-            burst_window,
-        );
-
         claim_id
     }
 
     /// Submit multiple claims in a single transaction up to MAX_BATCH_SIZE.
+    /// Isolates failures per claim — if one fails, others proceed (issue #817).
+    /// Uses try_invoke_contract to run each submit_claim in a sub-invocation.
+    /// Returns only successfully filed claim IDs; failed claims are skipped.
     pub fn batch_submit_claims(env: Env, claimant: Address, policy_ids: Vec<u128>) -> Vec<u128> {
         claimant.require_auth();
         Self::require_not_paused(&env);
         Self::require_not_admin(&env, &claimant);
         Self::require_not_zero_address(&env, &claimant);
 
+        if policy_ids.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
         let mut claim_ids = Vec::new(&env);
-        let count = if policy_ids.len() > MAX_BATCH_SIZE {
-            MAX_BATCH_SIZE
-        } else {
-            policy_ids.len()
-        };
+        let count = policy_ids.len();
+        let this = env.current_contract_address();
+        let fn_name = Symbol::new(&env, "submit_claim");
 
         for i in 0..count {
             let pid = policy_ids.get_unchecked(i);
-            let cid = Self::file_claim(&env, &claimant, pid);
-            claim_ids.push_back(cid);
+
+            // Each claim is submitted in its own sub-invocation (try_invoke_contract).
+            // If file_claim fails (e.g. already claimed, rate limit), only that
+            // sub-invocation is rolled back. Other claims proceed normally.
+            // This isolates per-claim failures like batch_auto_process does (issue #817).
+            let claim_type = Symbol::new(&env, "");
+            let args = soroban_sdk::vec![
+                &env,
+                claimant.to_val(),
+                pid.into_val(&env),
+                claim_type.to_val(),
+            ];
+
+            match env.try_invoke_contract::<u128, soroban_sdk::Error>(
+                &this,
+                &fn_name,
+                args,
+            ) {
+                Ok(Ok(claim_id)) => {
+                    claim_ids.push_back(claim_id);
+                }
+                Ok(Err(_)) | Err(_) => {
+                    // Claim submission failed — skip this policy and continue
+                    // with the next one. Failures don't propagate or revert the batch.
+                }
+            }
         }
 
         env.events().publish(
@@ -762,7 +819,37 @@ impl ClaimsProcessor {
         Self::evaluate_and_settle(&env, &mut claim, &policy, partial_payout_bps)
     }
 
+    /// Inner claim-processing logic that skips the keeper-auth and pause checks
+    /// (issue #803). Called by `batch_process_claims` after those checks have
+    /// already been performed once for the whole batch.
+    fn process_claim_inner(
+        env: &Env,
+        claim_id: u128,
+        partial_payout_bps: Option<u32>,
+    ) -> ClaimResult {
+        let mut claim: Claim = env.storage().persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(env, Error::ClaimNotFound));
+
+        if claim.status != ClaimStatus::Pending {
+            return ClaimResult::AlreadyProcessed;
+        }
+
+        let policy_engine: Address = env.storage().instance()
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        let policy = PolicyEngineClient::new(env, &policy_engine)
+            .get_policy(&claim.policy_id);
+
+        Self::evaluate_and_settle(env, &mut claim, &policy, partial_payout_bps)
+    }
+
     /// Process multiple existing claims in a single transaction up to MAX_BATCH_SIZE.
+    ///
+    /// Limitation: A single uniform `partial_payout_bps: Option<u32>` is passed to every
+    /// `process_claim` call in this batch. All claims in the batch receive the same payout
+    /// ratio (or full payout if `None`). To settle different claims at different payout
+    /// rates in one batch, use `batch_process_claims_overrides`.
     pub fn batch_process_claims(
         env: Env,
         keeper: Address,
@@ -781,7 +868,46 @@ impl ClaimsProcessor {
 
         for i in 0..count {
             let cid = claim_ids.get_unchecked(i);
-            let res = Self::process_claim(env.clone(), keeper.clone(), cid, partial_payout_bps);
+            // Use process_claim_inner to avoid redundant keeper-auth and pause
+            // checks on every iteration — both were verified once above (#803).
+            let res = Self::process_claim_inner(&env, cid, partial_payout_bps);
+            results.push_back((cid, res));
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_claims_processed"),),
+            BatchClaimsProcessed {
+                keeper,
+                count,
+            },
+        );
+
+        results
+    }
+
+    /// Process multiple existing claims with individual per-claim payout overrides up to MAX_BATCH_SIZE.
+    ///
+    /// Accepts a list of `(claim_id, partial_payout_bps)` tuples, allowing different claims in the same
+    /// batch to be settled at individual payout ratios.
+    pub fn batch_process_claims_overrides(
+        env: Env,
+        keeper: Address,
+        claims: Vec<(u128, Option<u32>)>,
+    ) -> Vec<(u128, ClaimResult)> {
+        Self::require_keeper(&env, &keeper);
+        Self::require_not_paused(&env);
+
+        let mut results = Vec::new(&env);
+        let count = if claims.len() > MAX_BATCH_SIZE {
+            MAX_BATCH_SIZE
+        } else {
+            claims.len()
+        };
+
+        for i in 0..count {
+            let (cid, bps) = claims.get_unchecked(i);
+            // Use process_claim_inner to skip per-iteration keeper/pause checks (#803).
+            let res = Self::process_claim_inner(&env, cid, bps);
             results.push_back((cid, res));
         }
 
@@ -874,9 +1000,8 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         let policy = PolicyEngineClient::new(&env, &policy_engine).get_policy(&claim.policy_id);
 
-        if claim.coverage_amount != policy.coverage_amount {
-            panic_with_error!(&env, Error::CoverageMismatch);
-        }
+        // CoverageMismatch guard runs inside evaluate_and_settle (issue #798 / #828),
+        // shared by all settlement paths. No duplicate check needed here.
 
         // Batch verify all readings in ONE cross-contract call
         let results = Self::batch_verify_oracle_readings(env.clone(), queries.clone());
@@ -938,22 +1063,26 @@ impl ClaimsProcessor {
             }
         }
         
-        // Update the last processed timestamp for this policy
-        env.storage().persistent()
-            .set(&StorageKey::AutoProcessLastTime(policy_id), &now);
-
         // ─── IDEMPOTENCY GUARD ───
-        // Check if an evaluation record already exists for this policy in our storage
+        // Check if an evaluation record already exists for this policy in our storage.
+        // This guard runs BEFORE updating AutoProcessLastTime (#786) so that a call
+        // that returns AlreadyProcessed does not consume the cooldown window.
         if env.storage().persistent().has(&StorageKey::PolicyClaim(policy_id)) {
             let existing_claim_id: u128 = env.storage().persistent()
                 .get(&StorageKey::PolicyClaim(policy_id)).unwrap();
-            
+
             if let Some(existing_claim) = env.storage().persistent().get::<StorageKey, Claim>(&StorageKey::Claim(existing_claim_id)) {
                 if existing_claim.status != ClaimStatus::Pending {
                     return ClaimResult::AlreadyProcessed;
                 }
             }
         }
+
+        // Update the last processed timestamp for this policy — written AFTER the
+        // idempotency guard so rejected/AlreadyProcessed calls do not consume
+        // the cooldown window (#786).
+        env.storage().persistent()
+            .set(&StorageKey::AutoProcessLastTime(policy_id), &now);
 
         let policy_engine: Address = env.storage().instance()
             .get(&StorageKey::PolicyEngine)
@@ -1085,48 +1214,54 @@ impl ClaimsProcessor {
             .get(&StorageKey::PendingClaims)
             .unwrap_or_else(|| Vec::new(&env));
         
-        // The pending queue is maintained in FIFO insertion order. Only re-sort
-        // (and persist the sorted order) when processing more than one claim —
-        // sorting a single-element slice is free but writing the whole vector
-        // back to instance storage costs as much as the claim settlement itself.
-        let sorted_pending: Vec<u128> = if limit <= 1 || pending.len() <= 1 {
+        let effective_limit = if limit > MAX_BATCH_SIZE { MAX_BATCH_SIZE } else { limit };
+        // The queue is maintained in FIFO order. For a one-claim request,
+        // preserve that order without reading and sorting the whole queue.
+        let sorted_pending = if effective_limit == 1 {
             pending.clone()
         } else {
-            let mut claim_timestamps: Vec<(u128, u64)> = Vec::new(&env);
-            for i in 0..pending.len() {
-                let claim_id = pending.get_unchecked(i);
-                if let Some(claim) = env.storage().persistent().get::<_, Claim>(&StorageKey::Claim(claim_id)) {
-                    claim_timestamps.push_back((claim_id, claim.submitted_at));
-                }
+        // FAIRNESS FIX: Sort claims by submission time to ensure true FIFO processing.
+        // Even if the pending queue gets slightly out of order (due to concurrent 
+        // submissions or manual queue manipulation), this ensures oldest claims 
+        // are always processed first.
+        let mut claim_timestamps: Vec<(u128, u64)> = Vec::new(&env);
+        for i in 0..pending.len() {
+            let claim_id = pending.get_unchecked(i);
+            if let Some(claim) = env.storage().persistent().get::<_, Claim>(&StorageKey::Claim(claim_id)) {
+                claim_timestamps.push_back((claim_id, claim.submitted_at));
             }
-
-            // Bubble sort by submission timestamp (ascending — oldest first).
-            // Soroban does not provide a built-in sort; O(n²) is acceptable
-            // because the queue is bounded by MAX_BATCH_SIZE.
-            let len = claim_timestamps.len();
-            for i in 0..len {
-                for j in 0..(len - i - 1) {
-                    let curr = claim_timestamps.get_unchecked(j);
-                    let next = claim_timestamps.get_unchecked(j + 1);
-                    if curr.1 > next.1 {
-                        claim_timestamps.set(j, next);
-                        claim_timestamps.set(j + 1, curr);
-                    }
-                }
+        }
+        
+        // Sort by timestamp (ascending - oldest first) using insertion sort (#784).
+        // Insertion sort is O(n) on nearly-sorted data (the common case — claims
+        // are appended in submission order) and avoids the O(n²) worst case of the
+        // previous bubble sort that could exhaust the Soroban instruction budget on
+        // large queues.
+        let len = claim_timestamps.len();
+        for i in 1..len {
+            let key = claim_timestamps.get_unchecked(i);
+            let mut j = i;
+            while j > 0 && claim_timestamps.get_unchecked(j - 1).1 > key.1 {
+                let prev = claim_timestamps.get_unchecked(j - 1);
+                claim_timestamps.set(j, prev);
+                j -= 1;
             }
-
-            let mut out: Vec<u128> = Vec::new(&env);
-            for i in 0..claim_timestamps.len() {
-                let (claim_id, _) = claim_timestamps.get_unchecked(i);
-                out.push_back(claim_id);
-            }
-            // Persist the sorted order so the next batch call starts already ordered.
-            env.storage().instance().set(&StorageKey::PendingClaims, &out);
-            out
+            claim_timestamps.set(j, key);
+        }
+        
+        // Rebuild pending queue in correct FIFO order
+        let mut sorted_pending: Vec<u128> = Vec::new(&env);
+        for i in 0..claim_timestamps.len() {
+            let (claim_id, _) = claim_timestamps.get_unchecked(i);
+            sorted_pending.push_back(claim_id);
+        }
+        
+        // Update storage with sorted order
+        env.storage().instance().set(&StorageKey::PendingClaims, &sorted_pending);
+            sorted_pending
         };
         
         let mut results: Vec<(u128, ClaimResult)> = Vec::new(&env);
-        let effective_limit = if limit > MAX_BATCH_SIZE { MAX_BATCH_SIZE } else { limit };
         let process_count = if sorted_pending.len() < effective_limit {
             sorted_pending.len()
         } else {
@@ -1261,6 +1396,7 @@ impl ClaimsProcessor {
     /// an admin resolves the dispute.
     pub fn dispute_claim(env: Env, caller: Address, claim_id: u128, reason: soroban_sdk::Symbol) {
         caller.require_auth();
+        Self::require_not_paused(&env);
         let mut claim: Claim = env.storage().persistent()
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
@@ -1346,6 +1482,7 @@ impl ClaimsProcessor {
     /// claims queue for the next keeper to process.
     pub fn resolve_dispute(env: Env, admin: Address, claim_id: u128) {
         Self::require_admin(&env, &admin);
+        Self::require_not_paused(&env);
         
         let mut claim: Claim = env.storage().persistent()
             .get(&StorageKey::Claim(claim_id))
@@ -2372,12 +2509,12 @@ impl ClaimsProcessor {
             panic_with_error!(&env, Error::NotEscalatable);
         }
 
-        // SECURITY FIX: Verify escalation is within the allowed time window from claim submission.
-        // Claims should only be escalatable within a reasonable time after submission.
-        // After the policy end_time + claim_deadline has passed, escalation is no longer meaningful
-        // because the policy period is over and the claim should have been processed already.
+        // The escalation window is relative to claim submission, not policy end.
+        // A claim submitted just before the deadline has the same escalation
+        // window as one submitted early. Using policy.end_time would give
+        // late-submitted claims less time to escalate, which is incorrect.
         let claim_deadline = Self::claim_deadline(&env);
-        let escalation_cutoff = policy.end_time.saturating_add(claim_deadline);
+        let escalation_cutoff = claim.submitted_at.saturating_add(claim_deadline);
         if now > escalation_cutoff {
             panic_with_error!(&env, Error::NotEscalatable);
         }
@@ -2431,6 +2568,12 @@ impl ClaimsProcessor {
         let policy_engine_id = Self::policy_engine(&env);
         let pe_client = parashield_policy_engine::PolicyEngineClient::new(&env, &policy_engine_id);
 
+        // Issue #805: cache (product_id -> threshold) so that claims sharing a
+        // product only pay one get_policy + one get_product cross-contract call
+        // per distinct product_id rather than 2 calls per claim.
+        let mut cached_product_id: Option<u128> = None;
+        let mut cached_threshold: u64 = Self::escalation_threshold(&env, None);
+
         for i in 0..pending.len() {
             let cid = pending.get_unchecked(i);
             if let Some(claim) = env
@@ -2440,9 +2583,16 @@ impl ClaimsProcessor {
             {
                 if claim.status == ClaimStatus::Pending {
                     let policy = pe_client.get_policy(&claim.policy_id);
-                    let product = pe_client.get_product(&policy.product_id);
-                    let threshold = Self::escalation_threshold(&env, Some(product.category));
-                    
+                    let threshold = if cached_product_id == Some(policy.product_id) {
+                        cached_threshold
+                    } else {
+                        let product = pe_client.get_product(&policy.product_id);
+                        let t = Self::escalation_threshold(&env, Some(product.category));
+                        cached_product_id = Some(policy.product_id);
+                        cached_threshold = t;
+                        t
+                    };
+
                     if now.saturating_sub(claim.submitted_at) >= threshold {
                         overdue.push_back(cid);
                     }
@@ -3060,18 +3210,23 @@ impl ClaimsProcessor {
     ///
     /// Called from `submit_claim` after all existing gates so a rejection at
     /// this point does not leak partial state.
+    ///
+    /// `history` must be the claimant's history as it stood *before* this
+    /// submission (issue #855) — `submit_claim` already writes the
+    /// post-submission history to storage by the time this runs, so
+    /// re-fetching it here would score the submission against itself.
     fn evaluate_fraud(
         env: &Env,
         claim_id: u128,
         claimant: &Address,
         coverage_amount: i128,
+        history: &ClaimantHistory,
     ) -> (u32, u32) {
         let Some(cfg) = Self::fraud_config(env) else {
             return (0, 0);
         };
         let now = env.ledger().timestamp();
-        let history = Self::claimant_history(env, claimant);
-        let (score, flags) = Self::score_submission(&cfg, now, &history, coverage_amount);
+        let (score, flags) = Self::score_submission(&cfg, now, history, coverage_amount);
         if score >= cfg.fraud_threshold_score && cfg.fraud_threshold_score > 0 {
             env.events().publish(
                 (Symbol::new(env, "fraud_flagged"),),
@@ -3166,3 +3321,5 @@ mod test_keeper_registry;
 mod test_claim_uniqueness;
 #[cfg(test)]
 mod test_coverage_mismatch;
+
+mod test_cross_contract_failures;

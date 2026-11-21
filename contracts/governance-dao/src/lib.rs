@@ -133,6 +133,9 @@ enum StorageKey {
     /// Marks that a delegator's weight was already counted in a proposal, so
     /// they cannot also vote it themselves — (proposal_id, delegator).
     DelegatedVote(u64, Address),
+    /// Tracks all delegators whose weight was counted for a proposal,
+    /// so DelegatedVote markers can be cleaned up on finalization/resolution.
+    DelegatedVoters(u64),
     /// A registered proposal template (`ProposalTemplate`) by name.
     Template(Symbol),
     /// Names of all registered templates (`Vec<Symbol>`).
@@ -154,6 +157,8 @@ enum StorageKey {
     /// Discussion). Cleared when the proposal resolves so the same action can
     /// be re-proposed after the previous one closes. Issue #630.
     ActiveProposalHash(BytesN<32>),
+    /// Immutable content hash captured at proposal creation, keyed by id.
+    ProposalContentHash(u64),
 }
 
 
@@ -169,7 +174,6 @@ pub enum Error {
     ProposalNotActive = 6,
     AlreadyVoted = 7,
     VotingClosed = 8,
-    VotingStillOpen = 9,
     ProposalNotPassed = 10,
     AlreadyExecuted = 11,
     AlreadyCancelled = 12,
@@ -344,22 +348,10 @@ impl GovernanceDao {
         // action; it just splits voter attention and wastes deposit capital.
         let content_hash = Self::proposal_content_hash(&env, &target, &function, &args);
         let hash_key = StorageKey::ActiveProposalHash(content_hash.clone());
-        if let Some(existing_id) = env.storage().instance().get::<_, u64>(&hash_key) {
-            // Only block if the existing proposal is still open. Once it
-            // resolves the hash is cleared (see finalize/cancel/reclaim_deposit)
-            // and the same action can be re-proposed legitimately.
-            if let Some(existing) = env
-                .storage()
-                .persistent()
-                .get::<_, Proposal>(&StorageKey::Proposal(existing_id))
-            {
-                if existing.status == ProposalStatus::Active
-                    || existing.status == ProposalStatus::Discussion
-                {
-                    panic_with_error!(&env, Error::DuplicateProposal);
-                }
-            }
-        }
+        let legacy_hash = Self::legacy_proposal_content_hash(&env, &target, &function, &args);
+        let legacy_hash_key = StorageKey::ActiveProposalHash(legacy_hash);
+        Self::reject_if_active_duplicate(&env, &hash_key);
+        Self::reject_if_active_duplicate(&env, &legacy_hash_key);
 
         let config: DaoConfig = env
             .storage()
@@ -416,10 +408,12 @@ impl GovernanceDao {
             verification_callback: None,
             execution_verified: true,
             is_vetoed: false,
+            executed_at: 0,
         };
 
         let proposal_key = StorageKey::Proposal(proposal_id);
         env.storage().persistent().set(&proposal_key, &proposal);
+        env.storage().persistent().set(&StorageKey::ProposalContentHash(proposal_id), &content_hash);
         env.storage()
             .instance()
             .set(&StorageKey::NextProposalId, &(proposal_id.checked_add(1).unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))));
@@ -494,19 +488,11 @@ impl GovernanceDao {
 
         let upgrade_content_hash = Self::proposal_content_hash(&env, &target, &upgrade_function, &upgrade_args);
         let upgrade_hash_key = StorageKey::ActiveProposalHash(upgrade_content_hash.clone());
-        if let Some(existing_id) = env.storage().instance().get::<_, u64>(&upgrade_hash_key) {
-            if let Some(existing) = env
-                .storage()
-                .persistent()
-                .get::<_, Proposal>(&StorageKey::Proposal(existing_id))
-            {
-                if existing.status == ProposalStatus::Active
-                    || existing.status == ProposalStatus::Discussion
-                {
-                    panic_with_error!(&env, Error::DuplicateProposal);
-                }
-            }
-        }
+        let legacy_upgrade_hash =
+            Self::legacy_proposal_content_hash(&env, &target, &upgrade_function, &upgrade_args);
+        let legacy_upgrade_hash_key = StorageKey::ActiveProposalHash(legacy_upgrade_hash);
+        Self::reject_if_active_duplicate(&env, &upgrade_hash_key);
+        Self::reject_if_active_duplicate(&env, &legacy_upgrade_hash_key);
 
         let config: DaoConfig = env
             .storage()
@@ -564,10 +550,12 @@ impl GovernanceDao {
             verification_callback: None,
             execution_verified: true,
             is_vetoed: false,
+            executed_at: 0,
         };
 
         let proposal_key = StorageKey::Proposal(proposal_id);
         env.storage().persistent().set(&proposal_key, &proposal);
+        env.storage().persistent().set(&StorageKey::ProposalContentHash(proposal_id), &upgrade_content_hash);
         env.storage().instance().set(
             &StorageKey::NextProposalId,
             &(proposal_id
@@ -1242,6 +1230,7 @@ impl GovernanceDao {
         // Issue #630: proposal is now resolved — clear its content hash so
         // the same action can be re-proposed.
         Self::clear_proposal_hash(&env, &proposal);
+        Self::cleanup_delegated_votes(&env, proposal_id);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_finalized"),),
@@ -1350,6 +1339,7 @@ impl GovernanceDao {
 
             // Issue #630: clear hash so the same action can be re-proposed.
             Self::clear_proposal_hash(&env, &proposal);
+            Self::cleanup_delegated_votes(&env, pid);
 
             env.events().publish(
                 (Symbol::new(&env, "proposal_finalized"),),
@@ -1405,6 +1395,7 @@ impl GovernanceDao {
 
         // Issue #630: clear hash so the same action can be re-proposed.
         Self::clear_proposal_hash(&env, &proposal);
+        Self::cleanup_delegated_votes(&env, proposal_id);
 
         env.events().publish(
             (Symbol::new(&env, "deposit_reclaimed"),),
@@ -1499,12 +1490,12 @@ impl GovernanceDao {
             },
         );
 
+        let executed_at = env.ledger().timestamp();
         proposal.status = ProposalStatus::Executed;
+        proposal.executed_at = executed_at;
         env.storage()
             .persistent()
             .set(&StorageKey::Proposal(proposal_id), &proposal);
-
-        let executed_at = env.ledger().timestamp();
         let audit = ExecutionAuditRecord {
             proposal_id,
             executor: proposal.proposer.clone(),
@@ -1685,6 +1676,7 @@ impl GovernanceDao {
 
         // Issue #630: clear hash so the same action can be re-proposed.
         Self::clear_proposal_hash(&env, &proposal);
+        Self::cleanup_delegated_votes(&env, proposal_id);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_cancelled"),),
@@ -1965,7 +1957,7 @@ impl GovernanceDao {
 
         // Validate template payload structure (#694)
         if min_title_len == 0 || min_title_len > 256 || required_arg_count > 64 {
-            panic_with_error!(&env, Error::InvalidParameter);
+            panic_with_error!(&env, Error::InvalidInput);
         }
 
         if env.storage().instance().has(&StorageKey::Template(name.clone())) {
@@ -2045,6 +2037,12 @@ impl GovernanceDao {
     /// `template.min_title_len` bytes and `args` must have exactly
     /// `template.required_arg_count` entries. Otherwise behaves exactly
     /// like `create_proposal` (same deposit/threshold/lifecycle).
+    ///
+    /// This template check is purely structural. It does not look at the
+    /// proposer's gov-token balance or scan for a duplicate active
+    /// proposal, so passing it is not a guarantee that the `create_proposal`
+    /// call below will succeed — that call can still panic with, e.g.,
+    /// `Error::InsufficientWeight` or `Error::DuplicateProposal` (issue #851).
     pub fn create_proposal_from_template(
         env: Env,
         proposer: Address,
@@ -2420,9 +2418,10 @@ impl GovernanceDao {
             .get(&StorageKey::Proposal(proposal_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
 
-        // Can only veto before execution
-        if proposal.status == ProposalStatus::Executed {
-            panic_with_error!(&env, Error::AlreadyExecuted);
+        // SECURITY FIX (issue #813): Only allow veto on Discussion and Active proposals
+        // Veto on terminal states (Passed, Failed, Executed, Cancelled, Expired) has no effect
+        if proposal.status != ProposalStatus::Discussion && proposal.status != ProposalStatus::Active {
+            panic_with_error!(&env, Error::ProposalNotActive);
         }
 
         if proposal.is_vetoed {
@@ -2545,6 +2544,10 @@ impl GovernanceDao {
             Some(cp) => (core::cmp::min(cp.amount, balance), cp.since),
             None => (0, now),
         };
+        // Guard against division by zero: a zero ramp_period means no ramp-up — apply full weight immediately (#809).
+        if cfg.ramp_period == 0 {
+            return balance;
+        }
         let elapsed = core::cmp::min(now.saturating_sub(since), cfg.ramp_period) as i128;
         let factor = min + (full - min) * elapsed / cfg.ramp_period as i128;
         aged.saturating_mul(factor) / full + (balance - aged).saturating_mul(min) / full
@@ -2672,7 +2675,7 @@ impl GovernanceDao {
             total_votes
                 .checked_mul(10_000)
                 .map(|v| v / total_supply)
-                .unwrap_or(10_000)
+                .unwrap_or(0)
                 .clamp(0, 10_000) as u32
         };
 
@@ -2732,6 +2735,13 @@ impl GovernanceDao {
             .get(&StorageKey::Delegators(voter.clone()))
             .unwrap_or_else(|| Vec::new(env));
 
+        let mut recorded_delegators: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DelegatedVoters(proposal_id))
+            .unwrap_or_else(|| Vec::new(env));
+        let mut recorded_any = false;
+
         let mut total: i128 = 0;
         for i in 0..delegators.len() {
             let delegator = delegators.get_unchecked(i);
@@ -2745,6 +2755,8 @@ impl GovernanceDao {
                 continue;
             }
             env.storage().persistent().set(&marker, &true);
+            recorded_delegators.push_back(delegator.clone());
+            recorded_any = true;
 
             let counted = Self::time_weighted(env, &delegator, balance);
             total = total.saturating_add(counted);
@@ -2761,13 +2773,64 @@ impl GovernanceDao {
             );
         }
 
+        if recorded_any {
+            env.storage()
+                .persistent()
+                .set(&StorageKey::DelegatedVoters(proposal_id), &recorded_delegators);
+        }
+
         total
+    }
+
+    /// Clean up DelegatedVote markers and DelegatedVoters tracking list for a resolved proposal.
+    fn cleanup_delegated_votes(env: &Env, proposal_id: u64) {
+        if let Some(voters) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<Address>>(&StorageKey::DelegatedVoters(proposal_id))
+        {
+            for i in 0..voters.len() {
+                let delegator = voters.get_unchecked(i);
+                env.storage()
+                    .persistent()
+                    .remove(&StorageKey::DelegatedVote(proposal_id, delegator));
+            }
+            env.storage()
+                .persistent()
+                .remove(&StorageKey::DelegatedVoters(proposal_id));
+        }
+    }
+
+    /// Panic with `DuplicateProposal` if `hash_key` points to a still-open
+    /// (`Active` or `Discussion`) proposal.
+    fn reject_if_active_duplicate(env: &Env, hash_key: &StorageKey) {
+        if let Some(existing_id) = env.storage().instance().get::<_, u64>(hash_key) {
+            // Only block if the existing proposal is still open. Once it
+            // resolves the hash is cleared (see finalize/cancel/reclaim_deposit)
+            // and the same action can be re-proposed legitimately.
+            if let Some(existing) = env
+                .storage()
+                .persistent()
+                .get::<_, Proposal>(&StorageKey::Proposal(existing_id))
+            {
+                if existing.status == ProposalStatus::Active
+                    || existing.status == ProposalStatus::Discussion
+                {
+                    panic_with_error!(env, Error::DuplicateProposal);
+                }
+            }
+        }
     }
 
     /// Compute a content hash over `(target, function, args)` that uniquely
     /// identifies the on-chain action a proposal would perform. Used to detect
-    /// duplicate proposals (issue #630). SHA-256 is available through the
+    /// duplicate proposals (issue #630, #820). SHA-256 is available through the
     /// Soroban host and produces a 32-byte `BytesN<32>`.
+    ///
+    /// Each argument is encoded as a fixed-width 9-byte sequence:
+    /// `[scval_type_tag: u8, raw_payload_be: [u8; 8]]` (issue #820), so the
+    /// ScVal type tag is explicitly part of the hash preimage alongside the
+    /// 64-bit `Val` payload.
     fn proposal_content_hash(
         env: &Env,
         target: &Address,
@@ -2783,7 +2846,34 @@ impl GovernanceDao {
         // Append the function symbol bytes (up to 9 chars encoded as Soroban's u64).
         let fn_val: u64 = function.to_val().get_payload();
         preimage.extend_from_array(&fn_val.to_be_bytes());
-        // Append each arg's raw XDR payload so identical argument lists hash identically.
+        // Append each arg's explicit ScVal type tag (1 byte) followed by its
+        // 64-bit big-endian payload (8 bytes) so argument types, boundaries,
+        // and ordering are unambiguous.
+        for i in 0..args.len() {
+            let v: Val = args.get_unchecked(i);
+            let tag: u8 = v.get_tag() as u8;
+            let payload: u64 = v.get_payload();
+            preimage.extend_from_array(&[tag]);
+            preimage.extend_from_array(&payload.to_be_bytes());
+        }
+        env.crypto().sha256(&preimage).into()
+    }
+
+    /// Pre-#820 payload-only hash kept solely for backward-compatible lookup
+    /// and cleanup of proposals created before the tag byte was added.
+    fn legacy_proposal_content_hash(
+        env: &Env,
+        target: &Address,
+        function: &Symbol,
+        args: &Vec<Val>,
+    ) -> BytesN<32> {
+        let mut preimage = soroban_sdk::Bytes::new(env);
+        let target_str = target.to_string();
+        let mut target_buf = [0u8; 56];
+        target_str.copy_into_slice(&mut target_buf);
+        preimage.extend_from_array(&target_buf);
+        let fn_val: u64 = function.to_val().get_payload();
+        preimage.extend_from_array(&fn_val.to_be_bytes());
         for i in 0..args.len() {
             let v: Val = args.get_unchecked(i);
             let payload: u64 = v.get_payload();
@@ -2794,18 +2884,28 @@ impl GovernanceDao {
 
     /// Remove the active-proposal hash entry for `proposal`, if present.
     /// Called whenever a proposal leaves Active/Discussion so the same action
-    /// can be re-proposed later (issue #630).
+    /// can be re-proposed later (issue #630). Also clears any legacy pre-#820
+    /// hash entry so in-flight proposals created before upgrade leave no
+    /// orphaned storage keys.
     fn clear_proposal_hash(env: &Env, proposal: &Proposal) {
-        let hash = Self::proposal_content_hash(
+        let hash = env.storage().persistent()
+            .get(&StorageKey::ProposalContentHash(proposal.id))
+            .unwrap_or_else(|| Self::proposal_content_hash(env, &proposal.target, &proposal.function, &proposal.args));
+        let key = StorageKey::ActiveProposalHash(hash);
+        if env.storage().instance().has(&key) {
+            env.storage().instance().remove(&key);
+        }
+        let legacy_hash = Self::legacy_proposal_content_hash(
             env,
             &proposal.target,
             &proposal.function,
             &proposal.args,
         );
-        let key = StorageKey::ActiveProposalHash(hash);
-        if env.storage().instance().has(&key) {
-            env.storage().instance().remove(&key);
+        let legacy_key = StorageKey::ActiveProposalHash(legacy_hash);
+        if env.storage().instance().has(&legacy_key) {
+            env.storage().instance().remove(&legacy_key);
         }
+        env.storage().persistent().remove(&StorageKey::ProposalContentHash(proposal.id));
     }
 
     fn require_admin(env: &Env, caller: &Address) {        let admin: Address = env
@@ -2832,14 +2932,11 @@ impl GovernanceDao {
         }
     }
 
-    /// Extend the TTL for proposal-related storage entries to prevent expiry
-    /// during voting, timelock, and execution periods.
-    fn extend_proposal_ttl(env: &Env, key: &StorageKey, _config: &DaoConfig) {
-        env.storage().persistent().extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
-    }
 }
 
 #[cfg(test)]
 mod test;
 #[cfg(test)]
 mod test_advanced;
+#[cfg(test)]
+mod test_content_hash;

@@ -22,7 +22,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token, Address,
-    BytesN, Env, IntoVal, Symbol, SymbolStr, TryFromVal, Vec,
+    BytesN, Env, IntoVal, String, Symbol, SymbolStr, TryFromVal, Vec,
 };
 
 pub mod types;
@@ -37,6 +37,8 @@ const CURRENT_STORAGE_VERSION: u32 = 3;
 const MAX_BATCH_BUY: u32 = 20;
 const DEFAULT_EXPIRY_WARNING_WINDOW: u64 = 7 * 24 * 60 * 60;
 const MAX_EXPIRY_SCAN: u32 = 50;
+/// Maximum number of policy IDs scanned per `backfill_product_stats` call (issue #821).
+pub const MAX_BACKFILL_BATCH: u32 = 100;
 /// Upper bound on a product's `coverage_max`. A product with an absurdly high
 /// ceiling would let a single policy lock up unbounded pool capital and create
 /// unrealistic exposure (issue #616). Matches the per-policy cap enforced in
@@ -80,8 +82,8 @@ enum StorageKey {
     Version,
     ExpiryWarningWindow,
     ExpiryWarned(u128),
-    /// Maps product name -> product_id, so names stay unique (issue #514).
-    ProductName(Symbol),
+    /// Maps product name -> product_id, so names stay unique (issue #514, #804).
+    ProductName(String),
     /// Ledger timestamp (u64) of a buyer's last purchase on an oracle key,
     /// used to enforce `PURCHASE_COOLING_OFF_SECONDS` (issue #671).
     LastPurchase((Address, Symbol)),
@@ -97,6 +99,10 @@ enum StorageKey {
     RegisteredOracleDataType(Symbol),
     /// Vec<Symbol> of all registered oracle data types (issue #745)
     OracleDataTypeRegistry,
+    /// Per-product aggregated statistics maintained incrementally in O(1) (issue #821).
+    ProductStats(u128),
+    /// Tracks whether `Policy(policy_id)` has been accounted for in `ProductStats` (issue #821).
+    PolicyStatsCounted(u128),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -469,22 +475,14 @@ impl PolicyEngine {
             panic_with_error!(&env, Error::InvalidCategory);
         }
 
-        // Product description / name must not be empty (issue #755).
-        if params.name == Symbol::new(&env, "") {
-            panic_with_error!(&env, Error::EmptyDescription);
-        }
+        // Product name must not be empty or too short (issue #755, #804).
         {
-            let sym_val = params.name.to_symbol_val();
-            let sym_str: Result<SymbolStr, _> = SymbolStr::try_from_val(&env, &sym_val);
-            if let Ok(s) = sym_str {
-                let s_str: &str = s.as_ref();
-                let bytes: &[u8] = s_str.as_bytes();
-                if bytes.is_empty() {
-                    panic_with_error!(&env, Error::EmptyDescription);
-                }
-                if bytes.len() < 3 {
-                    panic_with_error!(&env, Error::InvalidDescription);
-                }
+            let name_len = params.name.len();
+            if name_len == 0 {
+                panic_with_error!(&env, Error::EmptyDescription);
+            }
+            if name_len < 3 {
+                panic_with_error!(&env, Error::InvalidDescription);
             }
         }
 
@@ -611,6 +609,12 @@ impl PolicyEngine {
         }
 
         // Product names must be unique so users can tell products apart (#514).
+        // This uniqueness check is an exact byte comparison on `String` and
+        // performs no case-folding or Unicode normalization: "Crop" and
+        // "crop" (or two differently-normalized forms of the same visible
+        // name) are distinct names and do not collide (issue #850). Callers
+        // that want human-friendly de-duplication must normalize `name`
+        // themselves before calling `create_product`.
         let name_key = StorageKey::ProductName(params.name.clone());
         if env.storage().persistent().has(&name_key) {
             panic_with_error!(&env, Error::DuplicateProductName);
@@ -807,7 +811,7 @@ impl PolicyEngine {
     ///
     /// The buyer must have approved this contract to spend `premium` USDC
     /// (or the transaction must include the token transfer auth).
-    /// Premium = coverage_amount * premium_rate_bps / 10_000.
+    /// Premium = coverage_amount * premium_rate_bps * duration_days / (365 * 10_000).
     ///
     /// `oracle_key` is the specific measurement key to watch, e.g.
     /// `symbol_short!("kis2606")` for Kisumu June 2026 rainfall.
@@ -917,9 +921,9 @@ impl PolicyEngine {
             panic_with_error!(env, Error::InvalidStartTime);
         }
         
-        // SECURITY FIX: Validate oracle_key length to prevent excessively long keys
-        // that could cause issues with oracle lookups. Backend validates max 32 chars,
-        // but direct contract calls could bypass that. Enforce the same limit on-chain.
+        // Validate oracle_key: must be non-empty and at most 32 characters (issue #795).
+        // An empty Symbol passes the length-only check and would produce a policy with
+        // no oracle key, causing claim evaluation to fail silently.
         {
             let sym_val = oracle_key.to_symbol_val();
             let sym_str: Result<soroban_sdk::SymbolStr, _> = soroban_sdk::SymbolStr::try_from_val(env, &sym_val);
@@ -927,8 +931,10 @@ impl PolicyEngine {
                 Ok(s) => {
                     let s_str: &str = s.as_ref();
                     let bytes: &[u8] = s_str.as_bytes();
-                    // Reject oracle keys longer than 32 characters
-                    if bytes.len() > 32 {
+                    // Issue #789: match the same 3-9 char limit enforced by
+                    // create_product so the oracle key accepted at buy time is
+                    // always a valid key for the product it was created with.
+                    if bytes.len() < 3 || bytes.len() > 9 {
                         panic_with_error!(env, Error::InvalidOracleKey);
                     }
                 }
@@ -995,12 +1001,17 @@ impl PolicyEngine {
         }
         
         // SECURITY FIX: Calculate the required premium based on product parameters.
-        // This prevents callers from providing arbitrary premium amounts.
-        let required_premium = coverage_amount
+        // Ceiling division matches the backend's calculatePremium (#598) and ensures
+        // the pool never undercollects by up to 1 stroop per policy.
+        let numerator = coverage_amount
             .checked_mul(product.premium_rate_bps as i128)
             .and_then(|v| v.checked_mul(duration_days as i128))
-            .and_then(|v| v.checked_div(365))
-            .and_then(|v| v.checked_div(10_000))
+            .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
+        let divisor: i128 = 365 * 10_000;
+        // Ceiling integer division: (n + d - 1) / d
+        let required_premium = numerator
+            .checked_add(divisor - 1)
+            .and_then(|v| v.checked_div(divisor))
             .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
 
         // SECURITY FIX (issue #719): Reject zero or negative premium amounts to prevent free coverage
@@ -1073,6 +1084,7 @@ impl PolicyEngine {
             TTL_THRESHOLD,
             TTL_EXTEND_TO,
         );
+        Self::record_policy_created_in_stats(env, &policy);
 
         let user_key = StorageKey::UserPolicies(buyer.clone());
         let mut user_policies: Vec<u128> = env
@@ -1120,6 +1132,7 @@ impl PolicyEngine {
         env.storage()
             .persistent()
             .set(&StorageKey::Policy(policy_id), &policy);
+        Self::record_policy_deactivated_in_stats(&env, policy_id, policy.product_id);
         Self::remove_policy_from_user(&env, &policyholder, policy_id);
 
         let now = env.ledger().timestamp();
@@ -1134,7 +1147,10 @@ impl PolicyEngine {
                 .checked_mul(elapsed_capped as i128)
                 .and_then(|v| v.checked_div(total_duration as i128))
                 .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
-            policy.premium_paid.saturating_sub(earned)
+            // Clamp earned to [0, premium_paid] so integer division rounding
+            // can never produce a negative refund or a refund above the premium (#800).
+            let earned_clamped = earned.min(policy.premium_paid).max(0);
+            policy.premium_paid.saturating_sub(earned_clamped)
         };
 
         let usdc: Address = env
@@ -1255,6 +1271,7 @@ impl PolicyEngine {
         env.storage()
             .persistent()
             .set(&StorageKey::Policy(policy_id), &policy);
+        Self::record_policy_deactivated_in_stats(&env, policy_id, policy.product_id);
         Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
 
         env.events().publish(
@@ -1278,6 +1295,7 @@ impl PolicyEngine {
         env.storage()
             .persistent()
             .set(&StorageKey::Policy(policy_id), &policy);
+        Self::record_policy_deactivated_in_stats(&env, policy_id, policy.product_id);
         Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
 
         let timestamp = env.ledger().timestamp();
@@ -1302,60 +1320,90 @@ impl PolicyEngine {
     /// Return aggregated statistics for a product: total policies, active count,
     /// total coverage, and total premiums collected. Returns zeros if the product
     /// does not exist or has no policies.
+    ///
+    /// Reads pre-aggregated per-product counters in O(1) rather than scanning
+    /// `1..NextPolicyId` (issue #821).
+    /// Return aggregate stats for `product_id` in O(1) (#790).
+    ///
+    /// Counters are maintained incrementally by `buy_policy` / `cancel_policy` /
+    /// `pay_claim` / `expire_policy` so this is a single persistent-storage read
+    /// regardless of the number of policies. Existing policies created before
+    /// incremental tracking was introduced can be backfilled with
+    /// `backfill_product_stats`.
     pub fn get_product_stats(env: Env, product_id: u128) -> ProductStats {
-        let _product = match env
+        if !env
             .storage()
             .persistent()
-            .get::<_, InsuranceProduct>(&StorageKey::Product(product_id))
+            .has(&StorageKey::Product(product_id))
         {
-            Some(p) => p,
-            None => {
-                return ProductStats {
-                    product_id,
-                    total_policies: 0,
-                    active_policies: 0,
-                    total_coverage: 0,
-                    total_premium_collected: 0,
-                }
-            }
-        };
+            return ProductStats {
+                product_id,
+                total_policies: 0,
+                active_policies: 0,
+                total_coverage: 0,
+                total_premium_collected: 0,
+            };
+        }
 
-        let mut total_policies: u32 = 0;
-        let mut active_policies: u32 = 0;
-        let mut total_coverage: i128 = 0;
-        let mut total_premium_collected: i128 = 0;
+        env.storage()
+            .persistent()
+            .get::<_, ProductStats>(&StorageKey::ProductStats(product_id))
+            .unwrap_or(ProductStats {
+                product_id,
+                total_policies: 0,
+                active_policies: 0,
+                total_coverage: 0,
+                total_premium_collected: 0,
+            })
+    }
 
+    /// Admin-only: backfill per-product stats counters for pre-existing policies
+    /// created before incremental tracking was introduced (issue #821).
+    ///
+    /// Scans policy IDs in `[start_id.max(1), min(start_id.max(1) + capped_limit, next_id))`,
+    /// where `capped_limit = limit.min(MAX_BACKFILL_BATCH)`. Policies already recorded
+    /// in `StorageKey::PolicyStatsCounted` are skipped, making this function strictly
+    /// idempotent — calling it repeatedly over the same or overlapping ranges will
+    /// never double-count. Returns the number of newly backfilled policies.
+    pub fn backfill_product_stats(env: Env, admin: Address, start_id: u128, limit: u32) -> u32 {
+        Self::require_admin(&env, &admin);
+        if limit == 0 {
+            return 0;
+        }
+        let capped = limit.min(MAX_BACKFILL_BATCH) as u128;
         let next_id: u128 = env
             .storage()
             .instance()
             .get(&StorageKey::NextPolicyId)
             .unwrap_or(1);
+        let start = start_id.max(1);
+        if start >= next_id {
+            return 0;
+        }
+        let end = start.saturating_add(capped).min(next_id);
+        let mut backfilled: u32 = 0;
 
-        for pid in 1..next_id {
+        for pid in start..end {
+            let counted_key = StorageKey::PolicyStatsCounted(pid);
+            if env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&counted_key)
+                .unwrap_or(false)
+            {
+                continue;
+            }
             if let Some(policy) = env
                 .storage()
                 .persistent()
                 .get::<_, Policy>(&StorageKey::Policy(pid))
             {
-                if policy.product_id == product_id {
-                    total_policies += 1;
-                    if policy.status == PolicyStatus::Active {
-                        active_policies += 1;
-                    }
-                    total_coverage = total_coverage.saturating_add(policy.coverage_amount);
-                    total_premium_collected =
-                        total_premium_collected.saturating_add(policy.premium_paid);
-                }
+                Self::record_policy_created_in_stats(&env, &policy);
+                backfilled += 1;
             }
         }
 
-        ProductStats {
-            product_id,
-            total_policies,
-            active_policies,
-            total_coverage,
-            total_premium_collected,
-        }
+        backfilled
     }
 
     /// Return a paginated slice of policy IDs owned by `user`. `offset` is the zero-based
@@ -1853,6 +1901,75 @@ impl PolicyEngine {
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
+    /// Record a newly created (or backfilled) policy in its product's O(1) stats
+    /// counters and mark it as counted so backfill remains strictly idempotent (issue #821).
+    fn record_policy_created_in_stats(env: &Env, policy: &Policy) {
+        let stats_key = StorageKey::ProductStats(policy.product_id);
+        let mut stats: ProductStats = env
+            .storage()
+            .persistent()
+            .get(&stats_key)
+            .unwrap_or(ProductStats {
+                product_id: policy.product_id,
+                total_policies: 0,
+                active_policies: 0,
+                total_coverage: 0,
+                total_premium_collected: 0,
+            });
+        stats.total_policies = stats
+            .total_policies
+            .checked_add(1)
+            .unwrap_or_else(|| panic_with_error!(env, Error::Overflow));
+        if policy.status == PolicyStatus::Active {
+            stats.active_policies = stats
+                .active_policies
+                .checked_add(1)
+                .unwrap_or_else(|| panic_with_error!(env, Error::Overflow));
+        }
+        stats.total_coverage = stats
+            .total_coverage
+            .checked_add(policy.coverage_amount)
+            .unwrap_or_else(|| panic_with_error!(env, Error::Overflow));
+        stats.total_premium_collected = stats
+            .total_premium_collected
+            .checked_add(policy.premium_paid)
+            .unwrap_or_else(|| panic_with_error!(env, Error::Overflow));
+
+        env.storage().persistent().set(&stats_key, &stats);
+        env.storage()
+            .persistent()
+            .extend_ttl(&stats_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        let counted_key = StorageKey::PolicyStatsCounted(policy.id);
+        env.storage().persistent().set(&counted_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&counted_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Decrement `active_policies` when an active policy transitions to
+    /// `Cancelled`, `Claimed`, or `Expired` (issue #821). Only decrements if the
+    /// policy was already counted, preventing underflow on un-backfilled legacy policies.
+    fn record_policy_deactivated_in_stats(env: &Env, policy_id: u128, product_id: u128) {
+        let counted_key = StorageKey::PolicyStatsCounted(policy_id);
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&counted_key)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let stats_key = StorageKey::ProductStats(product_id);
+        if let Some(mut stats) = env.storage().persistent().get::<_, ProductStats>(&stats_key) {
+            stats.active_policies = stats.active_policies.checked_sub(1).unwrap_or(0);
+            env.storage().persistent().set(&stats_key, &stats);
+            env.storage()
+                .persistent()
+                .extend_ttl(&stats_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+    }
+
     fn require_admin(env: &Env, caller: &Address) {
         let admin: Address = env
             .storage()
@@ -2089,3 +2206,5 @@ mod test_product_names;
 mod test_category_validation;
 #[cfg(test)]
 mod test_cooling_off;
+#[cfg(test)]
+mod test_product_stats;

@@ -956,3 +956,692 @@ fn reading_just_past_five_times_the_mad_is_dropped() {
     // (90 + 100 + 100 + 110) / 4 = 100
     assert_eq!(mean_with_outlier(150_0000001), 100_0000000);
 }
+
+// ── Issue #835: weighted median, mean, outlier rejection, cross-validation,
+//    freshness and staleness edge cases ──────────────────────────────────────
+
+/// Odd submission count with unequal weights: a single heavy oracle whose
+/// weight exceeds half the total weight decides the weighted median.
+#[test]
+fn weighted_median_odd_count_heavy_oracle_decides() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let now = env.ledger().timestamp();
+
+    // Sorted by (value, weight): [(10, 10), (20, 10), (30, 80)]
+    // total_weight = 10 + 10 + 80 = 100, half = 50.
+    // Cumulative weights: 10 (<=50), 20 (<=50), 100 (>50) -> 30_000_000.
+    submit_from_many(
+        &env,
+        &c,
+        &admin,
+        BulkSubmission {
+            data_type: wt(),
+            key: kk(),
+            readings: &[(30_000_000, 80), (10_000_000, 10), (20_000_000, 10)],
+            timestamp: now,
+        },
+    );
+
+    assert_eq!(c.get_aggregated(&wt(), &kk()).median_value, 30_000_000);
+}
+
+/// Even submission count with equal weights: cumulative weight lands exactly on
+/// `total_weight / 2` (with even total_weight), returning the midpoint of the
+/// two middle values.
+#[test]
+fn weighted_median_even_count_equal_weights_averages_middle_two() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let now = env.ledger().timestamp();
+
+    // Sorted: [(10, 25), (20, 25), (40, 25), (80, 25)]
+    // total_weight = 100, half = 50.
+    // Cumulative after 20 is 50 == half (and 100 is even) -> (20 + 40) / 2 = 30.
+    submit_from_many(
+        &env,
+        &c,
+        &admin,
+        BulkSubmission {
+            data_type: wt(),
+            key: kk(),
+            readings: &[
+                (80_000_000, 25),
+                (10_000_000, 25),
+                (40_000_000, 25),
+                (20_000_000, 25),
+            ],
+            timestamp: now,
+        },
+    );
+
+    assert_eq!(c.get_aggregated(&wt(), &kk()).median_value, 30_000_000);
+}
+
+/// Even submission count with unequal weights hitting exact half vs crossing
+/// half on a heavy oracle.
+#[test]
+fn weighted_median_even_count_unequal_weights_exact_half_and_heavy_cross() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let now = env.ledger().timestamp();
+
+    // Case 1 (exact half): sorted [(10, 20), (20, 30), (50, 10), (90, 40)]
+    // total_weight = 100, half = 50.
+    // Cumulative after 20 = 20 + 30 = 50 == half -> (20 + 50) / 2 = 35_000_000.
+    let key1 = symbol_short!("even1");
+    submit_from_many(
+        &env,
+        &c,
+        &admin,
+        BulkSubmission {
+            data_type: wt(),
+            key: key1.clone(),
+            readings: &[
+                (10_000_000, 20),
+                (20_000_000, 30),
+                (50_000_000, 10),
+                (90_000_000, 40),
+            ],
+            timestamp: now,
+        },
+    );
+    assert_eq!(c.get_aggregated(&wt(), &key1).median_value, 35_000_000);
+
+    // Case 2 (heavy oracle crosses half): sorted [(10, 10), (20, 10), (50, 60), (90, 20)]
+    // total_weight = 100, half = 50.
+    // Cumulative: 10, 20, 80 (>50) -> 50_000_000.
+    let key2 = symbol_short!("even2");
+    submit_from_many(
+        &env,
+        &c,
+        &admin,
+        BulkSubmission {
+            data_type: wt(),
+            key: key2.clone(),
+            readings: &[
+                (10_000_000, 10),
+                (20_000_000, 10),
+                (50_000_000, 60),
+                (90_000_000, 20),
+            ],
+            timestamp: now,
+        },
+    );
+    assert_eq!(c.get_aggregated(&wt(), &key2).median_value, 50_000_000);
+}
+
+/// Single submission returns that exact value under WeightedMedian.
+#[test]
+fn weighted_median_single_submission_returns_value() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let now = env.ledger().timestamp();
+
+    // total_weight = 50, half = 25; cumulative = 50 > 25 -> 42_000_000.
+    submit_from_many(
+        &env,
+        &c,
+        &admin,
+        BulkSubmission {
+            data_type: wt(),
+            key: kk(),
+            readings: &[(42_000_000, 50)],
+            timestamp: now,
+        },
+    );
+
+    assert_eq!(c.get_aggregated(&wt(), &kk()).median_value, 42_000_000);
+}
+
+/// Signed (negative) values are supported and aggregated accurately for both
+/// odd and even counts.
+#[test]
+fn weighted_median_handles_negative_values() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let now = env.ledger().timestamp();
+
+    // Odd count: sorted [-30, -10, 20], equal weights 50 -> total 150, half 75.
+    // Cumulative after -30 is 50, after -10 is 100 > 75 -> -10_000_000.
+    let key_odd = symbol_short!("negodd");
+    submit_from_many(
+        &env,
+        &c,
+        &admin,
+        BulkSubmission {
+            data_type: wt(),
+            key: key_odd.clone(),
+            readings: &[(-30_000_000, 50), (20_000_000, 50), (-10_000_000, 50)],
+            timestamp: now,
+        },
+    );
+    assert_eq!(c.get_aggregated(&wt(), &key_odd).median_value, -10_000_000);
+
+    // Even count: sorted [-40, -10], equal weights 50 -> total 100, half 50.
+    // (-40_000_000 + -10_000_000) / 2 = -25_000_000.
+    let key_even = symbol_short!("negevn");
+    submit_from_many(
+        &env,
+        &c,
+        &admin,
+        BulkSubmission {
+            data_type: wt(),
+            key: key_even.clone(),
+            readings: &[(-40_000_000, 50), (-10_000_000, 50)],
+            timestamp: now,
+        },
+    );
+    assert_eq!(c.get_aggregated(&wt(), &key_even).median_value, -25_000_000);
+}
+
+/// Very large values up to MAX_DATA_VALUE (10^27) on a custom data type do not
+/// overflow WeightedMedian or Mean.
+#[test]
+fn large_values_near_max_data_value_do_not_overflow() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let now = env.ledger().timestamp();
+    let custom = symbol_short!("custom");
+
+    let v1: i128 = 900_000_000_000_000_000_000_000_000; // 9 * 10^26
+    let v2: i128 = 1_000_000_000_000_000_000_000_000_000; // 10^27 == MAX_DATA_VALUE
+    let expected_mid: i128 = 950_000_000_000_000_000_000_000_000; // (9e26 + 1e27) / 2
+
+    submit_from_many(
+        &env,
+        &c,
+        &admin,
+        BulkSubmission {
+            data_type: custom.clone(),
+            key: kk(),
+            readings: &[(v1, 50), (v2, 50)],
+            timestamp: now,
+        },
+    );
+
+    assert_eq!(c.get_aggregated(&custom, &kk()).median_value, expected_mid);
+
+    c.set_aggregation_method(&admin, &custom, &AggregationMethod::Mean);
+    assert_eq!(c.get_aggregated(&custom, &kk()).median_value, expected_mid);
+}
+
+/// All identical submissions produce MAD = 0; since every deviation is 0 and
+/// `0 * 10_000 > threshold * 0` is false, all submissions are kept.
+#[test]
+fn outlier_rejection_all_identical_values_mad_zero_keeps_all() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let now = env.ledger().timestamp();
+    c.set_aggregation_method(&admin, &wt(), &AggregationMethod::Mean);
+    c.set_outlier_config(&admin, &wt(), &true, &50_000u32, &4u32);
+
+    // median = 50_000_000, deviations = [0, 0, 0, 0, 0], mad = 0.
+    submit_from_many(
+        &env,
+        &c,
+        &admin,
+        BulkSubmission {
+            data_type: wt(),
+            key: kk(),
+            readings: &[
+                (50_000_000, 50),
+                (50_000_000, 50),
+                (50_000_000, 50),
+                (50_000_000, 50),
+                (50_000_000, 50),
+            ],
+            timestamp: now,
+        },
+    );
+
+    let agg = c.get_aggregated(&wt(), &kk());
+    assert_eq!(agg.median_value, 50_000_000);
+}
+
+/// When a unanimous majority yields MAD = 0, any single differing value has
+/// `deviation * 10_000 > 0` and is rejected.
+#[test]
+fn outlier_rejection_mad_zero_rejects_single_differing_value() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let now = env.ledger().timestamp();
+    c.set_aggregation_method(&admin, &wt(), &AggregationMethod::Mean);
+    c.set_outlier_config(&admin, &wt(), &true, &50_000u32, &4u32);
+
+    // Sorted: [50_000_000, 50_000_000, 50_000_000, 50_000_000, 50_000_001]
+    // median = 50_000_000, deviations = [0, 0, 0, 0, 1], mad = 0.
+    // For 50_000_001: 1 * 10_000 = 10_000 > 50_000 * 0 = 0 -> dropped.
+    // Mean of remaining 4 = 50_000_000.
+    submit_from_many(
+        &env,
+        &c,
+        &admin,
+        BulkSubmission {
+            data_type: wt(),
+            key: kk(),
+            readings: &[
+                (50_000_000, 50),
+                (50_000_000, 50),
+                (50_000_000, 50),
+                (50_000_000, 50),
+                (50_000_001, 50),
+            ],
+            timestamp: now,
+        },
+    );
+
+    assert_eq!(c.get_aggregated(&wt(), &kk()).median_value, 50_000_000);
+}
+
+/// `min_sample_size` boundaries: one below (filtering skipped), exact (no
+/// trimming slack), one above (single outlier dropped), and multiple outliers
+/// where trimming stops at `min_sample_size` after removing the worst offender.
+#[test]
+fn outlier_rejection_min_sample_size_boundaries() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let now = env.ledger().timestamp();
+    c.set_aggregation_method(&admin, &wt(), &AggregationMethod::Mean);
+    c.set_outlier_config(&admin, &wt(), &true, &20_000u32, &4u32);
+
+    // Register 5 oracles once (staying within MAX_ORACLES_PER_KEY = 10) and
+    // reuse them across distinct keys — enabled by per-key rate limiting (#834).
+    let oracles: std::vec::Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
+    for o in oracles.iter() {
+        c.add_oracle(&admin, o, &wt(), &50u32);
+    }
+
+    // 1. Below min_sample_size (n = 3 < 4): filtering skipped.
+    // Mean = (100 + 100 + 1000) / 3 = 400.
+    let k_below = symbol_short!("msbelow");
+    let vals_below = [100_000_000i128, 100_000_000, 1_000_000_000];
+    for (o, v) in oracles.iter().zip(vals_below.iter()) {
+        c.submit_data(o, &wt(), &k_below, v, &90u32, &now);
+    }
+    assert_eq!(c.get_aggregated(&wt(), &k_below).median_value, 400_000_000);
+
+    // 2. Exactly at min_sample_size (n = 4 == 4): no slack to drop any point.
+    // Mean = (100 + 100 + 100 + 1000) / 4 = 325.
+    let k_exact = symbol_short!("msexact");
+    let vals_exact = [100_000_000i128, 100_000_000, 100_000_000, 1_000_000_000];
+    for (o, v) in oracles.iter().zip(vals_exact.iter()) {
+        c.submit_data(o, &wt(), &k_exact, v, &90u32, &now);
+    }
+    assert_eq!(c.get_aggregated(&wt(), &k_exact).median_value, 325_000_000);
+
+    // 3. One above min_sample_size (n = 5 > 4) with 1 outlier: outlier dropped.
+    // Mean of remaining 4 = 100.
+    let k_above = symbol_short!("msabove");
+    let vals_above = [
+        100_000_000i128,
+        100_000_000,
+        100_000_000,
+        100_000_000,
+        1_000_000_000,
+    ];
+    for (o, v) in oracles.iter().zip(vals_above.iter()) {
+        c.submit_data(o, &wt(), &k_above, v, &90u32, &now);
+    }
+    assert_eq!(c.get_aggregated(&wt(), &k_above).median_value, 100_000_000);
+
+    // 4. n = 5, min_sample_size = 4, two outliers (500 and 1000):
+    // median = 100, mad = 0; worst offender (1000) dropped first, leaving 4 == min_keep.
+    // Mean of survivors [100, 100, 100, 500] = 800 / 4 = 200.
+    let k_two = symbol_short!("mstwo");
+    let vals_two = [
+        100_000_000i128,
+        100_000_000,
+        100_000_000,
+        500_000_000,
+        1_000_000_000,
+    ];
+    for (o, v) in oracles.iter().zip(vals_two.iter()) {
+        c.submit_data(o, &wt(), &k_two, v, &90u32, &now);
+    }
+    assert_eq!(c.get_aggregated(&wt(), &k_two).median_value, 200_000_000);
+}
+
+/// Custom MAD threshold (2.0x = 20_000 bps): borderline value at exactly 2.0x
+/// MAD is kept, while one unit beyond 2.0x MAD is rejected.
+#[test]
+fn outlier_rejection_custom_mad_threshold_borderline_vs_outlier() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let now = env.ledger().timestamp();
+    c.set_aggregation_method(&admin, &wt(), &AggregationMethod::Mean);
+    c.set_outlier_config(&admin, &wt(), &true, &20_000u32, &4u32);
+
+    // Sorted [80, 100, 100, 120, 140] -> median = 100, devs = [0, 0, 20, 20, 40], mad = 20.
+    // Borderline 140: dev = 40; 40 * 10_000 = 400_000 > 20_000 * 20 = 400_000 is false -> kept.
+    // Mean = (80 + 100 + 100 + 120 + 140) / 5 = 540 / 5 = 108.
+    let k_border = symbol_short!("madbord");
+    submit_from_many(
+        &env,
+        &c,
+        &admin,
+        BulkSubmission {
+            data_type: wt(),
+            key: k_border.clone(),
+            readings: &[
+                (80_000_000, 50),
+                (100_000_000, 50),
+                (100_000_000, 50),
+                (120_000_000, 50),
+                (140_000_000, 50),
+            ],
+            timestamp: now,
+        },
+    );
+    assert_eq!(c.get_aggregated(&wt(), &k_border).median_value, 108_000_000);
+
+    // Outlier 140_000_001: dev = 40_000_001 > 40_000_000 -> dropped.
+    // Mean = (80 + 100 + 100 + 120) / 4 = 400 / 4 = 100.
+    let k_out = symbol_short!("madout");
+    submit_from_many(
+        &env,
+        &c,
+        &admin,
+        BulkSubmission {
+            data_type: wt(),
+            key: k_out.clone(),
+            readings: &[
+                (80_000_000, 50),
+                (100_000_000, 50),
+                (100_000_000, 50),
+                (120_000_000, 50),
+                (140_000_001, 50),
+            ],
+            timestamp: now,
+        },
+    );
+    assert_eq!(c.get_aggregated(&wt(), &k_out).median_value, 100_000_000);
+}
+
+/// `AggregationMethod::Mean` vs `WeightedMedian` on the same dataset produce
+/// distinct, hand-verified results differing by a known amount.
+#[test]
+fn mean_versus_weighted_median_known_difference() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let now = env.ledger().timestamp();
+
+    // Readings: (10, weight 60), (20, weight 20), (90, weight 20).
+    // WeightedMedian: total_weight = 100, half = 50; cum after 10 = 60 > 50 -> 10_000_000.
+    // Mean: (10_000_000 + 20_000_000 + 90_000_000) / 3 = 120_000_000 / 3 = 40_000_000.
+    // Difference: 40_000_000 - 10_000_000 = 30_000_000.
+    submit_from_many(
+        &env,
+        &c,
+        &admin,
+        BulkSubmission {
+            data_type: wt(),
+            key: kk(),
+            readings: &[(10_000_000, 60), (20_000_000, 20), (90_000_000, 20)],
+            timestamp: now,
+        },
+    );
+
+    let wmed = c.get_aggregated(&wt(), &kk()).median_value;
+    assert_eq!(wmed, 10_000_000);
+
+    c.set_aggregation_method(&admin, &wt(), &AggregationMethod::Mean);
+    let mean = c.get_aggregated(&wt(), &kk()).median_value;
+    assert_eq!(mean, 40_000_000);
+    assert_eq!(mean - wmed, 30_000_000);
+}
+
+/// Cross-validation between data types: skips when target has no data, accepts
+/// variance <= max_variance (including exact boundary), rejects variance >
+/// max_variance with Error::CrossValidationFailed (#29), and succeeds after
+/// rule removal.
+#[test]
+fn cross_validation_between_data_types_boundary_and_removal() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let now = env.ledger().timestamp();
+
+    let temp = symbol_short!("temp");
+    let o_weather = Address::generate(&env);
+    let o_temp = Address::generate(&env);
+    c.add_oracle(&admin, &o_weather, &wt(), &100u32);
+    c.add_oracle(&admin, &o_temp, &temp, &100u32);
+    c.set_min_submit_interval(&admin, &0u64);
+
+    // Configure rule: |weather - temp| <= 10_000_000.
+    c.set_cross_validation_rule(
+        &admin,
+        &wt(),
+        &temp,
+        &10_000_000i128,
+        &soroban_sdk::Bytes::from_slice(&env, b"weather vs temp"),
+    );
+
+    // Target (`temp`) has no data yet -> cross-validation is skipped gracefully.
+    c.submit_data(&o_weather, &wt(), &kk(), &100_000_000, &95u32, &(now - 10));
+
+    // Populate target `temp` = 25_000_000.
+    c.submit_data(&o_temp, &temp, &kk(), &25_000_000, &95u32, &(now - 10));
+
+    // Exact boundary: |35_000_000 - 25_000_000| = 10_000_000 <= 10_000_000 -> accepted.
+    c.submit_data(&o_weather, &wt(), &kk(), &35_000_000, &95u32, &(now - 5));
+    assert_eq!(c.get_data(&wt(), &kk()).value, 35_000_000);
+
+    // One unit over boundary: |35_000_001 - 25_000_000| = 10_000_001 > 10_000_000 -> rejected.
+    let res = c.try_submit_data(&o_weather, &wt(), &kk(), &35_000_001, &95u32, &(now - 4));
+    assert_eq!(res, Err(Ok(Error::CrossValidationFailed)));
+
+    // Remove rule -> large divergence now succeeds.
+    c.remove_cross_validation_rule(&admin, &wt(), &temp);
+    c.submit_data(&o_weather, &wt(), &kk(), &100_000_000, &95u32, &(now - 3));
+    assert_eq!(c.get_data(&wt(), &kk()).value, 100_000_000);
+}
+
+/// `check_freshness` and `check_staleness` at one second inside, exactly at,
+/// and one second outside `max_age` (return values only; no event assertions).
+#[test]
+fn freshness_and_staleness_exact_threshold_boundaries() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+
+    let t0 = env.ledger().timestamp();
+    c.set_data_type_max_age(&admin, &wt(), &600u64);
+    submit_from_many(
+        &env,
+        &c,
+        &admin,
+        BulkSubmission {
+            data_type: wt(),
+            key: kk(),
+            readings: &[(30_000_000, 100)],
+            timestamp: t0,
+        },
+    );
+
+    // 1 second inside: age = 599 <= 600 -> fresh, not stale.
+    env.ledger().set_timestamp(t0 + 599);
+    let f_in = c.check_freshness(&wt(), &kk());
+    assert!(f_in.is_fresh);
+    assert_eq!(f_in.newest_age, 599);
+    assert_eq!(f_in.fresh_count, 1);
+    let s_in = c.check_staleness(&wt(), &kk());
+    assert!(!s_in.is_stale);
+    assert_eq!(s_in.stale_count, 0);
+    assert_eq!(s_in.oldest_fresh_age, 599);
+    assert_eq!(s_in.newest_age, 599);
+    assert_eq!(s_in.freshness_ratio_bps, 10_000);
+
+    // Exactly at threshold: age = 600 <= 600 -> fresh, not stale.
+    env.ledger().set_timestamp(t0 + 600);
+    let f_at = c.check_freshness(&wt(), &kk());
+    assert!(f_at.is_fresh);
+    assert_eq!(f_at.newest_age, 600);
+    assert_eq!(f_at.fresh_count, 1);
+    let s_at = c.check_staleness(&wt(), &kk());
+    assert!(!s_at.is_stale);
+    assert_eq!(s_at.stale_count, 0);
+    assert_eq!(s_at.oldest_fresh_age, 600);
+    assert_eq!(s_at.newest_age, 600);
+    assert_eq!(s_at.freshness_ratio_bps, 10_000);
+
+    // 1 second outside: age = 601 > 600 -> not fresh, stale.
+    env.ledger().set_timestamp(t0 + 601);
+    let f_out = c.check_freshness(&wt(), &kk());
+    assert!(!f_out.is_fresh);
+    assert_eq!(f_out.newest_age, 601);
+    assert_eq!(f_out.fresh_count, 0);
+    let s_out = c.check_staleness(&wt(), &kk());
+    assert!(s_out.is_stale);
+    assert_eq!(s_out.stale_count, 1);
+    assert_eq!(s_out.oldest_fresh_age, 0);
+    assert_eq!(s_out.newest_age, 601);
+    assert_eq!(s_out.freshness_ratio_bps, 0);
+}
+
+/// `check_staleness` on a key with no stored data reports stale with sentinel
+/// ages and zero counts.
+#[test]
+fn check_staleness_no_data_stored_returns_stale_report() {
+    let (env, _admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+
+    let report = c.check_staleness(&wt(), &kk());
+    assert!(report.is_stale);
+    assert_eq!(report.total_count, 0);
+    assert_eq!(report.stale_count, 0);
+    assert_eq!(report.oldest_fresh_age, 0);
+    assert_eq!(report.newest_age, u64::MAX);
+    assert_eq!(report.freshness_ratio_bps, 0);
+}
+
+/// A submission timestamp ahead of the ledger (within `TimestampFutureBuffer`
+/// = 60s) saturates age to 0, so both `check_freshness` and `check_staleness`
+/// treat it as fresh with age 0.
+#[test]
+fn freshness_and_staleness_with_future_timestamp_within_buffer() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let now = env.ledger().timestamp();
+
+    // Timestamp 30s in the future (allowed by default 60s future buffer).
+    submit_from_many(
+        &env,
+        &c,
+        &admin,
+        BulkSubmission {
+            data_type: wt(),
+            key: kk(),
+            readings: &[(25_000_000, 100)],
+            timestamp: now + 30,
+        },
+    );
+
+    let fresh = c.check_freshness(&wt(), &kk());
+    assert!(fresh.is_fresh);
+    assert_eq!(fresh.newest_age, 0);
+    assert_eq!(fresh.fresh_count, 1);
+
+    let stale = c.check_staleness(&wt(), &kk());
+    assert!(!stale.is_stale);
+    assert_eq!(stale.newest_age, 0);
+    assert_eq!(stale.oldest_fresh_age, 0);
+    assert_eq!(stale.stale_count, 0);
+    assert_eq!(stale.freshness_ratio_bps, 10_000);
+}
+
+/// Zero global `max_data_age`: only age == 0 is fresh; age == 1 is stale.
+#[test]
+fn freshness_and_staleness_with_zero_max_age() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let t0 = env.ledger().timestamp();
+    c.set_max_data_age(&admin, &0u64);
+
+    submit_from_many(
+        &env,
+        &c,
+        &admin,
+        BulkSubmission {
+            data_type: wt(),
+            key: kk(),
+            readings: &[(25_000_000, 100)],
+            timestamp: t0,
+        },
+    );
+
+    // At t0: age = 0 <= 0 -> fresh, not stale.
+    let f0 = c.check_freshness(&wt(), &kk());
+    assert!(f0.is_fresh);
+    assert_eq!(f0.max_age, 0);
+    assert_eq!(f0.newest_age, 0);
+    let s0 = c.check_staleness(&wt(), &kk());
+    assert!(!s0.is_stale);
+    assert_eq!(s0.max_age, 0);
+    assert_eq!(s0.stale_count, 0);
+    assert_eq!(s0.freshness_ratio_bps, 10_000);
+
+    // At t0 + 1: age = 1 > 0 -> not fresh, stale.
+    env.ledger().set_timestamp(t0 + 1);
+    let f1 = c.check_freshness(&wt(), &kk());
+    assert!(!f1.is_fresh);
+    assert_eq!(f1.fresh_count, 0);
+    assert_eq!(f1.newest_age, 1);
+    let s1 = c.check_staleness(&wt(), &kk());
+    assert!(s1.is_stale);
+    assert_eq!(s1.stale_count, 1);
+    assert_eq!(s1.freshness_ratio_bps, 0);
+}
+
+/// `check_staleness` flags stale only when strictly more than half of
+/// submissions are stale (`stale_count > total_count / 2`), and reports
+/// `freshness_ratio_bps = fresh_count * 10_000 / total_count`.
+#[test]
+fn check_staleness_majority_threshold_and_freshness_ratio() {
+    let (env, admin, cid) = setup();
+    let c = OracleVerifierClient::new(&env, &cid);
+    let t0 = env.ledger().timestamp();
+    c.set_data_type_max_age(&admin, &wt(), &1_000u64);
+
+    let o1 = Address::generate(&env);
+    let o2 = Address::generate(&env);
+    let o3 = Address::generate(&env);
+    c.add_oracle(&admin, &o1, &wt(), &100u32);
+    c.add_oracle(&admin, &o2, &wt(), &100u32);
+    c.add_oracle(&admin, &o3, &wt(), &100u32);
+
+    // o1 submits at t0, o2 submits at t0 + 500 (both fresh at t0 + 500).
+    c.submit_data(&o1, &wt(), &kk(), &10_000_000, &90u32, &t0);
+    env.ledger().set_timestamp(t0 + 500);
+    c.submit_data(&o2, &wt(), &kk(), &20_000_000, &90u32, &(t0 + 500));
+
+    // At t0 + 1100: o1 age = 1100 (stale), o2 age = 600 (fresh).
+    // stale_count = 1, total_count = 2 -> 1 > 2/2 (1 > 1) is false -> not stale.
+    // freshness_ratio_bps = 1 * 10_000 / 2 = 5_000.
+    env.ledger().set_timestamp(t0 + 1_100);
+    let rep_half = c.check_staleness(&wt(), &kk());
+    assert!(!rep_half.is_stale);
+    assert_eq!(rep_half.stale_count, 1);
+    assert_eq!(rep_half.total_count, 2);
+    assert_eq!(rep_half.oldest_fresh_age, 600);
+    assert_eq!(rep_half.newest_age, 600);
+    assert_eq!(rep_half.freshness_ratio_bps, 5_000);
+
+    // Add a second stale-to-be submission on a fresh key to test 2-of-3 stale.
+    let key3 = symbol_short!("maj3");
+    let t1 = t0 + 2_000;
+    env.ledger().set_timestamp(t1);
+    c.submit_data(&o1, &wt(), &key3, &10_000_000, &90u32, &t1);
+    c.submit_data(&o2, &wt(), &key3, &20_000_000, &90u32, &t1);
+    env.ledger().set_timestamp(t1 + 500);
+    c.submit_data(&o3, &wt(), &key3, &30_000_000, &90u32, &(t1 + 500));
+
+    // At t1 + 1100: o1 & o2 age = 1100 (stale), o3 age = 600 (fresh).
+    // stale_count = 2 > 3/2 (= 1) -> is_stale = true.
+    // freshness_ratio_bps = 1 * 10_000 / 3 = 3_333.
+    env.ledger().set_timestamp(t1 + 1_100);
+    let rep_two_thirds = c.check_staleness(&wt(), &key3);
+    assert!(rep_two_thirds.is_stale);
+    assert_eq!(rep_two_thirds.stale_count, 2);
+    assert_eq!(rep_two_thirds.total_count, 3);
+    assert_eq!(rep_two_thirds.freshness_ratio_bps, 3_333);
+}

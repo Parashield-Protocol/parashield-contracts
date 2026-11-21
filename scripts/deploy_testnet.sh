@@ -57,6 +57,7 @@ deploy_contract() {
 # ── Deploy in dependency order ────────────────────────────────────────────────
 
 ORACLE_ID=$(deploy_contract "parashield-oracle-verifier")
+RISK_POOL_ID=$(deploy_contract "parashield-risk-pool")
 POLICY_ID=$(deploy_contract "parashield-policy-engine")
 CLAIMS_ID=$(deploy_contract "parashield-claims-processor")
 
@@ -87,6 +88,14 @@ stellar contract invoke \
     --usdc_token "$USDC_TESTNET" \
     --oracle_address "$ORACLE_ID"
 
+log "Initializing risk-pool..."
+stellar contract invoke \
+    --id "$RISK_POOL_ID" \
+    --source "$SOURCE" \
+    --network "$NETWORK" \
+    -- initialize \
+    --admin "$DEPLOYER_ADDR"
+
 log "Initializing claims-processor..."
 stellar contract invoke \
     --id "$CLAIMS_ID" \
@@ -95,7 +104,9 @@ stellar contract invoke \
     -- initialize \
     --admin "$DEPLOYER_ADDR" \
     --policy_engine "$POLICY_ID" \
-    --oracle_verifier "$ORACLE_ID"
+    --risk_pool "$RISK_POOL_ID" \
+    --oracle_verifier "$ORACLE_ID" \
+    --staleness_threshold 604800
 
 log "Wiring claims-processor into policy-engine..."
 stellar contract invoke \
@@ -112,6 +123,7 @@ log ""
 log "=== Deployment complete ==="
 log "Network:          $NETWORK"
 log "Oracle Verifier:  $ORACLE_ID"
+log "Risk Pool:        $RISK_POOL_ID"
 log "Policy Engine:    $POLICY_ID"
 log "Claims Processor: $CLAIMS_ID"
 log ""
