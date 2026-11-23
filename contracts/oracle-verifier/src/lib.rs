@@ -2433,119 +2433,24 @@ impl OracleVerifier {
         confidence: u32,
         timestamp: u64,
     ) {
-        oracle.require_auth();
-        // Validate data_type is non-empty before any storage lookup (#588).
-        Self::validate_symbol_len(&env, &data_type);
-        Self::require_data_type_active(&env, &data_type);
-        if Self::encryption_required(&env, &data_type) {
-            panic_with_error!(&env, Error::EncryptionRequiredForType);
-        }
-        // Bound the key before it is used to build a persistent storage entry
-        // (#565).
-        Self::validate_key_len(&env, &key);
-        if confidence == 0 || confidence > 100 {
-            panic_with_error!(&env, Error::InvalidConfidence);
-        }
-        
-        // SECURITY FIX (issue #839): Validate data_value against per-data-type range
-        // as the primary check, falling back to global MAX_DATA_VALUE ceiling.
-        let type_max = Self::get_data_type_max(&env, &data_type);
-        if value.abs() > type_max {
-            panic_with_error!(&env, Error::InvalidInput);
-        }
-        if value > MAX_DATA_VALUE || value < -MAX_DATA_VALUE {
-            panic_with_error!(&env, Error::InvalidInput);
-        }
-
-        // Zero-timestamp oracle readings are rejected (issue #735)
-        if timestamp == 0 {
-            panic_with_error!(&env, Error::InvalidTimestamp);
-        }
-
+        Self::require_oracle_for_plain_submit(&env, &oracle, &data_type);
         let now = env.ledger().timestamp();
-        let future_buffer: u64 = env
-            .storage()
-            .instance()
-            .get(&StorageKey::TimestampFutureBuffer)
-            .unwrap_or(60);
-        if timestamp > now.saturating_add(future_buffer) {
-            panic_with_error!(&env, Error::InvalidTimestamp);
-        }
-        // Use per-data-type max timestamp age if configured, otherwise global
-        let max_timestamp_age: u64 = Self::effective_max_timestamp_age(&env, &data_type);
-        if timestamp < now.saturating_sub(max_timestamp_age) {
-            panic_with_error!(&env, Error::InvalidTimestamp);
-        }
-
-        // SECURITY FIX: Verify oracle is registered and active for THIS specific data_type.
-        // An oracle registered for 'rainfall' cannot submit 'flight' data.
-        let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
-        let entry: OracleEntry = env
-            .storage()
-            .persistent()
-            .get(&oracle_key)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
-        if !entry.active {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-        // Keep the registration alive alongside the reading it authorized.
-        env.storage()
-            .persistent()
-            .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
-
-        Self::enforce_rate_limit(&env, &data_type, &key, &oracle, now);
-
-        // Issue #775: monotonic reading-timestamp per (data_type, key, oracle).
-        // Readings for one stream from one oracle must advance strictly
-        // forward; otherwise a replayed or out-of-order submission from an
-        // honest-but-flaky feed can overwrite a fresher reading already
-        // folded into the aggregate. This check is intentionally scoped per
-        // oracle so one oracle's lagged clock does not block submissions
-        // from the others on the same key.
-        Self::require_strictly_newer_reading(&env, &data_type, &key, &oracle, timestamp);
-
-        // Issue #459: stale-submission gate. If the submitted timestamp is
-        // older than this data_type's `effective_max_age`, fold the point
-        // into the stale-penalty pipeline and return without adding it to
-        // `DataPoints`. `handle_stale_submission` deliberately does not
-        // panic — a panic would revert the counter increment and the
-        // penalty could never accumulate. The rejection is surfaced via the
-        // `StaleSubmissionDetected` event stream.
-        let max_data_age = Self::effective_max_age(&env, &data_type);
-        if now.saturating_sub(timestamp) > max_data_age {
-            Self::handle_stale_submission(&env, &oracle, &data_type, timestamp, max_data_age);
-            return;
-        }
-
-        let new_point = OracleDataPoint {
-            oracle: oracle.clone(),
+        if Self::validate_and_store_plain_reading(
+            &env,
+            &oracle,
+            &data_type,
+            &key,
             value,
             confidence,
             timestamp,
-        };
-        Self::store_plain_reading(&env, &data_type, &key, new_point, now, max_data_age);
-        Self::record_reading_timestamp(&env, &data_type, &key, &oracle, timestamp);
-
-        // Check cross-validation rules after storing new data
-        Self::check_cross_validation(&env, &data_type, &key);
-
-        // Issue #459: a fresh accepted submission clears any accumulated
-        // stale count for this oracle + data_type, so a well-behaved oracle
-        // recovering from a bad batch does not carry a lingering count into
-        // the next window.
-        Self::reset_stale_count(&env, &oracle, &data_type);
-
-        env.events().publish(
-            (Symbol::new(&env, "oracle_data_submitted"),),
-            OracleDataSubmitted {
-                oracle,
-                data_type,
-                key,
-                value,
-                confidence,
-                timestamp,
-            },
-        );
+            now,
+        ) {
+            // Issue #459: a fresh accepted submission clears any accumulated
+            // stale count for this oracle + data_type, so a well-behaved oracle
+            // recovering from a bad batch does not carry a lingering count into
+            // the next window.
+            Self::reset_stale_count(&env, &oracle, &data_type);
+        }
     }
 
     // ── Data Encryption (issue #379) ──────────────────────────────────────────
@@ -3201,121 +3106,156 @@ impl OracleVerifier {
     }
 
     /// Submit data for multiple keys in one call.
-    /// Each tuple: (key, value, confidence, timestamp). Every key must satisfy
-    /// the same length rules as `submit_data` (#565).
+    /// Each tuple: (key, value, confidence, timestamp). Every item goes through
+    /// the exact same validation, rate-limit, monotonic-timestamp, staleness,
+    /// and cross-validation pipeline as `submit_data`.
+    ///
+    /// Atomicity: Soroban reverts the entire transaction on any panic/error, so
+    /// an invalid element aborts the whole batch with zero partial writes.
     pub fn batch_submit_data(
         env: Env,
         oracle: Address,
         data_type: Symbol,
         submissions: Vec<(Symbol, i128, u32, u64)>,
     ) {
-        oracle.require_auth();
-        Self::require_data_type_active(&env, &data_type);
-        if Self::encryption_required(&env, &data_type) {
-            panic_with_error!(&env, Error::EncryptionRequiredForType);
+        Self::require_oracle_for_plain_submit(&env, &oracle, &data_type);
+        let now = env.ledger().timestamp();
+        let mut any_stored = false;
+
+        for i in 0..submissions.len() {
+            let (key, value, confidence, timestamp) = submissions.get_unchecked(i);
+            if Self::validate_and_store_plain_reading(
+                &env,
+                &oracle,
+                &data_type,
+                &key,
+                value,
+                confidence,
+                timestamp,
+                now,
+            ) {
+                any_stored = true;
+            }
         }
-        Self::validate_symbol_len(&env, &data_type);
+
+        if any_stored {
+            Self::reset_stale_count(&env, &oracle, &data_type);
+        }
+    }
+
+    /// Shared pre-flight authorization and data-type checks for `submit_data`
+    /// and `batch_submit_data` (#898).
+    fn require_oracle_for_plain_submit(env: &Env, oracle: &Address, data_type: &Symbol) {
+        oracle.require_auth();
+        // Validate data_type is non-empty before any storage lookup (#588).
+        Self::validate_symbol_len(env, data_type);
+        Self::require_data_type_active(env, data_type);
+        if Self::encryption_required(env, data_type) {
+            panic_with_error!(env, Error::EncryptionRequiredForType);
+        }
+        // SECURITY FIX: Verify oracle is registered and active for THIS specific data_type.
         let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         let entry: OracleEntry = env
             .storage()
             .persistent()
             .get(&oracle_key)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::OracleNotRegistered));
+            .unwrap_or_else(|| panic_with_error!(env, Error::OracleNotRegistered));
         if !entry.active {
-            panic_with_error!(&env, Error::Unauthorized);
+            panic_with_error!(env, Error::Unauthorized);
         }
         // Keep the registration alive alongside the readings it authorized.
         env.storage()
             .persistent()
             .extend_ttl(&oracle_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
 
-        for i in 0..submissions.len() {
-            let (key, value, confidence, timestamp) = submissions.get_unchecked(i);
-            Self::validate_key_len(&env, &key);
-            if confidence == 0 || confidence > 100 {
-                panic_with_error!(&env, Error::InvalidConfidence);
-            }
-            // Validate data_value is within per-data-type bounds (primary) and global MAX_DATA_VALUE (issue #839)
-            let type_max = Self::get_data_type_max(&env, &data_type);
-            if value.abs() > type_max {
-                panic_with_error!(&env, Error::InvalidInput);
-            }
-            if value > MAX_DATA_VALUE || value < -MAX_DATA_VALUE {
-                panic_with_error!(&env, Error::InvalidInput);
-            }
+    /// Single source of truth for per-reading validation, rate limiting,
+    /// monotonic timestamp checking, staleness handling, storage, cross-validation,
+    /// and event emission for both `submit_data` and `batch_submit_data` (#898).
+    /// Returns `true` if the reading was stored, or `false` if it was handled
+    /// as a stale submission.
+    #[allow(clippy::too_many_arguments)]
+    fn validate_and_store_plain_reading(
+        env: &Env,
+        oracle: &Address,
+        data_type: &Symbol,
+        key: &Symbol,
+        value: i128,
+        confidence: u32,
+        timestamp: u64,
+        now: u64,
+    ) -> bool {
+        // Bound the key before it is used to build a persistent storage entry (#565).
+        Self::validate_key_len(env, key);
+        if confidence == 0 || confidence > 100 {
+            panic_with_error!(env, Error::InvalidConfidence);
+        }
 
-            let now = env.ledger().timestamp();
-            let future_buffer: u64 = env
-                .storage()
-                .instance()
-                .get(&StorageKey::TimestampFutureBuffer)
-                .unwrap_or(60);
-            if timestamp > now.saturating_add(future_buffer) {
-                panic_with_error!(&env, Error::InvalidTimestamp);
-            }
-            // Use per-data-type max timestamp age if configured, otherwise global
-            let max_timestamp_age: u64 = Self::effective_max_timestamp_age(&env, &data_type);
-            if timestamp < now.saturating_sub(max_timestamp_age) {
-                panic_with_error!(&env, Error::InvalidTimestamp);
-            }
+        // Check global MAX_DATA_VALUE first so `value.abs()` cannot overflow on `i128::MIN`.
+        if value > MAX_DATA_VALUE || value < -MAX_DATA_VALUE {
+            panic_with_error!(env, Error::InvalidInput);
+        }
+        // SECURITY FIX (issue #839): Validate data_value against per-data-type range.
+        let type_max = Self::get_data_type_max(env, data_type);
+        if value.abs() > type_max {
+            panic_with_error!(env, Error::InvalidInput);
+        }
 
-            Self::enforce_rate_limit(&env, &data_type, &key, &oracle, now);
+        // Zero-timestamp oracle readings are rejected (issue #735).
+        if timestamp == 0 {
+            panic_with_error!(env, Error::InvalidTimestamp);
+        }
 
-            // Issue #775: monotonic reading-timestamp per (data_type, key,
-            // oracle). Same guard as submit_data — batch callers must not
-            // bypass it.
-            Self::require_strictly_newer_reading(&env, &data_type, &key, &oracle, timestamp);
+        let future_buffer: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TimestampFutureBuffer)
+            .unwrap_or(60);
+        if timestamp > now.saturating_add(future_buffer) {
+            panic_with_error!(env, Error::InvalidTimestamp);
+        }
+        let max_timestamp_age: u64 = Self::effective_max_timestamp_age(env, data_type);
+        if timestamp < now.saturating_sub(max_timestamp_age) {
+            panic_with_error!(env, Error::InvalidTimestamp);
+        }
 
-            // Issue #459: per-item stale-submission gate. A stale item in a
-            // batch is skipped (with penalty accounting) rather than failing
-            // the whole batch, so a partial-good batch still lands its
-            // fresh entries.
-            let max_data_age = Self::effective_max_age(&env, &data_type);
-            if now.saturating_sub(timestamp) > max_data_age {
-                Self::handle_stale_submission(
-                    &env,
-                    &oracle,
-                    &data_type,
-                    timestamp,
-                    max_data_age,
-                );
-                continue;
-            }
-            let new_point = OracleDataPoint {
+        Self::enforce_rate_limit(env, data_type, key, oracle, now);
+
+        // Issue #775: monotonic reading-timestamp per (data_type, key, oracle).
+        Self::require_strictly_newer_reading(env, data_type, key, oracle, timestamp);
+
+        // Issue #459: stale-submission gate.
+        let max_data_age = Self::effective_max_age(env, data_type);
+        if now.saturating_sub(timestamp) > max_data_age {
+            Self::handle_stale_submission(env, oracle, data_type, timestamp, max_data_age);
+            return false;
+        }
+
+        let new_point = OracleDataPoint {
+            oracle: oracle.clone(),
+            value,
+            confidence,
+            timestamp,
+        };
+        Self::store_plain_reading(env, data_type, key, new_point, now, max_data_age);
+        Self::record_reading_timestamp(env, data_type, key, oracle, timestamp);
+
+        // Check cross-validation rules after storing new data.
+        Self::check_cross_validation(env, data_type, key);
+
+        env.events().publish(
+            (Symbol::new(env, "oracle_data_submitted"),),
+            OracleDataSubmitted {
                 oracle: oracle.clone(),
+                data_type: data_type.clone(),
+                key: key.clone(),
                 value,
                 confidence,
                 timestamp,
-            };
-            Self::store_plain_reading(
-                &env,
-                &data_type,
-                &key,
-                new_point,
-                now,
-                max_data_age,
-            );
-            Self::record_reading_timestamp(&env, &data_type, &key, &oracle, timestamp);
+            },
+        );
 
-            env.events().publish(
-                (Symbol::new(&env, "oracle_data_submitted"),),
-                OracleDataSubmitted {
-                    oracle: oracle.clone(),
-                    data_type: data_type.clone(),
-                    key,
-                    value,
-                    confidence,
-                    timestamp,
-                },
-            );
-        }
-
-        // Issue #459: at least one fresh submission landed if we reach here
-        // (the loop exit for the all-stale case never runs on a non-empty
-        // batch since every iteration either commits or increments). Reset
-        // the counter, matching the per-oracle window semantics of the
-        // single-submit paths.
-        Self::reset_stale_count(&env, &oracle, &data_type);
+        true
     }
 
     /// Upgrade the contract WASM in-place. Only the admin may call this.
