@@ -5,7 +5,7 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::{storage::Persistent as _, Address as _, Ledger},
     token, Address, Bytes, Env, IntoVal, Symbol, Val, Vec,
 };
 
@@ -2373,4 +2373,126 @@ fn test_run_migrations_rejects_downgrade() {
     env.as_contract(&dao.address, || {
         GovernanceDao::run_migrations(&env, 2, 1);
     });
+}
+
+// ── Issue #900: proposal TTL sized from voting + timelock periods ────────────
+
+#[test]
+fn test_proposal_ttl_scales_with_voting_and_timelock_periods() {
+    let (env, dao, admin, v1, _v2, target) = setup();
+
+    // Short proposal: 1-day voting, 0 timelock.
+    let mut short_cfg = dao.get_config();
+    short_cfg.voting_period = 24 * 3600;
+    short_cfg.proposal_timelock = 0;
+    dao.update_config(&admin, &short_cfg);
+
+    let short_id = dao.create_proposal(
+        &v1,
+        &Bytes::from_slice(&env, b"short"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &Vec::new(&env),
+        &ProposalKind::Standard,
+        &Bytes::from_slice(&env, b"impact"),
+    );
+
+    let short_ttl = env.as_contract(&dao.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&StorageKey::Proposal(short_id))
+    });
+
+    // Long proposal: 30-day voting, 14-day timelock.
+    let mut long_cfg = dao.get_config();
+    long_cfg.voting_period = 30 * 24 * 3600;
+    long_cfg.proposal_timelock = 14 * 24 * 3600;
+    dao.update_config(&admin, &long_cfg);
+
+    let long_id = dao.create_proposal(
+        &v1,
+        &Bytes::from_slice(&env, b"long"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &Vec::new(&env),
+        &ProposalKind::Standard,
+        &Bytes::from_slice(&env, b"impact-long"),
+    );
+
+    let long_ttl = env.as_contract(&dao.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&StorageKey::Proposal(long_id))
+    });
+
+    assert!(
+        long_ttl > short_ttl,
+        "longer voting+timelock proposal must get a longer TTL than short proposal"
+    );
+
+    // Vote and lock records must match the proposal TTL.
+    dao.vote(&v1, &long_id, &VoteChoice::For);
+    let vote_ttl = env.as_contract(&dao.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&StorageKey::Vote(long_id, v1.clone()))
+    });
+    let lock_ttl = env.as_contract(&dao.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&StorageKey::LockedBalance(long_id, v1.clone()))
+    });
+    assert!(vote_ttl >= long_ttl);
+    assert!(lock_ttl >= long_ttl);
+}
+
+#[test]
+fn test_proposal_ttl_clamped_at_max_and_survives_to_execution() {
+    let (env, dao, admin, v1, _v2, target) = setup();
+
+    // Huge timelock should clamp cleanly to max_ttl without overflow or panic.
+    let mut cfg = dao.get_config();
+    cfg.voting_period = 30 * 24 * 3600;
+    cfg.proposal_timelock = u64::MAX / 2;
+    dao.update_config(&admin, &cfg);
+
+    let pid = dao.create_proposal(
+        &v1,
+        &Bytes::from_slice(&env, b"huge"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &Vec::new(&env),
+        &ProposalKind::Standard,
+        &Bytes::from_slice(&env, b"impact"),
+    );
+
+    let (ttl, max_ttl) = env.as_contract(&dao.address, || {
+        (
+            env.storage().persistent().get_ttl(&StorageKey::Proposal(pid)),
+            env.storage().max_ttl(),
+        )
+    });
+    assert!(ttl <= max_ttl);
+    assert!(ttl > 0);
+}
+
+#[test]
+fn test_terminal_proposal_keeps_readability_floor() {
+    let (env, dao, admin, v1, _v2, target) = setup();
+    let pid = dao.create_proposal(
+        &v1,
+        &Bytes::from_slice(&env, b"cancel"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &Vec::new(&env),
+        &ProposalKind::Standard,
+        &Bytes::from_slice(&env, b"impact"),
+    );
+    dao.cancel_proposal(&admin, &pid);
+
+    let ttl = env.as_contract(&dao.address, || {
+        env.storage().persistent().get_ttl(&StorageKey::Proposal(pid))
+    });
+    let expected_floor = (crate::GOVERNANCE_TTL_BUFFER_SECONDS / crate::LEDGER_SECONDS) as u32;
+    assert!(ttl >= expected_floor);
 }

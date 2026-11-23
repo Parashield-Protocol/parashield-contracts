@@ -2205,3 +2205,109 @@ fn claim_ordering_breaks_timestamp_ties_by_claim_id() {
     // Identical keys never swap.
     assert!(!ClaimsProcessor::claim_sorts_after(&(5, 100), &(5, 100)));
 }
+
+// ── Issue #899: PendingClaims invariant across dispute lifecycle ─────────────
+
+fn assert_pending_invariant(cp: &ClaimsProcessorClient, claim_id: u128) {
+    let pending = cp.get_pending_claims();
+    let mut count = 0u32;
+    for i in 0..pending.len() {
+        if pending.get_unchecked(i) == claim_id {
+            count += 1;
+        }
+    }
+    assert!(count <= 1, "PendingClaims must not contain duplicate claim_id");
+    let is_pending = cp.get_claim(&claim_id).status == ClaimStatus::Pending;
+    assert_eq!(
+        count == 1,
+        is_pending,
+        "PendingClaims membership must match ClaimStatus::Pending"
+    );
+}
+
+#[test]
+fn test_pending_queue_invariant_across_dispute_lifecycle() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer1 = Address::generate(&w.env);
+    let buyer2 = Address::generate(&w.env);
+    let pol_id1 = buy_crop_policy(&w, &buyer1, pid);
+    let pol_id2 = buy_crop_policy(&w, &buyer2, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    // Claim 1: submit -> dispute -> resolve -> dispute -> reject
+    let cid1 = cp.submit_claim(&buyer1, &pol_id1);
+    assert_pending_invariant(&cp, cid1);
+
+    cp.dispute_claim(&buyer1, &cid1, &symbol_short!("disagree"));
+    assert_pending_invariant(&cp, cid1);
+
+    cp.resolve_dispute(&w.admin, &cid1);
+    assert_pending_invariant(&cp, cid1);
+
+    cp.dispute_claim(&buyer1, &cid1, &symbol_short!("again"));
+    assert_pending_invariant(&cp, cid1);
+
+    cp.reject_claim(&w.admin, &cid1, &symbol_short!("invalid"));
+    assert_pending_invariant(&cp, cid1);
+
+    // Claim 2: submit -> dispute -> resolve -> batch_auto_process -> Paid
+    let cid2 = cp.submit_claim(&buyer2, &pol_id2);
+    assert_pending_invariant(&cp, cid2);
+
+    cp.dispute_claim(&buyer2, &cid2, &symbol_short!("review"));
+    assert_pending_invariant(&cp, cid2);
+
+    cp.resolve_dispute(&w.admin, &cid2);
+    assert_pending_invariant(&cp, cid2);
+
+    let results = cp.batch_auto_process(&w.keeper, &10);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results.get_unchecked(0), (cid2, ClaimResult::Paid));
+    assert_pending_invariant(&cp, cid2);
+}
+
+#[test]
+fn test_disputed_claim_not_processed_until_resolved() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("disagree"));
+
+    // Disputed claim must not be auto-processed or manually processed while disputed.
+    assert_eq!(cp.process_claim(&w.keeper, &claim_id, &None), ClaimResult::AlreadyProcessed);
+    assert_eq!(cp.batch_auto_process(&w.keeper, &10).len(), 0);
+    assert_eq!(cp.get_claim(&claim_id).status, ClaimStatus::Disputed);
+
+    // Resolving as retry re-queues it so batch_auto_process settles it.
+    cp.resolve_dispute(&w.admin, &claim_id);
+    assert_pending_invariant(&cp, claim_id);
+
+    let results = cp.batch_auto_process(&w.keeper, &10);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results.get_unchecked(0), (claim_id, ClaimResult::Paid));
+    assert_pending_invariant(&cp, claim_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_resolve_dispute_twice_fails() {
+    let w = deploy();
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    cp.dispute_claim(&buyer, &claim_id, &symbol_short!("disagree"));
+    cp.resolve_dispute(&w.admin, &claim_id);
+    cp.resolve_dispute(&w.admin, &claim_id);
+}

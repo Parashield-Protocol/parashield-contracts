@@ -1009,3 +1009,120 @@ fn test_emergency_withdraw_failed_token_transfer_leaves_no_state_change() {
     assert_eq!(pos.shares, shares);
     assert_eq!(pos.deposited, deposit_amt);
 }
+
+// ── Issue #897: read-only token probe in initialize ──────────────────────────
+
+mod mock_tokens {
+    use soroban_sdk::{contract, contracterror, contractimpl, Address, Env};
+
+    #[contracterror]
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    #[repr(u32)]
+    pub enum MockErr {
+        TransferDisabled = 1,
+        BalanceFailed = 2,
+    }
+
+    #[contract]
+    pub struct MockTokenNoZeroTransfer;
+
+    #[contractimpl]
+    impl MockTokenNoZeroTransfer {
+        pub fn balance(_env: Env, _id: Address) -> i128 {
+            0
+        }
+
+        pub fn transfer(env: Env, _from: Address, _to: Address, _amount: i128) {
+            soroban_sdk::panic_with_error!(&env, MockErr::TransferDisabled);
+        }
+    }
+
+    #[contract]
+    pub struct MockNoBalance;
+
+    #[contractimpl]
+    impl MockNoBalance {
+        pub fn ping(_env: Env) -> u32 {
+            1
+        }
+    }
+
+    #[contract]
+    pub struct MockWrongBalanceType;
+
+    #[contractimpl]
+    impl MockWrongBalanceType {
+        pub fn balance(_env: Env, _id: Address) -> bool {
+            true
+        }
+    }
+
+    #[contract]
+    pub struct MockFailingBalance;
+
+    #[contractimpl]
+    impl MockFailingBalance {
+        pub fn balance(env: Env, _id: Address) -> i128 {
+            soroban_sdk::panic_with_error!(&env, MockErr::BalanceFailed);
+        }
+    }
+}
+
+#[test]
+fn test_initialize_succeeds_when_token_panics_on_zero_transfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let backstop = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let policy_engine = Address::generate(&env);
+    let claims_processor = Address::generate(&env);
+    let token_id = env.register(mock_tokens::MockTokenNoZeroTransfer, ());
+
+    let pool_id = env.register(RiskPool, ());
+    let pool = RiskPoolClient::new(&env, &pool_id);
+
+    pool.initialize(
+        &admin,
+        &token_id,
+        &treasury,
+        &backstop,
+        &Symbol::new(&env, "crop"),
+        &policy_engine,
+        &claims_processor,
+    );
+    assert_eq!(pool.get_stats().total_deposited, 0);
+}
+
+#[test]
+fn test_initialize_rejects_invalid_token_contracts_and_accounts() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let backstop = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let policy_engine = Address::generate(&env);
+    let claims_processor = Address::generate(&env);
+
+    let no_balance_id = env.register(mock_tokens::MockNoBalance, ());
+    let wrong_type_id = env.register(mock_tokens::MockWrongBalanceType, ());
+    let failing_balance_id = env.register(mock_tokens::MockFailingBalance, ());
+    let non_contract_account = Address::generate(&env);
+
+    for bad_token in [no_balance_id, wrong_type_id, failing_balance_id, non_contract_account] {
+        let pool_id = env.register(RiskPool, ());
+        let pool = RiskPoolClient::new(&env, &pool_id);
+        let res = pool.try_initialize(
+            &admin,
+            &bad_token,
+            &treasury,
+            &backstop,
+            &Symbol::new(&env, "crop"),
+            &policy_engine,
+            &claims_processor,
+        );
+        assert_eq!(res, Err(Ok(crate::Error::InvalidToken)));
+    }
+}

@@ -322,13 +322,18 @@ impl RiskPool {
 
         let usdc_str = usdc_token.to_string();
 
+        // Read-only SEP-41 shape probe: invoke `balance(this_contract)` and
+        // require both call success and successful decoding as `i128`.
         let balance_res = env.try_invoke_contract::<i128, soroban_sdk::Error>(
             &usdc_token,
             &Symbol::new(&env, "balance"),
             soroban_sdk::vec![&env, env.current_contract_address().to_val()],
         );
-        if balance_res.is_err() {
-            panic_with_error!(&env, Error::InvalidToken);
+        match balance_res {
+            Ok(Ok(_balance)) => {}
+            Ok(Err(_)) | Err(Ok(_)) | Err(Err(_)) => {
+                panic_with_error!(&env, Error::InvalidToken);
+            }
         }
 
         if usdc_str.len() != 56 {

@@ -1853,3 +1853,118 @@ fn test_remove_oracle_twice_fails() {
     client.remove_oracle(&admin, &oracle, &weather());
     client.remove_oracle(&admin, &oracle, &weather());
 }
+
+// ── Issue #898: submit_data and batch_submit_data validation parity ──────────
+
+#[test]
+fn test_batch_submit_data_matches_submit_data_invalid_inputs() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    let unregistered = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+
+    // Small ledger timestamp so `now.saturating_sub(max_timestamp_age) == 0`;
+    // `timestamp == 0` must still be rejected by both paths.
+    env.ledger().set_timestamp(1_000);
+    let now = env.ledger().timestamp();
+
+    let cases: [(&Address, Symbol, i128, u32, u64, Error); 8] = [
+        (&oracle, kisumu_key(), 10_000_000, 95, 0, Error::InvalidTimestamp),
+        (&oracle, kisumu_key(), 10_000_000, 95, now + 61, Error::InvalidTimestamp),
+        (&oracle, kisumu_key(), 10_000_000, 0, now, Error::InvalidConfidence),
+        (&oracle, kisumu_key(), 10_000_000, 101, now, Error::InvalidConfidence),
+        (&oracle, kisumu_key(), i128::MIN, 95, now, Error::InvalidInput),
+        (&oracle, kisumu_key(), 100_000_000_000, 95, now, Error::InvalidInput),
+        (&oracle, Symbol::new(&env, ""), 10_000_000, 95, now, Error::InvalidSymbolLength),
+        (&unregistered, kisumu_key(), 10_000_000, 95, now, Error::OracleNotRegistered),
+    ];
+
+    for (submitter, key, val, conf, ts, expected_err) in cases {
+        let single_res = client.try_submit_data(submitter, &weather(), &key, &val, &conf, &ts);
+        let batch = soroban_sdk::vec![&env, (key, val, conf, ts)];
+        let batch_res = client.try_batch_submit_data(submitter, &weather(), &batch);
+
+        assert_eq!(single_res, Err(Ok(expected_err)));
+        assert_eq!(batch_res, Err(Ok(expected_err)));
+    }
+}
+
+#[test]
+fn test_batch_submit_data_atomicity_on_later_invalid_element() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+
+    let now = env.ledger().timestamp();
+    let key1 = kisumu_key();
+    let key2 = symbol_short!("nbo002");
+
+    // First item is valid, second item has invalid confidence -> whole batch reverts.
+    let bad_batch = soroban_sdk::vec![
+        &env,
+        (key1.clone(), 25_000_000i128, 95u32, now),
+        (key2.clone(), 30_000_000i128, 0u32, now),
+    ];
+    let res = client.try_batch_submit_data(&oracle, &weather(), &bad_batch);
+    assert_eq!(res, Err(Ok(Error::InvalidConfidence)));
+
+    // Neither key should be stored.
+    assert!(client.get_data_points(&weather(), &key1).is_empty());
+    assert!(client.get_data_points(&weather(), &key2).is_empty());
+
+    // Duplicate key in the same batch triggers rate limit and reverts the whole batch.
+    let dup_batch = soroban_sdk::vec![
+        &env,
+        (key1.clone(), 25_000_000i128, 95u32, now),
+        (key1.clone(), 26_000_000i128, 95u32, now + 1),
+    ];
+    let dup_res = client.try_batch_submit_data(&oracle, &weather(), &dup_batch);
+    assert_eq!(dup_res, Err(Ok(Error::RateLimited)));
+    assert!(client.get_data_points(&weather(), &key1).is_empty());
+}
+
+#[test]
+fn test_batch_submit_data_enforces_cross_validation_and_ordering() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    let temp = symbol_short!("temp");
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+    client.add_oracle(&admin, &oracle, &temp, &90u32);
+    client.set_min_submit_interval(&admin, &0u64);
+
+    let now = env.ledger().timestamp();
+    let k = kisumu_key();
+    client.submit_data(&oracle, &temp, &k, &100_000_000i128, &95u32, &now);
+
+    let desc = soroban_sdk::Bytes::from_slice(&env, b"weather-temp-sync");
+    client.add_cross_validation_rule(&admin, &weather(), &temp, &10_000_000i128, &desc);
+
+    // Batch submission violating cross-validation must fail identically to submit_data.
+    let batch = soroban_sdk::vec![&env, (k.clone(), 200_000_000i128, 95u32, now)];
+    let res = client.try_batch_submit_data(&oracle, &weather(), &batch);
+    assert_eq!(res, Err(Ok(Error::CrossValidationFailed)));
+
+    // Out-of-order timestamps for the same key within a single batch must fail with StaleReadingTimestamp.
+    let k2 = symbol_short!("eld003");
+    let unordered_batch = soroban_sdk::vec![
+        &env,
+        (k2.clone(), 20_000_000i128, 95u32, now),
+        (k2.clone(), 21_000_000i128, 95u32, now - 10),
+    ];
+    let ord_res = client.try_batch_submit_data(&oracle, &weather(), &unordered_batch);
+    assert_eq!(ord_res, Err(Ok(Error::StaleReadingTimestamp)));
+}
+
+#[test]
+fn test_batch_submit_data_empty_batch_is_noop() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+
+    let empty: soroban_sdk::Vec<(Symbol, i128, u32, u64)> = soroban_sdk::Vec::new(&env);
+    client.batch_submit_data(&oracle, &weather(), &empty);
+}
