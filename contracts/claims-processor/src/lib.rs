@@ -89,6 +89,9 @@ enum StorageKey {
     Claim(u128),
     PolicyClaim(u128),   // policy_id → claim_id (one claim per policy)
     NextClaimId,
+    /// Queue of claim IDs awaiting processing.
+    /// Invariant: a `claim_id` is in `PendingClaims` if and only if its
+    /// `Claim.status == ClaimStatus::Pending` (no duplicates, FIFO order).
     PendingClaims,       // Vec<u128>
     Keeper(Address),     // keeper whitelist: address → bool
     Paused,              // bool — emergency pause state
@@ -1491,12 +1494,8 @@ impl ClaimsProcessor {
         env.storage().persistent().set(&claim_key, &claim);
         Self::extend_claim_ttl(&env, &claim_key);
         
-        // Re-add the claim to the pending queue for re-processing
-        let mut pending: Vec<u128> = env.storage().instance()
-            .get(&StorageKey::PendingClaims)
-            .unwrap_or_else(|| Vec::new(&env));
-        pending.push_back(claim_id);
-        env.storage().instance().set(&StorageKey::PendingClaims, &pending);
+        // Re-add the claim to the pending queue for re-processing (idempotent)
+        Self::add_to_pending(&env, claim_id);
         
         env.events().publish(
             (Symbol::new(&env, "claim_resolved"),),
@@ -3027,6 +3026,17 @@ impl ClaimsProcessor {
             .instance()
             .get(&StorageKey::ClaimDeadline)
             .unwrap_or(DEFAULT_CLAIM_DEADLINE)
+    }
+
+    /// Append `claim_id` to `PendingClaims` if not already present (preserves FIFO order and uniqueness).
+    fn add_to_pending(env: &Env, claim_id: u128) {
+        let mut pending: Vec<u128> = env.storage().instance()
+            .get(&StorageKey::PendingClaims)
+            .unwrap_or_else(|| Vec::new(env));
+        if pending.first_index_of(claim_id).is_none() {
+            pending.push_back(claim_id);
+            env.storage().instance().set(&StorageKey::PendingClaims, &pending);
+        }
     }
 
     fn remove_from_pending(env: &Env, claim_id: u128) {
