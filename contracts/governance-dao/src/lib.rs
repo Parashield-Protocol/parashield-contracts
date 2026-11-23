@@ -52,6 +52,8 @@ const MAX_VOTING_PERIOD: u64 = 30 * 24 * 3_600;
 use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO};
 /// Minimum delay after vote_end before finalize() can be called
 const FINALIZE_DELAY: u64 = 300; // 5 minutes
+/// Minimum readability floor for proposal entries (30 days at 5 s/ledger).
+const MIN_PROPOSAL_TTL_LEDGERS: u32 = (GOVERNANCE_TTL_BUFFER_SECONDS / LEDGER_SECONDS) as u32;
 /// How long a proposal must sit unfinalized past `vote_end` before its
 /// proposer (or anyone, on the proposer's behalf) can reclaim the deposit
 /// directly via `reclaim_deposit`, bypassing the quorum/majority computation
@@ -426,6 +428,7 @@ impl GovernanceDao {
         let proposal_key = StorageKey::Proposal(proposal_id);
         env.storage().persistent().set(&proposal_key, &proposal);
         env.storage().persistent().set(&StorageKey::ProposalContentHash(proposal_id), &content_hash);
+        Self::extend_proposal_ttl(&env, &proposal, config.proposal_timelock);
         env.storage()
             .instance()
             .set(&StorageKey::NextProposalId, &(proposal_id.checked_add(1).unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))));
@@ -568,6 +571,7 @@ impl GovernanceDao {
         let proposal_key = StorageKey::Proposal(proposal_id);
         env.storage().persistent().set(&proposal_key, &proposal);
         env.storage().persistent().set(&StorageKey::ProposalContentHash(proposal_id), &upgrade_content_hash);
+        Self::extend_proposal_ttl(&env, &proposal, config.proposal_timelock);
         env.storage().instance().set(
             &StorageKey::NextProposalId,
             &(proposal_id
@@ -923,6 +927,8 @@ impl GovernanceDao {
         );
         let proposal_key = StorageKey::Proposal(proposal_id);
         env.storage().persistent().set(&proposal_key, &proposal);
+        Self::extend_proposal_ttl(&env, &proposal, config.proposal_timelock);
+        Self::extend_vote_ttl(&env, &proposal, &voter, config.proposal_timelock);
 
         env.events().publish(
             (Symbol::new(&env, "vote_cast"),),
@@ -1067,6 +1073,8 @@ impl GovernanceDao {
             env.storage()
                 .persistent()
                 .set(&StorageKey::Proposal(proposal_id), &proposal);
+            Self::extend_proposal_ttl(&env, &proposal, config.proposal_timelock);
+            Self::extend_vote_ttl(&env, &proposal, &voter, config.proposal_timelock);
 
             env.events().publish(
                 (Symbol::new(&env, "vote_cast"),),
@@ -1238,6 +1246,7 @@ impl GovernanceDao {
 
         let proposal_key = StorageKey::Proposal(proposal_id);
         env.storage().persistent().set(&proposal_key, &proposal);
+        Self::extend_proposal_ttl(&env, &proposal, config.proposal_timelock);
 
         // Issue #630: proposal is now resolved — clear its content hash so
         // the same action can be re-proposed.
@@ -1404,6 +1413,7 @@ impl GovernanceDao {
 
         let proposal_key = StorageKey::Proposal(proposal_id);
         env.storage().persistent().set(&proposal_key, &proposal);
+        Self::extend_proposal_ttl(&env, &proposal, config.proposal_timelock);
 
         // Issue #630: clear hash so the same action can be re-proposed.
         Self::clear_proposal_hash(&env, &proposal);
@@ -1459,6 +1469,13 @@ impl GovernanceDao {
             env.storage()
                 .persistent()
                 .set(&StorageKey::Proposal(proposal_id), &proposal);
+            let timelock = env
+                .storage()
+                .instance()
+                .get::<_, DaoConfig>(&StorageKey::Config)
+                .map(|c| c.proposal_timelock)
+                .unwrap_or(0);
+            Self::extend_proposal_ttl(&env, &proposal, timelock);
             Self::clear_proposal_hash(&env, &proposal);
             env.events().publish(
                 (Symbol::new(&env, "proposal_expired"),),
@@ -1508,6 +1525,13 @@ impl GovernanceDao {
         env.storage()
             .persistent()
             .set(&StorageKey::Proposal(proposal_id), &proposal);
+        let timelock = env
+            .storage()
+            .instance()
+            .get::<_, DaoConfig>(&StorageKey::Config)
+            .map(|c| c.proposal_timelock)
+            .unwrap_or(0);
+        Self::extend_proposal_ttl(&env, &proposal, timelock);
         let audit = ExecutionAuditRecord {
             proposal_id,
             executor: proposal.proposer.clone(),
@@ -1679,6 +1703,7 @@ impl GovernanceDao {
             .set(&StorageKey::Proposal(proposal_id), &proposal);
 
         let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        Self::extend_proposal_ttl(&env, &proposal, config.proposal_timelock);
         let gov_token = token::Client::new(&env, &config.gov_token);
         gov_token.transfer(
             &env.current_contract_address(),
@@ -1729,6 +1754,7 @@ impl GovernanceDao {
         env.storage()
             .persistent()
             .set(&StorageKey::Proposal(proposal_id), &proposal);
+        Self::extend_proposal_ttl(&env, &proposal, config.proposal_timelock);
 
         env.events().publish(
             (Symbol::new(&env, "discussion_period_ended"),),
@@ -2467,6 +2493,13 @@ impl GovernanceDao {
         env.storage()
             .persistent()
             .set(&StorageKey::Proposal(proposal_id), &proposal);
+        let timelock = env
+            .storage()
+            .instance()
+            .get::<_, DaoConfig>(&StorageKey::Config)
+            .map(|c| c.proposal_timelock)
+            .unwrap_or(0);
+        Self::extend_proposal_ttl(&env, &proposal, timelock);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_vetoed"),),
@@ -2993,6 +3026,82 @@ impl GovernanceDao {
         addr_str.copy_into_slice(&mut buf);
         if buf[0] != b'G' && buf[0] != b'C' {
             panic_with_error!(env, Error::InvalidAddress);
+        }
+    }
+
+    /// Compute `(threshold_ledgers, extend_to_ledgers)` for a proposal from its
+    /// own remaining lifetime (`vote_end`, `FINALIZE_DELAY`, `timelock`,
+    /// `execution_deadline`) plus `GOVERNANCE_TTL_BUFFER_SECONDS`, converted
+    /// via `LEDGER_SECONDS` and clamped to `[MIN_PROPOSAL_TTL_LEDGERS, max_ttl]`
+    /// (#900). Terminal proposals use `MIN_PROPOSAL_TTL_LEDGERS` so history
+    /// queries remain readable without paying for a full active window.
+    fn proposal_ttl_params(env: &Env, proposal: &Proposal, timelock: u64) -> (u32, u32) {
+        let max_ttl = env.storage().max_ttl();
+        let floor = MIN_PROPOSAL_TTL_LEDGERS.min(max_ttl);
+        if matches!(
+            proposal.status,
+            ProposalStatus::Executed
+                | ProposalStatus::Cancelled
+                | ProposalStatus::Expired
+                | ProposalStatus::Failed
+        ) {
+            let threshold = (floor / 2).max(1).min(floor);
+            return (threshold, floor);
+        }
+
+        let now = env.ledger().timestamp();
+        let min_eol = proposal
+            .vote_end
+            .saturating_add(FINALIZE_DELAY)
+            .saturating_add(timelock);
+        let eol = proposal
+            .execution_deadline
+            .max(min_eol)
+            .max(proposal.execution_time);
+        let remaining_secs = eol.saturating_sub(now);
+        let total_secs = remaining_secs.saturating_add(GOVERNANCE_TTL_BUFFER_SECONDS);
+        let raw_ledgers = total_secs.saturating_add(LEDGER_SECONDS - 1) / LEDGER_SECONDS;
+        let extend_to = u32::try_from(raw_ledgers)
+            .unwrap_or(u32::MAX)
+            .min(max_ttl)
+            .max(floor);
+        let threshold = (extend_to / 2).max(1).min(extend_to);
+        (threshold, extend_to)
+    }
+
+    /// Extend TTL on `Proposal(id)` and `ProposalContentHash(id)` using the
+    /// proposal-scoped lifetime (#900).
+    fn extend_proposal_ttl(env: &Env, proposal: &Proposal, timelock: u64) {
+        let (threshold, extend_to) = Self::proposal_ttl_params(env, proposal, timelock);
+        let proposal_key = StorageKey::Proposal(proposal.id);
+        if env.storage().persistent().has(&proposal_key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&proposal_key, threshold, extend_to);
+        }
+        let hash_key = StorageKey::ProposalContentHash(proposal.id);
+        if env.storage().persistent().has(&hash_key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&hash_key, threshold, extend_to);
+        }
+    }
+
+    /// Extend TTL on `Vote(id, voter)` and `LockedBalance(id, voter)` so vote
+    /// and lock records stay aligned with their proposal (#900).
+    fn extend_vote_ttl(env: &Env, proposal: &Proposal, voter: &Address, timelock: u64) {
+        let (threshold, extend_to) = Self::proposal_ttl_params(env, proposal, timelock);
+        let vote_key = StorageKey::Vote(proposal.id, voter.clone());
+        if env.storage().persistent().has(&vote_key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&vote_key, threshold, extend_to);
+        }
+        let lock_key = StorageKey::LockedBalance(proposal.id, voter.clone());
+        if env.storage().persistent().has(&lock_key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&lock_key, threshold, extend_to);
         }
     }
 
